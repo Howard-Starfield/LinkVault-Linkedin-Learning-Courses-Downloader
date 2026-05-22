@@ -32,9 +32,50 @@ namespace LLCD.DownloaderConfig
         [JsonProperty("Quality")]
         public Quality Quality { get; set; }
 
+        [JsonProperty("DownloadVideos")]
+        public bool DownloadVideos { get; set; } = true;
+
+        [JsonProperty("DownloadExerciseFiles")]
+        public bool DownloadExerciseFiles { get; set; } = true;
+
+        [JsonProperty("DownloadSubtitles")]
+        public bool DownloadSubtitles { get; set; } = true;
+
+        [JsonProperty("YtDlpDownloadDirectory")]
+        public DirectoryInfo YtDlpDownloadDirectory { get; set; }
+
+        [JsonProperty("YtDlpCookiesSourceIndex")]
+        public int YtDlpCookiesSourceIndex { get; set; }
+
+        [JsonProperty("YtDlpFormatTypeIndex")]
+        public int YtDlpFormatTypeIndex { get; set; }
+
+        [JsonProperty("YtDlpAudioFormatIndex")]
+        public int YtDlpAudioFormatIndex { get; set; }
+
+        [JsonProperty("YtDlpDownloadSubtitles")]
+        public bool YtDlpDownloadSubtitles { get; set; }
+
+        [JsonProperty("YtDlpDownloadAutoSubtitles")]
+        public bool YtDlpDownloadAutoSubtitles { get; set; }
+
+        [JsonProperty("YtDlpWriteInfoJson")]
+        public bool YtDlpWriteInfoJson { get; set; }
+
+        [JsonProperty("YtDlpWriteThumbnail")]
+        public bool YtDlpWriteThumbnail { get; set; }
+
+        [JsonProperty("YtDlpAutoDetectPlaylist")]
+        public bool YtDlpAutoDetectPlaylist { get; set; }
+
+        [JsonProperty("YtDlpSubtitleLanguages")]
+        public string YtDlpSubtitleLanguages { get; set; } = "en";
 
         private string EncryptToken(string token)
         {
+            if (String.IsNullOrEmpty(token))
+                return String.Empty;
+
             byte[] b = ASCIIEncoding.ASCII.GetBytes(token);
             string encryptedToken = Convert.ToBase64String(b);
             return encryptedToken;
@@ -46,10 +87,13 @@ namespace LLCD.DownloaderConfig
             string decryptedToken;
             try
             {
+                if (String.IsNullOrWhiteSpace(encryptedToken))
+                    return String.Empty;
+
                 b = Convert.FromBase64String(encryptedToken);
                 decryptedToken = ASCIIEncoding.ASCII.GetString(b);
             }
-            catch (FormatException)
+            catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
             {
                 decryptedToken = "";
             }
@@ -110,7 +154,7 @@ namespace LLCD.DownloaderConfig
 
         }
 
-        public static Config FromJson(string json) => JsonConvert.DeserializeObject<Config>(json, Converter.Settings);
+        public static Config FromJson(string json) => JsonConvert.DeserializeObject<Config>(json, Converter.Settings) ?? new Config();
 
     }
     public static class SerializeConfig

@@ -119,6 +119,35 @@ namespace LLCD.DownloaderTUI
             }
         }
 
+        public static bool GetDownloadVideos()
+        {
+            while (true)
+            {
+                Console.WriteLine(CONTINUEGLYPH + "Download course videos? 1.Yes 2.No");
+                Console.Write(ANSWERGLYPH);
+                string answer = Console.ReadLine();
+                switch (answer.Clean())
+                {
+                    case "":
+                    case "yes":
+                    case "y":
+                    case "1.yes":
+                    case "1":
+                        return true;
+                    case "no":
+                    case "n":
+                    case "2.no":
+                    case "2.n":
+                    case "2":
+                        return false;
+                    default:
+                        ShowError("The answer you entered isn't recognized");
+                        ShowError("Please try again");
+                        break;
+                }
+            }
+        }
+
         private static string Clean(this string answer, bool toLower = true)
         {
             if (toLower)

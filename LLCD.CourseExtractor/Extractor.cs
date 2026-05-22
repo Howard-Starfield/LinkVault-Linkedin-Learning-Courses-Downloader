@@ -31,18 +31,55 @@ namespace LLCD.CourseExtractor
         public string EnterpriseProfileHash { get; set; }
 
         public Extractor(string courseUrl, Quality quality, string token, int delay = 0)
+            : this(courseUrl, quality, token, CreateDefaultCookieContainer(), delay)
+        {
+        }
+
+        private Extractor(string courseUrl, Quality quality, string token, CookieContainer cookieContainer, int delay)
+            : this(courseUrl, quality, token, new HttpClient(new HttpClientHandler { UseCookies = true, CookieContainer = cookieContainer }), cookieContainer, delay)
+        {
+        }
+
+        internal Extractor(string courseUrl, Quality quality, string token, HttpClient client, CookieContainer cookieContainer, int delay = 0)
         {
             _courseUrl = courseUrl;
             _quality = quality;
             _delay = delay;
-            _cookieContainer = new CookieContainer();
-            _cookieContainer.Add(new Cookie("li_at", token, "/", ".www.linkedin.com"));
-            var clienthandler = new HttpClientHandler { UseCookies = true, CookieContainer = _cookieContainer };
-            _client = new HttpClient(clienthandler);
-            _client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0");
+            _cookieContainer = cookieContainer ?? CreateDefaultCookieContainer();
+            AddLinkedInTokenCookie(_cookieContainer, token);
+            _client = client ?? throw new ArgumentNullException(nameof(client));
+            if (!_client.DefaultRequestHeaders.Contains("User-Agent"))
+            {
+                _client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0");
+            }
         }
 
         public static string ExtractToken(Browser browser)
+        {
+            return ExtractTokens(browser).FirstOrDefault();
+        }
+
+        public static async Task<string> ExtractValidToken(Browser browser)
+        {
+            foreach (var token in ExtractTokens(browser))
+            {
+                var extractor = new Extractor("https://www.linkedin.com/learning", Quality.Low, token);
+                try
+                {
+                    if (await extractor.HasValidToken())
+                    {
+                        return token;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Extracted browser token failed validation");
+                }
+            }
+            return null;
+        }
+
+        private static List<string> ExtractTokens(Browser browser)
         {
             var cookieExtractor = new CookiesExtractor(".www.linkedin.com");
             List<DBCookie> cookies;
@@ -60,14 +97,27 @@ namespace LLCD.CourseExtractor
                 default:
                     throw new ArgumentException("browser");
             }
-            if (cookies.Where(c => c.Name == "li_at").Count() != 0)
-            {
-                return cookies.Where(c => c.Name == "li_at").First().Value;
-            }
-            return null;
+            return cookies
+                .Where(c => c.Name == "li_at" && !String.IsNullOrWhiteSpace(c.Value))
+                .Select(c => c.Value)
+                .Distinct()
+                .ToList();
         }
 
-        public async Task<Course> GetCourse(IProgress<float> progress = null)
+        private static CookieContainer CreateDefaultCookieContainer()
+        {
+            return new CookieContainer();
+        }
+
+        private static void AddLinkedInTokenCookie(CookieContainer cookieContainer, string token)
+        {
+            if (cookieContainer == null || String.IsNullOrWhiteSpace(token))
+                return;
+
+            cookieContainer.Add(new Cookie("li_at", token, "/", ".www.linkedin.com"));
+        }
+
+        public async Task<Course> GetCourse(IProgress<float> progress = null, bool includeVideoDetails = true)
         {
             if (!HasValidUrl())
             {
@@ -104,6 +154,13 @@ namespace LLCD.CourseExtractor
             }
 
             course.Slug = _courseSlug;
+            await RefreshExerciseFileUrls(course);
+            if (!includeVideoDetails)
+            {
+                progress?.Report(1);
+                return course;
+            }
+
             float j = 1;
             float totalCount = course.Chapters.SelectMany(c => c.Videos).Count();
             foreach (var chapter in course.Chapters)
@@ -139,7 +196,6 @@ namespace LLCD.CourseExtractor
 
         public async Task<bool> HasValidToken()
         {
-            Regex patternTrialLink = new Regex(@"nav__button-tertiary.*\n?.\r?.*Start free trial");
             if (_linkedinHomeRaw is null)
             {
                 var response = await _client.GetAsync("https://www.linkedin.com/learning");
@@ -147,12 +203,20 @@ namespace LLCD.CourseExtractor
                 _linkedinHomeRaw = WebUtility.HtmlDecode(_linkedinHomeRaw);
             }
 
-            if (patternTrialLink.IsMatch(_linkedinHomeRaw))
+            if (HasTrialPrompt(_linkedinHomeRaw))
             {
                 return false;
             }
             var cookies = _cookieContainer.GetCookies(new Uri("https://www.linkedin.com/learning"));
+            if (cookies["JSESSIONID"] is null)
+            {
+                return false;
+            }
             var jsession = cookies["JSESSIONID"].Value;
+            if (_client.DefaultRequestHeaders.Contains("Csrf-Token"))
+            {
+                _client.DefaultRequestHeaders.Remove("Csrf-Token");
+            }
             _client.DefaultRequestHeaders.Add("Csrf-Token", jsession);
             _isTokenChecked = true;
             return true;
@@ -161,7 +225,6 @@ namespace LLCD.CourseExtractor
 
         private async Task<String> ExtractEnterpriseProfileHash()
         {
-            Regex patternEnterpriseProfileHash = new Regex(@"enterpriseProfileHash"":""(?<enterpriseProfileHash>.*?)""");
             if (_linkedinHomeRaw is null)
             {
                 var response = await _client.GetAsync("https://www.linkedin.com/learning");
@@ -169,19 +232,146 @@ namespace LLCD.CourseExtractor
                 _linkedinHomeRaw = WebUtility.HtmlDecode(_linkedinHomeRaw);
             }
 
-            if (patternEnterpriseProfileHash.IsMatch(_linkedinHomeRaw))
+            return ExtractEnterpriseProfileHash(_linkedinHomeRaw);
+        }
+
+        private async Task RefreshExerciseFileUrls(Course course)
+        {
+            if (course?.ExerciseFiles == null || course.ExerciseFiles.Count == 0)
+                return;
+
+            try
             {
-                return patternEnterpriseProfileHash.Match(_linkedinHomeRaw).Groups["enterpriseProfileHash"].Value;
+                var response = await _client.GetAsync($"https://www.linkedin.com/learning/{_courseSlug}");
+                var coursePageHtml = WebUtility.HtmlDecode(await response.Content.ReadAsStringAsync());
+                var urls = ExtractExerciseFileUrlsFromHtml(coursePageHtml);
+                if (urls.Count == 0)
+                    return;
+
+                var matchedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var unmatchedExerciseFiles = new List<ExerciseFile>();
+                foreach (var exerciseFile in course.ExerciseFiles)
+                {
+                    var refreshedUrl = FindExerciseFileUrlByName(urls, exerciseFile.FileName);
+                    if (!String.IsNullOrWhiteSpace(refreshedUrl))
+                    {
+                        exerciseFile.DownloadUrl = refreshedUrl;
+                        matchedUrls.Add(refreshedUrl);
+                    }
+                    else
+                    {
+                        unmatchedExerciseFiles.Add(exerciseFile);
+                    }
+                }
+
+                var unmatchedUrls = urls
+                    .Where(url => !matchedUrls.Contains(url))
+                    .ToList();
+                if (unmatchedExerciseFiles.Count > 0 && unmatchedExerciseFiles.Count == unmatchedUrls.Count)
+                {
+                    for (int i = 0; i < unmatchedExerciseFiles.Count; i++)
+                    {
+                        unmatchedExerciseFiles[i].DownloadUrl = unmatchedUrls[i];
+                    }
+                }
             }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not refresh exercise file URLs from course page");
+            }
+        }
+
+        internal static List<string> ExtractExerciseFileUrlsFromHtml(string html)
+        {
+            if (String.IsNullOrWhiteSpace(html))
+                return new List<string>();
+
+            var normalizedHtml = WebUtility.HtmlDecode(WebUtility.HtmlDecode(html)
+                .Replace("\\u002F", "/")
+                .Replace("\\u002f", "/")
+                .Replace("\\/", "/")
+                .Replace("\\u0026", "&")
+                .Replace("\\u0026amp;", "&")
+                .Replace("\\u003D", "=")
+                .Replace("\\u003d", "="));
+
+            var fileUrlMatches = Regex.Matches(
+                normalizedHtml,
+                @"https?:\/\/[^""'<>\s\\]+(?:\.(?:zip|pdf|rar|7z|tar|gz|docx?|xlsx?|pptx?))(?:\?[^""'<>\s\\]*)?",
+                RegexOptions.IgnoreCase);
+            var ambryUrlMatches = Regex.Matches(
+                normalizedHtml,
+                @"https?:\/\/(?:www\.)?linkedin\.com\/ambry\/\?[^""'<>\s\\]+",
+                RegexOptions.IgnoreCase);
+
+            return fileUrlMatches
+                .Cast<Match>()
+                .Concat(ambryUrlMatches.Cast<Match>())
+                .Select(match => match.Value.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static string FindExerciseFileUrlByName(IEnumerable<string> urls, string fileName)
+        {
+            if (urls == null || String.IsNullOrWhiteSpace(fileName))
+                return null;
+
+            foreach (var url in urls)
+            {
+                string urlFileName = GetUrlFileName(url);
+                if (String.Equals(urlFileName, fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return url;
+                }
+            }
+
             return null;
+        }
+
+        private static string GetUrlFileName(string url)
+        {
+            if (String.IsNullOrWhiteSpace(url))
+                return null;
+
+            try
+            {
+                var uri = new Uri(url);
+                return Path.GetFileName(uri.AbsolutePath);
+            }
+            catch (UriFormatException)
+            {
+                return null;
+            }
+        }
+
+        internal static bool HasTrialPrompt(string html)
+        {
+            if (String.IsNullOrWhiteSpace(html))
+                return false;
+
+            return Regex.IsMatch(html, @"nav__button-tertiary.*Start free trial", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        }
+
+        internal static string ExtractEnterpriseProfileHash(string html)
+        {
+            if (String.IsNullOrWhiteSpace(html))
+                return null;
+
+            var match = Regex.Match(html, @"enterpriseProfileHash"":""(?<enterpriseProfileHash>.*?)""");
+            return match.Success ? match.Groups["enterpriseProfileHash"].Value : null;
         }
         public bool HasValidUrl()
         {
-            if (!_courseUrl.Contains("https://") || !_courseUrl.Contains("http://"))
+            if (String.IsNullOrWhiteSpace(_courseUrl))
+                return false;
+
+            _courseUrl = _courseUrl.Trim();
+            if (!_courseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && !_courseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
             {
                 _courseUrl = "https://" + _courseUrl;
             }
-            Regex patternCourseUrl = new Regex(@"https?:\/\/(?:www\.)?linkedin\.com\/learning\/(?<courseSlug>[a-zA-Z0-9-]+)");
+            Regex patternCourseUrl = new Regex(@"^https?:\/\/(?:www\.)?linkedin\.com\/learning\/(?<courseSlug>[a-zA-Z0-9-]+)(?:[\/?#]|$)", RegexOptions.IgnoreCase);
 
             if (patternCourseUrl.IsMatch(_courseUrl))
             {

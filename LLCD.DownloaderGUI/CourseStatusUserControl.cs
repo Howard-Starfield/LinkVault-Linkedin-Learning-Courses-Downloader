@@ -18,6 +18,7 @@ namespace LLCD.DownloaderGUI
             InitializeComponent();
         }
         public CourseStatus _status;
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public CourseStatus Status
         {
             get
@@ -48,6 +49,11 @@ namespace LLCD.DownloaderGUI
                         lblCourseStatus.Text = value.ToString();
                         lblCourseStatus.BackColor = Color.FromArgb(207, 102, 121);
                         lblCourseStatus.ForeColor = Color.Black;
+                        break;
+                    case CourseStatus.Cancelled:
+                        lblCourseStatus.Text = "Cancelled";
+                        lblCourseStatus.BackColor = Color.FromArgb(255, 204, 153);
+                        lblCourseStatus.ForeColor = Color.FromArgb(64, 35, 0);
                         break;
                 }
                 _status = value;

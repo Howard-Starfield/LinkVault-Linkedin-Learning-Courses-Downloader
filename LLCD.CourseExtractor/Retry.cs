@@ -1,7 +1,5 @@
-﻿using Serilog;
+using Serilog;
 using System;
-using System.Collections.Generic;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace LLCD.CourseExtractor
@@ -16,6 +14,10 @@ namespace LLCD.CourseExtractor
                 try
                 {
                     return function();
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -52,12 +54,11 @@ namespace LLCD.CourseExtractor
             {
                 try
                 {
-                    var resultTask = function();
-
-                    await Task.WhenAny(resultTask).ConfigureAwait(false);
-
-                    if (resultTask.Status == TaskStatus.RanToCompletion || resultTask.Status == TaskStatus.Canceled)
-                        return resultTask.Result;
+                    return await function().ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -103,14 +104,12 @@ namespace LLCD.CourseExtractor
             {
                 try
                 {
-                    var resultTask = function();
-
-                    await Task.WhenAny(resultTask).ConfigureAwait(false);
-
-                    if (resultTask.Status == TaskStatus.RanToCompletion || resultTask.Status == TaskStatus.Canceled)
-                        return;
-                    else
-                        throw resultTask.Exception;
+                    await function().ConfigureAwait(false);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -141,5 +140,3 @@ namespace LLCD.CourseExtractor
 
     }
 }
-
-

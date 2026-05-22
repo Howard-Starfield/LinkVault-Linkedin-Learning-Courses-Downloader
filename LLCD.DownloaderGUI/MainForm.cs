@@ -9,7 +9,6 @@ using System.Drawing.Text;
 using System.Drawing;
 using System.Threading.Tasks;
 using Serilog;
-using Squirrel;
 using LLCD.CourseContent;
 using LLCD.CourseExtractor;
 using LLCD.DownloaderConfig;
@@ -30,6 +29,7 @@ namespace LLCD.DownloaderGUI
             cmboxBrowser.SelectedIndex = 0;
             Focus();
             _exceptionControls = new Control[] { panelStatus };
+            InitializeYtDlpTab();
         }
 
         private void btnBrowse_Click(object sender, EventArgs e)
@@ -154,7 +154,8 @@ namespace LLCD.DownloaderGUI
             var courses = new List<Course>();
             foreach (var extractor in extractors)
             {
-                var course = await ExtractCourse(extractor);
+                bool includeVideoDetails = checkBoxVideos.Checked || checkBoxSubtitles.Checked;
+                var course = await ExtractCourse(extractor, includeVideoDetails);
                 if (course is null)
                     return;
                 courses.Add(course);
@@ -166,7 +167,7 @@ namespace LLCD.DownloaderGUI
             lblCurrentExtractionOperation.Text = "Courses Extracted Successfully";
             UC_CourseExtractorStatus.Status = CourseStatus.Finished;
 
-            var downloaderForm = new DownloaderForm(courses, new DirectoryInfo(txtCourseDirectory.Text), checkBoxExerciseFiles.Checked,checkBoxSubtitles.Checked);
+            var downloaderForm = new DownloaderForm(courses, new DirectoryInfo(txtCourseDirectory.Text), checkBoxVideos.Checked, checkBoxExerciseFiles.Checked, checkBoxSubtitles.Checked);
             UCCourseDownloaderStatus.Status = CourseStatus.Running;
             try
             {
@@ -187,6 +188,11 @@ namespace LLCD.DownloaderGUI
                 MessageBox.Show("Course Downloaded Successfully :)", "Hooray", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 lblCurrentExtractionOperation.Text = "Course Downloaded Successfully";
             }
+            else if (downloaderForm.DownloaderStatus == CourseStatus.Cancelled)
+            {
+                UCCourseDownloaderStatus.Status = CourseStatus.Cancelled;
+                lblCurrentExtractionOperation.Text = "Course Download Cancelled";
+            }
             else
             {
                 UCCourseDownloaderStatus.Status = CourseStatus.Failed;
@@ -194,7 +200,7 @@ namespace LLCD.DownloaderGUI
             }
         }
 
-        private async Task<Course> ExtractCourse(Extractor extractor)
+        private async Task<Course> ExtractCourse(Extractor extractor, bool includeVideoDetails)
         {
             UC_CourseExtractorStatus.Status = CourseStatus.Running;
 
@@ -206,7 +212,7 @@ namespace LLCD.DownloaderGUI
                         int progressValue = (int)(progressPercent * 100);
                         UpdateUI(() => progressBarExtractor.Value = progressValue == 100 ? 0 : progressValue);
                     });
-                course = await extractor.GetCourse(progress);
+                course = await extractor.GetCourse(progress, includeVideoDetails);
             }
             catch (Exception ex)
             {
@@ -267,11 +273,13 @@ namespace LLCD.DownloaderGUI
         private async Task SaveConfig()
         {
             lblCurrentExtractionOperation.Text = "Saving config file";
-            Config config = new Config
-            {
-                AuthenticationToken = txtToken.Text,
-                Quality = (Quality)cmboxQuality.SelectedIndex
-            };
+            Config config = await LoadConfigOrDefault();
+            config.AuthenticationToken = txtToken.Text;
+            config.Quality = (Quality)cmboxQuality.SelectedIndex;
+            config.DownloadVideos = checkBoxVideos.Checked;
+            config.DownloadExerciseFiles = checkBoxExerciseFiles.Checked;
+            config.DownloadSubtitles = checkBoxSubtitles.Checked;
+            ApplyYtDlpSettingsToConfig(config);
             try
             {
                 config.CourseDirectory = new DirectoryInfo(txtCourseDirectory.Text);
@@ -294,48 +302,6 @@ namespace LLCD.DownloaderGUI
 
         }
 
-
-        private async Task CheckForUpdates()
-        {
-            bool restartApp = false;
-            try
-            {
-                using (var githubUpdateManager = UpdateManager.GitHubUpdateManager("https://github.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader.UpdateManager"))
-                using (var updateManager = await githubUpdateManager)
-                {
-                    Log.Information("Checking for updates...");
-                    var updateInfo = await updateManager.CheckForUpdate();
-                    if (updateInfo.ReleasesToApply.Any())
-                    {
-                        var versionCount = updateInfo.ReleasesToApply.Count;
-                        Log.Information($"{versionCount} update(s) found.");
-
-                        var versionWord = versionCount > 1 ? "versions" : "version";
-                        var message = new StringBuilder().AppendLine($"App is {versionCount} {versionWord} behind.")
-                            .AppendLine("If you choose to update, the app will automatically restart after the update.")
-                            .AppendLine($"Would you like to update?")
-                            .ToString();
-                        UpdaterForm updaterForm = new UpdaterForm(message, updateManager);
-                        UpdateUI(() => updaterForm.ShowDialog());
-                        restartApp = updaterForm.IsUpdated;
-                    }
-                    else
-                    {
-                        Log.Information("No updates detected.");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, $"There was an issue during the update process! {ex.Message}");
-            }
-
-            if (restartApp)
-            {
-                UpdateManager.RestartApp();
-            }
-        }
-
         private async void MainForm_Load(object sender, EventArgs e)
         {
             foreach (Control control in this.Controls)
@@ -345,15 +311,26 @@ namespace LLCD.DownloaderGUI
 
             btnBrowse.Font = new Font(FormHelpers.QuicksandFontFamilySemiBold, 12, FontStyle.Bold);
             txtCourseUrls.Font = new Font(FormHelpers.QuicksandFontFamilyRegular, 12);
+            RefreshResponsiveLayouts();
 
             if (File.Exists("./Config.json"))
             {
                 try
                 {
                     var config = await Config.Fill();
-                    txtCourseDirectory.Text = config.CourseDirectory.FullName;
-                    txtToken.Text = config.AuthenticationToken;
-                    cmboxQuality.SelectedIndex = (int)config.Quality;
+                    if (config.CourseDirectory != null)
+                    {
+                        txtCourseDirectory.Text = config.CourseDirectory.FullName;
+                    }
+                    txtToken.Text = config.AuthenticationToken ?? String.Empty;
+                    if ((int)config.Quality >= 0 && (int)config.Quality < cmboxQuality.Items.Count)
+                    {
+                        cmboxQuality.SelectedIndex = (int)config.Quality;
+                    }
+                    checkBoxVideos.Checked = config.DownloadVideos;
+                    checkBoxExerciseFiles.Checked = config.DownloadExerciseFiles;
+                    checkBoxSubtitles.Checked = config.DownloadSubtitles;
+                    ApplyYtDlpSettingsFromConfig(config);
                     Log.Information("Acquired data from config");
                 }
                 catch (JsonSerializationException ex)
@@ -366,7 +343,11 @@ namespace LLCD.DownloaderGUI
             {
                 Log.Information("No Config is found");
             }
-            await CheckForUpdates();
+
+            if (String.IsNullOrWhiteSpace(txtToken.Text))
+            {
+                await TryAutoImportLinkedInToken();
+            }
         }
 
 
@@ -383,18 +364,72 @@ namespace LLCD.DownloaderGUI
         }
 
 
-        private void btnExtractToken_Click(object sender, EventArgs e)
+        private async void btnExtractToken_Click(object sender, EventArgs e)
         {
-            string token = Extractor.ExtractToken((Browser)cmboxBrowser.SelectedIndex);
+            string token = await Extractor.ExtractValidToken((Browser)cmboxBrowser.SelectedIndex);
             if (token is null)
             {
-                MessageBox.Show($"No linkedin learning token is found for {cmboxBrowser.SelectedItem.ToString().Replace("From ", "")}.\nPlease make sure that you are logged into linkedin.com/learning on the browser's default profile", "Token not found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show($"No valid linkedin learning token is found for {cmboxBrowser.SelectedItem.ToString().Replace("From ", "")}.\nPlease make sure that you are logged into linkedin.com/learning in one of the browser profiles.", "Token not found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             else
             {
                 txtToken.Text = token;
             }
 
+        }
+
+        private async Task TryAutoImportLinkedInToken()
+        {
+            btnExtractToken.Enabled = false;
+            UC_CourseExtractorStatus.Status = CourseStatus.Starting;
+            lblCurrentExtractionOperation.Text = "Checking browser login for LinkedIn token";
+
+            try
+            {
+                var selectedBrowser = (Browser)cmboxBrowser.SelectedIndex;
+                var browsers = new[] { selectedBrowser }
+                    .Concat(Enum.GetValues(typeof(Browser)).Cast<Browser>())
+                    .Distinct();
+
+                foreach (var browser in browsers)
+                {
+                    string token = await Extractor.ExtractValidToken(browser);
+                    if (!String.IsNullOrWhiteSpace(token))
+                    {
+                        cmboxBrowser.SelectedIndex = (int)browser;
+                        txtToken.Text = token;
+                        lblCurrentExtractionOperation.Text = "LinkedIn token imported from " + BrowserDisplayName(browser);
+                        return;
+                    }
+                }
+
+                lblCurrentExtractionOperation.Text = "No browser token found; sign in and use Import Token";
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Automatic LinkedIn token import failed");
+                lblCurrentExtractionOperation.Text = "Automatic token import failed; use Import Token";
+            }
+            finally
+            {
+                UC_CourseExtractorStatus.Status = CourseStatus.NotRunning;
+                btnExtractToken.Enabled = true;
+            }
+        }
+
+        private static string BrowserDisplayName(Browser browser)
+        {
+            switch (browser)
+            {
+                case Browser.Chrome:
+                    return "Google Chrome";
+                case Browser.Firefox:
+                    return "Mozilla Firefox";
+                case Browser.Edge:
+                    return "Microsoft Edge";
+                default:
+                    return browser.ToString();
+            }
         }
 
         private void checkBoxDelay_CheckedChanged(object sender, EventArgs e)
@@ -421,6 +456,22 @@ namespace LLCD.DownloaderGUI
             if (e.KeyChar < 48 || e.KeyChar > 57)
             {
                 e.Handled = true;
+            }
+        }
+
+        private static async Task<Config> LoadConfigOrDefault()
+        {
+            if (!File.Exists("./Config.json"))
+                return new Config();
+
+            try
+            {
+                return await Config.Fill();
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not load existing config; using defaults");
+                return new Config();
             }
         }
     }

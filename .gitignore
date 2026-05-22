@@ -26,6 +26,8 @@ bld/
 [Bb]in/
 [Oo]bj/
 [Ll]og/
+logs/
+build-verify/
 
 # Visual Studio 2015/2017 cache/options directory
 .vs/
@@ -191,6 +193,9 @@ PublishScripts/
 # NuGet v3's project.json files produces more ignorable files
 *.nuget.props
 *.nuget.targets
+
+# Local research clones / agent scratch data
+agent-harness/
 
 # Microsoft Azure Build Output
 csx/

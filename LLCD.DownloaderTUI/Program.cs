@@ -46,11 +46,21 @@ namespace LLCD.DownloaderTUI
                     Config config = Config.FromJson(File.ReadAllText("./Config.json"));
                     Console.WriteLine(TUI.CONTINUEGLYPH + "Data in config file : ");
                     Console.WriteLine(TUI.CONTINUEGLYPH + "Quality to download in : " + config.Quality);
+                    Console.WriteLine(TUI.CONTINUEGLYPH + "Download videos : " + (config.DownloadVideos ? "Yes" : "No"));
                     Console.WriteLine(TUI.CONTINUEGLYPH + "Course Directory/Path : " + config.CourseDirectory);
-                    Console.WriteLine(TUI.CONTINUEGLYPH + "Authentication Token : " + config.AuthenticationToken);
+                    Console.WriteLine(TUI.CONTINUEGLYPH + "Authentication Token : " + (String.IsNullOrWhiteSpace(config.AuthenticationToken) ? "[missing]" : "[saved]"));
                     if (TUI.UseConfig())
                     {
-                        await RunWithConfig(config);
+                        if (IsLinkedInConfigUsable(config))
+                        {
+                            await RunWithConfig(config);
+                        }
+                        else
+                        {
+                            TUI.ShowError("Config file does not contain the LinkedIn downloader settings needed by the console app.");
+                            Console.WriteLine(TUI.CONTINUEGLYPH + "The data you enter will be saved in a new Config file");
+                            await RunWithoutConfig();
+                        }
                     }
                     else
                     {
@@ -107,19 +117,28 @@ namespace LLCD.DownloaderTUI
 
         }
 
+        private static bool IsLinkedInConfigUsable(Config config)
+        {
+            return config != null &&
+                   config.CourseDirectory != null &&
+                   !String.IsNullOrWhiteSpace(config.AuthenticationToken);
+        }
+
         private static async Task RunWithoutConfig()
         {
             string courseUrl = TUI.GetCourseUrl();
             string token = TUI.GetLoginToken();
             var courseRootDirectory = TUI.GetPath();
             var selectedQuality = TUI.GetQuality();
+            bool downloadVideos = TUI.GetDownloadVideos();
 
 
             Config config = new Config
             {
                 AuthenticationToken = token,
                 Quality = selectedQuality,
-                CourseDirectory = courseRootDirectory
+                CourseDirectory = courseRootDirectory,
+                DownloadVideos = downloadVideos
             };
             await config.Save();
             Console.WriteLine(TUI.CONTINUEGLYPH + "Saved entries to config file");
@@ -148,7 +167,7 @@ namespace LLCD.DownloaderTUI
             try
             {
                 using var pbarExtractor = new ProgressBar(10000, "Extracting Course Links - This will take some time", optionPbarExtractor);
-                course = await extractor.GetCourse(pbarExtractor.AsProgress<float>());
+                course = await extractor.GetCourse(pbarExtractor.AsProgress<float>(), config.DownloadVideos);
             }
             catch (Exception ex)
             {
@@ -160,7 +179,7 @@ namespace LLCD.DownloaderTUI
             Console.WriteLine(TUI.ENDGLYPH + "Course Extracted Successfully");
             Log.Information("Course Extracted. Downloading...");
             Console.WriteLine();
-            CourseDownloader.DownloadCourse(course, config.CourseDirectory);
+            CourseDownloader.DownloadCourse(course, config.CourseDirectory, config.DownloadVideos);
         }
         private static async void AllUnhandledExceptions(object sender, UnhandledExceptionEventArgs e)
         {

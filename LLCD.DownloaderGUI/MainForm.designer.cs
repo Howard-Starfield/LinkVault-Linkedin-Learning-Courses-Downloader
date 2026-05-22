@@ -51,6 +51,7 @@
             this.label3 = new System.Windows.Forms.Label();
             this.cmboxBrowser = new System.Windows.Forms.ComboBox();
             this.numericUpDownDelay = new System.Windows.Forms.NumericUpDown();
+            this.checkBoxVideos = new System.Windows.Forms.CheckBox();
             this.checkBoxExerciseFiles = new System.Windows.Forms.CheckBox();
             this.checkBoxDelay = new System.Windows.Forms.CheckBox();
             this.checkBoxSubtitles = new System.Windows.Forms.CheckBox();
@@ -70,7 +71,7 @@
             this.panelBody.ForeColor = System.Drawing.Color.White;
             this.panelBody.Location = new System.Drawing.Point(12, 12);
             this.panelBody.Name = "panelBody";
-            this.panelBody.Size = new System.Drawing.Size(697, 690);
+            this.panelBody.Size = new System.Drawing.Size(697, 728);
             this.panelBody.TabIndex = 0;
             // 
             // panelStatus
@@ -83,7 +84,7 @@
             this.panelStatus.Controls.Add(this.label8);
             this.panelStatus.Controls.Add(this.progressBarCourses);
             this.panelStatus.Controls.Add(this.progressBarExtractor);
-            this.panelStatus.Location = new System.Drawing.Point(13, 479);
+            this.panelStatus.Location = new System.Drawing.Point(13, 517);
             this.panelStatus.Name = "panelStatus";
             this.panelStatus.Size = new System.Drawing.Size(671, 207);
             this.panelStatus.TabIndex = 22;
@@ -159,13 +160,14 @@
             this.panelInput.Controls.Add(this.label3);
             this.panelInput.Controls.Add(this.cmboxBrowser);
             this.panelInput.Controls.Add(this.numericUpDownDelay);
+            this.panelInput.Controls.Add(this.checkBoxVideos);
             this.panelInput.Controls.Add(this.checkBoxExerciseFiles);
             this.panelInput.Controls.Add(this.checkBoxDelay);
             this.panelInput.Controls.Add(this.checkBoxSubtitles);
             this.panelInput.Font = new System.Drawing.Font("Quicksand", 14.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.panelInput.Location = new System.Drawing.Point(13, 0);
             this.panelInput.Name = "panelInput";
-            this.panelInput.Size = new System.Drawing.Size(671, 459);
+            this.panelInput.Size = new System.Drawing.Size(671, 497);
             this.panelInput.TabIndex = 21;
             // 
             // label1
@@ -186,7 +188,7 @@
             this.btnDownload.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnDownload.Font = new System.Drawing.Font("Quicksand Medium", 14.25F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.btnDownload.ForeColor = System.Drawing.Color.Black;
-            this.btnDownload.Location = new System.Drawing.Point(429, 392);
+            this.btnDownload.Location = new System.Drawing.Point(429, 430);
             this.btnDownload.Name = "btnDownload";
             this.btnDownload.Size = new System.Drawing.Size(221, 45);
             this.btnDownload.TabIndex = 17;
@@ -254,9 +256,9 @@
             this.label4.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(207)))), ((int)(((byte)(210)))), ((int)(((byte)(214)))));
             this.label4.Location = new System.Drawing.Point(11, 13);
             this.label4.Name = "label4";
-            this.label4.Size = new System.Drawing.Size(142, 28);
+            this.label4.Size = new System.Drawing.Size(171, 28);
             this.label4.TabIndex = 0;
-            this.label4.Text = "Video quality : ";
+            this.label4.Text = "Video resolution : ";
             // 
             // txtToken
             // 
@@ -353,6 +355,20 @@
             this.numericUpDownDelay.TextAlign = System.Windows.Forms.HorizontalAlignment.Center;
             this.numericUpDownDelay.KeyPress += new System.Windows.Forms.KeyPressEventHandler(this.numericUpDownDelay_KeyPress);
             // 
+            // checkBoxVideos
+            // 
+            this.checkBoxVideos.AutoSize = true;
+            this.checkBoxVideos.Checked = true;
+            this.checkBoxVideos.CheckState = System.Windows.Forms.CheckState.Checked;
+            this.checkBoxVideos.Font = new System.Drawing.Font("Quicksand", 14.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.checkBoxVideos.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(207)))), ((int)(((byte)(210)))), ((int)(((byte)(214)))));
+            this.checkBoxVideos.Location = new System.Drawing.Point(16, 367);
+            this.checkBoxVideos.Name = "checkBoxVideos";
+            this.checkBoxVideos.Size = new System.Drawing.Size(183, 32);
+            this.checkBoxVideos.TabIndex = 13;
+            this.checkBoxVideos.Text = "Download videos";
+            this.checkBoxVideos.UseVisualStyleBackColor = true;
+            // 
             // checkBoxExerciseFiles
             // 
             this.checkBoxExerciseFiles.AutoSize = true;
@@ -360,10 +376,10 @@
             this.checkBoxExerciseFiles.CheckState = System.Windows.Forms.CheckState.Checked;
             this.checkBoxExerciseFiles.Font = new System.Drawing.Font("Quicksand", 14.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.checkBoxExerciseFiles.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(207)))), ((int)(((byte)(210)))), ((int)(((byte)(214)))));
-            this.checkBoxExerciseFiles.Location = new System.Drawing.Point(16, 367);
+            this.checkBoxExerciseFiles.Location = new System.Drawing.Point(16, 405);
             this.checkBoxExerciseFiles.Name = "checkBoxExerciseFiles";
             this.checkBoxExerciseFiles.Size = new System.Drawing.Size(237, 32);
-            this.checkBoxExerciseFiles.TabIndex = 13;
+            this.checkBoxExerciseFiles.TabIndex = 14;
             this.checkBoxExerciseFiles.Text = "Download exercise files";
             this.checkBoxExerciseFiles.UseVisualStyleBackColor = true;
             // 
@@ -387,10 +403,10 @@
             this.checkBoxSubtitles.CheckState = System.Windows.Forms.CheckState.Checked;
             this.checkBoxSubtitles.Font = new System.Drawing.Font("Quicksand", 14.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.checkBoxSubtitles.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(207)))), ((int)(((byte)(210)))), ((int)(((byte)(214)))));
-            this.checkBoxSubtitles.Location = new System.Drawing.Point(16, 405);
+            this.checkBoxSubtitles.Location = new System.Drawing.Point(16, 443);
             this.checkBoxSubtitles.Name = "checkBoxSubtitles";
             this.checkBoxSubtitles.Size = new System.Drawing.Size(197, 32);
-            this.checkBoxSubtitles.TabIndex = 14;
+            this.checkBoxSubtitles.TabIndex = 15;
             this.checkBoxSubtitles.Text = "Download subtitles";
             this.checkBoxSubtitles.UseVisualStyleBackColor = true;
             // 
@@ -417,7 +433,7 @@
             this.AutoScaleDimensions = new System.Drawing.SizeF(96F, 96F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
             this.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(18)))), ((int)(((byte)(18)))), ((int)(((byte)(18)))));
-            this.ClientSize = new System.Drawing.Size(717, 711);
+            this.ClientSize = new System.Drawing.Size(717, 749);
             this.Controls.Add(this.panelBody);
             this.ForeColor = System.Drawing.Color.White;
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
@@ -453,6 +469,7 @@
         private CourseStatusUserControl UCCourseDownloaderStatus;
         private System.Windows.Forms.ProgressBar progressBarCourses;
         private System.Windows.Forms.ComboBox cmboxBrowser;
+        private System.Windows.Forms.CheckBox checkBoxVideos;
         private System.Windows.Forms.CheckBox checkBoxExerciseFiles;
         private System.Windows.Forms.Panel panelInput;
         private System.Windows.Forms.TextBox txtCourseUrls;
@@ -469,4 +486,3 @@
         private System.Windows.Forms.Label label1;
     }
 }
-

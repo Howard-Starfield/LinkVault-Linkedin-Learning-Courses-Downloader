@@ -19,6 +19,7 @@ namespace LLCD.DownloaderGUI
 
         private bool _isLoggedin;
 
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public bool IsLoggedin
         {
             get { return _isLoggedin; }

@@ -5,7 +5,6 @@ using System.Windows.Forms;
 using LLCD.DownloaderConfig;
 using Microsoft.Win32;
 using Serilog;
-using Squirrel;
 
 namespace LLCD.DownloaderGUI
 {
@@ -24,18 +23,13 @@ namespace LLCD.DownloaderGUI
                 .MinimumLevel.Debug()
                 .WriteTo.File("./logs/log.txt", rollingInterval: RollingInterval.Day, retainedFileCountLimit: 10)
                 .CreateLogger();
-            using (var mgr = new UpdateManager("https://github.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader.UpdateManager"))
-            {
-                SquirrelAwareApp.HandleEvents(
-                  onInitialInstall: v => { mgr.CreateShortcutForThisExe(); },
-                  onAppUpdate: v => { mgr.CreateShortcutForThisExe();},
-                  onAppUninstall: v => mgr.RemoveShortcutForThisExe());
-            }
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
             if (!File.Exists("IconAddedToRegistry"))
             {
                 AddIconToRegistry();
-                File.Create("IconAddedToRegistry");
+                using (File.Create("IconAddedToRegistry"))
+                {
+                }
             }
             Config.Restore();
             Application.Run(new MainForm());
@@ -43,17 +37,18 @@ namespace LLCD.DownloaderGUI
         private static void AddIconToRegistry()
         {
             Log.Information("Setting key value for icon in registry");
+            string exePath = Assembly.GetExecutingAssembly().Location;
             using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64))
             using (RegistryKey myKey = baseKey.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\Linkedin-Learning-Courses-Downloader", true))
             {
-                Log.Information("Current exe path : " + Assembly.GetExecutingAssembly().GetName().CodeBase.Replace("file:///", ""));
+                Log.Information("Current exe path : " + exePath);
                 if (myKey is null)
                 {
                     Log.Warning("Key not found");
                 }
                 else
                 {
-                    myKey.SetValue("DisplayIcon", Assembly.GetExecutingAssembly().GetName().CodeBase.Replace("file:///", ""), RegistryValueKind.String);
+                    myKey.SetValue("DisplayIcon", exePath, RegistryValueKind.String);
                     Log.Information("Key value for icon is set successfully");
                 }
             }
