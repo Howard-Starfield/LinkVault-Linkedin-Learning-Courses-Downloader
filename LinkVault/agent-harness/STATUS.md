@@ -1,5 +1,37 @@
 # Status
 
+## 2026-05-23 NSIS Installer Verification Slice
+
+Status: the release gate now produces and requires the first installer artifact.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/scripts/verify-release.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+- `LinkVault/agent-harness/RELEASE_HANDOFF.md`
+
+Implemented in this slice:
+
+- Verified `pnpm.cmd tauri build --bundles nsis` works in the local Windows environment.
+- Updated `pnpm.cmd run verify:release` to build with `--bundles nsis`.
+- The release verifier now requires both `src-tauri/target/release/linkvault.exe` and an NSIS `*-setup.exe` under `src-tauri/target/release/bundle/nsis`.
+- MSI remains deferred until installer branding and code-signing decisions are settled.
+
+Validation evidence:
+
+- `pnpm.cmd tauri build --bundles nsis` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:release` passed in `LinkVault/linkvault-tauri`.
+- Release executable produced: `LinkVault/linkvault-tauri/src-tauri/target/release/linkvault.exe` at 15.61 MB.
+- NSIS installer produced: `LinkVault/linkvault-tauri/src-tauri/target/release/bundle/nsis/LinkVault_0.1.0_x64-setup.exe` at 4.10 MB.
+- Release executable stayed alive for the 5000ms startup smoke window before clean termination.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+
+Current next slice:
+
+Run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
+
 ## 2026-05-23 Release Verification Slice
 
 Status: the first packaging target is decided as the release executable and has a repeatable verifier.
