@@ -47,6 +47,7 @@
 - [x] Add repeatable NSIS installer verification for the first installer target.
 - [x] Add non-installing installer artifact verification for filename, version, size, and PE header.
 - [x] Assert checked-in Tauri bundle config in release verification.
+- [x] Generate release handoff manifest with artifact SHA-256 hashes.
 - [x] Replace visible demo progress streams with persisted active/completed/failed/cancelled job event state.
 - [x] Add repeatable Playwright visual assertions for desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - [x] Add repeatable Playwright interaction assertions for URL parse errors, blank-line multi-URL order, guarded start, visible toasts, and no live LinkedIn calls.

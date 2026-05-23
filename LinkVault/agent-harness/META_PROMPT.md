@@ -37,6 +37,7 @@ Current verification commands:
 - `pnpm.cmd run verify:tauri-smoke` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd run verify:release` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd run verify:installer` from `LinkVault/linkvault-tauri` after `verify:release`
+- `pnpm.cmd run verify:release-manifest` from `LinkVault/linkvault-tauri` after `verify:release`
 - `pnpm.cmd tauri build --debug` from `LinkVault/linkvault-tauri`
 - Optional manual visual check if needed: start Vite on another port, then capture screenshots with Playwright at `1536x1024`, `1280x800`, and `390x844`.
 
@@ -79,6 +80,7 @@ Current backend seams:
 - Desktop-only manual validation steps live in `LinkVault/agent-harness/DESKTOP_UAT.md`; release-prep gates and packaging decisions live in `LinkVault/agent-harness/RELEASE_HANDOFF.md`.
 - The first packaging target is the release executable and the first installer target is NSIS. `src-tauri/tauri.conf.json` has checked-in `bundle.active = true`, `bundle.targets = ["nsis"]`, and `icons/icon.ico`. `pnpm.cmd run verify:release` asserts this config, runs plain `pnpm.cmd tauri build`, requires `src-tauri/target/release/linkvault.exe`, requires an NSIS `*-setup.exe`, smoke-launches the release executable, and terminates it cleanly.
 - `pnpm.cmd run verify:installer` checks the generated NSIS setup executable filename, version prefix, minimum size, and Windows PE header without running a system install.
+- `pnpm.cmd run verify:release-manifest` writes `output/release/linkvault-release-manifest.json` with artifact paths, sizes, SHA-256 hashes, bundle targets, version, and commit metadata.
 - Next integration work should run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
 
 Scope:

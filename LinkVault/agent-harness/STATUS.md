@@ -1,5 +1,36 @@
 # Status
 
+## 2026-05-23 Release Manifest Verification Slice
+
+Status: release artifacts now have a generated handoff manifest with SHA-256 hashes.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/scripts/verify-release-manifest.mjs`
+- `LinkVault/linkvault-tauri/package.json`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+- `LinkVault/agent-harness/RELEASE_HANDOFF.md`
+
+Implemented in this slice:
+
+- Added `pnpm.cmd run verify:release-manifest`.
+- The verifier requires the release executable and NSIS installer produced by `pnpm.cmd run verify:release`.
+- The verifier writes `LinkVault/linkvault-tauri/output/release/linkvault-release-manifest.json` with product/version/identifier, bundle targets, artifact paths, sizes, SHA-256 hashes, current commit, and dirty-worktree indicator.
+- The generated manifest stays out of source control because `output/` is ignored.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:release-manifest` passed in `LinkVault/linkvault-tauri`.
+- Manifest written to `LinkVault/linkvault-tauri/output/release/linkvault-release-manifest.json`.
+- Release executable SHA-256: `b24a55a4f2ebf33bde29bdfcc008d5d63d43c03ab4abcb20772443bbf455c1e8`.
+- NSIS installer SHA-256: `1aff6a1fc7069ce636c30547584a59867fd6d7fa9c8780574103403f0e7a22be`.
+
+Current next slice:
+
+Commit the LinkVault-only verifier, then run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
+
 ## 2026-05-23 Checked-In NSIS Bundle Config Slice
 
 Status: NSIS installer generation is now first-class Tauri configuration instead of a release-script-only CLI flag.
