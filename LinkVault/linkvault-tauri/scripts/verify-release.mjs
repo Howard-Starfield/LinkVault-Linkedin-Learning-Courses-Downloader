@@ -9,6 +9,7 @@ const root = path.resolve(__dirname, "..");
 const tauriDir = path.join(root, "src-tauri");
 const releaseExe = path.join(tauriDir, "target", "release", "linkvault.exe");
 const bundleDir = path.join(tauriDir, "target", "release", "bundle");
+const nsisDir = path.join(bundleDir, "nsis");
 const smokeMs = Number(process.env.LINKVAULT_RELEASE_SMOKE_MS ?? 5000);
 
 function assertRelease(condition, message) {
@@ -19,7 +20,10 @@ function assertRelease(condition, message) {
 
 function runReleaseBuild() {
   const command = process.platform === "win32" ? "cmd.exe" : "pnpm";
-  const args = process.platform === "win32" ? ["/d", "/s", "/c", "pnpm.cmd", "tauri", "build"] : ["tauri", "build"];
+  const args =
+    process.platform === "win32"
+      ? ["/d", "/s", "/c", "pnpm.cmd", "tauri", "build", "--bundles", "nsis"]
+      : ["tauri", "build", "--bundles", "nsis"];
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
@@ -29,7 +33,7 @@ function runReleaseBuild() {
 
   assertRelease(
     result.status === 0,
-    `\`pnpm tauri build\` must complete successfully.${result.error ? ` ${result.error.message}` : ""}`
+    `\`pnpm tauri build --bundles nsis\` must complete successfully.${result.error ? ` ${result.error.message}` : ""}`
   );
 }
 
@@ -84,6 +88,10 @@ const releaseExeSize = statSync(releaseExe).size;
 assertRelease(releaseExeSize > 0, "release executable must not be empty.");
 
 const bundleFiles = await listFilesRecursive(bundleDir);
+const nsisInstallers = (await listFilesRecursive(nsisDir)).filter((artifact) => {
+  const fileName = path.basename(artifact).toLowerCase();
+  return fileName.endsWith("-setup.exe");
+});
 const shareableArtifacts = [releaseExe, ...bundleFiles].filter((artifact) => {
   const extension = path.extname(artifact).toLowerCase();
   return [".exe", ".msi", ".zip"].includes(extension);
@@ -102,6 +110,12 @@ if (bundleFiles.length > 0) {
 }
 
 assertRelease(shareableArtifacts.length > 0, "release build must produce at least one shareable artifact.");
+assertRelease(nsisInstallers.length > 0, `NSIS setup executable must exist under ${nsisDir}.`);
+
+process.stdout.write("NSIS installers:\n");
+for (const installer of nsisInstallers) {
+  process.stdout.write(`- ${installer} (${formatBytes(statSync(installer).size)})\n`);
+}
 
 const app = spawn(releaseExe, [], {
   cwd: root,
