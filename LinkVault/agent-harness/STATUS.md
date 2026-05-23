@@ -16,13 +16,14 @@ Files changed:
 Implemented in this slice:
 
 - Added `pnpm.cmd run verify:release`.
-- The release verifier runs `pnpm tauri build`, requires `src-tauri/target/release/linkvault.exe`, checks it is non-empty, and lists any Tauri bundle artifacts emitted under `src-tauri/target/release/bundle`.
+- The release verifier runs `pnpm tauri build`, requires `src-tauri/target/release/linkvault.exe`, checks it is non-empty, lists any Tauri bundle artifacts emitted under `src-tauri/target/release/bundle`, launches the release executable through the startup smoke window, and terminates it cleanly.
 - Decided the first shareable packaging target as the release executable; MSI/NSIS installer artifacts remain optional until icon, branding, and code-signing decisions are made.
 
 Validation evidence:
 
 - `pnpm.cmd run verify:release` passed in `LinkVault/linkvault-tauri`.
 - Release executable produced: `LinkVault/linkvault-tauri/src-tauri/target/release/linkvault.exe` at 15.61 MB.
+- Release executable stayed alive for the 5000ms startup smoke window before clean termination.
 - No installer bundle artifacts were emitted under `LinkVault/linkvault-tauri/src-tauri/target/release/bundle` by the current Tauri config.
 - `pnpm.cmd run verify:tauri-smoke` passed in `LinkVault/linkvault-tauri`.
 - `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.

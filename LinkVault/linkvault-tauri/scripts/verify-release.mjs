@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
@@ -9,6 +9,7 @@ const root = path.resolve(__dirname, "..");
 const tauriDir = path.join(root, "src-tauri");
 const releaseExe = path.join(tauriDir, "target", "release", "linkvault.exe");
 const bundleDir = path.join(tauriDir, "target", "release", "bundle");
+const smokeMs = Number(process.env.LINKVAULT_RELEASE_SMOKE_MS ?? 5000);
 
 function assertRelease(condition, message) {
   if (!condition) {
@@ -55,6 +56,26 @@ function formatBytes(bytes) {
   return `${mb.toFixed(2)} MB`;
 }
 
+async function wait(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function assertProcessAlive(child) {
+  await wait(smokeMs);
+  assertRelease(child.exitCode === null && !child.killed, "release executable exited during startup smoke window.");
+}
+
+function stopProcess(child) {
+  if (!child.pid) return;
+
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+    return;
+  }
+
+  child.kill("SIGTERM");
+}
+
 runReleaseBuild();
 
 assertRelease(existsSync(releaseExe), `release executable must exist at ${releaseExe}.`);
@@ -81,3 +102,16 @@ if (bundleFiles.length > 0) {
 }
 
 assertRelease(shareableArtifacts.length > 0, "release build must produce at least one shareable artifact.");
+
+const app = spawn(releaseExe, [], {
+  cwd: root,
+  stdio: "ignore",
+  windowsHide: true
+});
+
+try {
+  await assertProcessAlive(app);
+  process.stdout.write(`Release executable stayed alive for ${smokeMs}ms.\n`);
+} finally {
+  stopProcess(app);
+}
