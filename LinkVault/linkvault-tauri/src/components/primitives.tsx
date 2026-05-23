@@ -1,5 +1,8 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
-import { Check } from "lucide-react";
+import { useEffect, useId, useRef } from "react";
+import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
+import { createPortal } from "react-dom";
+import { Check, X } from "lucide-react";
+import { toast } from "sonner";
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: "primary" | "secondary" | "ghost" | "outline" | "danger";
@@ -70,7 +73,7 @@ export function Checkbox({ label, className = "", ...props }: CheckboxProps) {
   return (
     <label className={`inline-flex min-h-6 items-center gap-2 text-sm text-foreground ${className}`}>
       <span className="grid h-4 w-4 place-items-center rounded border border-input bg-field text-primary">
-        <input type="checkbox" className="peer sr-only" {...props} />
+        <input type="checkbox" aria-label={label} className="peer sr-only" {...props} />
         <Check aria-hidden="true" className="hidden h-3 w-3 peer-checked:block" />
       </span>
       <span className="min-w-0 truncate">{label}</span>
@@ -100,3 +103,138 @@ export function Panel({ className = "", children }: { className?: string; childr
   return <section className={`rounded-lg border border-border bg-card shadow-panel ${className}`}>{children}</section>;
 }
 
+export function Tooltip({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <span className="group/tooltip relative inline-flex">
+      {children}
+      <span
+        role="tooltip"
+        className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 hidden -translate-x-1/2 whitespace-nowrap rounded-md bg-foreground px-3 py-1.5 text-xs text-background shadow-panel group-focus-within/tooltip:block group-hover/tooltip:block"
+      >
+        {label}
+        <span className="absolute left-1/2 top-full h-2 w-2 -translate-x-1/2 -translate-y-1 rotate-45 bg-foreground" />
+      </span>
+    </span>
+  );
+}
+
+export function Popover({
+  label,
+  trigger,
+  open,
+  onOpenChange,
+  children
+}: {
+  label: string;
+  trigger: ReactNode;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children: ReactNode;
+}) {
+  const shellRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onOpenChange(false);
+      }
+    }
+    function handlePointerDown(event: PointerEvent) {
+      if (shellRef.current && !shellRef.current.contains(event.target as Node)) {
+        onOpenChange(false);
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [onOpenChange, open]);
+
+  return (
+    <div ref={shellRef} className="relative inline-flex">
+      {trigger}
+      {open ? (
+        <div
+          role="dialog"
+          aria-label={label}
+          className="absolute bottom-full right-0 z-50 mb-2 w-72 max-w-[calc(100vw-16px)] rounded-md border border-border bg-card p-4 text-sm text-foreground shadow-panel"
+        >
+          {children}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function Dialog({
+  open,
+  onOpenChange,
+  title,
+  description,
+  children
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const timeout = window.setTimeout(() => closeRef.current?.focus(), 0);
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onOpenChange(false);
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.clearTimeout(timeout);
+      document.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onOpenChange, open]);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 backdrop-blur-sm" onMouseDown={() => onOpenChange(false)}>
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
+        className="relative grid max-h-[85vh] w-full max-w-lg gap-4 overflow-y-auto rounded-lg border border-border bg-card p-6 text-foreground shadow-panel"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <button
+          ref={closeRef}
+          type="button"
+          className="absolute right-4 top-4 grid h-8 w-8 place-items-center rounded-md border border-border bg-secondary text-muted-strong transition hover:bg-secondary-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={`Close ${title}`}
+          onClick={() => onOpenChange(false)}
+        >
+          <X aria-hidden="true" className="h-4 w-4" />
+        </button>
+        <div className="pr-10">
+          <h2 id={titleId} className="text-base font-semibold">{title}</h2>
+          {description ? <p id={descriptionId} className="mt-1 text-sm text-muted">{description}</p> : null}
+        </div>
+        {children}
+      </section>
+    </div>,
+    document.body
+  );
+}
+
+export function guardedToast(title: string, description: string) {
+  toast.warning(title, { description });
+}

@@ -20,7 +20,7 @@ import {
   XCircle
 } from "lucide-react";
 import { IconBrandLinkedin, IconMovie, IconTool } from "@tabler/icons-react";
-import { Button, Checkbox, Field, IconButton, Input, Panel, Progress, Select, Textarea } from "./components/primitives";
+import { Button, Checkbox, Dialog, Field, IconButton, Input, Panel, Popover, Progress, Select, Textarea, Tooltip, guardedToast } from "./components/primitives";
 
 type ParsedCourse = {
   original: string;
@@ -136,6 +136,8 @@ export default function App() {
   const [isValidatingToken, setIsValidatingToken] = useState(false);
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
   const [isCancellingDownload, setIsCancellingDownload] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
@@ -288,9 +290,7 @@ export default function App() {
       setProcessingSummary(processResponse);
       await refreshBootstrapState();
       if (processResponse.processed) {
-        toast.success("Queued download processed", {
-          description: `${processResponse.completed_artifacts} completed, ${processResponse.failed_artifacts} failed, ${processResponse.cancelled_artifacts} cancelled.`
-        });
+        showProcessedDownloadToast(processResponse);
       } else {
         toast.info("No queued download to process", {
           description: "The local queue did not contain a pending LinkedIn course."
@@ -340,6 +340,7 @@ export default function App() {
   }
 
   return (
+    <>
     <div className="lv-shell">
       <aside className="lv-sidebar" aria-label="Primary navigation">
         <div className="grid gap-0.5 border-b border-sidebar-border px-3 pb-7 pt-4">
@@ -381,9 +382,25 @@ export default function App() {
 
         <div className="flex items-center justify-between px-6 py-4 text-xs text-sidebar-muted">
           <span>v0.1.0</span>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
             <SunMedium aria-hidden="true" className="h-4 w-4" />
-            <CircleHelp aria-hidden="true" className="h-4 w-4" />
+            <Popover
+              label="LinkVault help"
+              open={isHelpOpen}
+              onOpenChange={setIsHelpOpen}
+              trigger={
+                <Tooltip label="Open help">
+                  <IconButton aria-label="Open help" aria-expanded={isHelpOpen} onClick={() => setIsHelpOpen((open) => !open)}>
+                    <CircleHelp aria-hidden="true" className="h-4 w-4" />
+                  </IconButton>
+                </Tooltip>
+              }
+            >
+              <div className="text-xs font-semibold text-muted-strong">LinkedIn Courses MVP</div>
+              <p className="mt-2 text-xs leading-5 text-muted">
+                Generic Video and LinkedIn Scraper are visible for context only. Course downloads use manual or browser-imported LinkedIn sessions.
+              </p>
+            </Popover>
           </div>
         </div>
       </aside>
@@ -401,9 +418,11 @@ export default function App() {
               <span className="h-2 w-2 rounded-full bg-success" />
               Downloader online
             </span>
-            <IconButton aria-label="Open settings">
-              <Settings aria-hidden="true" className="h-4 w-4" />
-            </IconButton>
+            <Tooltip label="Open settings">
+              <IconButton aria-label="Open settings" onClick={() => setIsSettingsOpen(true)}>
+                <Settings aria-hidden="true" className="h-4 w-4" />
+              </IconButton>
+            </Tooltip>
           </div>
         </header>
 
@@ -442,7 +461,7 @@ export default function App() {
                 <Field label="Download folder">
                   <div className="field-action-grid">
                     <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Download folder" />
-                    <Button type="button" onClick={() => toast.info("Folder picker scaffolded", { description: "Tauri folder selection will be wired in a later backend slice." })}>
+                    <Button type="button" onClick={() => guardedToast("Folder picker scaffolded", "Tauri folder selection will be wired in a later backend slice.")}>
                       <Folder aria-hidden="true" className="h-4 w-4" />
                       Browse
                     </Button>
@@ -604,6 +623,34 @@ export default function App() {
         </div>
       </main>
     </div>
+    <Dialog
+      open={isSettingsOpen}
+      onOpenChange={setIsSettingsOpen}
+      title="LinkVault settings"
+      description="Local downloader settings are restored from SQLite without storing plaintext LinkedIn tokens."
+    >
+      <div className="grid gap-3 text-sm">
+        <div className="rounded-md border border-border bg-field p-3">
+          <div className="text-xs font-semibold uppercase text-muted">Default output</div>
+          <div className="mt-1 truncate text-muted-strong" title={folder}>{folder}</div>
+        </div>
+        <div className="grid gap-2 rounded-md border border-border bg-field p-3 text-xs text-muted">
+          <div className="flex items-center justify-between gap-3">
+            <span>Default resolution</span>
+            <span className="font-medium text-muted-strong">{resolution}p</span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span>Browser source</span>
+            <span className="font-medium text-muted-strong">{browserSource}</span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span>Plaintext token storage</span>
+            <span className="font-medium text-success">Disabled</span>
+          </div>
+        </div>
+      </div>
+    </Dialog>
+    </>
   );
 }
 
@@ -841,6 +888,16 @@ function jobStatusBadgeClass(status: string) {
   return "bg-primary/15 text-primary";
 }
 
+function showProcessedDownloadToast(response: ProcessQueuedDownloadResponse) {
+  const description = `${response.completed_artifacts} completed, ${response.failed_artifacts} failed, ${response.cancelled_artifacts} cancelled.`;
+  if (response.failed_artifacts > 0 || response.cancelled_artifacts > 0) {
+    toast.warning("Queued download processed with issues", { description });
+    return;
+  }
+
+  toast.success("Queued download processed", { description });
+}
+
 async function parseLinkedInCourseUrls(input: string) {
   try {
     return await invoke<ParsedCourse[]>("parse_linkedin_course_urls", { input });
@@ -1067,6 +1124,193 @@ function processNextQueuedDownloadForPreview(): ProcessQueuedDownloadResponse {
       processed: jobs.length > 0,
       completed_artifacts: jobs.length > 0 ? 2 : 0,
       failed_artifacts: jobs.length > 0 ? 1 : 0,
+      cancelled_artifacts: 0
+    };
+  }
+
+  if (scenario === "multi-course-progress") {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const unsafeQueueSecret = "do-not-render-queue-secret";
+    void unsafeQueueSecret;
+
+    const activeJob = jobs[0]
+      ? {
+          ...jobs[0],
+          status: "active",
+          updated_at: timestamp,
+          artifact_counts: {
+            total: 6,
+            completed: 3,
+            failed: 0,
+            cancelled: 0,
+            active: 1,
+            pending: 2,
+            skipped: 0,
+            video_total: 3,
+            video_completed: 2,
+            subtitle_total: 2,
+            subtitle_completed: 1,
+            exercise_total: 1,
+            exercise_completed: 0
+          }
+        }
+      : null;
+    const queuedJob = jobs[1]
+      ? {
+          ...jobs[1],
+          status: "queued",
+          updated_at: timestamp - 1,
+          artifact_counts: {
+            total: 4,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            active: 0,
+            pending: 4,
+            skipped: 0,
+            video_total: 2,
+            video_completed: 0,
+            subtitle_total: 1,
+            subtitle_completed: 0,
+            exercise_total: 1,
+            exercise_completed: 0
+          }
+        }
+      : null;
+
+    const nextJobs = [activeJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null);
+    if (nextJobs.length > 0) {
+      writePreviewState(nextJobs, [
+        {
+          id: 1,
+          job_id: nextJobs[0].id,
+          event_type: "job.active",
+          message: "Started first queued course before continuing to the next course.",
+          created_at: timestamp
+        },
+        {
+          id: 2,
+          job_id: nextJobs[0].id,
+          event_type: "artifact.completed",
+          message: "First course video and subtitle artifacts are progressing.",
+          created_at: timestamp - 1
+        }
+      ]);
+    }
+
+    return {
+      processed: nextJobs.length > 0,
+      completed_artifacts: activeJob ? 3 : 0,
+      failed_artifacts: 0,
+      cancelled_artifacts: 0
+    };
+  }
+
+  if (scenario === "failed-course-lifecycle") {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const unsafeFailureBody = "{\"error\":\"do-not-render-failed-course-body\",\"li_at\":\"do-not-render-failed-course-token\"}";
+    void unsafeFailureBody;
+
+    const failedJob = jobs[0]
+      ? {
+          ...jobs[0],
+          status: "failed",
+          updated_at: timestamp,
+          artifact_counts: emptyArtifactCounts()
+        }
+      : null;
+    const queuedJob = jobs[1]
+      ? {
+          ...jobs[1],
+          status: "queued",
+          updated_at: timestamp - 1,
+          artifact_counts: {
+            total: 4,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            active: 0,
+            pending: 4,
+            skipped: 0,
+            video_total: 2,
+            video_completed: 0,
+            subtitle_total: 1,
+            subtitle_completed: 0,
+            exercise_total: 1,
+            exercise_completed: 0
+          }
+        }
+      : null;
+
+    const nextJobs = [failedJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null);
+    if (nextJobs.length > 0) {
+      writePreviewState(nextJobs, [
+        {
+          id: 1,
+          job_id: nextJobs[0].id,
+          event_type: "job.failed",
+          message: "First queued course failed before artifact planning; remaining courses stay queued.",
+          created_at: timestamp
+        }
+      ]);
+    }
+
+    return {
+      processed: nextJobs.length > 0,
+      completed_artifacts: 0,
+      failed_artifacts: failedJob ? 1 : 0,
+      cancelled_artifacts: 0
+    };
+  }
+
+  if (scenario === "repetitive-artifact-failures") {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const unsafeFailureUrl = "https://cdn.linkedin.example/exercises.zip?signature=do-not-render-repeated-failure-url";
+    void unsafeFailureUrl;
+
+    if (jobs[0]) {
+      const completedWithIssuesJob = {
+        ...jobs[0],
+        status: "completed",
+        updated_at: timestamp,
+        artifact_counts: {
+          total: 8,
+          completed: 2,
+          failed: 6,
+          cancelled: 0,
+          active: 0,
+          pending: 0,
+          skipped: 0,
+          video_total: 1,
+          video_completed: 1,
+          subtitle_total: 1,
+          subtitle_completed: 1,
+          exercise_total: 6,
+          exercise_completed: 0
+        }
+      };
+      writePreviewState([completedWithIssuesJob, ...jobs.slice(1)], [
+        {
+          id: 1,
+          job_id: completedWithIssuesJob.id,
+          event_type: "artifact.failed",
+          message: "6 exercise artifacts failed; details are coalesced in activity.",
+          created_at: timestamp
+        },
+        {
+          id: 2,
+          job_id: completedWithIssuesJob.id,
+          event_type: "artifact.completed",
+          message: "Video and subtitle artifacts completed despite repeated exercise failures.",
+          created_at: timestamp - 1
+        }
+      ]);
+    }
+
+    return {
+      processed: jobs.length > 0,
+      completed_artifacts: jobs.length > 0 ? 2 : 0,
+      failed_artifacts: jobs.length > 0 ? 6 : 0,
       cancelled_artifacts: 0
     };
   }
