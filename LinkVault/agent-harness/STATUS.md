@@ -1,5 +1,36 @@
 # Status
 
+## 2026-05-23 Release Verification Slice
+
+Status: the first packaging target is decided as the release executable and has a repeatable verifier.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/scripts/verify-release.mjs`
+- `LinkVault/linkvault-tauri/package.json`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+- `LinkVault/agent-harness/RELEASE_HANDOFF.md`
+
+Implemented in this slice:
+
+- Added `pnpm.cmd run verify:release`.
+- The release verifier runs `pnpm tauri build`, requires `src-tauri/target/release/linkvault.exe`, checks it is non-empty, and lists any Tauri bundle artifacts emitted under `src-tauri/target/release/bundle`.
+- Decided the first shareable packaging target as the release executable; MSI/NSIS installer artifacts remain optional until icon, branding, and code-signing decisions are made.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:release` passed in `LinkVault/linkvault-tauri`.
+- Release executable produced: `LinkVault/linkvault-tauri/src-tauri/target/release/linkvault.exe` at 15.61 MB.
+- No installer bundle artifacts were emitted under `LinkVault/linkvault-tauri/src-tauri/target/release/bundle` by the current Tauri config.
+- `pnpm.cmd run verify:tauri-smoke` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+
+Current next slice:
+
+Run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
+
 ## 2026-05-23 Desktop UAT And Release Handoff Slice
 
 Status: desktop-only validation and release-prep handoff steps are documented for the native runtime checks that should not be faked in browser preview.

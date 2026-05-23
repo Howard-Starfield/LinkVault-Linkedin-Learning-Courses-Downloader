@@ -35,6 +35,7 @@ Current verification commands:
 - `pnpm.cmd run verify:visual` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd run verify:ui` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd run verify:tauri-smoke` from `LinkVault/linkvault-tauri`
+- `pnpm.cmd run verify:release` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd tauri build --debug` from `LinkVault/linkvault-tauri`
 - Optional manual visual check if needed: start Vite on another port, then capture screenshots with Playwright at `1536x1024`, `1280x800`, and `390x844`.
 
@@ -75,7 +76,8 @@ Current backend seams:
 - The Browse action now uses Tauri's native folder picker in desktop runtime through `@tauri-apps/plugin-dialog` / `tauri-plugin-dialog`, with `dialog:allow-open` granted in the default capability. Browser preview keeps a deterministic guarded fallback toast.
 - `pnpm.cmd run verify:tauri-smoke` now checks native dialog plugin wiring, runs a debug Tauri build, launches `linkvault.exe`, waits through the startup/bootstrap smoke window, and terminates it cleanly without opening a blocking OS folder dialog.
 - Desktop-only manual validation steps live in `LinkVault/agent-harness/DESKTOP_UAT.md`; release-prep gates and packaging decisions live in `LinkVault/agent-harness/RELEASE_HANDOFF.md`.
-- Next integration work should run the manual desktop UAT checklist on the Windows desktop, then decide the first packaging target: raw executable, release executable, MSI, or NSIS installer.
+- The first packaging target is the release executable. `pnpm.cmd run verify:release` builds it, requires `src-tauri/target/release/linkvault.exe`, and lists optional bundle artifacts emitted by the current Tauri config.
+- Next integration work should run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
 
 Scope:
 Build a LinkedIn Learning course downloader only. Preserve 1080p best-available default, fallback to lower resolutions, exercise file download, auto unzip, safe zip extraction, transcript/subtitle download, browser token import, manual token paste, cancellation, progress, and local SQLite cache.
