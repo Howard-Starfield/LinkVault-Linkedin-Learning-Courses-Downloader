@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
   Activity,
@@ -339,6 +340,27 @@ export default function App() {
     }
   }
 
+  async function browseDownloadFolder() {
+    if (!isTauriRuntime()) {
+      guardedToast("Folder picker unavailable in preview", "The native folder picker is available in the Tauri desktop runtime.");
+      return;
+    }
+
+    try {
+      const selectedFolder = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: folder || undefined
+      });
+      if (typeof selectedFolder === "string" && selectedFolder.trim()) {
+        setFolder(selectedFolder);
+        toast.success("Download folder selected", { description: selectedFolder });
+      }
+    } catch (error) {
+      toast.error("Folder picker failed", { description: String(error) });
+    }
+  }
+
   return (
     <>
     <div className="lv-shell">
@@ -461,7 +483,7 @@ export default function App() {
                 <Field label="Download folder">
                   <div className="field-action-grid">
                     <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Download folder" />
-                    <Button type="button" onClick={() => guardedToast("Folder picker scaffolded", "Tauri folder selection will be wired in a later backend slice.")}>
+                    <Button type="button" onClick={browseDownloadFolder}>
                       <Folder aria-hidden="true" className="h-4 w-4" />
                       Browse
                     </Button>

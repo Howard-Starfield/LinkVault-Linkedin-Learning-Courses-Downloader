@@ -3,6 +3,5 @@
   "identifier": "default",
   "description": "Default desktop capability for LinkVault",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": ["core:default", "opener:default", "dialog:allow-open"]
 }
-

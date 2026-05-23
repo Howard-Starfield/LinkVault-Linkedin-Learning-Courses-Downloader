@@ -368,6 +368,21 @@ async function verifyPrimitiveOverlays(page, baseUrl) {
   await page.screenshot({ path: path.join(outputDir, "linkvault-ui-primitive-overlays.png") });
 }
 
+async function verifyBrowseFolderPreviewFallback(page, baseUrl) {
+  await openApp(page, baseUrl);
+
+  const folder = page.getByLabel("Download folder");
+  const beforeFolder = await folder.inputValue();
+  await page.getByRole("button", { name: "Browse" }).click();
+  await page.getByText("Folder picker unavailable in preview").waitFor();
+  await page.getByText("The native folder picker is available in the Tauri desktop runtime.").waitFor();
+
+  const afterFolder = await folder.inputValue();
+  assertUi(afterFolder === beforeFolder, "preview Browse fallback should not corrupt the current folder setting.");
+
+  await page.screenshot({ path: path.join(outputDir, "linkvault-ui-folder-picker-preview.png") });
+}
+
 await mkdir(outputDir, { recursive: true });
 
 const port = await findFreePort(preferredPort);
@@ -398,6 +413,7 @@ try {
   await verifyRepetitiveArtifactFailureToasts(page, baseUrl);
   await verifyKeyboardNavigation(page, baseUrl);
   await verifyPrimitiveOverlays(page, baseUrl);
+  await verifyBrowseFolderPreviewFallback(page, baseUrl);
 
   assertUi(linkedInRequests.length === 0, `browser-preview UI tests must not call LinkedIn: ${linkedInRequests.join(", ")}`);
 

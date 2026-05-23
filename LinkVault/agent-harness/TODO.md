@@ -37,6 +37,7 @@
 - [x] Build first screen from `REFERENCE_CONTRACT.md`.
 - [x] Define Tailwind v4 tokens based on `design.md` and `reference.png`.
 - [x] Build local primitives: button, icon button, textarea, input, select, checkbox, progress, tooltip, dialog/popover shell, toast adapter.
+- [x] Wire native Tauri folder picker for the download folder browse action, with browser-preview fallback coverage.
 - [x] Replace visible demo progress streams with persisted active/completed/failed/cancelled job event state.
 - [x] Add repeatable Playwright visual assertions for desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - [x] Add repeatable Playwright interaction assertions for URL parse errors, blank-line multi-URL order, guarded start, visible toasts, and no live LinkedIn calls.
