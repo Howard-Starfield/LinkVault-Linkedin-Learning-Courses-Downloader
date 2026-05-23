@@ -87,6 +87,19 @@ async function collectReferenceMetrics(page) {
       width: innerWidth,
       height: innerHeight,
       bodyText: document.body.innerText,
+      placeholderText: [...document.querySelectorAll("input, textarea")]
+        .map((element) => element.getAttribute("placeholder"))
+        .filter(Boolean)
+        .join("\n"),
+      fieldValueText: [...document.querySelectorAll("input, textarea, select")]
+        .map((element) => {
+          if (element instanceof HTMLSelectElement) {
+            return element.selectedOptions[0]?.textContent ?? element.value;
+          }
+          return element.value;
+        })
+        .filter(Boolean)
+        .join("\n"),
       documentScrollWidth: document.documentElement.scrollWidth,
       bodyScrollWidth: document.body.scrollWidth,
       shellScrollWidth: shell?.scrollWidth ?? 0,
@@ -146,7 +159,7 @@ async function verifyReferenceDesktop(page, baseUrl) {
   assertVisual(desktop.bodyText.includes("Download Queue"), "desktop should show Download Queue.");
   assertVisual(desktop.bodyText.includes("No live download"), "desktop should show persisted empty live state.");
   assertVisual(desktop.bodyText.includes("No persisted jobs"), "desktop should show persisted empty queue state.");
-  assertVisual(desktop.resolutionValue === "1080", "default video resolution should be 1080.");
+  assertVisual(desktop.resolutionValue === "720", "browser preview default video resolution should match the reference screen.");
   assertVisual(desktop.tokenType === "password", "LinkedIn token input should remain password masked.");
   assertVisual(desktop.genericVideoDisabled, "Generic Video must be disabled for MVP scope.");
   assertVisual(desktop.startDisabled, "Start Download should be disabled before required inputs are present.");
@@ -156,6 +169,51 @@ async function verifyReferenceDesktop(page, baseUrl) {
   assertVisual(desktop.documentScrollWidth <= desktop.width + 1, "desktop document must not horizontally overflow.");
   assertVisual(desktop.buttonOverflowCount === 0, "desktop buttons must not have clipped text.");
   await page.screenshot({ path: path.join(outputDir, "linkvault-visual-assert-desktop.png") });
+}
+
+async function verifyReferencePreviewDesktop(page, baseUrl) {
+  await openViewport(page, `${baseUrl}/?preview=reference`, 1536, 1024);
+  const reference = await collectReferenceMetrics(page);
+  const referenceText = `${reference.bodyText}\n${reference.placeholderText}\n${reference.fieldValueText}`;
+  const expectedText = [
+    "Course and video archive",
+    "Downloader online",
+    "Course Setup",
+    "One course URL per line",
+    "/Users/ian/Downloads/LinkedIn Courses",
+    "Paste your LinkedIn li_at cookie value",
+    "720 (High)",
+    "Service Desk Fundamentals",
+    "Course 2 of 5",
+    "Downloading",
+    "18m 24s remaining",
+    "Videos",
+    "36 / 52",
+    "Subtitles",
+    "Exercise files",
+    "12 / 18",
+    "Software Testing Foundations",
+    "Course 1 of 5",
+    "Completed",
+    "Downloading video: Why managing time helps you serve customers better",
+    "Downloading exercise file: Ex_Files_Time_Management.zip",
+    "Downloading subtitles",
+    "Downloading video: Efficiently managing customer emails",
+    "Downloading video: Using calendar tools for task management",
+    "Completed • Today, 10:15 AM",
+    "5.2 GB • 52m 11s",
+    "1 active • 1 completed",
+    "Coming Soon",
+    "v1.2.0"
+  ];
+  for (const text of expectedText) {
+    assertVisual(referenceText.includes(text), `reference preview should render "${text}".`);
+  }
+  assertVisual(reference.resolutionValue === "720", "reference preview should select 720.");
+  assertVisual(reference.progressbarCount >= 4, "reference preview should render live and queue progress bars.");
+  assertVisual(reference.documentScrollWidth <= reference.width + 1, "reference preview desktop must not horizontally overflow.");
+  assertVisual(reference.buttonOverflowCount === 0, "reference preview buttons must not have clipped text.");
+  await page.screenshot({ path: path.join(outputDir, "linkvault-visual-reference.png") });
 }
 
 async function verifyReferenceLaptop(page, baseUrl) {
@@ -222,6 +280,7 @@ try {
   const page = await browser.newPage();
 
   await verifyReferenceDesktop(page, baseUrl);
+  await verifyReferencePreviewDesktop(page, baseUrl);
   await verifyReferenceLaptop(page, baseUrl);
   await verifyLongLabelDesktop(page, baseUrl);
   await verifyLongLabelMobile(page, baseUrl);

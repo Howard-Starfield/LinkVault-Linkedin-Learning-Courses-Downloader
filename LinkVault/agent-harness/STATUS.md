@@ -1,5 +1,38 @@
 # Status
 
+## 2026-05-23 Linear Reference Frontend Refinement Slice
+
+Status: complete.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/src/index.css`
+- `LinkVault/linkvault-tauri/scripts/verify-visual.mjs`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Refined the first-screen React shell against `LinkVault/reference.png` and `LinkVault/design.md` with tighter Linear-inspired dark tokens, quieter panels, and denser queue/activity rows.
+- Updated reference copy and visible labels including `Coming Soon`, `v1.2.0`, `720 (High)`, `Downloading`, and bullet-separated queue summaries.
+- Added deterministic `?preview=reference` browser state for `Service Desk Fundamentals` and `Software Testing Foundations`, with the reference activity messages, progress counts, timestamps, folder text, and completed metadata.
+- Made completed queue rows compact so the queue footer remains visible at `1536x1024`.
+- Extended `pnpm.cmd run verify:visual` to assert the reference preview text, placeholders, field values, no horizontal overflow, and screenshot output.
+
+Validation evidence:
+
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- Reference screenshot written to `LinkVault/linkvault-tauri/output/playwright/linkvault-visual-reference.png`.
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+
+Current next slice:
+
+Commit the LinkVault-only frontend refinement, then run any desired manual desktop visual pass in the Tauri window.
+
 ## 2026-05-23 Release Manifest Verification Slice
 
 Status: release artifacts now have a generated handoff manifest with SHA-256 hashes.

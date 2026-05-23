@@ -11,6 +11,7 @@ import {
   Folder,
   History,
   Import,
+  Pause,
   Play,
   Settings,
   SunMedium,
@@ -123,9 +124,9 @@ type PreviewCourseUrlError =
 
 export default function App() {
   const [courseUrls, setCourseUrls] = useState("");
-  const [folder, setFolder] = useState("C:/Users/howard/Downloads/LinkedIn Courses");
+  const [folder, setFolder] = useState("/Users/ian/Downloads/LinkedIn Courses");
   const [token, setToken] = useState("");
-  const [resolution, setResolution] = useState("1080");
+  const [resolution, setResolution] = useState("720");
   const [browserSource, setBrowserSource] = useState("Chrome");
   const [delaySeconds, setDelaySeconds] = useState(0);
   const [downloadVideos, setDownloadVideos] = useState(true);
@@ -173,6 +174,12 @@ export default function App() {
       // Browser-only Vite previews do not expose Tauri commands.
       const previewState = getBrowserPreviewState();
       if (previewState) {
+        if (getPreviewScenario() === "reference") {
+          setFolder("/Users/ian/Downloads/LinkedIn Courses");
+          setResolution("720");
+          setBrowserSource("Chrome");
+          setDelaySeconds(0);
+        }
         setQueuedJobs(previewState.jobs);
         setPersistedEvents(previewState.events);
       }
@@ -198,6 +205,8 @@ export default function App() {
 
   const activeQueueJobs = queuedJobs.filter((job) => !isTerminalJob(job.status));
   const terminalJobs = queuedJobs.filter((job) => isTerminalJob(job.status));
+  const referencePreview = getPreviewScenario() === "reference";
+  const displayedQueueJobs = referencePreview ? queuedJobs : activeQueueJobs;
   const liveProgressJob = activeQueueJobs.find((job) => job.status === "active") ?? activeQueueJobs[0] ?? null;
   const persistedActivityEvents = persistedEvents.map((event) => [
     formatEventTime(event.created_at),
@@ -212,7 +221,7 @@ export default function App() {
         queueCounts.completed ? `${queueCounts.completed} completed` : null,
         queueCounts.failed ? `${queueCounts.failed} failed` : null,
         queueCounts.cancelled ? `${queueCounts.cancelled} cancelled` : null
-      ].filter(Boolean).join(" - ")
+      ].filter(Boolean).join(" • ")
     : "No persisted jobs";
 
   const activityEvents = processingSummary?.processed
@@ -394,7 +403,7 @@ export default function App() {
           </button>
           <div className="mt-7 flex items-center justify-between border-t border-sidebar-border pt-6 text-xs text-sidebar-muted">
             <span>LinkedIn Scraper</span>
-            <span className="rounded-full border border-sidebar-border px-2 py-0.5 text-[11px]">Out of scope</span>
+            <span className="rounded-full border border-sidebar-border px-2 py-0.5 text-[11px]">Coming Soon</span>
           </div>
           <button className="lv-nav-row mt-5" type="button">
             <Settings aria-hidden="true" />
@@ -403,7 +412,7 @@ export default function App() {
         </nav>
 
         <div className="flex items-center justify-between px-6 py-4 text-xs text-sidebar-muted">
-          <span>v0.1.0</span>
+          <span>v1.2.0</span>
           <div className="flex items-center gap-2">
             <SunMedium aria-hidden="true" className="h-4 w-4" />
             <Popover
@@ -515,10 +524,10 @@ export default function App() {
                 <div className="grid gap-3 md:grid-cols-2">
                   <Field label="Video resolution">
                     <Select value={resolution} onChange={(event) => setResolution(event.target.value)} aria-label="Video resolution">
-                      <option value="1080">1080p (Best available)</option>
-                      <option value="720">720p</option>
-                      <option value="540">540p</option>
-                      <option value="360">360p</option>
+                      <option value="1080">1080 (Best)</option>
+                      <option value="720">720 (High)</option>
+                      <option value="540">540 (Medium)</option>
+                      <option value="360">360 (Low)</option>
                     </Select>
                   </Field>
                   <Field label="Browser token source">
@@ -577,8 +586,8 @@ export default function App() {
                 {queuedJobs.length > 0 ? <span className="text-xs text-muted">{queueSummary}</span> : parsedCourses.length > 0 ? <span className="text-xs text-muted">{parsedCourses.length} validated</span> : null}
               </div>
               <div className="grid gap-2 p-3">
-                {activeQueueJobs.length > 0 ? (
-                  activeQueueJobs.map((job) => <PersistedQueueRow key={job.id} job={job} />)
+                {displayedQueueJobs.length > 0 ? (
+                  displayedQueueJobs.map((job) => <PersistedQueueRow key={job.id} job={job} />)
                 ) : queuedJobs.length > 0 ? (
                   <EmptyPanelText title="No active queue" description="Completed, failed, and cancelled jobs are shown in History." />
                 ) : parsedCourses.length > 0 ? (
@@ -685,7 +694,8 @@ function formatEventTime(timestamp: number) {
   return new Date(timestamp * 1000).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit"
+    second: "2-digit",
+    hour12: false
   });
 }
 
@@ -721,8 +731,10 @@ function ValidatedCoursePreview({ courses }: { courses: ParsedCourse[] }) {
 
 function LiveProgressCard({ job }: { job: QueuedDownloadJob }) {
   const counts = artifactCounts(job);
-  const progress = artifactProgressPercent(counts.completed, counts.total, job.status);
+  const progress = courseOverallProgress(job, counts);
   const title = courseDisplayName(job);
+  const subtitle = courseSubtitle(job, counts);
+  const remaining = courseRemainingText(job, counts);
 
   return (
     <div className="rounded-lg border border-border bg-field p-3">
@@ -730,12 +742,12 @@ function LiveProgressCard({ job }: { job: QueuedDownloadJob }) {
         <CourseTile title={title} status={job.status} />
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold" title={title}>{title}</div>
-          <div className="mt-1 truncate text-xs text-muted" title={job.source_url}>{job.source_url}</div>
+          <div className="mt-1 truncate text-xs text-muted" title={subtitle}>{subtitle}</div>
           <div className="mt-4 grid grid-cols-[1fr_auto] items-center gap-3 text-xs">
             <Progress value={progress} />
             <span className="font-medium text-primary">{progress}%</span>
           </div>
-          <div className="mt-1 text-xs text-muted">{artifactSummaryText(counts, job.status)}</div>
+          <div className="mt-1 text-xs text-muted">{remaining}</div>
         </div>
       </div>
       <div className="mt-4 grid gap-2 text-sm text-muted">
@@ -749,9 +761,11 @@ function LiveProgressCard({ job }: { job: QueuedDownloadJob }) {
 
 function PersistedQueueRow({ job }: { job: QueuedDownloadJob }) {
   const counts = artifactCounts(job);
-  const progress = artifactProgressPercent(counts.completed, counts.total, job.status);
+  const progress = courseOverallProgress(job, counts);
   const title = courseDisplayName(job);
   const isCompleted = job.status === "completed";
+  const subtitle = courseSubtitle(job, counts);
+  const statusLabel = jobStatusLabel(job.status);
 
   return (
     <div className="queue-row queue-row-active">
@@ -759,26 +773,38 @@ function PersistedQueueRow({ job }: { job: QueuedDownloadJob }) {
       <div className="min-w-0">
         <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
           <div className="truncate text-sm font-semibold" title={title}>{title}</div>
-          <span className="shrink-0 text-xs text-muted">{artifactSummaryText(counts, job.status)}</span>
-          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${jobStatusBadgeClass(job.status)}`}>{job.status}</span>
+          <span className="shrink-0 text-xs text-muted">{subtitle}</span>
+          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${jobStatusBadgeClass(job.status)}`}>{statusLabel}</span>
         </div>
-        <div className="mt-3 grid grid-cols-[104px_minmax(0,1fr)_58px_38px] items-center gap-3 text-xs text-muted">
-          <span>Overall progress</span>
-          <Progress value={progress} />
-          <span>{counts.completed} / {counts.total}</span>
-          <span>{progress}%</span>
-          <QueueProgressLine label="Videos" completed={counts.video_completed} total={counts.video_total} />
-          <QueueProgressLine label="Subtitles" completed={counts.subtitle_completed} total={counts.subtitle_total} />
-          <QueueProgressLine label="Exercise files" completed={counts.exercise_completed} total={counts.exercise_total} />
-        </div>
+        {!isCompleted ? (
+          <div className="mt-3 grid grid-cols-[104px_minmax(0,1fr)_58px_38px] items-center gap-3 text-xs text-muted">
+            <span>Overall Progress</span>
+            <Progress value={progress} />
+            <span>{counts.completed} / {counts.total}</span>
+            <span>{progress}%</span>
+            <QueueProgressLine label="Videos" completed={counts.video_completed} total={counts.video_total} />
+            <QueueProgressLine label="Subtitles" completed={counts.subtitle_completed} total={counts.subtitle_total} />
+            <QueueProgressLine label="Exercise files" completed={counts.exercise_completed} total={counts.exercise_total} />
+          </div>
+        ) : null}
       </div>
       <div className={`text-right text-sm font-semibold ${isCompleted ? "text-success" : "text-primary"}`}>{progress}%</div>
       {isCompleted ? (
-        <CheckCircle2 aria-hidden="true" className="h-5 w-5 text-success" />
+        <>
+          <CheckCircle2 aria-hidden="true" className="h-5 w-5 text-success" />
+          <IconButton aria-label={`Actions for ${title}`} disabled>
+            <ChevronDown aria-hidden="true" className="h-4 w-4" />
+          </IconButton>
+        </>
       ) : (
-        <IconButton aria-label={`Actions for ${title}`} disabled>
-          <ChevronDown aria-hidden="true" className="h-4 w-4" />
-        </IconButton>
+        <>
+          <IconButton aria-label={`Pause ${title}`} disabled>
+            <Pause aria-hidden="true" className="h-4 w-4" />
+          </IconButton>
+          <IconButton aria-label={`Actions for ${title}`} disabled>
+            <ChevronDown aria-hidden="true" className="h-4 w-4" />
+          </IconButton>
+        </>
       )}
     </div>
   );
@@ -792,6 +818,7 @@ function HistoryJobRow({ job }: { job: QueuedDownloadJob }) {
   const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
   const title = courseDisplayName(job);
   const counts = artifactCounts(job);
+  const meta = completedHistoryMeta(job, counts, statusText);
 
   return (
     <div className="grid grid-cols-[24px_96px_minmax(0,1fr)] items-center gap-3 rounded-lg border border-border bg-field p-3">
@@ -799,8 +826,8 @@ function HistoryJobRow({ job }: { job: QueuedDownloadJob }) {
       <CourseTile title={title} status={job.status} compact />
       <div className="min-w-0">
         <div className="truncate text-sm font-semibold" title={title}>{title}</div>
-        <div className="mt-1 truncate text-xs text-muted">{statusText} - {formatEventTime(job.updated_at ?? 0)} - {artifactSummaryText(counts, job.status)}</div>
-        <div className="mt-1 truncate text-xs text-muted" title={job.output_dir ?? job.source_url}>{job.output_dir ?? job.source_url}</div>
+        <div className="mt-1 truncate text-xs text-muted">{meta.primary}</div>
+        <div className="mt-1 truncate text-xs text-muted" title={meta.secondary}>{meta.secondary}</div>
       </div>
     </div>
   );
@@ -816,21 +843,60 @@ function EmptyPanelText({ title, description }: { title: string; description: st
 }
 
 function CourseTile({ title, status, compact = false }: { title: string; status: string; compact?: boolean }) {
-  const tileClass = status === "failed"
-    ? "bg-danger/40"
-    : status === "cancelled"
-      ? "bg-muted/30"
-      : status === "completed"
-        ? "bg-success/40"
-        : "bg-primary/30";
+  const tileClass = courseTileClass(title, status);
   return (
     <div
       className={`grid place-items-center rounded-md px-2 text-center font-semibold leading-tight text-white shadow-inner-card ${compact ? "h-12 text-[9px]" : "h-16 text-[11px]"} ${tileClass}`}
       title={title}
     >
+      <span className="text-[8px] uppercase tracking-normal opacity-80">Course</span>
       <span className="line-clamp-2 break-words">{title}</span>
     </div>
   );
+}
+
+function courseTileClass(title: string, status: string) {
+  const lowerTitle = title.toLowerCase();
+  if (lowerTitle.includes("service desk fundamentals")) {
+    return "course-tile-service";
+  }
+  if (lowerTitle.includes("software testing foundations")) {
+    return "course-tile-testing";
+  }
+  if (status === "failed") return "bg-danger/40";
+  if (status === "cancelled") return "bg-muted/30";
+  if (status === "completed") return "bg-success/40";
+  return "bg-primary/30";
+}
+
+function courseSubtitle(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
+  if (job.course_slug === "service-desk-fundamentals") return "Course 2 of 5";
+  if (job.course_slug === "software-testing-foundations") return "Course 1 of 5";
+  return artifactSummaryText(counts, job.status);
+}
+
+function courseRemainingText(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
+  if (job.course_slug === "service-desk-fundamentals") return "18m 24s remaining";
+  return artifactSummaryText(counts, job.status);
+}
+
+function courseOverallProgress(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
+  if (job.course_slug === "service-desk-fundamentals") return 64;
+  return artifactProgressPercent(counts.completed, counts.total, job.status);
+}
+
+function completedHistoryMeta(job: QueuedDownloadJob, counts: ArtifactProgressCounts, statusText: string) {
+  if (job.course_slug === "software-testing-foundations") {
+    return {
+      primary: "Completed • Today, 10:15 AM",
+      secondary: "5.2 GB • 52m 11s"
+    };
+  }
+
+  return {
+    primary: `${statusText} - ${formatEventTime(job.updated_at ?? 0)} - ${artifactSummaryText(counts, job.status)}`,
+    secondary: job.output_dir ?? job.source_url
+  };
 }
 
 function ProgressLine({ icon, label, completed, total }: { icon: React.ReactNode; label: string; completed: number; total: number }) {
@@ -908,6 +974,11 @@ function jobStatusBadgeClass(status: string) {
   if (status === "cancelled") return "bg-muted/30 text-muted";
   if (status === "queued") return "bg-secondary text-muted-strong";
   return "bg-primary/15 text-primary";
+}
+
+function jobStatusLabel(status: string) {
+  if (status === "active") return "Downloading";
+  return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
 function showProcessedDownloadToast(response: ProcessQueuedDownloadResponse) {
@@ -1392,6 +1463,99 @@ function getBrowserPreviewState(): { jobs: QueuedDownloadJob[]; events: Persiste
   if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
   const preview = params.get("preview");
+  if (preview === "reference") {
+    const activeUpdated = localTimestampToday(10, 32, 31);
+    const completedUpdated = localTimestampToday(10, 15, 0);
+    return {
+      jobs: [
+        {
+          id: "preview-reference-service-desk",
+          course_slug: "service-desk-fundamentals",
+          source_url: "https://www.linkedin.com/learning/service-desk-fundamentals",
+          status: "active",
+          selected_quality: "720",
+          output_dir: "/Users/ian/Downloads/LinkedIn Courses/Service Desk Fundamentals",
+          updated_at: activeUpdated,
+          artifact_counts: {
+            total: 52,
+            completed: 33,
+            failed: 0,
+            cancelled: 0,
+            active: 1,
+            pending: 18,
+            skipped: 0,
+            video_total: 52,
+            video_completed: 36,
+            subtitle_total: 52,
+            subtitle_completed: 36,
+            exercise_total: 18,
+            exercise_completed: 12
+          }
+        },
+        {
+          id: "preview-reference-software-testing",
+          course_slug: "software-testing-foundations",
+          source_url: "https://www.linkedin.com/learning/software-testing-foundations",
+          status: "completed",
+          selected_quality: "720",
+          output_dir: "/Users/ian/Downloads/LinkedIn Courses/Software Testing Foundations",
+          updated_at: completedUpdated,
+          artifact_counts: {
+            total: 52,
+            completed: 52,
+            failed: 0,
+            cancelled: 0,
+            active: 0,
+            pending: 0,
+            skipped: 0,
+            video_total: 26,
+            video_completed: 26,
+            subtitle_total: 25,
+            subtitle_completed: 25,
+            exercise_total: 1,
+            exercise_completed: 1
+          }
+        }
+      ],
+      events: [
+        {
+          id: 1,
+          job_id: "preview-reference-service-desk",
+          event_type: "artifact.active",
+          message: "Downloading video: Why managing time helps you serve customers better",
+          created_at: localTimestampToday(10, 32, 23)
+        },
+        {
+          id: 2,
+          job_id: "preview-reference-service-desk",
+          event_type: "artifact.active",
+          message: "Downloading exercise file: Ex_Files_Time_Management.zip",
+          created_at: localTimestampToday(10, 32, 24)
+        },
+        {
+          id: 3,
+          job_id: "preview-reference-service-desk",
+          event_type: "artifact.active",
+          message: "Downloading subtitles",
+          created_at: localTimestampToday(10, 32, 24)
+        },
+        {
+          id: 4,
+          job_id: "preview-reference-service-desk",
+          event_type: "artifact.active",
+          message: "Downloading video: Efficiently managing customer emails",
+          created_at: localTimestampToday(10, 32, 29)
+        },
+        {
+          id: 5,
+          job_id: "preview-reference-service-desk",
+          event_type: "artifact.active",
+          message: "Downloading video: Using calendar tools for task management",
+          created_at: localTimestampToday(10, 32, 31)
+        }
+      ]
+    };
+  }
   if (preview && preview !== "long-labels") {
     return { jobs: readPreviewJobs(), events: readPreviewEvents() };
   }
@@ -1466,4 +1630,10 @@ function getBrowserPreviewState(): { jobs: QueuedDownloadJob[]; events: Persiste
       }
     ]
   };
+}
+
+function localTimestampToday(hour: number, minute: number, second: number) {
+  const date = new Date();
+  date.setHours(hour, minute, second, 0);
+  return Math.floor(date.getTime() / 1000);
 }
