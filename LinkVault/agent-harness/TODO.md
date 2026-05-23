@@ -36,7 +36,7 @@
 
 - [x] Build first screen from `REFERENCE_CONTRACT.md`.
 - [x] Define Tailwind v4 tokens based on `design.md` and `reference.png`.
-- [ ] Build local primitives: button, icon button, textarea, input, select, checkbox, progress, tooltip, dialog/popover shell, toast adapter. Initial button/input/select/textarea/checkbox/progress/panel primitives exist.
+- [x] Build local primitives: button, icon button, textarea, input, select, checkbox, progress, tooltip, dialog/popover shell, toast adapter.
 - [x] Replace visible demo progress streams with persisted active/completed/failed/cancelled job event state.
 - [x] Add repeatable Playwright visual assertions for desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - [x] Add repeatable Playwright interaction assertions for URL parse errors, blank-line multi-URL order, guarded start, visible toasts, and no live LinkedIn calls.
@@ -48,10 +48,10 @@
 - [x] URL parser UI: multiple URLs with blank lines are accepted, blanks ignored, and order preserved in queued rows.
 - [x] Course metadata UI: course JSON shape drift surfaces a safe visible error without raw unsafe response text.
 - [x] Exercise 404 UI: failed optional exercise artifact appears as failed while remaining video/subtitle progress can continue.
-- [ ] Download lifecycle UI: multiple courses preserve queue order and per-course progress.
-- [ ] Download lifecycle UI: one failed course behavior is decided, documented, and represented in queue/history state.
-- [ ] Failure toast UI: repetitive artifact failures are coalesced or rate-limited so Sonner does not flood.
-- [ ] Keyboard navigation UI: sidebar, setup form, actions, queue, and activity controls are reachable in logical order.
+- [x] Download lifecycle UI: multiple courses preserve queue order and per-course progress.
+- [x] Download lifecycle UI: one failed course behavior is decided, documented, and represented in queue/history state.
+- [x] Failure toast UI: repetitive artifact failures are coalesced or rate-limited so Sonner does not flood.
+- [x] Keyboard navigation UI: sidebar, setup form, actions, queue, and activity controls are reachable in logical order.
 
 ## Edge Cases To Test First
 

@@ -1,5 +1,182 @@
 # Status
 
+## 2026-05-23 Local Primitive Completion Slice
+
+Status: local primitive coverage now includes tooltip, dialog, popover, and guarded toast helper primitives with deterministic browser-preview coverage.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/components/primitives.tsx`
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added local `Tooltip`, `Popover`, `Dialog`, and `guardedToast` primitives matching the existing compact LinkVault shell style.
+- Wired the header settings icon to a focus-returning settings dialog.
+- Wired the sidebar help icon to an Escape-closeable popover.
+- Moved the guarded folder picker placeholder onto the shared guarded toast helper.
+- Extended `pnpm.cmd run verify:ui` to assert tooltip visibility, popover Escape close, dialog focus on open, dialog Escape close, and focus return to the trigger.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd tauri build --debug` passed and built `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
+- Interactive assertion screenshot was refreshed:
+  - `LinkVault/linkvault-tauri/output/playwright/linkvault-ui-primitive-overlays.png`
+
+Current next slice:
+
+Run a final commit checkpoint for the accumulated LinkVault UI coverage and primitive work, keeping unrelated parent repo changes unstaged.
+
+## 2026-05-23 Keyboard Navigation UI Interaction Test Slice
+
+Status: core keyboard navigation now has deterministic browser-preview UI coverage across sidebar, setup form, actions, queue, and activity controls.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/components/primitives.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added default `aria-label` propagation for the local checkbox primitive so focused download-option checkboxes expose meaningful names.
+- Added browser-preview keyboard traversal assertions for the sidebar nav, settings action, setup form fields, download option checkboxes, token import action, queue action, and activity actions.
+- The verifier asserts Start Download remains guarded during keyboard traversal.
+- The assertion screenshot was refreshed under `output/playwright/`.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd tauri build --debug` passed and built `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
+- Interactive assertion screenshot was refreshed:
+  - `LinkVault/linkvault-tauri/output/playwright/linkvault-ui-keyboard-navigation.png`
+
+Current next slice:
+
+Finish the local primitive coverage gap: add or harden the remaining tooltip, dialog/popover shell, and toast adapter primitives as needed by the LinkVault UI.
+
+## 2026-05-23 Repetitive Artifact Failure Toast UI Slice
+
+Status: repeated artifact failures now surface as one coalesced processing warning toast with deterministic browser-preview coverage.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added `showProcessedDownloadToast` so processed jobs with failed or cancelled artifacts show `Queued download processed with issues` instead of a success toast.
+- Kept successful processed jobs on the existing success toast path.
+- Added a browser-preview `repetitive-artifact-failures` processing scenario with 6 failed exercise artifacts coalesced into one safe activity event.
+- Extended `pnpm.cmd run verify:ui` to assert exactly one Sonner failure-related toast is visible for repeated failures.
+- The UI assertion proves signed artifact URLs and manual token values are not rendered.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd tauri build --debug` passed and built `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
+- Interactive assertion screenshot was refreshed:
+  - `LinkVault/linkvault-tauri/output/playwright/linkvault-ui-repetitive-artifact-failures.png`
+
+Current next slice:
+
+Add deterministic UI coverage for keyboard navigation: sidebar, setup form, actions, queue, and activity controls should be reachable in a logical order.
+
+## 2026-05-23 Failed-Course Lifecycle UI Interaction Test Slice
+
+Status: one failed course behavior is decided, documented, and covered by deterministic browser-preview UI assertions.
+
+Behavior decision:
+
+- Processing is one queued course at a time.
+- If the processed course fails before artifact planning, that course moves to terminal failed history.
+- Remaining queued courses stay queued in their original order for a later processing run.
+- Safe UI state must not invent artifact progress for the failed course or expose unsafe response/token values.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added a browser-preview `failed-course-lifecycle` processing scenario.
+- The first queued course becomes terminal failed with no artifact plan.
+- The second queued course remains visible in the active queue with its own artifact counts.
+- Extended `pnpm.cmd run verify:ui` to assert queue summary `1 queued - 1 failed`, terminal failed history, preserved remaining queued course state, no invented artifact progress, and safe activity messaging.
+- The UI assertion proves unsafe backend response bodies, secret-like backend values, and manual token values are not rendered.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd tauri build --debug` passed and built `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
+- Interactive assertion screenshot was refreshed:
+  - `LinkVault/linkvault-tauri/output/playwright/linkvault-ui-failed-course-lifecycle.png`
+
+Current next slice:
+
+Add deterministic UI coverage for repetitive artifact failure toast behavior: coalesce or rate-limit repeated failures so Sonner does not flood.
+
+## 2026-05-23 Multi-Course Progress UI Interaction Test Slice
+
+Status: multiple-course lifecycle ordering now has deterministic browser-preview UI coverage with per-course artifact progress and no live LinkedIn calls.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added a browser-preview `multi-course-progress` processing scenario that leaves the first queued course active and the second course queued.
+- The first course now exposes partial artifact counts in preview state: 3 of 6 complete, including per-type video/subtitle/exercise counts.
+- The second course exposes its own queued artifact plan instead of inheriting the first course's progress.
+- Extended `pnpm.cmd run verify:ui` to assert visible course order, queue summary `1 active - 1 queued`, per-course artifact summaries, per-type progress rows, and safe activity events.
+- The UI assertion proves internal queue-only values and manual token values are not rendered.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd tauri build --debug` passed and built `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
+- Interactive assertion screenshot was refreshed:
+  - `LinkVault/linkvault-tauri/output/playwright/linkvault-ui-multi-course-progress.png`
+
+Current next slice:
+
+Decide and document one failed course behavior in the download lifecycle UI, then represent it in deterministic queue/history state without live LinkedIn calls.
+
 ## 2026-05-23 Exercise 404 UI Interaction Test Slice
 
 Status: optional exercise 404 handling now has deterministic browser-preview UI coverage showing failed exercise state while video/subtitle work continues.
