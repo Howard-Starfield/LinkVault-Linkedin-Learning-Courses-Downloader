@@ -1,0 +1,9 @@
+node_modules
+.playwright-cli
+dist
+dist-ssr
+src-tauri/target
+src-tauri/gen
+output
+*.sqlite3
+*.db
