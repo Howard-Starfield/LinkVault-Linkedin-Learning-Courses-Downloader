@@ -1,5 +1,31 @@
 # Status
 
+## 2026-05-23 Desktop UAT And Release Handoff Slice
+
+Status: desktop-only validation and release-prep handoff steps are documented for the native runtime checks that should not be faked in browser preview.
+
+Files changed:
+
+- `LinkVault/agent-harness/DESKTOP_UAT.md`
+- `LinkVault/agent-harness/RELEASE_HANDOFF.md`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added a Windows desktop UAT checklist covering startup, native folder picker, help/settings overlays, guarded download behavior, and evidence to record.
+- Added a release handoff checklist covering the automated gate, manual pre-share gate, packaging command, and open release decisions.
+- Kept OS-modal native folder picker validation as explicit manual UAT while retaining automated smoke coverage for Tauri plugin permission wiring and startup bootstrap.
+
+Validation evidence:
+
+- Documentation-only slice after the green Tauri smoke/UI/build/Rust/visual validation pass recorded below.
+
+Current next slice:
+
+Run the manual desktop UAT checklist on the Windows desktop, then decide the first packaging target: raw executable, release executable, MSI, or NSIS installer.
+
 ## 2026-05-23 Tauri Runtime Smoke Script Slice
 
 Status: Tauri-only runtime surfaces now have a repeatable desktop smoke verifier.
