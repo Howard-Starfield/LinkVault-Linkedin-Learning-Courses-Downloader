@@ -15,6 +15,7 @@ cargo test
 Set-Location ..
 pnpm.cmd run verify:visual
 pnpm.cmd tauri build --debug
+pnpm.cmd run verify:release
 ```
 
 Expected:
@@ -23,6 +24,7 @@ Expected:
 - `verify:ui` covers browser-preview interaction flows and safe error rendering.
 - `verify:visual` covers desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - `cargo test` covers backend parsing, auth, browser-cookie import, SQLite lifecycle, artifact download, cancellation, safe zip extraction, and live-client boundaries.
+- `verify:release` builds the release target, requires `src-tauri/target/release/linkvault.exe`, and lists any installer artifacts emitted under `src-tauri/target/release/bundle`.
 
 ## Manual Gate Before Sharing Builds
 
@@ -35,9 +37,10 @@ Expected:
 ## Packaging Notes
 
 - Debug build output: `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
-- Release packaging command: `pnpm.cmd tauri build` from `LinkVault/linkvault-tauri`.
+- First packaging target: release executable at `LinkVault/linkvault-tauri/src-tauri/target/release/linkvault.exe`.
+- Release verification command: `pnpm.cmd run verify:release` from `LinkVault/linkvault-tauri`.
 - Keep release artifacts out of source commits unless explicitly requested.
-- Before distributing, decide whether the first shared artifact should be a raw debug executable, release executable, MSI, or NSIS installer.
+- MSI/NSIS installer artifacts are optional until installer branding and code-signing decisions are made.
 
 ## Open Release Decisions
 

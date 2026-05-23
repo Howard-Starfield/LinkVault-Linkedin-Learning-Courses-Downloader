@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "verify:ui": "node ./scripts/verify-ui.mjs",
     "verify:visual": "node ./scripts/verify-visual.mjs",
-    "verify:tauri-smoke": "node ./scripts/verify-tauri-smoke.mjs"
+    "verify:tauri-smoke": "node ./scripts/verify-tauri-smoke.mjs",
+    "verify:release": "node ./scripts/verify-release.mjs"
   },
   "dependencies": {
     "@tabler/icons-react": "^3.24.0",
