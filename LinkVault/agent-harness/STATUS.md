@@ -1,5 +1,34 @@
 # Status
 
+## 2026-05-23 Installer Artifact Verification Slice
+
+Status: generated NSIS installer artifacts now have a fast non-installing verifier.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/scripts/verify-installer.mjs`
+- `LinkVault/linkvault-tauri/package.json`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+- `LinkVault/agent-harness/RELEASE_HANDOFF.md`
+
+Implemented in this slice:
+
+- Added `pnpm.cmd run verify:installer`.
+- The verifier checks the generated NSIS setup executable filename, `LinkVault_0.1.0_` version prefix, `-setup.exe` suffix, minimum size, and Windows PE `MZ` header.
+- The verifier intentionally does not run the installer, so it avoids system install/uninstall side effects.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:installer` passed in `LinkVault/linkvault-tauri`.
+- Verified NSIS installer: `LinkVault/linkvault-tauri/src-tauri/target/release/bundle/nsis/LinkVault_0.1.0_x64-setup.exe` at 4.10 MB.
+- Installer artifact assertions covered filename/version prefix, `-setup.exe` suffix, minimum size, and Windows PE `MZ` header.
+
+Current next slice:
+
+Commit the LinkVault-only verifier, then run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
+
 ## 2026-05-23 NSIS Installer Verification Slice
 
 Status: the release gate now produces and requires the first installer artifact.
