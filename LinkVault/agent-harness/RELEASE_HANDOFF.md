@@ -17,6 +17,7 @@ pnpm.cmd run verify:visual
 pnpm.cmd tauri build --debug
 pnpm.cmd run verify:release
 pnpm.cmd run verify:installer
+pnpm.cmd run verify:release-manifest
 ```
 
 Expected:
@@ -27,6 +28,7 @@ Expected:
 - `cargo test` covers backend parsing, auth, browser-cookie import, SQLite lifecycle, artifact download, cancellation, safe zip extraction, and live-client boundaries.
 - `verify:release` asserts the checked-in Tauri bundle config, runs `pnpm.cmd tauri build`, requires `src-tauri/target/release/linkvault.exe`, requires an NSIS setup executable under `src-tauri/target/release/bundle/nsis`, launches the release executable through the startup smoke window, and terminates it cleanly.
 - `verify:installer` checks the generated NSIS setup executable filename, version prefix, minimum size, and Windows PE header without running a system install.
+- `verify:release-manifest` writes `output/release/linkvault-release-manifest.json` with artifact paths, sizes, SHA-256 hashes, bundle targets, version, and current commit metadata.
 
 ## Manual Gate Before Sharing Builds
 
@@ -44,6 +46,7 @@ Expected:
 - Checked-in installer config: `bundle.active = true`, `bundle.targets = ["nsis"]`, and `icons/icon.ico` in `src-tauri/tauri.conf.json`.
 - Release verification command: `pnpm.cmd run verify:release` from `LinkVault/linkvault-tauri`.
 - Installer artifact verification command: `pnpm.cmd run verify:installer` from `LinkVault/linkvault-tauri` after `verify:release`.
+- Release manifest command: `pnpm.cmd run verify:release-manifest` from `LinkVault/linkvault-tauri` after `verify:release`.
 - Keep release artifacts out of source commits unless explicitly requested.
 - MSI installer artifacts are deferred until installer branding and code-signing decisions are made.
 
