@@ -1,5 +1,37 @@
 # Status
 
+## 2026-05-23 Checked-In NSIS Bundle Config Slice
+
+Status: NSIS installer generation is now first-class Tauri configuration instead of a release-script-only CLI flag.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src-tauri/tauri.conf.json`
+- `LinkVault/linkvault-tauri/scripts/verify-release.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+- `LinkVault/agent-harness/RELEASE_HANDOFF.md`
+
+Implemented in this slice:
+
+- Added checked-in Tauri bundle configuration: `bundle.active = true`, `bundle.targets = ["nsis"]`, `icons/icon.ico`, publisher, installer descriptions, and NSIS installer icon.
+- Updated `pnpm.cmd run verify:release` to run plain `pnpm.cmd tauri build` and assert the checked-in bundle config before building.
+- The release verifier still requires the release executable, NSIS setup executable, and release startup smoke.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:release` passed in `LinkVault/linkvault-tauri`.
+- Plain `pnpm.cmd tauri build` produced the checked-in NSIS bundle target.
+- Release executable produced: `LinkVault/linkvault-tauri/src-tauri/target/release/linkvault.exe` at 15.61 MB.
+- NSIS installer produced: `LinkVault/linkvault-tauri/src-tauri/target/release/bundle/nsis/LinkVault_0.1.0_x64-setup.exe` at 4.12 MB.
+- Release executable stayed alive for the 5000ms startup smoke window before clean termination.
+- `pnpm.cmd run verify:installer` passed in `LinkVault/linkvault-tauri`.
+
+Current next slice:
+
+Run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
+
 ## 2026-05-23 Installer Artifact Verification Slice
 
 Status: generated NSIS installer artifacts now have a fast non-installing verifier.
