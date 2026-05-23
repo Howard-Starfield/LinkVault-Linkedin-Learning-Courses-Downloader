@@ -226,7 +226,7 @@ async function verifyMultiCourseProgress(page, baseUrl) {
   const firstIndex = text.indexOf("First Lifecycle Course");
   const secondIndex = text.indexOf("Second Lifecycle Course");
 
-  assertUi(text.includes("1 active - 1 queued"), "multi-course queue summary should show one active and one queued course.");
+  assertUi(text.includes("1 active • 1 queued"), "multi-course queue summary should show one active and one queued course.");
   assertUi(firstIndex >= 0, "first lifecycle course should be visible in the queue.");
   assertUi(secondIndex >= 0, "second lifecycle course should be visible in the queue.");
   assertUi(firstIndex < secondIndex, "multiple-course lifecycle should preserve visible queue order.");
@@ -264,7 +264,7 @@ async function verifyFailedCourseLifecycle(page, baseUrl) {
   await page.getByText("First queued course failed before artifact planning; remaining courses stay queued.").waitFor();
 
   const text = await bodyText(page);
-  assertUi(text.includes("1 queued - 1 failed"), "failed-course lifecycle should show one queued course and one failed course.");
+  assertUi(text.includes("1 queued • 1 failed"), "failed-course lifecycle should show one queued course and one failed course.");
   assertUi(text.includes("Second Still Queued Course"), "remaining course should stay visible in the active queue.");
   assertUi(text.includes("0 of 4 artifacts complete"), "remaining queued course should preserve its own artifact plan.");
   assertUi(text.includes("First Failed Lifecycle Course"), "failed course should remain visible in terminal history.");

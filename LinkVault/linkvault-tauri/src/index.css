@@ -2,33 +2,33 @@
 
 @theme {
   --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
-  --color-background: #0d1119;
-  --color-foreground: #eef1f6;
-  --color-muted: #949ba8;
-  --color-muted-strong: #c0c5cf;
-  --color-card: #171c27;
-  --color-field: #10151f;
-  --color-secondary: #242a36;
-  --color-secondary-strong: #2e3543;
-  --color-border: #303747;
-  --color-input: #343b4b;
-  --color-track: #32394a;
-  --color-primary: #8e69ff;
-  --color-primary-hover: #7d58f2;
+  --color-background: #0a0f17;
+  --color-foreground: #f1f4f8;
+  --color-muted: #8d95a3;
+  --color-muted-strong: #c4cad4;
+  --color-card: #171c26;
+  --color-field: #10151e;
+  --color-secondary: #222936;
+  --color-secondary-strong: #2a3241;
+  --color-border: #2b3342;
+  --color-input: #313949;
+  --color-track: #303849;
+  --color-primary: #8f6cff;
+  --color-primary-hover: #7e5cf4;
   --color-primary-foreground: #ffffff;
   --color-ring: #9a7aff;
   --color-success: #35c66b;
   --color-danger: #db4f5d;
   --color-danger-hover: #c94350;
-  --color-sidebar: #090d13;
+  --color-sidebar: #080c12;
   --color-sidebar-foreground: #f6f7fb;
   --color-sidebar-muted: #969eaa;
   --color-sidebar-border: #232936;
   --color-window-red: #ff5f57;
   --color-window-yellow: #febc2e;
   --color-window-green: #28c840;
-  --shadow-panel: 0 18px 50px rgb(0 0 0 / 0.18);
-  --shadow-inner-card: inset 0 0 36px rgb(255 255 255 / 0.08);
+  --shadow-panel: 0 18px 42px rgb(0 0 0 / 0.24);
+  --shadow-inner-card: inset 0 0 42px rgb(255 255 255 / 0.09);
 }
 
 :root {
@@ -69,8 +69,9 @@ textarea {
   width: 100vw;
   overflow: hidden;
   background:
-    radial-gradient(circle at 42% -12%, rgb(142 105 255 / 0.18), transparent 34rem),
-    linear-gradient(135deg, #0a0e15 0%, #111722 52%, #0b1018 100%);
+    radial-gradient(circle at 45% -10%, rgb(143 108 255 / 0.12), transparent 34rem),
+    radial-gradient(circle at 72% 34%, rgb(67 88 125 / 0.10), transparent 28rem),
+    linear-gradient(135deg, #080c12 0%, #111720 52%, #0a0f17 100%);
   color: var(--color-foreground);
 }
 
@@ -80,7 +81,7 @@ textarea {
   min-width: 15rem;
   flex-direction: column;
   border-right: 1px solid var(--color-sidebar-border);
-  background: linear-gradient(180deg, rgb(9 13 19 / 0.98), rgb(8 11 16 / 0.96));
+  background: linear-gradient(180deg, rgb(8 12 18 / 0.98), rgb(7 10 15 / 0.97));
   color: var(--color-sidebar-foreground);
 }
 
@@ -107,7 +108,7 @@ textarea {
 
 .lv-nav-row:hover,
 .lv-nav-row.active {
-  background: #242a36;
+  background: linear-gradient(90deg, rgb(143 108 255 / 0.17), rgb(44 51 66 / 0.76));
 }
 
 .lv-nav-row.active {
@@ -166,7 +167,7 @@ textarea {
 }
 
 .queue-row-active {
-  grid-template-columns: 120px minmax(0, 1fr) 64px 32px;
+  grid-template-columns: 120px minmax(0, 1fr) 64px 32px 32px;
 }
 
 .queue-row-completed {
@@ -178,6 +179,18 @@ textarea {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
+}
+
+.course-tile-service {
+  background:
+    linear-gradient(145deg, rgb(37 101 192 / 0.84), rgb(23 60 130 / 0.92)),
+    radial-gradient(circle at 72% 30%, rgb(86 141 223 / 0.45), transparent 48%);
+}
+
+.course-tile-testing {
+  background:
+    linear-gradient(145deg, rgb(37 139 78 / 0.82), rgb(22 92 56 / 0.92)),
+    radial-gradient(circle at 70% 28%, rgb(82 191 122 / 0.44), transparent 48%);
 }
 
 @media (max-width: 1100px), (max-height: 760px) {

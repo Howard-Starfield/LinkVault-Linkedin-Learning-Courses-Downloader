@@ -39,6 +39,7 @@
 
 - [x] Build first screen from `REFERENCE_CONTRACT.md`.
 - [x] Define Tailwind v4 tokens based on `design.md` and `reference.png`.
+- [x] Refine the first screen against `reference.png` with Linear-inspired dark density, exact reference copy, and a deterministic `?preview=reference` visual check.
 - [x] Build local primitives: button, icon button, textarea, input, select, checkbox, progress, tooltip, dialog/popover shell, toast adapter.
 - [x] Wire native Tauri folder picker for the download folder browse action, with browser-preview fallback coverage.
 - [x] Add repeatable Tauri desktop smoke verification for dialog permission wiring and startup/bootstrap launch.
