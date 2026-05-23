@@ -69,7 +69,8 @@ Current backend seams:
 - Repetitive artifact failures now use one coalesced `Queued download processed with issues` warning toast rather than per-artifact failure toasts.
 - Keyboard navigation coverage now verifies sidebar, setup form, actions, queue, and activity controls in logical order; the checkbox primitive gives focused download options meaningful accessible names.
 - Local primitive coverage now includes Tooltip, Popover, Dialog, and guardedToast primitives. The settings icon opens a focus-returning dialog; the help icon opens an Escape-closeable popover; guarded folder picker behavior uses the shared toast helper.
-- Next integration work should run a final commit checkpoint for the accumulated LinkVault UI coverage and primitive work, keeping unrelated parent repo changes unstaged.
+- The Browse action now uses Tauri's native folder picker in desktop runtime through `@tauri-apps/plugin-dialog` / `tauri-plugin-dialog`, with `dialog:open` granted in the default capability. Browser preview keeps a deterministic guarded fallback toast.
+- Next integration work should run a real desktop smoke check for Tauri-only surfaces that browser preview cannot exercise directly: folder picker permission, settings dialog, and startup bootstrap.
 
 Scope:
 Build a LinkedIn Learning course downloader only. Preserve 1080p best-available default, fallback to lower resolutions, exercise file download, auto unzip, safe zip extraction, transcript/subtitle download, browser token import, manual token paste, cancellation, progress, and local SQLite cache.

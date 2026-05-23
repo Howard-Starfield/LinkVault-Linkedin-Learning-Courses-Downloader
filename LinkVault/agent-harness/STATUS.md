@@ -1,5 +1,47 @@
 # Status
 
+## 2026-05-23 Native Folder Picker Wiring Slice
+
+Status: the download folder Browse action now uses the native Tauri folder picker in desktop runtime with deterministic browser-preview fallback coverage.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/package.json`
+- `LinkVault/linkvault-tauri/pnpm-lock.yaml`
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/linkvault-tauri/src-tauri/Cargo.toml`
+- `LinkVault/linkvault-tauri/src-tauri/Cargo.lock`
+- `LinkVault/linkvault-tauri/src-tauri/src/lib.rs`
+- `LinkVault/linkvault-tauri/src-tauri/capabilities/default.json`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added `@tauri-apps/plugin-dialog` and `tauri-plugin-dialog`.
+- Registered the dialog plugin in the Tauri builder and granted `dialog:open` in the default capability.
+- Replaced the Browse placeholder with `open({ directory: true, multiple: false })` in real Tauri runtime.
+- Selected folders update the download folder field and show a success toast.
+- Dialog errors show a safe failure toast without mutating the current folder value.
+- Browser-only preview keeps a deterministic guarded fallback toast instead of attempting native dialog IPC.
+- Extended `pnpm.cmd run verify:ui` to assert the preview fallback toast and unchanged folder value.
+
+Validation evidence:
+
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 78 tests passed.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd tauri build --debug` passed and built `LinkVault/linkvault-tauri/src-tauri/target/debug/linkvault.exe`.
+- Interactive assertion screenshot was refreshed:
+  - `LinkVault/linkvault-tauri/output/playwright/linkvault-ui-folder-picker-preview.png`
+
+Current next slice:
+
+Run a real desktop smoke check for the Tauri runtime surfaces that browser preview cannot exercise directly: folder picker permission, settings dialog, and startup bootstrap.
+
 ## 2026-05-23 Local Primitive Completion Slice
 
 Status: local primitive coverage now includes tooltip, dialog, popover, and guarded toast helper primitives with deterministic browser-preview coverage.
