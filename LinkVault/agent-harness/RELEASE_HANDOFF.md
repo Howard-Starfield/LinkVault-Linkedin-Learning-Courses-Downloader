@@ -24,7 +24,7 @@ Expected:
 - `verify:ui` covers browser-preview interaction flows and safe error rendering.
 - `verify:visual` covers desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - `cargo test` covers backend parsing, auth, browser-cookie import, SQLite lifecycle, artifact download, cancellation, safe zip extraction, and live-client boundaries.
-- `verify:release` builds the release target, requires `src-tauri/target/release/linkvault.exe`, and lists any installer artifacts emitted under `src-tauri/target/release/bundle`.
+- `verify:release` builds the release target, requires `src-tauri/target/release/linkvault.exe`, lists any installer artifacts emitted under `src-tauri/target/release/bundle`, launches the release executable through the startup smoke window, and terminates it cleanly.
 
 ## Manual Gate Before Sharing Builds
 

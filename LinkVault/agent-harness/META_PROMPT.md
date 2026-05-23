@@ -76,7 +76,7 @@ Current backend seams:
 - The Browse action now uses Tauri's native folder picker in desktop runtime through `@tauri-apps/plugin-dialog` / `tauri-plugin-dialog`, with `dialog:allow-open` granted in the default capability. Browser preview keeps a deterministic guarded fallback toast.
 - `pnpm.cmd run verify:tauri-smoke` now checks native dialog plugin wiring, runs a debug Tauri build, launches `linkvault.exe`, waits through the startup/bootstrap smoke window, and terminates it cleanly without opening a blocking OS folder dialog.
 - Desktop-only manual validation steps live in `LinkVault/agent-harness/DESKTOP_UAT.md`; release-prep gates and packaging decisions live in `LinkVault/agent-harness/RELEASE_HANDOFF.md`.
-- The first packaging target is the release executable. `pnpm.cmd run verify:release` builds it, requires `src-tauri/target/release/linkvault.exe`, and lists optional bundle artifacts emitted by the current Tauri config.
+- The first packaging target is the release executable. `pnpm.cmd run verify:release` builds it, requires `src-tauri/target/release/linkvault.exe`, lists optional bundle artifacts emitted by the current Tauri config, smoke-launches the release executable, and terminates it cleanly.
 - Next integration work should run the manual desktop UAT checklist on the Windows desktop and resolve installer branding/code-signing decisions.
 
 Scope:
