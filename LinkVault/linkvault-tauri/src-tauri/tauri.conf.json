@@ -23,6 +23,19 @@
     "security": {
       "csp": null
     }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "publisher": "LinkVault",
+    "shortDescription": "LinkedIn Learning course downloader",
+    "longDescription": "LinkVault downloads LinkedIn Learning courses, subtitles, and exercise files into a local folder with a local SQLite activity cache.",
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico"
+      }
+    }
   }
 }
-

@@ -7,6 +7,7 @@
 - [x] Decide credential storage approach for `li_at`: do not store plaintext in SQLite; use a secret-store seam for live token persistence.
 - [x] Decide first packaging target: release executable, with installers deferred until branding/signing are decided.
 - [x] Decide first installer target: NSIS setup executable, with MSI deferred until branding/signing are decided.
+- [x] Check in NSIS bundle config so plain `pnpm.cmd tauri build` emits the installer.
 - [x] Convert `EDGE_CASE_MATRIX.md` into first Rust and UI test tickets. Initial concrete UI tickets are listed below.
 - [x] Convert `REFERENCE_CONTRACT.md` into Playwright screenshot assertions once React exists. Covered by `pnpm.cmd run verify:visual`.
 
@@ -45,6 +46,7 @@
 - [x] Add repeatable release-build verification for the first packaging target.
 - [x] Add repeatable NSIS installer verification for the first installer target.
 - [x] Add non-installing installer artifact verification for filename, version, size, and PE header.
+- [x] Assert checked-in Tauri bundle config in release verification.
 - [x] Replace visible demo progress streams with persisted active/completed/failed/cancelled job event state.
 - [x] Add repeatable Playwright visual assertions for desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - [x] Add repeatable Playwright interaction assertions for URL parse errors, blank-line multi-URL order, guarded start, visible toasts, and no live LinkedIn calls.

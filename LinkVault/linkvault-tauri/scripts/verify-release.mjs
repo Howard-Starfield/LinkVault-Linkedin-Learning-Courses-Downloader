@@ -1,12 +1,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const tauriDir = path.join(root, "src-tauri");
+const tauriConfigPath = path.join(tauriDir, "tauri.conf.json");
 const releaseExe = path.join(tauriDir, "target", "release", "linkvault.exe");
 const bundleDir = path.join(tauriDir, "target", "release", "bundle");
 const nsisDir = path.join(bundleDir, "nsis");
@@ -20,10 +21,7 @@ function assertRelease(condition, message) {
 
 function runReleaseBuild() {
   const command = process.platform === "win32" ? "cmd.exe" : "pnpm";
-  const args =
-    process.platform === "win32"
-      ? ["/d", "/s", "/c", "pnpm.cmd", "tauri", "build", "--bundles", "nsis"]
-      : ["tauri", "build", "--bundles", "nsis"];
+  const args = process.platform === "win32" ? ["/d", "/s", "/c", "pnpm.cmd", "tauri", "build"] : ["tauri", "build"];
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
@@ -33,8 +31,19 @@ function runReleaseBuild() {
 
   assertRelease(
     result.status === 0,
-    `\`pnpm tauri build --bundles nsis\` must complete successfully.${result.error ? ` ${result.error.message}` : ""}`
+    `\`pnpm tauri build\` must complete successfully.${result.error ? ` ${result.error.message}` : ""}`
   );
+}
+
+async function assertBundleConfig() {
+  const config = JSON.parse(await readFile(tauriConfigPath, "utf8"));
+  const targets = Array.isArray(config.bundle?.targets) ? config.bundle.targets : [];
+  const icons = Array.isArray(config.bundle?.icon) ? config.bundle.icon : [];
+
+  assertRelease(config.bundle?.active === true, "Tauri bundle.active must be true.");
+  assertRelease(targets.includes("nsis"), "Tauri bundle.targets must include nsis.");
+  assertRelease(icons.includes("icons/icon.ico"), "Tauri bundle.icon must include icons/icon.ico.");
+  assertRelease(config.bundle?.windows?.nsis?.installerIcon === "icons/icon.ico", "NSIS installerIcon must use icons/icon.ico.");
 }
 
 async function listFilesRecursive(directory) {
@@ -80,6 +89,7 @@ function stopProcess(child) {
   child.kill("SIGTERM");
 }
 
+await assertBundleConfig();
 runReleaseBuild();
 
 assertRelease(existsSync(releaseExe), `release executable must exist at ${releaseExe}.`);
