@@ -32,6 +32,7 @@ Current verification commands:
 - `cargo test` from `LinkVault/linkvault-tauri/src-tauri`
 - `pnpm.cmd run verify:visual` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd run verify:ui` from `LinkVault/linkvault-tauri`
+- `pnpm.cmd run verify:tauri-smoke` from `LinkVault/linkvault-tauri`
 - `pnpm.cmd tauri build --debug` from `LinkVault/linkvault-tauri`
 - Optional manual visual check if needed: start Vite on another port, then capture screenshots with Playwright at `1536x1024`, `1280x800`, and `390x844`.
 
@@ -69,8 +70,9 @@ Current backend seams:
 - Repetitive artifact failures now use one coalesced `Queued download processed with issues` warning toast rather than per-artifact failure toasts.
 - Keyboard navigation coverage now verifies sidebar, setup form, actions, queue, and activity controls in logical order; the checkbox primitive gives focused download options meaningful accessible names.
 - Local primitive coverage now includes Tooltip, Popover, Dialog, and guardedToast primitives. The settings icon opens a focus-returning dialog; the help icon opens an Escape-closeable popover; guarded folder picker behavior uses the shared toast helper.
-- The Browse action now uses Tauri's native folder picker in desktop runtime through `@tauri-apps/plugin-dialog` / `tauri-plugin-dialog`, with `dialog:open` granted in the default capability. Browser preview keeps a deterministic guarded fallback toast.
-- Next integration work should run a real desktop smoke check for Tauri-only surfaces that browser preview cannot exercise directly: folder picker permission, settings dialog, and startup bootstrap.
+- The Browse action now uses Tauri's native folder picker in desktop runtime through `@tauri-apps/plugin-dialog` / `tauri-plugin-dialog`, with `dialog:allow-open` granted in the default capability. Browser preview keeps a deterministic guarded fallback toast.
+- `pnpm.cmd run verify:tauri-smoke` now checks native dialog plugin wiring, runs a debug Tauri build, launches `linkvault.exe`, waits through the startup/bootstrap smoke window, and terminates it cleanly without opening a blocking OS folder dialog.
+- Next integration work should run a manual desktop UAT pass against `linkvault.exe` for the native folder picker and overlay interactions, then prepare a release/package handoff checklist.
 
 Scope:
 Build a LinkedIn Learning course downloader only. Preserve 1080p best-available default, fallback to lower resolutions, exercise file download, auto unzip, safe zip extraction, transcript/subtitle download, browser token import, manual token paste, cancellation, progress, and local SQLite cache.
