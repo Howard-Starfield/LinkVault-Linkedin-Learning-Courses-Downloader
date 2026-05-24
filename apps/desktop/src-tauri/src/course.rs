@@ -60,6 +60,8 @@ pub enum CourseParseError {
 pub enum CourseFetchError {
     #[error("LinkedIn course API request failed: {0}")]
     Api(String),
+    #[error("LinkedIn course API returned HTTP status {status}")]
+    Http { status: u16 },
     #[error(transparent)]
     Parse(#[from] CourseParseError),
     #[error("LinkedIn did not return a downloadable video for {video_slug}")]
