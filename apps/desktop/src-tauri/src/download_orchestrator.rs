@@ -44,6 +44,13 @@ pub enum DownloadOrchestrationError {
     InvalidQuality(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueStopReason {
+    kind: &'static str,
+    message: &'static str,
+    status: Option<u16>,
+}
+
 pub fn process_next_queued_job(
     connection: &Connection,
     client: &mut impl CourseApiClient,
@@ -67,13 +74,21 @@ pub fn process_next_queued_job(
     match plan_active_job(connection, client, &queued_job, timestamp) {
         Ok(processed) => Ok(Some(processed)),
         Err(error) => {
+            let stop_reason = queue_stop_reason_for_orchestration_error(&error);
             transition_job_status(
                 connection,
                 &queued_job.id,
                 "failed",
                 timestamp,
-                Some("Course metadata fetch or artifact planning failed."),
+                Some(
+                    stop_reason
+                        .map(|reason| reason.message)
+                        .unwrap_or("Course metadata fetch or artifact planning failed."),
+                ),
             )?;
+            if let Some(reason) = stop_reason {
+                append_queue_stop_event(connection, &queued_job.id, reason, timestamp)?;
+            }
             Err(error)
         }
     }
@@ -143,27 +158,146 @@ pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
     ) {
         Ok(planned_job) => planned_job,
         Err(error) => {
+            let stop_reason = queue_stop_reason_for_orchestration_error(&error);
             transition_job_status(
                 connection,
                 &queued_job.id,
                 "failed",
                 timestamp,
-                Some("Course metadata fetch or artifact planning failed."),
+                Some(
+                    stop_reason
+                        .map(|reason| reason.message)
+                        .unwrap_or("Course metadata fetch or artifact planning failed."),
+                ),
             )?;
+            if let Some(reason) = stop_reason {
+                append_queue_stop_event(connection, &queued_job.id, reason, timestamp)?;
+            }
             return Err(error);
         }
     };
 
-    let summary = download_artifacts_for_active_job(
+    let summary = match download_artifacts_for_active_job(
         connection,
         artifact_client,
         cancellation,
         &queued_job.id,
         &planned_job.downloads,
         timestamp,
-    )?;
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            if let Some(reason) = queue_stop_reason_for_artifact_error(&error) {
+                append_queue_stop_event(connection, &queued_job.id, reason, timestamp)?;
+            }
+            return Err(DownloadOrchestrationError::Artifact(error));
+        }
+    };
 
     Ok(Some(summary))
+}
+
+fn append_queue_stop_event(
+    connection: &Connection,
+    job_id: &str,
+    reason: QueueStopReason,
+    timestamp: i64,
+) -> Result<(), CacheError> {
+    append_job_event(
+        connection,
+        &NewJobEvent {
+            job_id: job_id.to_string(),
+            event_type: "queue.guardrail.stop".to_string(),
+            message: reason.message.to_string(),
+            payload_json: Some(
+                serde_json::json!({
+                    "kind": reason.kind,
+                    "status": reason.status,
+                    "remainingJobs": "left_queued_for_manual_resume"
+                })
+                .to_string(),
+            ),
+            created_at: timestamp,
+        },
+    )?;
+    Ok(())
+}
+
+fn queue_stop_reason_for_orchestration_error(
+    error: &DownloadOrchestrationError,
+) -> Option<QueueStopReason> {
+    match error {
+        DownloadOrchestrationError::Course(error) => queue_stop_reason_for_course_error(error),
+        DownloadOrchestrationError::Artifact(error) => queue_stop_reason_for_artifact_error(error),
+        _ => None,
+    }
+}
+
+fn queue_stop_reason_for_course_error(error: &CourseFetchError) -> Option<QueueStopReason> {
+    match error {
+        CourseFetchError::Parse(crate::course::CourseParseError::ExpiredToken) => {
+            Some(queue_stop_reason("auth", "Queue stopped: LinkedIn session expired. Refresh the saved session before resuming.", None))
+        }
+        CourseFetchError::Http { status } => queue_stop_reason_for_status(*status),
+        CourseFetchError::Api(message) => queue_stop_reason_for_api_message(message),
+        _ => None,
+    }
+}
+
+fn queue_stop_reason_for_artifact_error(error: &ArtifactDownloadError) -> Option<QueueStopReason> {
+    match error {
+        ArtifactDownloadError::Http { status, .. } => queue_stop_reason_for_status(*status),
+        ArtifactDownloadError::AttemptsFailed { attempts } => attempts
+            .iter()
+            .filter_map(|attempt| attempt.status)
+            .find_map(queue_stop_reason_for_status),
+        _ => None,
+    }
+}
+
+fn queue_stop_reason_for_api_message(message: &str) -> Option<QueueStopReason> {
+    extract_http_status(message).and_then(queue_stop_reason_for_status)
+}
+
+fn extract_http_status(message: &str) -> Option<u16> {
+    message
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| part.len() == 3)
+        .filter_map(|part| part.parse::<u16>().ok())
+        .find(|status| (100..=599).contains(status))
+}
+
+fn queue_stop_reason_for_status(status: u16) -> Option<QueueStopReason> {
+    match status {
+        401 | 403 => Some(queue_stop_reason(
+            "auth",
+            "Queue stopped: LinkedIn rejected the saved session. Refresh the saved session before resuming.",
+            Some(status),
+        )),
+        429 => Some(queue_stop_reason(
+            "rate_limit",
+            "Queue stopped: LinkedIn is rate limiting requests. Wait before resuming the queue.",
+            Some(status),
+        )),
+        500..=599 => Some(queue_stop_reason(
+            "server",
+            "Queue stopped: LinkedIn returned repeated server errors. Wait before resuming the queue.",
+            Some(status),
+        )),
+        _ => None,
+    }
+}
+
+fn queue_stop_reason(
+    kind: &'static str,
+    message: &'static str,
+    status: Option<u16>,
+) -> QueueStopReason {
+    QueueStopReason {
+        kind,
+        message,
+        status,
+    }
 }
 
 fn plan_active_job(
@@ -1042,8 +1176,14 @@ mod tests {
                 .iter()
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
-            vec!["job.active", "job.failed"]
+            vec!["job.active", "job.failed", "queue.guardrail.stop"]
         );
+        assert_eq!(
+            events[1].message,
+            "Queue stopped: LinkedIn session expired. Refresh the saved session before resuming."
+        );
+        assert!(!events[2].message.contains("CSRF"));
+        assert!(!events[2].message.contains("secret"));
         assert!(list_artifacts_for_job(&connection, "job-1")
             .unwrap()
             .is_empty());
@@ -1143,6 +1283,54 @@ mod tests {
                 .status,
             "failed"
         );
+    }
+
+    #[test]
+    fn artifact_guardrail_stops_queue_on_rate_limit_and_leaves_remaining_jobs_queued() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        let mut job = sample_job("job-1", "queued", 100);
+        job.output_dir = output.path().to_string_lossy().to_string();
+        insert_job(&connection, &job).unwrap();
+        insert_job(&connection, &sample_job("job-2", "queued", 100)).unwrap();
+        let mut course_client = FakeCourseApiClient::new(vec![
+            ("fields=chapters,title,exerciseFiles", metadata_fixture()),
+            (
+                "https://www.linkedin.com/learning/sample-course",
+                r#"https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh"#,
+            ),
+            ("resolution=_1080", selected_video_fixture()),
+        ]);
+        let mut artifact_client =
+            FakeArtifactClient::new(vec![("https://cdn.example.test/welcome.mp4", 429, b"")]);
+
+        let error = process_next_queued_job_and_download_artifacts(
+            &connection,
+            &mut course_client,
+            &mut artifact_client,
+            &NeverCancelled,
+            200,
+        )
+        .unwrap_err();
+        let failed_jobs = list_jobs_by_status(&connection, "failed").unwrap();
+        let queued_jobs = list_jobs_by_status(&connection, "queued").unwrap();
+        let events = list_job_events(&connection, "job-1").unwrap();
+
+        assert!(matches!(
+            error,
+            DownloadOrchestrationError::Artifact(ArtifactDownloadError::Http { status: 429, .. })
+        ));
+        assert_eq!(failed_jobs.len(), 1);
+        assert_eq!(queued_jobs.len(), 1);
+        assert_eq!(queued_jobs[0].id, "job-2");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "queue.guardrail.stop"
+                && event.message.contains("rate limiting")));
+        assert!(events
+            .iter()
+            .filter_map(|event| event.payload_json.as_deref())
+            .all(|payload| !payload.contains("token=fresh") && !payload.contains("li_at")));
     }
 
     #[test]

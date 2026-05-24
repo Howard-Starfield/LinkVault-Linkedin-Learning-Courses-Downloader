@@ -152,6 +152,7 @@ const SIDEBAR_MAX_WIDTH = 320;
 const SIDEBAR_DEFAULT_WIDTH = 220;
 const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
+const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
   return Math.min(Math.max(width, SIDEBAR_MIN_WIDTH), SIDEBAR_MAX_WIDTH);
@@ -769,9 +770,10 @@ export default function App() {
                       <Input
                         value={token}
                         onChange={(event) => setToken(event.target.value)}
-                        placeholder={hasSavedToken ? "Saved token available" : "Paste your LinkedIn li_at cookie value"}
+                        placeholder={hasSavedToken ? SAVED_TOKEN_PLACEHOLDER : "Paste your LinkedIn li_at cookie value"}
                         type="password"
                         aria-label="LinkedIn li_at token"
+                        title={hasSavedToken && !token ? "Saved LinkedIn session is available" : undefined}
                       />
                       <Button type="button" onClick={clearToken}>
                         <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />

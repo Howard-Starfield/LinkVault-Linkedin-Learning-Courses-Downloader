@@ -325,7 +325,6 @@ pub async fn process_next_queued_download_with_saved_token(
     let quiz_assessments = extract_quizzes_for_next_job(
         app,
         db_path.clone(),
-        token.clone(),
         session.clone(),
         now_unix_timestamp(),
     )
@@ -372,7 +371,6 @@ pub async fn process_next_queued_download_from_browser_source(
     let quiz_assessments = extract_quizzes_for_next_job(
         app,
         db_path.clone(),
-        token.clone(),
         session.clone(),
         now_unix_timestamp(),
     )
@@ -451,7 +449,6 @@ fn process_next_queued_download_with_clients(
 async fn extract_quizzes_for_next_job(
     _app: tauri::AppHandle,
     db_path: PathBuf,
-    _token: String,
     _session: ValidatedLinkedInSession,
     timestamp: i64,
 ) -> Vec<crate::course::CourseAssessment> {

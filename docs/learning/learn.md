@@ -244,3 +244,27 @@ Use this pattern in other projects when a feature fails because an app is scrapi
 ### Reusable Lesson
 
 When a final output is a user-friendly study format, do not assume the website's source format controls the saved format. If the app has structured data and deterministic ordering, generate a clean reader-facing file from the app model while keeping raw artifacts available separately.
+
+## 2026-05-24 Defensive Security Review
+
+### What We Learned
+
+- Treat a security pass as a defensive review: look for token exposure, unsafe file writes, path traversal, noisy retries, and logs that reveal private data.
+- The LinkedIn `li_at` token should never be stored in SQLite, job events, frontend logs, or cached course payloads.
+- DPAPI-backed storage is the right local default on Windows because the saved token is encrypted for the current user instead of kept as plaintext.
+- Even safe-looking logs can leak useful private context. Job events should prefer filenames and artifact names over full local filesystem paths.
+- Signed download URLs can include sensitive query values, so diagnostics should record safe URL summaries only: host, path, filename, query key names, status, and error kind.
+- Keep queue behavior conservative. Stop automatically on `401`, `403`, `429`, repeated/server `5xx`, or expired-token signals instead of continuing through many links.
+- Preserve cancellation and pause/resume behavior so users stay in control and the app does not keep making requests after they stop it.
+
+### Guardrails Added
+
+- Removed an unused token parameter and token clone from quiz extraction so the raw token has fewer in-memory copies.
+- Artifact lifecycle events now show concise names like `welcome.mp4` instead of full output paths.
+- Exercise extraction success events now show the extracted folder name instead of the full folder path.
+- Added regression tests that fail if artifact events start leaking the download root path again.
+- Queue guardrail events use sanitized payloads and leave remaining queued jobs for manual resume after rate-limit, auth, token, or server-failure stops.
+
+### Reusable Lesson
+
+Security hardening is not only encryption. Reduce how often secrets are copied, never persist raw tokens or signed URLs, keep logs useful but sanitized, and stop queues on signals that mean the session or service is rejecting the app.

@@ -123,7 +123,7 @@ pub fn download_artifacts_for_active_job(
             connection,
             &job.id,
             "artifact.active",
-            format!("Started {}.", download.artifact.path),
+            format!("Started {}.", artifact_display_name(&download.artifact)),
             &download.artifact.id,
             timestamp,
         )?;
@@ -217,7 +217,7 @@ pub fn download_artifacts_for_active_job(
                             connection,
                             &job.id,
                             "artifact.completed",
-                            format!("Completed {}.", download.artifact.path),
+                            format!("Completed {}.", artifact_display_name(&download.artifact)),
                             &download.artifact.id,
                             timestamp,
                         )?;
@@ -252,7 +252,7 @@ pub fn download_artifacts_for_active_job(
                     connection,
                     &job.id,
                     "artifact.completed",
-                    format!("Completed {}.", download.artifact.path),
+                    format!("Completed {}.", artifact_display_name(&download.artifact)),
                     &download.artifact.id,
                     timestamp,
                 )?;
@@ -427,7 +427,7 @@ fn cancel_artifacts_from(
             connection,
             job_id,
             "artifact.cancelled",
-            format!("Cancelled {}.", cancelled.path),
+            format!("Cancelled {}.", artifact_display_name(&cancelled)),
             &cancelled.id,
             timestamp,
         )?;
@@ -589,11 +589,24 @@ fn safe_artifact_error_reason(error: &ArtifactDownloadError) -> String {
     }
 }
 
+fn artifact_display_name(artifact: &ArtifactRecord) -> String {
+    Path::new(&artifact.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(artifact.artifact_type.as_str())
+        .to_string()
+}
+
 fn format_extraction_success_message(result: &ExerciseArchiveExtractionResult) -> String {
     match &result.destination_directory {
         Some(destination_directory) => format!(
             "Extracted exercise archive to {}.",
-            destination_directory.display()
+            destination_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("exercise files")
         ),
         None => "Extracted exercise archive.".to_string(),
     }
@@ -684,6 +697,16 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "artifact.completed"));
+        assert!(events
+            .iter()
+            .filter(|event| event.event_type.starts_with("artifact."))
+            .all(|event| !event.message.contains(&output.path().display().to_string())));
+        assert!(events
+            .iter()
+            .any(|event| event.message == "Started welcome.mp4."));
+        assert!(events
+            .iter()
+            .any(|event| event.message == "Completed welcome.mp4."));
         assert!(events
             .iter()
             .any(|event| event.event_type == "job.completed"));
@@ -1376,6 +1399,13 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "artifact.extracted"));
+        assert!(events
+            .iter()
+            .any(|event| event.message == "Extracted exercise archive to exercise."));
+        assert!(events
+            .iter()
+            .filter(|event| event.event_type.starts_with("artifact."))
+            .all(|event| !event.message.contains(&output.path().display().to_string())));
         assert!(events
             .iter()
             .any(|event| event.event_type == "job.cancelled"));

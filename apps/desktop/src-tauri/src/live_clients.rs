@@ -90,10 +90,9 @@ impl CourseApiClient for AuthenticatedLinkedInClient {
             .map_err(|error| CourseFetchError::Api(classify_reqwest_error(&error)))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(CourseFetchError::Api(format!(
-                "HTTP status {}",
-                status.as_u16()
-            )));
+            return Err(CourseFetchError::Http {
+                status: status.as_u16(),
+            });
         }
         response
             .text()
