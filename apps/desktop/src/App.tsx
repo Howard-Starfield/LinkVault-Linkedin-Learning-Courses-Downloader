@@ -77,6 +77,8 @@ type ArtifactProgressCounts = {
   subtitle_completed: number;
   quiz_total?: number;
   quiz_completed?: number;
+  study_guide_total?: number;
+  study_guide_completed?: number;
   exercise_total: number;
   exercise_completed: number;
 };
@@ -948,10 +950,6 @@ export default function App() {
   );
 }
 
-function isTerminalJob(status: string) {
-  return status === "completed" || status === "failed" || status === "cancelled";
-}
-
 function shouldShowInLiveQueue(status: string) {
   return status !== "completed" && status !== "cancelled";
 }
@@ -1222,6 +1220,8 @@ function artifactCounts(job: QueuedDownloadJob): ArtifactProgressCounts {
     subtitle_completed: 0,
     quiz_total: 0,
     quiz_completed: 0,
+    study_guide_total: 0,
+    study_guide_completed: 0,
     exercise_total: 0,
     exercise_completed: 0
   };

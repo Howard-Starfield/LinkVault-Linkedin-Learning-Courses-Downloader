@@ -198,3 +198,49 @@ Use this pattern in other projects when a feature fails because an app is scrapi
 5. Inspect sanitized response shapes and add parser tests.
 6. Run a live artifact-only probe that writes the final file.
 7. Only after the stable API path fails should WebView/browser automation become the main solution.
+
+## 2026-05-24 LinkVault Root Study Guide
+
+### What We Learned
+
+- LinkedIn does not force our final study-file format. It gives the app structured metadata, transcript lines, and assessment questions; our app chooses how to write those into files.
+- Existing `.srt` transcript files should stay beside videos because video players understand SRT.
+- Existing `.quiz.md` files should stay near their chapter/video because they are useful standalone notes.
+- A root `Study.md` is possible because the ordered `Course` model already exists before downloads begin. We do not need to infer order from the filesystem or from which file finishes first.
+- The right source of truth for ordering is LinkedIn course metadata: course -> chapters -> videos -> assessments.
+
+### Best Workflow
+
+1. Fetch and parse course metadata first.
+2. Build all planned artifact paths from that ordered metadata.
+3. Write text artifacts first: transcripts and quiz Markdown.
+4. Generate root `Study.md` after text artifacts are planned/written.
+5. Continue with large video and exercise downloads afterward.
+
+### Implementation Principle
+
+- Treat `Study.md` as a generated artifact, not a scrape result.
+- Count it in progress so totals stay honest.
+- Generate it only when study content exists, such as subtitles or quizzes.
+- Keep `Study.md` as a self-contained study document:
+  - quizzes first,
+  - transcripts next,
+  - embedded questions and transcript text,
+  - no local file paths for `.srt`, `.quiz.md`, or video files.
+- Still preserve the separate `.srt`, `.quiz.md`, and video files beside the chapter content; `Study.md` is for reading, while the separate files are for reuse by video players and standalone notes.
+
+### Natural Transcript Paragraphs
+
+- LinkedIn transcript lines arrive as timestamped caption fragments, so writing them directly creates a hard-to-read wall of text.
+- Convert SRT to article-style paragraphs by:
+  - removing index lines and timestamp lines,
+  - joining only caption text,
+  - normalizing whitespace,
+  - splitting on sentence endings,
+  - grouping sentences into moderate-length paragraphs.
+- Do not rewrite the instructor's words. The formatter only changes layout, not meaning.
+- Keep course order from the parsed model: course -> chapter -> video. Do not rely on which file downloaded first.
+
+### Reusable Lesson
+
+When a final output is a user-friendly study format, do not assume the website's source format controls the saved format. If the app has structured data and deterministic ordering, generate a clean reader-facing file from the app model while keeping raw artifacts available separately.
