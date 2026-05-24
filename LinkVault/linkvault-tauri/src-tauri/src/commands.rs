@@ -8,14 +8,17 @@ use crate::browser_cookies::{
     ChromiumCookieDecoder,
 };
 use crate::cache::{
-    append_job_event, get_setting, insert_job, list_artifacts_for_job, list_job_events,
-    list_recent_jobs, open_or_initialize, upsert_setting_json, JobRecord, NewJobEvent,
+    append_job_event, clear_failed_jobs, get_course_cache_entry, get_setting, insert_job,
+    list_artifacts_for_job, list_job_events, list_jobs_by_status, list_recent_jobs,
+    open_or_initialize, retry_failed_job, upsert_setting_json, JobRecord, NewJobEvent,
 };
 use crate::course::CourseApiClient;
-use crate::download_orchestrator::process_next_queued_job_and_download_artifacts;
+use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
 use crate::linkedin::{parse_course_urls, CourseUrl};
 use crate::live_clients::AuthenticatedLinkedInClient;
 use crate::quality::{fallback_order, VideoQuality};
+use crate::quiz_hints::{quiz_hints_from_json, quiz_hints_json, QuizHints};
+use crate::token_store;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -27,13 +30,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct LinkVaultState {
     db_path: PathBuf,
+    token_path: PathBuf,
     download_cancellation: Arc<AtomicBool>,
 }
 
 impl LinkVaultState {
     pub fn new(db_path: PathBuf) -> Self {
+        let token_path = db_path.with_file_name("linkvault.li_at.dpapi");
         Self {
             db_path,
+            token_path,
             download_cancellation: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -61,6 +67,11 @@ impl LinkVaultState {
     fn is_download_cancellation_requested(&self) -> bool {
         self.download_cancellation.load(Ordering::SeqCst)
     }
+
+    #[cfg(test)]
+    fn token_path(&self) -> &std::path::Path {
+        &self.token_path
+    }
 }
 
 #[derive(Clone)]
@@ -79,6 +90,7 @@ pub struct BootstrapState {
     default_resolution: VideoQuality,
     browser_sources: Vec<&'static str>,
     stores_plaintext_tokens_in_sqlite: bool,
+    has_saved_token: bool,
     saved_download_preferences: Option<SavedDownloadPreferences>,
     persisted_jobs: Vec<PersistedDownloadJob>,
     recent_events: Vec<PersistedJobEvent>,
@@ -94,6 +106,8 @@ pub struct SavedDownloadPreferences {
     download_videos: bool,
     download_exercises: bool,
     download_subtitles: bool,
+    #[serde(default = "default_download_quizzes")]
+    download_quizzes: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +121,8 @@ pub struct StartDownloadRequest {
     download_videos: bool,
     download_exercises: bool,
     download_subtitles: bool,
+    #[serde(default = "default_download_quizzes")]
+    download_quizzes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -115,6 +131,7 @@ pub struct QueuedDownloadJob {
     course_slug: String,
     source_url: String,
     status: String,
+    thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -123,6 +140,7 @@ pub struct PersistedDownloadJob {
     course_slug: String,
     source_url: String,
     status: String,
+    thumbnail_url: Option<String>,
     selected_quality: String,
     output_dir: String,
     updated_at: i64,
@@ -142,6 +160,8 @@ pub struct ArtifactProgressCounts {
     video_completed: usize,
     subtitle_total: usize,
     subtitle_completed: usize,
+    quiz_total: usize,
+    quiz_completed: usize,
     exercise_total: usize,
     exercise_completed: usize,
 }
@@ -173,10 +193,16 @@ pub struct CancelDownloadResponse {
     cancellation_requested: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SavedTokenStatus {
+    has_saved_token: bool,
+}
+
 #[tauri::command]
 pub fn bootstrap_state(state: tauri::State<'_, LinkVaultState>) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
-    load_bootstrap_state(&connection).map_err(|error| error.to_string())
+    load_bootstrap_state(&connection, token_store::has_saved_token(&state.token_path))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -200,6 +226,20 @@ pub fn start_download_jobs(
 }
 
 #[tauri::command]
+pub fn save_download_preferences(
+    state: tauri::State<'_, LinkVaultState>,
+    preferences: SavedDownloadPreferences,
+) -> Result<SavedDownloadPreferences, String> {
+    if preferences.output_dir.trim().is_empty() {
+        return Err("Choose a download folder before saving settings.".to_string());
+    }
+
+    let connection = state.connection()?;
+    persist_download_preferences(&connection, &preferences, now_unix_timestamp())?;
+    Ok(preferences)
+}
+
+#[tauri::command]
 pub fn cancel_active_download(
     state: tauri::State<'_, LinkVaultState>,
 ) -> Result<CancelDownloadResponse, String> {
@@ -207,6 +247,28 @@ pub fn cancel_active_download(
     Ok(CancelDownloadResponse {
         cancellation_requested: true,
     })
+}
+
+#[tauri::command]
+pub fn retry_failed_download_job(
+    state: tauri::State<'_, LinkVaultState>,
+    job_id: String,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    retry_failed_job(&connection, &job_id, now_unix_timestamp())
+        .map_err(|error| error.to_string())?;
+    load_bootstrap_state(&connection, token_store::has_saved_token(&state.token_path))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn clear_failed_download_jobs(
+    state: tauri::State<'_, LinkVaultState>,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    clear_failed_jobs(&connection).map_err(|error| error.to_string())?;
+    load_bootstrap_state(&connection, token_store::has_saved_token(&state.token_path))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -218,6 +280,27 @@ pub async fn validate_li_at_token(token: String) -> Result<ValidatedLinkedInSess
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn save_li_at_token(
+    state: tauri::State<'_, LinkVaultState>,
+    token: String,
+) -> Result<SavedTokenStatus, String> {
+    token_store::save_token(&state.token_path, &token).map_err(|error| error.to_string())?;
+    Ok(SavedTokenStatus {
+        has_saved_token: true,
+    })
+}
+
+#[tauri::command]
+pub fn clear_saved_li_at_token(
+    state: tauri::State<'_, LinkVaultState>,
+) -> Result<SavedTokenStatus, String> {
+    token_store::clear_token(&state.token_path).map_err(|error| error.to_string())?;
+    Ok(SavedTokenStatus {
+        has_saved_token: false,
+    })
 }
 
 #[tauri::command]
@@ -242,22 +325,81 @@ pub async fn validate_browser_token_source(
 
 #[tauri::command]
 pub async fn process_next_queued_download_with_li_at(
+    app: tauri::AppHandle,
     state: tauri::State<'_, LinkVaultState>,
     token: String,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let db_path = state.db_path.clone();
     let cancellation = state.reset_download_cancellation();
-    tauri::async_runtime::spawn_blocking(move || {
+    let token_and_session = tauri::async_runtime::spawn_blocking(move || {
         let mut home_client =
             ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
         let session = validate_li_at_with_client(&token, &mut home_client)
             .map_err(|error| error.to_string())?;
+        Ok::<_, String>((token, session))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    let (token, session) = token_and_session;
+    let quiz_assessments = extract_quizzes_for_next_job(
+        app,
+        db_path.clone(),
+        token.clone(),
+        session.clone(),
+        now_unix_timestamp(),
+    )
+    .await;
+    tauri::async_runtime::spawn_blocking(move || {
         process_next_queued_download_with_validated_token(
             db_path,
             token,
             session,
             now_unix_timestamp(),
             cancellation,
+            quiz_assessments,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn process_next_queued_download_with_saved_token(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, LinkVaultState>,
+) -> Result<ProcessQueuedDownloadResponse, String> {
+    let db_path = state.db_path.clone();
+    let token_path = state.token_path.clone();
+    let cancellation = state.reset_download_cancellation();
+    let token_and_session = tauri::async_runtime::spawn_blocking(move || {
+        let token = token_store::load_token(&token_path).map_err(|error| error.to_string())?;
+        let mut home_client =
+            ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
+        let session = validate_li_at_with_client(&token, &mut home_client)
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((token, session))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    let (token, session) = token_and_session;
+    let quiz_assessments = extract_quizzes_for_next_job(
+        app,
+        db_path.clone(),
+        token.clone(),
+        session.clone(),
+        now_unix_timestamp(),
+    )
+    .await;
+    tauri::async_runtime::spawn_blocking(move || {
+        process_next_queued_download_with_validated_token(
+            db_path,
+            token,
+            session,
+            now_unix_timestamp(),
+            cancellation,
+            quiz_assessments,
         )
     })
     .await
@@ -266,12 +408,13 @@ pub async fn process_next_queued_download_with_li_at(
 
 #[tauri::command]
 pub async fn process_next_queued_download_from_browser_source(
+    app: tauri::AppHandle,
     state: tauri::State<'_, LinkVaultState>,
     source: BrowserSource,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let db_path = state.db_path.clone();
     let cancellation = state.reset_download_cancellation();
-    tauri::async_runtime::spawn_blocking(move || {
+    let token_and_session = tauri::async_runtime::spawn_blocking(move || {
         let roots = BrowserCookieRoots::from_env();
         let decoder = chromium_user_data_path_for_source(source, &roots)
             .map(|path| ChromiumCookieDecoder::from_user_data_path(&path))
@@ -282,12 +425,28 @@ pub async fn process_next_queued_download_from_browser_source(
             ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
         let (candidate, session) = select_first_valid_browser_token(&candidates, &mut home_client)
             .map_err(|error| error.to_string())?;
+        Ok::<_, String>((candidate.value, session))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    let (token, session) = token_and_session;
+    let quiz_assessments = extract_quizzes_for_next_job(
+        app,
+        db_path.clone(),
+        token.clone(),
+        session.clone(),
+        now_unix_timestamp(),
+    )
+    .await;
+    tauri::async_runtime::spawn_blocking(move || {
         process_next_queued_download_with_validated_token(
             db_path,
-            candidate.value,
+            token,
             session,
             now_unix_timestamp(),
             cancellation,
+            quiz_assessments,
         )
     })
     .await
@@ -300,12 +459,12 @@ fn process_next_queued_download_with_validated_token(
     session: ValidatedLinkedInSession,
     timestamp: i64,
     cancellation: DownloadCancellation,
+    quiz_assessments: Vec<crate::course::CourseAssessment>,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let connection = open_or_initialize(&db_path).map_err(|error| error.to_string())?;
     let mut course_client =
         AuthenticatedLinkedInClient::new(&token, &session).map_err(|error| error.to_string())?;
-    let mut artifact_client =
-        AuthenticatedLinkedInClient::new(&token, &session).map_err(|error| error.to_string())?;
+    let mut artifact_client = course_client.clone();
 
     process_next_queued_download_with_clients(
         &connection,
@@ -313,6 +472,7 @@ fn process_next_queued_download_with_validated_token(
         &mut artifact_client,
         timestamp,
         &cancellation,
+        quiz_assessments,
     )
 }
 
@@ -322,13 +482,15 @@ fn process_next_queued_download_with_clients(
     artifact_client: &mut impl ArtifactHttpClient,
     timestamp: i64,
     cancellation: &impl CancellationFlag,
+    quiz_assessments: Vec<crate::course::CourseAssessment>,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
-    let summary = process_next_queued_job_and_download_artifacts(
+    let summary = process_next_queued_job_and_download_artifacts_with_quiz_assessments(
         connection,
         course_client,
         artifact_client,
         cancellation,
         timestamp,
+        quiz_assessments,
     )
     .map_err(|error| error.to_string())?;
 
@@ -348,6 +510,47 @@ fn process_next_queued_download_with_clients(
     })
 }
 
+async fn extract_quizzes_for_next_job(
+    _app: tauri::AppHandle,
+    db_path: PathBuf,
+    _token: String,
+    _session: ValidatedLinkedInSession,
+    timestamp: i64,
+) -> Vec<crate::course::CourseAssessment> {
+    let Ok(connection) = open_or_initialize(&db_path) else {
+        return Vec::new();
+    };
+    let Ok(Some(job)) =
+        list_jobs_by_status(&connection, "queued").map(|jobs| jobs.into_iter().next())
+    else {
+        return Vec::new();
+    };
+    if !job.download_quizzes {
+        return Vec::new();
+    }
+
+    let hints = quiz_hints_from_json(&job.quiz_hints_json);
+    let _ = append_job_event(
+        &connection,
+        &NewJobEvent {
+            job_id: job.id,
+            event_type: "quiz.metadata_discovery".to_string(),
+            message: "Quiz extraction will use authenticated LinkedIn course metadata.".to_string(),
+            payload_json: Some(
+                serde_json::json!({
+                    "courseSlug": job.course_slug,
+                    "hintQuizUrls": hints.quiz_urls.len(),
+                    "hintAssessmentUrns": hints.assessment_urns.len(),
+                    "source": "learning-api detailedCourses assessments field",
+                })
+                .to_string(),
+            ),
+            created_at: timestamp,
+        },
+    );
+    Vec::new()
+}
+
 fn queue_download_jobs(
     connection: &Connection,
     request: StartDownloadRequest,
@@ -361,23 +564,11 @@ fn queue_download_jobs(
         return Err("Choose a download folder before starting.".to_string());
     }
 
-    let settings_json = serde_json::json!({
-        "outputDir": request.output_dir,
-        "selectedQuality": request.selected_quality,
-        "delaySeconds": request.delay_seconds,
-        "browserSource": request.browser_source,
-        "downloadVideos": request.download_videos,
-        "downloadExercises": request.download_exercises,
-        "downloadSubtitles": request.download_subtitles,
-    })
-    .to_string();
-    upsert_setting_json(
+    persist_download_preferences(
         connection,
-        "download.preferences",
-        &settings_json,
+        &SavedDownloadPreferences::from(&request),
         created_at,
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
 
     let mut jobs = Vec::with_capacity(courses.len());
     for (index, course) in courses.iter().enumerate() {
@@ -390,11 +581,14 @@ fn queue_download_jobs(
             &JobRecord {
                 id: job_id.clone(),
                 course_slug: course.slug.clone(),
+                source_url: course.normalized_url.clone(),
                 status: "queued".to_string(),
                 selected_quality: request.selected_quality.clone(),
                 download_videos: request.download_videos,
                 download_exercises: request.download_exercises,
                 download_subtitles: request.download_subtitles,
+                download_quizzes: request.download_quizzes,
+                quiz_hints_json: course_quiz_hints_json(course),
                 output_dir: request.output_dir.clone(),
                 created_at,
                 updated_at: created_at,
@@ -410,6 +604,8 @@ fn queue_download_jobs(
                 payload_json: Some(
                     serde_json::json!({
                         "sourceUrl": course.normalized_url,
+                        "quizUrls": course.quiz_urls,
+                        "assessmentUrns": course.assessment_urns,
                         "delaySeconds": request.delay_seconds,
                     })
                     .to_string(),
@@ -424,13 +620,59 @@ fn queue_download_jobs(
             course_slug: course.slug.clone(),
             source_url: course.normalized_url.clone(),
             status: "queued".to_string(),
+            thumbnail_url: None,
         });
     }
 
     Ok(StartDownloadResponse { jobs })
 }
 
-fn load_bootstrap_state(connection: &Connection) -> Result<BootstrapState, String> {
+fn persist_download_preferences(
+    connection: &Connection,
+    preferences: &SavedDownloadPreferences,
+    updated_at: i64,
+) -> Result<(), String> {
+    let settings_json = serde_json::to_string(preferences).map_err(|error| error.to_string())?;
+    upsert_setting_json(
+        connection,
+        "download.preferences",
+        &settings_json,
+        updated_at,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn course_quiz_hints_json(course: &CourseUrl) -> String {
+    quiz_hints_json(&QuizHints {
+        quiz_urls: course.quiz_urls.clone(),
+        assessment_urns: course.assessment_urns.clone(),
+    })
+}
+
+impl From<&StartDownloadRequest> for SavedDownloadPreferences {
+    fn from(request: &StartDownloadRequest) -> Self {
+        Self {
+            output_dir: request.output_dir.clone(),
+            selected_quality: request.selected_quality.clone(),
+            delay_seconds: request.delay_seconds,
+            browser_source: request.browser_source.clone(),
+            download_videos: request.download_videos,
+            download_exercises: request.download_exercises,
+            download_subtitles: request.download_subtitles,
+            download_quizzes: request.download_quizzes,
+        }
+    }
+}
+
+fn default_download_quizzes() -> bool {
+    true
+}
+
+fn load_bootstrap_state(
+    connection: &Connection,
+    has_saved_token: bool,
+) -> Result<BootstrapState, String> {
     let saved_download_preferences = get_setting(connection, "download.preferences")
         .map_err(|error| error.to_string())?
         .and_then(|setting| serde_json::from_str(&setting.value_json).ok());
@@ -463,11 +705,20 @@ fn load_bootstrap_state(connection: &Connection) -> Result<BootstrapState, Strin
         let artifacts =
             list_artifacts_for_job(connection, &job.id).map_err(|error| error.to_string())?;
         let artifact_counts = summarize_artifacts(&artifacts);
+        let thumbnail_url = get_course_cache_entry(connection, &job.course_slug)
+            .ok()
+            .flatten()
+            .and_then(|entry| cached_course_thumbnail_url(&entry.payload_json));
         persisted_jobs.push(PersistedDownloadJob {
-            source_url: format!("https://www.linkedin.com/learning/{}", job.course_slug),
+            source_url: if job.source_url.trim().is_empty() {
+                format!("https://www.linkedin.com/learning/{}", job.course_slug)
+            } else {
+                job.source_url.clone()
+            },
             id: job.id,
             course_slug: job.course_slug,
             status: job.status,
+            thumbnail_url,
             selected_quality: job.selected_quality,
             output_dir: job.output_dir,
             updated_at: job.updated_at,
@@ -479,10 +730,32 @@ fn load_bootstrap_state(connection: &Connection) -> Result<BootstrapState, Strin
         default_resolution: VideoQuality::P1080,
         browser_sources: vec!["Chrome", "Edge", "Firefox"],
         stores_plaintext_tokens_in_sqlite: false,
+        has_saved_token,
         saved_download_preferences,
         persisted_jobs,
         recent_events,
     })
+}
+
+fn cached_course_thumbnail_url(payload_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("thumbnail_url")
+                .or_else(|| payload.get("thumbnailUrl"))
+                .and_then(|value| value.as_str())
+                .and_then(non_empty_string)
+        })
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn summarize_artifacts(artifacts: &[crate::cache::ArtifactRecord]) -> ArtifactProgressCounts {
@@ -510,6 +783,12 @@ fn summarize_artifacts(artifacts: &[crate::cache::ArtifactRecord]) -> ArtifactPr
                 counts.subtitle_total += 1;
                 if artifact.status == "completed" {
                     counts.subtitle_completed += 1;
+                }
+            }
+            "quiz" => {
+                counts.quiz_total += 1;
+                if artifact.status == "completed" {
+                    counts.quiz_completed += 1;
                 }
             }
             "exercise_zip" | "exercise_file" => {
@@ -575,6 +854,7 @@ mod tests {
                 download_videos: true,
                 download_exercises: true,
                 download_subtitles: false,
+                download_quizzes: true,
             },
             1_700_000_000,
         )
@@ -596,13 +876,63 @@ mod tests {
         assert!(!setting.value_json.to_ascii_lowercase().contains("li_at"));
         assert!(!setting.value_json.to_ascii_lowercase().contains("token"));
         assert_eq!(queued_jobs.len(), 2);
+        assert_eq!(
+            queued_jobs[0].source_url,
+            "https://www.linkedin.com/learning/sample-course"
+        );
         assert_eq!(queued_jobs[0].selected_quality, "1080");
         assert!(queued_jobs[0].download_videos);
         assert!(queued_jobs[0].download_exercises);
         assert!(!queued_jobs[0].download_subtitles);
+        assert!(queued_jobs[0].download_quizzes);
         assert_eq!(first_events.len(), 1);
         assert_eq!(first_events[0].event_type, "job.queued");
         assert!(first_events[0].message.contains("sample-course"));
+    }
+
+    #[test]
+    fn queue_download_jobs_persists_direct_quiz_hints() {
+        let connection = initialized_connection();
+
+        queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/sample-course/quiz/urn:li:learningApiAssessment:69813586?resume=false&u=52983649&trk=ignored".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+            },
+            100,
+        )
+        .unwrap();
+
+        let queued_job = list_jobs_by_status(&connection, "queued")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let hints = quiz_hints_from_json(&queued_job.quiz_hints_json);
+
+        assert_eq!(
+            queued_job.source_url,
+            "https://www.linkedin.com/learning/sample-course"
+        );
+        assert_eq!(
+            hints.quiz_urls,
+            vec![
+                "https://www.linkedin.com/learning/sample-course/quiz/urn:li:learningApiAssessment:69813586?resume=false&u=52983649"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            hints.assessment_urns,
+            vec!["urn:li:learningApiAssessment:69813586".to_string()]
+        );
     }
 
     #[test]
@@ -620,6 +950,7 @@ mod tests {
                 download_videos: true,
                 download_exercises: true,
                 download_subtitles: true,
+                download_quizzes: true,
             },
             100,
         )
@@ -645,6 +976,7 @@ mod tests {
                 download_videos: true,
                 download_exercises: false,
                 download_subtitles: true,
+                download_quizzes: true,
             },
             1_700_000_000,
         )
@@ -669,6 +1001,7 @@ mod tests {
             ("video-1", "video", "completed"),
             ("video-2", "video", "failed"),
             ("subtitle-1", "subtitle", "completed"),
+            ("quiz-1", "quiz", "completed"),
             ("exercise-1", "exercise_zip", "cancelled"),
         ] {
             upsert_artifact(
@@ -687,11 +1020,12 @@ mod tests {
             .unwrap();
         }
 
-        let bootstrap = load_bootstrap_state(&connection).unwrap();
+        let bootstrap = load_bootstrap_state(&connection, true).unwrap();
         let preferences = bootstrap.saved_download_preferences.unwrap();
 
         assert_eq!(bootstrap.default_resolution, VideoQuality::P1080);
         assert!(!bootstrap.stores_plaintext_tokens_in_sqlite);
+        assert!(bootstrap.has_saved_token);
         assert_eq!(preferences.output_dir, "C:/downloads");
         assert_eq!(preferences.selected_quality, "720");
         assert_eq!(preferences.browser_source, "Firefox");
@@ -699,12 +1033,13 @@ mod tests {
         assert!(preferences.download_videos);
         assert!(!preferences.download_exercises);
         assert!(preferences.download_subtitles);
+        assert!(preferences.download_quizzes);
         assert_eq!(bootstrap.persisted_jobs.len(), 1);
         assert_eq!(bootstrap.persisted_jobs[0].id, response.jobs[0].id);
         assert_eq!(bootstrap.persisted_jobs[0].course_slug, "sample-course");
         assert_eq!(bootstrap.persisted_jobs[0].status, "failed");
-        assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.total, 4);
-        assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.completed, 2);
+        assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.total, 5);
+        assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.completed, 3);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.failed, 1);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.cancelled, 1);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.video_total, 2);
@@ -720,6 +1055,11 @@ mod tests {
             bootstrap.persisted_jobs[0]
                 .artifact_counts
                 .subtitle_completed,
+            1
+        );
+        assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.quiz_total, 1);
+        assert_eq!(
+            bootstrap.persisted_jobs[0].artifact_counts.quiz_completed,
             1
         );
         assert_eq!(
@@ -748,6 +1088,7 @@ mod tests {
             &mut artifact_client,
             200,
             &NeverCancelled,
+            Vec::new(),
         )
         .unwrap();
 
@@ -765,6 +1106,13 @@ mod tests {
     #[test]
     fn linkvault_state_records_and_resets_download_cancellation_requests() {
         let state = LinkVaultState::new("linkvault-test.sqlite3".into());
+        assert_eq!(
+            state
+                .token_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("linkvault.li_at.dpapi")
+        );
 
         state.request_download_cancellation();
         assert!(state.is_download_cancellation_requested());

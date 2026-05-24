@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::Duration;
 use thiserror::Error;
 
 const LINKEDIN_LEARNING_HOME: &str = "https://www.linkedin.com/learning";
@@ -36,6 +37,8 @@ pub struct ValidatedLinkedInSession {
     pub csrf_token: String,
     pub enterprise_profile_hash: Option<String>,
     pub request_headers: Vec<(String, String)>,
+    #[serde(skip)]
+    pub cookies: Vec<LinkedInCookie>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -68,6 +71,7 @@ impl ReqwestLinkedInHomeClient {
         let client = reqwest::blocking::Client::builder()
             .cookie_store(true)
             .user_agent(LINKEDIN_USER_AGENT)
+            .timeout(Duration::from_secs(20))
             .build()
             .map_err(|error| TokenValidationError::HomeFetch(error.to_string()))?;
 
@@ -136,6 +140,7 @@ pub fn validate_li_at_with_client(
         csrf_token,
         enterprise_profile_hash,
         request_headers,
+        cookies: response.cookies,
     })
 }
 
@@ -230,6 +235,13 @@ mod tests {
 
         assert_eq!(client.seen_tokens, vec!["li-at-token"]);
         assert_eq!(session.csrf_token, "ajax:123");
+        assert_eq!(
+            session.cookies,
+            vec![LinkedInCookie {
+                name: "JSESSIONID".to_string(),
+                value: "ajax:123".to_string()
+            }]
+        );
         assert_eq!(
             session.request_headers,
             vec![

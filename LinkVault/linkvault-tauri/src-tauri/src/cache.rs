@@ -21,11 +21,14 @@ CREATE TABLE IF NOT EXISTS course_cache (
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY NOT NULL,
     course_slug TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL CHECK (status IN ('queued', 'active', 'completed', 'failed', 'cancelled')),
     selected_quality TEXT NOT NULL,
     download_videos INTEGER NOT NULL,
     download_exercises INTEGER NOT NULL,
     download_subtitles INTEGER NOT NULL,
+    download_quizzes INTEGER NOT NULL DEFAULT 1,
+    quiz_hints_json TEXT NOT NULL DEFAULT '[]',
     output_dir TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -44,7 +47,7 @@ CREATE TABLE IF NOT EXISTS job_events (
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY NOT NULL,
     job_id TEXT NOT NULL,
-    artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'exercise_zip', 'exercise_file')),
+    artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'quiz', 'exercise_zip', 'exercise_file')),
     path TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'completed', 'failed', 'cancelled', 'skipped')),
     size_bytes INTEGER,
@@ -63,6 +66,116 @@ pub fn open_or_initialize(path: &Path) -> Result<Connection> {
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.execute_batch(SCHEMA)?;
+    migrate_jobs_download_quizzes(connection)?;
+    migrate_jobs_source_url(connection)?;
+    migrate_jobs_quiz_hints(connection)?;
+    migrate_artifacts_quiz_type(connection)?;
+    Ok(())
+}
+
+fn migrate_jobs_download_quizzes(connection: &Connection) -> Result<()> {
+    let has_column = connection
+        .prepare("PRAGMA table_info(jobs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "download_quizzes");
+
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN download_quizzes INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_jobs_source_url(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "jobs", "source_url")? {
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN source_url TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_jobs_quiz_hints(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "jobs", "quiz_hints_json")? {
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN quiz_hints_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
+fn migrate_artifacts_quiz_type(connection: &Connection) -> Result<()> {
+    let create_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'",
+        [],
+        |row| row.get(0),
+    )?;
+    if create_sql.contains("'quiz'") {
+        return Ok(());
+    }
+
+    connection.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+
+        CREATE TABLE artifacts_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            job_id TEXT NOT NULL,
+            artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'quiz', 'exercise_zip', 'exercise_file')),
+            path TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'completed', 'failed', 'cancelled', 'skipped')),
+            size_bytes INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO artifacts_new (
+            id,
+            job_id,
+            artifact_type,
+            path,
+            status,
+            size_bytes,
+            created_at,
+            updated_at
+        )
+        SELECT
+            id,
+            job_id,
+            artifact_type,
+            path,
+            status,
+            size_bytes,
+            created_at,
+            updated_at
+        FROM artifacts;
+
+        DROP TABLE artifacts;
+        ALTER TABLE artifacts_new RENAME TO artifacts;
+
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+
     Ok(())
 }
 
@@ -100,11 +213,14 @@ pub struct CourseCacheEntry {
 pub struct JobRecord {
     pub id: String,
     pub course_slug: String,
+    pub source_url: String,
     pub status: String,
     pub selected_quality: String,
     pub download_videos: bool,
     pub download_exercises: bool,
     pub download_subtitles: bool,
+    pub download_quizzes: bool,
+    pub quiz_hints_json: String,
     pub output_dir: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -236,25 +352,31 @@ pub fn insert_job(connection: &Connection, job: &JobRecord) -> CacheResult<()> {
         INSERT INTO jobs (
             id,
             course_slug,
+            source_url,
             status,
             selected_quality,
             download_videos,
             download_exercises,
             download_subtitles,
+            download_quizzes,
+            quiz_hints_json,
             output_dir,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         "#,
         params![
             &job.id,
             &job.course_slug,
+            &job.source_url,
             &job.status,
             &job.selected_quality,
             job.download_videos,
             job.download_exercises,
             job.download_subtitles,
+            job.download_quizzes,
+            &job.quiz_hints_json,
             &job.output_dir,
             job.created_at,
             job.updated_at
@@ -340,6 +462,48 @@ pub fn reconcile_active_jobs_after_restart(
     Ok(reconciled)
 }
 
+pub fn retry_failed_job(
+    connection: &Connection,
+    job_id: &str,
+    retried_at: i64,
+) -> CacheResult<JobRecord> {
+    let current =
+        get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))?;
+    if current.status != "failed" {
+        return Err(CacheError::InvalidJobTransition {
+            from: current.status,
+            to: "queued".to_string(),
+        });
+    }
+
+    connection.execute(
+        "UPDATE jobs SET status = 'queued', updated_at = ?2 WHERE id = ?1",
+        params![job_id, retried_at],
+    )?;
+    connection.execute("DELETE FROM artifacts WHERE job_id = ?1", params![job_id])?;
+    append_job_event(
+        connection,
+        &NewJobEvent {
+            job_id: job_id.to_string(),
+            event_type: "job.retry".to_string(),
+            message: "Retry requested; job returned to the queue.".to_string(),
+            payload_json: None,
+            created_at: retried_at,
+        },
+    )?;
+
+    get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))
+}
+
+pub fn clear_failed_jobs(connection: &Connection) -> CacheResult<usize> {
+    connection
+        .execute(
+            "DELETE FROM jobs WHERE status IN ('failed', 'cancelled')",
+            [],
+        )
+        .map_err(CacheError::from)
+}
+
 pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobRecord>> {
     let job = connection
         .query_row(
@@ -347,11 +511,14 @@ pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobR
             SELECT
                 id,
                 course_slug,
+                source_url,
                 status,
                 selected_quality,
                 download_videos,
                 download_exercises,
                 download_subtitles,
+                download_quizzes,
+                quiz_hints_json,
                 output_dir,
                 created_at,
                 updated_at
@@ -371,11 +538,14 @@ pub fn list_jobs_by_status(connection: &Connection, status: &str) -> CacheResult
         SELECT
             id,
             course_slug,
+            source_url,
             status,
             selected_quality,
             download_videos,
             download_exercises,
             download_subtitles,
+            download_quizzes,
+            quiz_hints_json,
             output_dir,
             created_at,
             updated_at
@@ -396,11 +566,14 @@ pub fn list_recent_jobs(connection: &Connection, limit: usize) -> CacheResult<Ve
         SELECT
             id,
             course_slug,
+            source_url,
             status,
             selected_quality,
             download_videos,
             download_exercises,
             download_subtitles,
+            download_quizzes,
+            quiz_hints_json,
             output_dir,
             created_at,
             updated_at
@@ -532,14 +705,17 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> Result<JobRecord> {
     Ok(JobRecord {
         id: row.get(0)?,
         course_slug: row.get(1)?,
-        status: row.get(2)?,
-        selected_quality: row.get(3)?,
-        download_videos: row.get(4)?,
-        download_exercises: row.get(5)?,
-        download_subtitles: row.get(6)?,
-        output_dir: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        source_url: row.get(2)?,
+        status: row.get(3)?,
+        selected_quality: row.get(4)?,
+        download_videos: row.get(5)?,
+        download_exercises: row.get(6)?,
+        download_subtitles: row.get(7)?,
+        download_quizzes: row.get(8)?,
+        quiz_hints_json: row.get(9)?,
+        output_dir: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -721,6 +897,55 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].id, "job-new");
         assert_eq!(recent[1].id, "job-middle");
+    }
+
+    #[test]
+    fn retry_failed_job_returns_job_to_queue_and_clears_artifacts() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("job-1", "failed", 100)).unwrap();
+        upsert_artifact(
+            &connection,
+            &ArtifactRecord {
+                id: "artifact-1".to_string(),
+                job_id: "job-1".to_string(),
+                artifact_type: "video".to_string(),
+                path: "C:/downloads/sample/welcome.mp4".to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                created_at: 110,
+                updated_at: 120,
+            },
+        )
+        .unwrap();
+
+        let retried = retry_failed_job(&connection, "job-1", 200).unwrap();
+
+        assert_eq!(retried.status, "queued");
+        assert_eq!(retried.updated_at, 200);
+        assert!(list_artifacts_for_job(&connection, "job-1")
+            .unwrap()
+            .is_empty());
+        let events = list_job_events(&connection, "job-1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "job.retry");
+    }
+
+    #[test]
+    fn clear_failed_jobs_removes_failed_and_cancelled_jobs_only() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("queued-job", "queued", 100)).unwrap();
+        insert_job(&connection, &sample_job("failed-job", "failed", 100)).unwrap();
+        insert_job(&connection, &sample_job("cancelled-job", "cancelled", 100)).unwrap();
+
+        let removed = clear_failed_jobs(&connection).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(get_job(&connection, "failed-job").unwrap().is_none());
+        assert!(get_job(&connection, "cancelled-job").unwrap().is_none());
+        assert_eq!(
+            get_job(&connection, "queued-job").unwrap().unwrap().status,
+            "queued"
+        );
     }
 
     #[test]
@@ -919,11 +1144,14 @@ mod tests {
         JobRecord {
             id: id.to_string(),
             course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
             status: status.to_string(),
             selected_quality: "1080p".to_string(),
             download_videos: true,
             download_exercises: true,
             download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
             output_dir: "C:/downloads".to_string(),
             created_at: timestamp,
             updated_at: timestamp,

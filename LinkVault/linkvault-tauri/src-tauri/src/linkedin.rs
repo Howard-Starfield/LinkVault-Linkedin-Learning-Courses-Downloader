@@ -7,6 +7,8 @@ pub struct CourseUrl {
     pub original: String,
     pub normalized_url: String,
     pub slug: String,
+    pub quiz_urls: Vec<String>,
+    pub assessment_urns: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -69,11 +71,72 @@ fn parse_course_url(value: &str, line: usize) -> Result<CourseUrl, CourseUrlErro
         .filter(|segment| !segment.trim().is_empty())
         .ok_or(CourseUrlError::MissingSlug { line })?;
 
+    let remaining_segments = segments.collect::<Vec<_>>();
+    let quiz_urls = extract_quiz_urls(&url, slug, &remaining_segments);
+    let assessment_urns = extract_assessment_urns(&remaining_segments);
+
     Ok(CourseUrl {
         original: value.to_string(),
         normalized_url: format!("https://www.linkedin.com/learning/{slug}"),
         slug: slug.to_string(),
+        quiz_urls,
+        assessment_urns,
     })
+}
+
+fn extract_quiz_urls(url: &Url, slug: &str, remaining_segments: &[&str]) -> Vec<String> {
+    let Some(quiz_index) = remaining_segments
+        .iter()
+        .position(|segment| segment.eq_ignore_ascii_case("quiz"))
+    else {
+        return Vec::new();
+    };
+
+    let Some(assessment_segment) = remaining_segments.get(quiz_index + 1) else {
+        return Vec::new();
+    };
+
+    let mut quiz_url =
+        format!("https://www.linkedin.com/learning/{slug}/quiz/{assessment_segment}");
+    if let Some(query) = normalized_quiz_query(url) {
+        quiz_url.push('?');
+        quiz_url.push_str(&query);
+    }
+    vec![quiz_url]
+}
+
+fn extract_assessment_urns(remaining_segments: &[&str]) -> Vec<String> {
+    remaining_segments
+        .windows(2)
+        .filter(|segments| segments[0].eq_ignore_ascii_case("quiz"))
+        .filter_map(|segments| {
+            let urn = segments[1].trim();
+            if urn.starts_with("urn:li:learningApiAssessment:")
+                || urn.starts_with("urn%3Ali%3AlearningApiAssessment%3A")
+            {
+                Some(urn.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn normalized_quiz_query(url: &Url) -> Option<String> {
+    let allowed = ["resume", "u"];
+    let query = url
+        .query_pairs()
+        .filter(|(key, value)| {
+            allowed.contains(&key.as_ref()) && !key.trim().is_empty() && !value.trim().is_empty()
+        })
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        None
+    } else {
+        Some(query)
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +163,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed[0].slug, "service-desk-fundamentals");
+        assert_eq!(
+            parsed[0].normalized_url,
+            "https://www.linkedin.com/learning/service-desk-fundamentals"
+        );
+        assert!(parsed[0].quiz_urls.is_empty());
+    }
+
+    #[test]
+    fn preserves_direct_quiz_hint_while_normalizing_course_url() {
+        let parsed = parse_course_urls(
+            "https://www.linkedin.com/learning/time-management-for-customer-service-professionals/quiz/urn:li:learningApiAssessment:69813586?resume=false&u=52983649&trk=ignored",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed[0].normalized_url,
+            "https://www.linkedin.com/learning/time-management-for-customer-service-professionals"
+        );
+        assert_eq!(
+            parsed[0].quiz_urls,
+            vec![
+                "https://www.linkedin.com/learning/time-management-for-customer-service-professionals/quiz/urn:li:learningApiAssessment:69813586?resume=false&u=52983649"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            parsed[0].assessment_urns,
+            vec!["urn:li:learningApiAssessment:69813586".to_string()]
+        );
     }
 
     #[test]

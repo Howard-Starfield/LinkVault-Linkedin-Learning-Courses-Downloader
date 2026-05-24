@@ -1,5 +1,3 @@
-[![forthebadge](https://forthebadge.com/images/badges/made-with-c-sharp.svg)](https://forthebadge.com) [![forthebadge](https://forthebadge.com/images/badges/contains-tasty-spaghetti-code.svg)](https://forthebadge.com) [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/N4N01KBWC)
-
 # LinkVault
 
 > Archive LinkedIn Learning courses and supported generic video links from one desktop app.
@@ -7,7 +5,7 @@
 ## Features
 
 * Modern LinkVault desktop GUI for Windows, macOS, and Linux through Avalonia
-* Download in the video quality you like (720p,  540p or 360p)
+* Download in the video quality you like, including 1080p best available, 720p, 540p, or 360p
 * Download Exercise files and subtitles automatically
 * Download multiple courses at a time
 * Automatically import LinkedIn Learning login token from Chrome, Firefox or Microsoft Edge
@@ -17,11 +15,9 @@
 * User-triggered `yt-dlp` and FFmpeg tool download into the app-local `tools` folder
 * Placeholder navigation for a future LinkedIn Scraper module
 
-![Downloader Screenshot](https://raw.githubusercontent.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader/d82584942ed880733edc9445910b7d457c19bb7f/LLCD.DownloaderGUI/img/Linkedin-Learning-Downloader-Screenshot.png)
-
 ## Easy install
 
-Build or run the LinkVault project from the solution. The modernized app no longer uses Squirrel `Update.exe`.
+Build or run the LinkVault project from the solution.
 
 ## Requirements
 
@@ -64,20 +60,18 @@ Generic downloads can use browser cookies when you explicitly choose Chrome, Fir
 Install the .NET 10 SDK, then run:
 
 ```powershell
-dotnet restore Linkedin-Learning-Courses-Downloader.sln
-dotnet build Linkedin-Learning-Courses-Downloader.sln --no-restore
+dotnet restore LinkVault.sln
+dotnet build LinkVault.sln --no-restore
 dotnet run --project LLCD.LinkVault\LLCD.LinkVault.csproj
 ```
-
-The legacy WinForms app is still available at `LLCD.DownloaderGUI\LLCD.DownloaderGUI.csproj` while LinkVault is being rolled in as the modern shell.
 
 Useful verification commands:
 
 ```powershell
 dotnet test LLCD.CourseExtractor.Tests\LLCD.CourseExtractor.Tests.csproj --no-build
 dotnet test LLCD.CourseExtractor.Tests\LLCD.CourseExtractor.Tests.csproj --filter "FullyQualifiedName~YtDlp"
-dotnet list Linkedin-Learning-Courses-Downloader.sln package --vulnerable --include-transitive
-dotnet list Linkedin-Learning-Courses-Downloader.sln package --outdated
+dotnet list LinkVault.sln package --vulnerable --include-transitive
+dotnet list LinkVault.sln package --outdated
 ```
 
 The normal test run skips live LinkedIn/browser-state tests. To run those explicitly, set `LLCD_RUN_LIVE_LINKEDIN_TESTS=1` and provide the relevant secrets through environment variables: `LLCD_TEST_LINKEDIN_TOKEN` or `LLCD_TEST_FIREFOX_TOKEN`, `LLCD_TEST_CHROME_TOKEN`, and `LLCD_TEST_ENTERPRISE_PROFILE_HASH` when the specific assertion needs them.
@@ -91,8 +85,6 @@ The normal test run skips live LinkedIn/browser-state tests. To run those explic
 1. Press `Shift+F9` on your keyboard **OR** right click anywhere on the LinkedIn Learning website , choose "Inspect Element" and click storage.
 2. Look for the word "li_at" in the column "Name". Copy the value and paste it in the program.
 
-![LinkedIn Firefox Token Tutorial GIF](https://raw.githubusercontent.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader/main/LLCD.DownloaderGUI/img/LinkedinFirefoxTokenTutorial-min.gif)
-
 * **Google Chrome**
 
 1. Right click anywhere on the page and click inspect element **OR** press `F12` on your keyboard
@@ -100,17 +92,15 @@ The normal test run skips live LinkedIn/browser-state tests. To run those explic
 3. Double click on the word "Cookies" then click on https://www.linkedin.com
 4. Look for the word "li_at" in the column "Name". Copy the value and paste it in the program.
 
-![LinkedIn Chrome Token Tutorial](https://raw.githubusercontent.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader/main/LLCD.DownloaderGUI/img/LinkedinChromeTokenTutorial.gif)
-
 ## How to build and run this code on your pc
 
 You don't need to do that if you just want to run the app, but if you want to build your own version:
 
 1. Open visual studio and click on file then Clone Repository.
-2. For repository location type https://github.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader.git.
+2. For repository location, use your LinkVault repository URL.
 3. Click Clone.
-4. The code should be on your pc now. To edit the code, open the Linkedin-Learning-Courses-Downloader.sln file.
-5. Set `LLCD.DownloaderGUI` as the startup project and run it.
+4. The code should be on your pc now. To edit the code, open the `LinkVault.sln` file.
+5. Set `LLCD.LinkVault` as the startup project and run it.
 
 ## Notes on generic downloads
 
@@ -122,13 +112,9 @@ For LinkedIn Learning courses, prefer the native `LinkedIn Learning` tab because
 
 I accept any contribution to the codebase whether it is a small bugfix or an exciting new feature as long as it works and fits the scope of the app. Just create a pull request and I will look into it as soon as I can.
 
-## Buy me a coffee?
-
-You can buy me a coffee using [PayPal(Kofi)](https://ko-fi.com/ahmedayman4a) or [Cryptocurrency](https://commerce.coinbase.com/checkout/be939297-c143-496f-a801-a7856ed9ac8b).
-
 ## Any Questions? Issues? Recommendations?
 
-Just create an [issue](https://github.com/ahmedayman4a/Linkedin-Learning-Courses-Downloader/issues/new/choose) and I will reply as soon as I can.
+Open an issue in the LinkVault repository and I will reply as soon as I can.
 
 ## Acknowledgments
 

@@ -70,7 +70,7 @@ Result: The folder stays clean, and failed zips are kept so the user does not lo
 
 Problem: The old label said video quality, but users needed a clear resolution choice.
 
-Fix: The app now shows `Video resolution` and still uses 720, 540, or 360.
+Fix: The app now shows `Video resolution` and includes best available, 720, 540, and 360 choices.
 
 Result: The user can pick the video size more clearly.
 

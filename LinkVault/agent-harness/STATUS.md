@@ -1,5 +1,207 @@
 # Status
 
+## 2026-05-23 Completion Validation Sweep
+
+Status: automated validation passed; only authenticated manual desktop UAT remains as an external-token verification item.
+
+Validation evidence:
+
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 93 tests passed.
+
+Completion audit:
+
+- Typography and dark UI density are covered by the current React/CSS implementation plus visual checks across desktop, laptop, narrow, long-label, and reference-preview states.
+- Live progress is covered by SQLite-backed job/artifact counts in `bootstrap_state`, frontend polling while processing is active, and deterministic `?preview=live-polling-progress` assertions that intermediate state appears before completion.
+- One-course-at-a-time behavior is covered by backend queued-job processing plus UI tests showing one active course and remaining queued courses.
+- Recent Activity is bounded and coalesces long repeated artifact bursts while preserving started, completed, extracted, failed, and skipped/failure-style terminal events.
+- Token safety remains covered by backend tests and UI assertions that preview/manual token values are not rendered.
+
+Remaining manual UAT:
+
+- A real LinkedIn session is still required to observe live network-backed progress in the desktop Tauri window. No plaintext token should be logged or stored during that UAT.
+
+## 2026-05-23 Deterministic Live Polling UI Coverage Slice
+
+Status: complete for browser-preview verification; authenticated desktop UAT is still required for true LinkedIn network progress.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Added a browser-preview `?preview=live-polling-progress` scenario that simulates the live queued-download command staying pending while persisted jobs/events advance.
+- The preview now stages a first course from queued -> active with `1 / 6` artifacts complete, advances to `3 / 6`, then completes at `6 / 6` while leaving the second course queued.
+- Extended `pnpm.cmd run verify:ui` to assert the in-flight polling state appears before the completion toast: `1 active - 1 queued`, partial per-type artifact counts, no token leakage, final `1 queued - 1 completed`, and the exercise extraction terminal event.
+- This closes a deterministic test gap in the previous polling implementation: the UI now proves it can refresh intermediate SQLite-like state while processing is unresolved, without requiring live LinkedIn credentials.
+
+Validation evidence:
+
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` was not rerun for this slice because no Rust/backend command or event behavior changed.
+
+Current next slice:
+
+Run manual desktop Tauri UAT with a valid LinkedIn session to prove the same polling behavior against real SQLite job/artifact writes during network downloads.
+
+## 2026-05-23 Live Frontend Progress And Density Slice
+
+Status: complete for deterministic frontend verification; live desktop UAT with an authenticated token is still required.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src/App.tsx`
+- `LinkVault/linkvault-tauri/src/index.css`
+- `LinkVault/linkvault-tauri/src/components/primitives.tsx`
+- `LinkVault/linkvault-tauri/scripts/verify-ui.mjs`
+- `LinkVault/linkvault-tauri/scripts/verify-visual.mjs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- The frontend now refreshes SQLite-backed bootstrap state every 750ms while the live queued-download Tauri command is in flight, so active job/artifact counts can update during videos, subtitles, exercise downloads, and extraction instead of only after command completion.
+- Reference-preview-only display shortcuts for `Service Desk Fundamentals` and `Software Testing Foundations` are now scoped to `preview-reference-*` jobs. Real jobs compute overall progress from persisted completed, failed, and cancelled artifact counts.
+- Recent Activity is now a bounded scroll region and hides low-value artifact source diagnostics from the visible feed while preserving normal started, cached, planned, completed, extracted, failed, and skipped/failure events. Very long bursts of repeated artifact active/completed events are coalesced.
+- Tightened app-shell typography: sidebar/app headings, panel titles, form controls, checkboxes, dialog titles, and body controls are more compact and aligned with desktop productivity density.
+- Removed decorative radial glow backgrounds and moved dark tokens closer to a restrained Linear-style dark hierarchy with near-black surfaces, subtle borders, and one indigo accent.
+- Queue summary separators are ASCII ` - ` so they do not render as mojibake in Windows/browser previews.
+
+Validation evidence:
+
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- `cargo test` was not rerun for this slice because no Rust/backend command or event behavior changed.
+
+Current next slice:
+
+Run a manual desktop Tauri UAT with a valid LinkedIn session to verify that the in-flight polling visibly updates during a real course download. Expected result: only one queued course becomes active, remaining courses stay queued, per-course counts advance from SQLite artifact rows, and Recent Activity scrolls without growing the layout.
+
+## 2026-05-23 Live Exercise Ambry Decode Fix
+
+Status: complete; live exercise-only UAT passed with the provided course/token.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src-tauri/src/course.rs`
+- `LinkVault/linkvault-tauri/src-tauri/src/commands.rs`
+- `LinkVault/linkvault-tauri/src-tauri/src/live_clients.rs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Live finding:
+
+- The authenticated course page included a valid LinkedIn Ambry exercise URL, but the query equals sign was HTML-entity encoded as `&#61;`.
+- The previous parser did not decode `&#61;`, so it interpreted `x-li-ambry-ep` as an empty parameter and retried an invalid Ambry placeholder, producing `HTTP status 400`.
+- The metadata direct host for this course, `lilcdn-a.akamaihd.net`, did not resolve locally or through public DNS, so the Ambry fallback is required for this course.
+
+Implemented in this slice:
+
+- Decoded `&#61;`, `&#x3D;`, and `&#x3d;` before exercise URL extraction.
+- Accepted relative `/ambry/?x-li-ambry-ep=...` exercise links by normalizing them to `https://www.linkedin.com/ambry/...`.
+- Skipped Ambry placeholder URLs whose `x-li-ambry-ep` value is empty.
+- Kept a shared reqwest client/cookie jar between course metadata/page fetch and artifact download clients.
+
+Validation evidence:
+
+- `cargo test ambry_exercise` passed in `LinkVault/linkvault-tauri/src-tauri`: 3 Ambry extraction tests passed.
+- `cargo test extracts_html_entity_encoded_ambry_equals_sign` passed in `LinkVault/linkvault-tauri/src-tauri`.
+- Temporary live exercise-only UAT against `time-management-for-customer-service-professionals` downloaded `Ex_Files_Time_Management_Customer_Service.zip` from LinkedIn Ambry with `216960` bytes, extracted it, and completed with `completed: 1, failed: 0, cancelled: 0`.
+- The temporary live UAT binary and temp output directories were removed after validation.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 93 tests passed.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+
+Current next slice:
+
+Have the user run a desktop app download UAT for the same course to confirm the UI path now shows the exercise artifact completed.
+
+## 2026-05-23 Exercise Artifact URL Fallback Slice
+
+Status: deterministic fallback path implemented; fresh live desktop UAT is still required.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src-tauri/src/artifact_downloader.rs`
+- `LinkVault/linkvault-tauri/src-tauri/src/course.rs`
+- `LinkVault/linkvault-tauri/src-tauri/src/download_orchestrator.rs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+- `LinkVault/agent-harness/META_PROMPT.md`
+
+Implemented in this slice:
+
+- Exercise metadata now retains alternate candidate URLs when course-page refresh finds a different URL for the same exercise.
+- Filename-matched refreshed URLs are tried first, while the original metadata URL is kept as a fallback.
+- Existing direct named ZIP URLs are no longer overwritten by unmatched Ambry URLs only because counts align; unmatched refreshed URLs are retained as alternates.
+- Artifact execution can try a list of exercise URLs in order, using the first HTTP 200 response and returning the last HTTP failure if all candidates fail.
+- Added deterministic coverage proving an alternate exercise URL is tried after an HTTP failure and still extracts the downloaded ZIP.
+- Aligned live artifact requests with the legacy C# downloader: metadata and course-page requests remain authenticated, but actual file artifact GETs are plain requests with no LinkedIn cookies or CSRF headers, including `linkedin.com/ambry` exercise URLs.
+- Browser cookie import now skips unreadable/locked cookie databases per profile and continues scanning other profiles, matching the old C# best-effort behavior.
+- Exercise artifact diagnostics now include sanitized per-attempt HTTP status data for every failed candidate URL, so future live failures can distinguish refreshed Ambry failures from direct ZIP fallback failures without logging signed query values.
+- LinkedIn-host artifact URLs now use a bounded request-mode fallback: try the legacy plain request first, then retry the same URL with the validated LinkedIn session if the plain response is non-success. Third-party signed file/CDN URLs remain plain-only.
+- Artifact downloads now accept any successful `2xx` response, not only exact `200`, so valid partial-content file responses such as `206` are written instead of being treated as failures.
+
+Validation evidence:
+
+- `cargo fmt` passed in `LinkVault/linkvault-tauri/src-tauri`.
+- `cargo test browser_cookies` passed in `LinkVault/linkvault-tauri/src-tauri`: 11 browser-cookie tests passed.
+- `cargo test artifact_downloader` passed in `LinkVault/linkvault-tauri/src-tauri`: 11 artifact-downloader tests passed.
+- `cargo test live_clients` passed in `LinkVault/linkvault-tauri/src-tauri`: 5 live-client tests passed.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 89 tests passed.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:ui` passed in `LinkVault/linkvault-tauri`.
+- `pnpm.cmd run verify:visual` passed in `LinkVault/linkvault-tauri`.
+- A temporary exercise-only live UAT runner was compiled and removed. It could not validate a browser token: Chrome and Edge cookie stores returned Windows file-lock error 32, and Firefox returned zero LinkedIn token candidates. No raw token was printed or stored by that runner.
+- After the locked-profile skip fix, the temporary exercise-only live UAT runner was compiled and removed again. Chrome, Edge, and Firefox imports completed without file-lock errors but returned zero usable LinkedIn token candidates, so the live exercise download remains unproven in this shell.
+
+Current next slice:
+
+Run a fresh live desktop download UAT for `time-management-for-customer-service-professionals`. Expected result: videos/subtitles remain in numbered chapter folders, Best Available resolves to the best real stream exposed by LinkedIn, and the exercise ZIP downloads/extracts if either refreshed or metadata exercise URL is valid. If it still fails, inspect the safe `artifact.source.diagnostic` event; do not log signed query values.
+
+## 2026-05-23 Live Exercise Artifact Failure Slice
+
+Status: live desktop UAT found course videos/subtitles can download while the exercise zip fails; exercise artifact failures are now non-fatal.
+
+Files changed:
+
+- `LinkVault/linkvault-tauri/src-tauri/src/artifact_downloader.rs`
+- `LinkVault/agent-harness/STATUS.md`
+- `LinkVault/agent-harness/TODO.md`
+
+Live finding:
+
+- The app DB at `%APPDATA%/dev.linkvault.downloader/linkvault.sqlite3` showed four failed attempts for `time-management-for-customer-service-professionals`.
+- The latest run downloaded 17 videos and 17 subtitle files into `C:\Users\howard\Downloads\Time Management for Customer Service Professionals`.
+- The only failed artifact was `Ex_Files_Time_Management_Customer_Service.zip`; the backend marked the whole job failed because only exercise HTTP 404 was treated as optional.
+
+Implemented in this slice:
+
+- Any exercise artifact download failure now marks only that exercise artifact failed and continues remaining artifacts.
+- Exercise failure events include a safe reason such as `HTTP status 403` without rendering signed URLs or token query strings.
+- Fatal non-exercise artifact failures now append a safe `artifact.failed` event before the job failure event.
+
+Validation evidence:
+
+- `cargo fmt` passed in `LinkVault/linkvault-tauri/src-tauri`.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 79 tests passed.
+
+Current next slice:
+
+Run the desktop app again on the same course. Expected result: videos/subtitles remain downloaded, the exercise zip may show as failed/skipped, and the course should complete with issues instead of ending as a failed job.
+
 ## 2026-05-23 Linear Reference Frontend Refinement Slice
 
 Status: complete.
@@ -1294,6 +1496,16 @@ Implemented in this slice:
 
 Validation evidence:
 
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 81 tests passed after the download parity slice.
+- Live DB inspection on 2026-05-23 showed older completed `time-management-for-customer-service-professionals` 1080 jobs totaled `195573786` video bytes while 720 jobs totaled `250224809` video bytes. `ffprobe` on the old "1080" file reported `1138x640`, confirming the LinkedIn `_1080` response can return a sub-720 stream.
+- After the selected-video guard, the latest Best Available job `job-1779574479-time-management-for-customer-service-professionals-0` downloaded 17 videos totaling `250224809` bytes, matching the 720 runs. `ffprobe` on representative files reported `1280x720`, so this course currently resolves to 720 as the best proven stream.
+- The latest live exercise attempts through `job-1779575584-time-management-for-customer-service-professionals-0` still failed before writing/extraction with `HTTP status 400`; the exercise artifact row is failed with no `size_bytes`, so extraction is not the failing layer.
+- Chapter folder parity is restored in artifact planning: video/subtitle paths are now `Course/01 - Chapter/01 - Video.ext`; exercise files remain at the course root like the C# downloader.
+- LinkedIn token validation now carries LinkedIn home-response cookies transiently in memory with `#[serde(skip)]` so they are not returned through Tauri serialization or stored in SQLite. Course/API and course-page refresh calls can use the fuller session cookie header. Artifact file URLs, including LinkedIn-host Ambry exercise links and third-party signed file/CDN URLs, use legacy plain GET behavior with no cookies or CSRF headers.
+- Exercise URL refresh now keeps an existing direct named ZIP URL from course metadata instead of replacing it with an unmatched Ambry URL solely because candidate counts align. This prevents downgrading a file-name-matched `files3.lynda.com/.../exercise.zip` URL to a page-level `/ambry/` URL that may return `HTTP status 400`.
+- Exercise artifact failures now append a safe `artifact.source.diagnostic` event with URL host, path, file name, query-key names, query count, Ambry classification, and per-attempt HTTP statuses only; signed query values are not logged.
+- `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 82 tests passed after the exercise refresh and diagnostic slice.
+- `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
 - `pnpm.cmd install` completed in `LinkVault/linkvault-tauri`.
 - `pnpm.cmd build` passed in `LinkVault/linkvault-tauri`.
 - `cargo test` passed in `LinkVault/linkvault-tauri/src-tauri`: 10 tests passed.
@@ -1310,7 +1522,7 @@ Known local environment note:
 
 Current next slice:
 
-Port backend auth/token seams with deterministic fake-HTTP tests: browser token candidate model, manual `li_at` validation, trial prompt rejection, `JSESSIONID`/CSRF behavior, and enterprise `x-li-identity` extraction. Keep plaintext token values out of SQLite.
+Run live desktop download UAT to a clean test output folder and verify: chapter folders are created, exercise ZIP downloads/extracts after direct named metadata URLs are preserved, and selecting Best Available resolves to the best real stream exposed by LinkedIn rather than the observed `1138x640` stream. If exercise still fails, inspect the new `artifact.source.diagnostic` event for host/path/query-key evidence without exposing signed URL values.
 
 ## 2026-05-23 Tauri Scaffold Path Decision
 

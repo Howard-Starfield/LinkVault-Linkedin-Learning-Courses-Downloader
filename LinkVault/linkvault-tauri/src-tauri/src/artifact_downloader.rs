@@ -7,10 +7,12 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactDownloadSource {
     Url(String),
+    Urls(Vec<String>),
     Text(String),
 }
 
@@ -24,6 +26,13 @@ pub struct PlannedArtifactDownload {
 pub struct ArtifactHttpResponse {
     pub status: u16,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactHttpAttempt {
+    pub url: String,
+    pub status: Option<u16>,
+    pub error_kind: Option<String>,
 }
 
 pub trait ArtifactHttpClient {
@@ -58,7 +67,12 @@ pub enum ArtifactDownloadError {
     #[error("artifact download network request failed: {0}")]
     Network(String),
     #[error("artifact download returned HTTP status {status}")]
-    Http { status: u16 },
+    Http {
+        status: u16,
+        attempts: Vec<ArtifactHttpAttempt>,
+    },
+    #[error("artifact download failed after all URL attempts")]
+    AttemptsFailed { attempts: Vec<ArtifactHttpAttempt> },
     #[error("job must be active before artifact downloads can run: {job_id}")]
     JobNotActive { job_id: String },
 }
@@ -244,9 +258,8 @@ pub fn download_artifacts_for_active_job(
                 )?;
                 summary.completed += 1;
             }
-            Err(ArtifactDownloadError::Http { status: 404 })
-                if is_exercise_artifact(&download.artifact) =>
-            {
+            Err(error) if is_exercise_artifact(&download.artifact) => {
+                let failure_reason = safe_artifact_error_reason(&error);
                 update_artifact_status(
                     connection,
                     &download.artifact.id,
@@ -258,13 +271,22 @@ pub fn download_artifacts_for_active_job(
                     connection,
                     &job.id,
                     "artifact.failed",
-                    "Exercise artifact returned 404 and was skipped.".to_string(),
+                    format!("Exercise artifact download failed and was skipped: {failure_reason}."),
                     &download.artifact.id,
+                    timestamp,
+                )?;
+                append_artifact_source_event(
+                    connection,
+                    &job.id,
+                    &download.artifact.id,
+                    &download.source,
+                    Some(&error),
                     timestamp,
                 )?;
                 summary.failed += 1;
             }
             Err(error) => {
+                let failure_reason = safe_artifact_error_reason(&error);
                 update_artifact_status(
                     connection,
                     &download.artifact.id,
@@ -272,12 +294,28 @@ pub fn download_artifacts_for_active_job(
                     None,
                     timestamp,
                 )?;
+                append_artifact_event(
+                    connection,
+                    &job.id,
+                    "artifact.failed",
+                    format!("Artifact download failed: {failure_reason}."),
+                    &download.artifact.id,
+                    timestamp,
+                )?;
+                append_artifact_source_event(
+                    connection,
+                    &job.id,
+                    &download.artifact.id,
+                    &download.source,
+                    Some(&error),
+                    timestamp,
+                )?;
                 crate::cache::transition_job_status(
                     connection,
                     &job.id,
                     "failed",
                     timestamp,
-                    Some("Artifact download failed."),
+                    Some(&format!("Artifact download failed: {failure_reason}.")),
                 )?;
                 return Err(error);
             }
@@ -301,22 +339,53 @@ fn write_artifact(
 ) -> Result<ArtifactWriteOutcome, ArtifactDownloadError> {
     let bytes = match &download.source {
         ArtifactDownloadSource::Text(text) => text.as_bytes().to_vec(),
-        ArtifactDownloadSource::Url(url) => {
-            let response = client.get_bytes(url)?;
-            if response.status != 200 {
-                return Err(ArtifactDownloadError::Http {
-                    status: response.status,
-                });
-            }
-            if cancellation.is_cancelled() {
-                return Ok(ArtifactWriteOutcome::CancelledBeforeWrite);
-            }
-            response.bytes
+        ArtifactDownloadSource::Url(url) => download_bytes_from_urls(client, &[url])?,
+        ArtifactDownloadSource::Urls(urls) => {
+            let url_refs = urls.iter().map(String::as_str).collect::<Vec<_>>();
+            download_bytes_from_urls(client, &url_refs)?
         }
     };
+    if cancellation.is_cancelled() {
+        return Ok(ArtifactWriteOutcome::CancelledBeforeWrite);
+    }
 
     write_bytes_atomically(Path::new(&download.artifact.path), &bytes)?;
     Ok(ArtifactWriteOutcome::Written(bytes.len() as i64))
+}
+
+fn download_bytes_from_urls(
+    client: &mut impl ArtifactHttpClient,
+    urls: &[&str],
+) -> Result<Vec<u8>, ArtifactDownloadError> {
+    let mut attempts = Vec::new();
+    for url in urls {
+        match client.get_bytes(url) {
+            Ok(response) if (200..300).contains(&response.status) => {
+                return Ok(response.bytes);
+            }
+            Ok(response) => {
+                attempts.push(ArtifactHttpAttempt {
+                    url: (*url).to_string(),
+                    status: Some(response.status),
+                    error_kind: None,
+                });
+            }
+            Err(ArtifactDownloadError::Network(kind)) => {
+                attempts.push(ArtifactHttpAttempt {
+                    url: (*url).to_string(),
+                    status: None,
+                    error_kind: Some(kind),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(status) = attempts.iter().rev().find_map(|attempt| attempt.status) {
+        Err(ArtifactDownloadError::Http { status, attempts })
+    } else {
+        Err(ArtifactDownloadError::AttemptsFailed { attempts })
+    }
 }
 
 fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -387,6 +456,112 @@ fn append_artifact_event(
     Ok(())
 }
 
+fn append_artifact_source_event(
+    connection: &Connection,
+    job_id: &str,
+    artifact_id: &str,
+    source: &ArtifactDownloadSource,
+    error: Option<&ArtifactDownloadError>,
+    timestamp: i64,
+) -> Result<(), ArtifactDownloadError> {
+    append_job_event(
+        connection,
+        &NewJobEvent {
+            job_id: job_id.to_string(),
+            event_type: "artifact.source.diagnostic".to_string(),
+            message: "Recorded safe artifact source diagnostic.".to_string(),
+            payload_json: Some(
+                serde_json::json!({
+                    "artifactId": artifact_id,
+                    "source": artifact_source_summary(source),
+                    "failure": error.map(artifact_error_summary),
+                })
+                .to_string(),
+            ),
+            created_at: timestamp,
+        },
+    )?;
+    Ok(())
+}
+
+fn artifact_error_summary(error: &ArtifactDownloadError) -> serde_json::Value {
+    match error {
+        ArtifactDownloadError::Http { status, attempts } => {
+            serde_json::json!({
+                "kind": "http",
+                "status": status,
+                "attempts": artifact_attempts_summary(attempts),
+            })
+        }
+        ArtifactDownloadError::AttemptsFailed { attempts } => serde_json::json!({
+            "kind": "attempts_failed",
+            "attempts": artifact_attempts_summary(attempts),
+        }),
+        ArtifactDownloadError::Network(_) => serde_json::json!({ "kind": "network" }),
+        ArtifactDownloadError::Io(error) => {
+            serde_json::json!({ "kind": "io", "errorKind": error.kind().to_string() })
+        }
+        ArtifactDownloadError::Cache(_) => serde_json::json!({ "kind": "cache" }),
+        ArtifactDownloadError::JobNotActive { .. } => {
+            serde_json::json!({ "kind": "job_not_active" })
+        }
+    }
+}
+
+fn artifact_attempts_summary(attempts: &[ArtifactHttpAttempt]) -> Vec<serde_json::Value> {
+    attempts
+        .iter()
+        .map(|attempt| {
+            serde_json::json!({
+                "status": attempt.status,
+                "errorKind": attempt.error_kind,
+                "url": summarize_url_source(&attempt.url),
+            })
+        })
+        .collect()
+}
+
+fn artifact_source_summary(source: &ArtifactDownloadSource) -> serde_json::Value {
+    match source {
+        ArtifactDownloadSource::Text(_) => serde_json::json!({ "kind": "text" }),
+        ArtifactDownloadSource::Url(url) => summarize_url_source(url),
+        ArtifactDownloadSource::Urls(urls) => {
+            let summaries = urls
+                .iter()
+                .map(|url| summarize_url_source(url))
+                .collect::<Vec<_>>();
+            serde_json::json!({ "kind": "urls", "count": urls.len(), "urls": summaries })
+        }
+    }
+}
+
+fn summarize_url_source(value: &str) -> serde_json::Value {
+    let Ok(url) = Url::parse(value) else {
+        return serde_json::json!({ "kind": "url", "valid": false });
+    };
+    let query_keys = url
+        .query_pairs()
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>();
+    let query_count = query_keys.len();
+    let file_name = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or("");
+
+    serde_json::json!({
+        "kind": "url",
+        "valid": true,
+        "host": url.host_str().unwrap_or(""),
+        "path": url.path(),
+        "fileName": file_name,
+        "queryKeys": query_keys,
+        "queryCount": query_count,
+        "isAmbry": url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("www.linkedin.com") || host.eq_ignore_ascii_case("linkedin.com")) && url.path().eq_ignore_ascii_case("/ambry/"),
+    })
+}
+
 fn is_exercise_artifact(artifact: &ArtifactRecord) -> bool {
     matches!(
         artifact.artifact_type.as_str(),
@@ -396,6 +571,22 @@ fn is_exercise_artifact(artifact: &ArtifactRecord) -> bool {
 
 fn is_exercise_zip_artifact(artifact: &ArtifactRecord) -> bool {
     artifact.artifact_type == "exercise_zip"
+}
+
+fn safe_artifact_error_reason(error: &ArtifactDownloadError) -> String {
+    match error {
+        ArtifactDownloadError::Http { status, .. } => format!("HTTP status {status}"),
+        ArtifactDownloadError::AttemptsFailed { attempts } => attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.status)
+            .map(|status| format!("HTTP status {status}"))
+            .unwrap_or_else(|| "network request failed".to_string()),
+        ArtifactDownloadError::Network(_) => "network request failed".to_string(),
+        ArtifactDownloadError::Io(error) => format!("file write failed: {}", error.kind()),
+        ArtifactDownloadError::Cache(_) => "cache update failed".to_string(),
+        ArtifactDownloadError::JobNotActive { .. } => "job was not active".to_string(),
+    }
 }
 
 fn format_extraction_success_message(result: &ExerciseArchiveExtractionResult) -> String {
@@ -567,12 +758,320 @@ mod tests {
                 .status,
             "completed"
         );
-        assert!(events
-            .iter()
-            .any(|event| event.message == "Exercise artifact returned 404 and was skipped."));
+        assert!(events.iter().any(|event| event.message
+            == "Exercise artifact download failed and was skipped: HTTP status 404."));
         assert!(!events
             .iter()
             .any(|event| event.message.contains("exercise.zip?token=")));
+    }
+
+    #[test]
+    fn exercise_non_404_download_failure_marks_artifact_failed_and_continues() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let exercise_path = output.path().join("Sample Course").join("exercise.zip");
+        let video_path = output.path().join("Sample Course").join("welcome.mp4");
+        let downloads = vec![
+            planned_url(
+                "artifact-exercise",
+                "job-1",
+                "exercise_zip",
+                &exercise_path,
+                "https://cdn/exercise.zip?token=do-not-render",
+            ),
+            planned_url(
+                "artifact-video",
+                "job-1",
+                "video",
+                &video_path,
+                "https://cdn/video.mp4",
+            ),
+        ];
+        let mut client = FakeArtifactClient::new(vec![
+            ("https://cdn/exercise.zip?token=do-not-render", 403, b""),
+            ("https://cdn/video.mp4", 200, b"video"),
+        ]);
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        let job = get_job(&connection, "job-1").unwrap().unwrap();
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        let events = list_job_events(&connection, "job-1").unwrap();
+
+        assert_eq!(
+            summary,
+            ArtifactDownloadSummary {
+                completed: 1,
+                failed: 1,
+                cancelled: 0
+            }
+        );
+        assert_eq!(job.status, "completed");
+        assert!(!exercise_path.exists());
+        assert_eq!(fs::read(&video_path).unwrap(), b"video");
+        assert_eq!(
+            artifacts
+                .iter()
+                .find(|artifact| artifact.id == "artifact-exercise")
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert!(events.iter().any(|event| event.message
+            == "Exercise artifact download failed and was skipped: HTTP status 403."));
+        assert!(!events
+            .iter()
+            .any(|event| event.message.contains("do-not-render")));
+        let diagnostic = events
+            .iter()
+            .find(|event| event.event_type == "artifact.source.diagnostic")
+            .unwrap();
+        assert!(!diagnostic
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains("do-not-render"));
+        assert!(diagnostic
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains(r#""host":"cdn""#));
+        assert!(diagnostic
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains(r#""status":403"#));
+    }
+
+    #[test]
+    fn exercise_url_list_tries_alternate_after_http_failure() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let exercise_path = output.path().join("Sample Course").join("exercise.zip");
+        let zip_bytes = create_zip_bytes(&[("readme.txt", "hello")]);
+        let downloads = vec![planned(
+            "artifact-exercise",
+            "job-1",
+            "exercise_zip",
+            &exercise_path,
+            ArtifactDownloadSource::Urls(vec![
+                "https://www.linkedin.com/ambry/?x-li-ambry-ep=bad&download=true".to_string(),
+                "https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh"
+                    .to_string(),
+            ]),
+        )];
+        let mut client = FakeArtifactClient::new_owned(vec![
+            (
+                "https://www.linkedin.com/ambry/?x-li-ambry-ep=bad&download=true",
+                400,
+                Vec::new(),
+            ),
+            (
+                "https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh",
+                200,
+                zip_bytes,
+            ),
+        ]);
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        let events = list_job_events(&connection, "job-1").unwrap();
+
+        assert_eq!(
+            summary,
+            ArtifactDownloadSummary {
+                completed: 1,
+                failed: 0,
+                cancelled: 0
+            }
+        );
+        assert!(!exercise_path.exists());
+        assert_eq!(
+            artifacts
+                .iter()
+                .find(|artifact| artifact.id == "artifact-exercise")
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "artifact.extracted"));
+    }
+
+    #[test]
+    fn exercise_url_list_tries_alternate_after_network_failure() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let exercise_path = output.path().join("Sample Course").join("exercise.zip");
+        let zip_bytes = create_zip_bytes(&[("readme.txt", "hello")]);
+        let downloads = vec![planned(
+            "artifact-exercise",
+            "job-1",
+            "exercise_zip",
+            &exercise_path,
+            ArtifactDownloadSource::Urls(vec![
+                "https://lilcdn-a.akamaihd.net/secure/courses/123/exercise.zip?hashval=secret"
+                    .to_string(),
+                "https://www.linkedin.com/ambry/?x-li-ambry-ep=fallback".to_string(),
+            ]),
+        )];
+        let mut client = NetworkThenSuccessArtifactClient {
+            expected_urls: VecDeque::from(vec![
+                "https://lilcdn-a.akamaihd.net/secure/courses/123/exercise.zip?hashval=secret",
+                "https://www.linkedin.com/ambry/?x-li-ambry-ep=fallback",
+            ]),
+            success_bytes: zip_bytes,
+        };
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        let events = list_job_events(&connection, "job-1").unwrap();
+        assert_eq!(
+            summary,
+            ArtifactDownloadSummary {
+                completed: 1,
+                failed: 0,
+                cancelled: 0
+            }
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "artifact.extracted"));
+    }
+
+    #[test]
+    fn artifact_download_accepts_successful_partial_content_response() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let video_path = output.path().join("Sample Course").join("welcome.mp4");
+        let downloads = vec![planned_url(
+            "artifact-video",
+            "job-1",
+            "video",
+            &video_path,
+            "https://cdn.example.test/welcome.mp4",
+        )];
+        let mut client = FakeArtifactClient::new(vec![(
+            "https://cdn.example.test/welcome.mp4",
+            206,
+            b"video",
+        )]);
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            ArtifactDownloadSummary {
+                completed: 1,
+                failed: 0,
+                cancelled: 0
+            }
+        );
+        assert_eq!(fs::read(&video_path).unwrap(), b"video");
+    }
+
+    #[test]
+    fn exercise_url_list_failure_records_sanitized_attempt_statuses() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let exercise_path = output.path().join("Sample Course").join("exercise.zip");
+        let downloads = vec![planned(
+            "artifact-exercise",
+            "job-1",
+            "exercise_zip",
+            &exercise_path,
+            ArtifactDownloadSource::Urls(vec![
+                "https://www.linkedin.com/ambry/?x-li-ambry-ep=secret-one&download=true"
+                    .to_string(),
+                "https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=secret-two"
+                    .to_string(),
+            ]),
+        )];
+        let mut client = FakeArtifactClient::new(vec![
+            (
+                "https://www.linkedin.com/ambry/?x-li-ambry-ep=secret-one&download=true",
+                400,
+                b"",
+            ),
+            (
+                "https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=secret-two",
+                403,
+                b"",
+            ),
+        ]);
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        let events = list_job_events(&connection, "job-1").unwrap();
+        let diagnostic = events
+            .iter()
+            .find(|event| event.event_type == "artifact.source.diagnostic")
+            .unwrap()
+            .payload_json
+            .as_deref()
+            .unwrap();
+
+        assert_eq!(
+            summary,
+            ArtifactDownloadSummary {
+                completed: 0,
+                failed: 1,
+                cancelled: 0
+            }
+        );
+        assert!(diagnostic.contains(r#""status":400"#));
+        assert!(diagnostic.contains(r#""status":403"#));
+        assert!(diagnostic.contains(r#""queryKeys":["x-li-ambry-ep","download"]"#));
+        assert!(diagnostic.contains(r#""queryKeys":["token"]"#));
+        assert!(!diagnostic.contains("secret-one"));
+        assert!(!diagnostic.contains("secret-two"));
     }
 
     #[test]
@@ -1021,6 +1520,29 @@ mod tests {
         }
     }
 
+    struct NetworkThenSuccessArtifactClient {
+        expected_urls: VecDeque<&'static str>,
+        success_bytes: Vec<u8>,
+    }
+
+    impl ArtifactHttpClient for NetworkThenSuccessArtifactClient {
+        fn get_bytes(&mut self, url: &str) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
+            let Some(expected_url) = self.expected_urls.pop_front() else {
+                panic!("unexpected request: {url}");
+            };
+            assert_eq!(url, expected_url);
+            if self.expected_urls.len() == 1 {
+                return Err(ArtifactDownloadError::Network(
+                    "simulated network failure".to_string(),
+                ));
+            }
+            Ok(ArtifactHttpResponse {
+                status: 200,
+                bytes: self.success_bytes.clone(),
+            })
+        }
+    }
+
     struct CancelAfterPolls {
         remaining_false_polls: Cell<usize>,
     }
@@ -1049,11 +1571,14 @@ mod tests {
         JobRecord {
             id: id.to_string(),
             course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
             status: status.to_string(),
             selected_quality: "1080".to_string(),
             download_videos: true,
             download_exercises: true,
             download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
             output_dir: output_dir.to_string_lossy().to_string(),
             created_at: 100,
             updated_at: 100,
