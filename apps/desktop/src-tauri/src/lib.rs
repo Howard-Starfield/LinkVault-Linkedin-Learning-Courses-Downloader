@@ -27,14 +27,11 @@ pub fn run() {
             commands::parse_linkedin_course_urls,
             commands::process_next_queued_download_from_browser_source,
             commands::process_next_queued_download_with_saved_token,
-            commands::process_next_queued_download_with_li_at,
             commands::quality_fallback_order,
             commands::retry_failed_download_job,
             commands::save_download_preferences,
             commands::save_li_at_token,
             commands::start_download_jobs,
-            commands::validate_browser_token_source,
-            commands::validate_li_at_token
         ])
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;

@@ -197,6 +197,9 @@ PublishScripts/
 # Local research clones / agent scratch data
 agent-harness/
 
+# Legacy project tree left behind by local Windows file locks after migration.
+LinkVault/
+
 # Microsoft Azure Build Output
 csx/
 *.build.csdef

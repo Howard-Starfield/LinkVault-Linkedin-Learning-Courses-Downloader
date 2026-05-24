@@ -272,22 +272,19 @@ pub fn clear_failed_download_jobs(
 }
 
 #[tauri::command]
-pub async fn validate_li_at_token(token: String) -> Result<ValidatedLinkedInSession, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut client = ReqwestLinkedInHomeClient::new()?;
-        validate_li_at_with_client(&token, &mut client)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn save_li_at_token(
+pub async fn save_li_at_token(
     state: tauri::State<'_, LinkVaultState>,
     token: String,
 ) -> Result<SavedTokenStatus, String> {
-    token_store::save_token(&state.token_path, &token).map_err(|error| error.to_string())?;
+    let token_path = state.token_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut client = ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
+        validate_li_at_with_client(&token, &mut client).map_err(|error| error.to_string())?;
+        token_store::save_token(&token_path, &token).map_err(|error| error.to_string())?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     Ok(SavedTokenStatus {
         has_saved_token: true,
     })
@@ -301,67 +298,6 @@ pub fn clear_saved_li_at_token(
     Ok(SavedTokenStatus {
         has_saved_token: false,
     })
-}
-
-#[tauri::command]
-pub async fn validate_browser_token_source(
-    source: BrowserSource,
-) -> Result<ValidatedLinkedInSession, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let roots = BrowserCookieRoots::from_env();
-        let decoder = chromium_user_data_path_for_source(source, &roots)
-            .map(|path| ChromiumCookieDecoder::from_user_data_path(&path))
-            .unwrap_or_else(ChromiumCookieDecoder::disabled);
-        let candidates =
-            read_li_at_candidates(source, &roots, &decoder).map_err(|error| error.to_string())?;
-        let mut client = ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
-        select_first_valid_browser_token(&candidates, &mut client)
-            .map(|(_, session)| session)
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn process_next_queued_download_with_li_at(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, LinkVaultState>,
-    token: String,
-) -> Result<ProcessQueuedDownloadResponse, String> {
-    let db_path = state.db_path.clone();
-    let cancellation = state.reset_download_cancellation();
-    let token_and_session = tauri::async_runtime::spawn_blocking(move || {
-        let mut home_client =
-            ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
-        let session = validate_li_at_with_client(&token, &mut home_client)
-            .map_err(|error| error.to_string())?;
-        Ok::<_, String>((token, session))
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-
-    let (token, session) = token_and_session;
-    let quiz_assessments = extract_quizzes_for_next_job(
-        app,
-        db_path.clone(),
-        token.clone(),
-        session.clone(),
-        now_unix_timestamp(),
-    )
-    .await;
-    tauri::async_runtime::spawn_blocking(move || {
-        process_next_queued_download_with_validated_token(
-            db_path,
-            token,
-            session,
-            now_unix_timestamp(),
-            cancellation,
-            quiz_assessments,
-        )
-    })
-    .await
-    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

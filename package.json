@@ -1,0 +1,17 @@
+{
+  "name": "linkvault",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop dev",
+    "build": "pnpm --dir apps/desktop build",
+    "preview": "pnpm --dir apps/desktop preview",
+    "tauri": "pnpm --dir apps/desktop tauri",
+    "verify:ui": "pnpm --dir apps/desktop verify:ui",
+    "verify:visual": "pnpm --dir apps/desktop verify:visual",
+    "verify:tauri-smoke": "pnpm --dir apps/desktop verify:tauri-smoke",
+    "verify:release": "pnpm --dir apps/desktop verify:release",
+    "verify:installer": "pnpm --dir apps/desktop verify:installer",
+    "verify:release-manifest": "pnpm --dir apps/desktop verify:release-manifest",
+    "cargo:test": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml"
+  }
+}
