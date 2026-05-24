@@ -12,6 +12,7 @@
     "verify:release": "pnpm --dir apps/desktop verify:release",
     "verify:installer": "pnpm --dir apps/desktop verify:installer",
     "verify:release-manifest": "pnpm --dir apps/desktop verify:release-manifest",
-    "cargo:test": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml"
+    "cargo:test": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
+    "cargo:clippy": "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets"
   }
 }

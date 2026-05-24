@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS job_events (
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY NOT NULL,
     job_id TEXT NOT NULL,
-    artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'quiz', 'exercise_zip', 'exercise_file')),
+    artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'quiz', 'study_guide', 'exercise_zip', 'exercise_file')),
     path TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'completed', 'failed', 'cancelled', 'skipped')),
     size_bytes INTEGER,
@@ -69,7 +69,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     migrate_jobs_download_quizzes(connection)?;
     migrate_jobs_source_url(connection)?;
     migrate_jobs_quiz_hints(connection)?;
-    migrate_artifacts_quiz_type(connection)?;
+    migrate_artifacts_known_types(connection)?;
     Ok(())
 }
 
@@ -122,13 +122,13 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
         .any(|name| name == column))
 }
 
-fn migrate_artifacts_quiz_type(connection: &Connection) -> Result<()> {
+fn migrate_artifacts_known_types(connection: &Connection) -> Result<()> {
     let create_sql: String = connection.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'",
         [],
         |row| row.get(0),
     )?;
-    if create_sql.contains("'quiz'") {
+    if create_sql.contains("'quiz'") && create_sql.contains("'study_guide'") {
         return Ok(());
     }
 
@@ -139,7 +139,7 @@ fn migrate_artifacts_quiz_type(connection: &Connection) -> Result<()> {
         CREATE TABLE artifacts_new (
             id TEXT PRIMARY KEY NOT NULL,
             job_id TEXT NOT NULL,
-            artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'quiz', 'exercise_zip', 'exercise_file')),
+            artifact_type TEXT NOT NULL CHECK (artifact_type IN ('video', 'subtitle', 'quiz', 'study_guide', 'exercise_zip', 'exercise_file')),
             path TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'completed', 'failed', 'cancelled', 'skipped')),
             size_bytes INTEGER,

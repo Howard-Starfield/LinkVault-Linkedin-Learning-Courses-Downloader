@@ -5,7 +5,7 @@ LinkVault helps you save LinkedIn Learning courses you already have access to in
 ## What You Can Do
 
 - Download course videos into a folder you choose.
-- Save subtitles, exercise files, and quiz notes when available.
+- Save subtitles, exercise files, quiz notes, and a readable `Study.md` guide when available.
 - Queue multiple course links and track progress in one place.
 - Retry failed downloads without rebuilding the whole list.
 - Save your cookie once, then reuse it for future launches.
@@ -29,11 +29,28 @@ Your downloads are saved into the folder you picked. Your saved session is prote
 - Microsoft C++ Build Tools or Visual Studio Build Tools
 - Microsoft WebView2 Runtime
 
-## Build The App
+## Run Locally
+
+Use this when you want to work on the app from source.
 
 ```powershell
-cd "C:\Users\howard\Downloads\Ai_script\Linkedin-Learning-Courses-Downloader-main"
+git clone https://github.com/Howard-Starfield/Linkedin-Learning-Courses-Downloader.git
+cd Linkedin-Learning-Courses-Downloader
 pnpm.cmd --dir apps\desktop install
+pnpm.cmd tauri dev
+```
+
+The desktop app opens from Tauri. The Vite frontend runs at:
+
+```text
+http://127.0.0.1:1420
+```
+
+## Build The App
+
+Use this when you want a production executable or Windows installer.
+
+```powershell
 pnpm.cmd tauri build
 ```
 
@@ -44,21 +61,13 @@ apps\desktop\src-tauri\target\release\linkvault.exe
 apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.0_x64-setup.exe
 ```
 
-## Run For Development
+## Frontend-Only Preview
 
-```powershell
-pnpm.cmd tauri dev
-```
-
-Browser-only preview:
+This is useful for UI work, but desktop-only features need Tauri.
 
 ```powershell
 pnpm.cmd dev
-```
-
-Then open:
-
-```text
+# open:
 http://127.0.0.1:1420
 ```
 

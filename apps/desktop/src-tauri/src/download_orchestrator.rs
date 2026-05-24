@@ -337,7 +337,11 @@ fn build_initial_artifact_downloads(
     course: &Course,
     timestamp: i64,
 ) -> Vec<PlannedArtifactDownload> {
-    let mut downloads = Vec::new();
+    let mut text_downloads = Vec::new();
+    let mut video_downloads = Vec::new();
+    let mut exercise_downloads = Vec::new();
+    let mut study_videos = Vec::new();
+    let mut study_assessments = Vec::new();
     let course_dir = safe_file_name(&course.title);
 
     let mut video_artifact_index = 0;
@@ -355,15 +359,16 @@ fn build_initial_artifact_downloads(
             );
             if job.download_videos {
                 if let Some(download_url) = &video.download_url {
-                    downloads.push(PlannedArtifactDownload {
+                    let video_path = planned_path(
+                        &job.output_dir,
+                        &[&course_dir, &chapter_dir, &format!("{video_name}.mp4")],
+                    );
+                    video_downloads.push(PlannedArtifactDownload {
                         artifact: ArtifactRecord {
                             id: format!("artifact-{}-video-{video_artifact_index}", job.id),
                             job_id: job.id.clone(),
                             artifact_type: "video".to_string(),
-                            path: planned_path(
-                                &job.output_dir,
-                                &[&course_dir, &chapter_dir, &format!("{video_name}.mp4")],
-                            ),
+                            path: video_path.clone(),
                             status: "pending".to_string(),
                             size_bytes: None,
                             created_at: timestamp,
@@ -371,11 +376,18 @@ fn build_initial_artifact_downloads(
                         },
                         source: ArtifactDownloadSource::Url(download_url.clone()),
                     });
+                    ensure_study_video(
+                        &mut study_videos,
+                        chapter_index,
+                        video_artifact_index,
+                        &chapter.title,
+                        video.title.as_deref().unwrap_or(&video.slug),
+                    );
                 }
             }
             if job.download_subtitles {
                 if let Some(transcript_srt) = &video.transcript_srt {
-                    downloads.push(PlannedArtifactDownload {
+                    text_downloads.push(PlannedArtifactDownload {
                         artifact: ArtifactRecord {
                             id: format!("artifact-{}-subtitle-{video_artifact_index}", job.id),
                             job_id: job.id.clone(),
@@ -391,18 +403,27 @@ fn build_initial_artifact_downloads(
                         },
                         source: ArtifactDownloadSource::Text(transcript_srt.clone()),
                     });
+                    ensure_study_video(
+                        &mut study_videos,
+                        chapter_index,
+                        video_artifact_index,
+                        &chapter.title,
+                        video.title.as_deref().unwrap_or(&video.slug),
+                    )
+                    .transcript_paragraphs = transcript_srt_to_paragraphs(transcript_srt);
                 }
             }
             if job.download_quizzes {
                 if let Some(quiz_markdown) = &video.quiz_markdown {
-                    downloads.push(PlannedArtifactDownload {
+                    let quiz_file_name = format!("{video_name}.quiz.md");
+                    text_downloads.push(PlannedArtifactDownload {
                         artifact: ArtifactRecord {
                             id: format!("artifact-{}-quiz-{video_artifact_index}", job.id),
                             job_id: job.id.clone(),
                             artifact_type: "quiz".to_string(),
                             path: planned_path(
                                 &job.output_dir,
-                                &[&course_dir, &chapter_dir, &format!("{video_name}.quiz.md")],
+                                &[&course_dir, &chapter_dir, &quiz_file_name],
                             ),
                             status: "pending".to_string(),
                             size_bytes: None,
@@ -411,16 +432,70 @@ fn build_initial_artifact_downloads(
                         },
                         source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
                     });
+                    ensure_study_video(
+                        &mut study_videos,
+                        chapter_index,
+                        video_artifact_index,
+                        &chapter.title,
+                        video.title.as_deref().unwrap_or(&video.slug),
+                    )
+                    .quiz_markdown = Some(quiz_markdown.clone());
                 }
             }
             video_artifact_index += 1;
         }
     }
 
+    if job.download_quizzes {
+        for (assessment_index, assessment) in course.assessments.iter().enumerate() {
+            if let Some(quiz_markdown) = &assessment.quiz_markdown {
+                let artifact_segments =
+                    assessment_quiz_path_segments(course, assessment, assessment_index);
+                let artifact_segment_refs = artifact_segments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                text_downloads.push(PlannedArtifactDownload {
+                    artifact: ArtifactRecord {
+                        id: format!("artifact-{}-assessment-{assessment_index}", job.id),
+                        job_id: job.id.clone(),
+                        artifact_type: "quiz".to_string(),
+                        path: planned_path(&job.output_dir, &artifact_segment_refs),
+                        status: "pending".to_string(),
+                        size_bytes: None,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    },
+                    source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                });
+                study_assessments.push(StudyGuideQuiz {
+                    title: assessment.title.clone(),
+                    markdown: quiz_markdown.clone(),
+                });
+            }
+        }
+    }
+
+    if let Some(study_markdown) = format_study_guide(course, &study_videos, &study_assessments) {
+        text_downloads.push(PlannedArtifactDownload {
+            artifact: ArtifactRecord {
+                id: format!("artifact-{}-study-guide", job.id),
+                job_id: job.id.clone(),
+                artifact_type: "study_guide".to_string(),
+                path: planned_path(&job.output_dir, &[&course_dir, "Study.md"]),
+                status: "pending".to_string(),
+                size_bytes: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            source: ArtifactDownloadSource::Text(study_markdown),
+        });
+    }
+
     if job.download_exercises {
         for (exercise_index, exercise_file) in course.exercise_files.iter().enumerate() {
             let file_name = safe_file_name(&exercise_file.file_name);
-            downloads.push(PlannedArtifactDownload {
+            exercise_downloads.push(PlannedArtifactDownload {
                 artifact: ArtifactRecord {
                     id: format!("artifact-{}-exercise-{exercise_index}", job.id),
                     job_id: job.id.clone(),
@@ -436,32 +511,297 @@ fn build_initial_artifact_downloads(
         }
     }
 
-    if job.download_quizzes {
-        for (assessment_index, assessment) in course.assessments.iter().enumerate() {
-            if let Some(quiz_markdown) = &assessment.quiz_markdown {
-                let file_name = format!(
-                    "{:02} - {}.quiz.md",
-                    assessment_index + 1,
-                    safe_file_name(&assessment.title)
-                );
-                downloads.push(PlannedArtifactDownload {
-                    artifact: ArtifactRecord {
-                        id: format!("artifact-{}-assessment-{assessment_index}", job.id),
-                        job_id: job.id.clone(),
-                        artifact_type: "quiz".to_string(),
-                        path: planned_path(&job.output_dir, &[&course_dir, &file_name]),
-                        status: "pending".to_string(),
-                        size_bytes: None,
-                        created_at: timestamp,
-                        updated_at: timestamp,
-                    },
-                    source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
-                });
+    let mut downloads =
+        Vec::with_capacity(text_downloads.len() + video_downloads.len() + exercise_downloads.len());
+    downloads.extend(text_downloads);
+    downloads.extend(video_downloads);
+    downloads.extend(exercise_downloads);
+    downloads
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StudyGuideVideo {
+    chapter_index: usize,
+    video_index: usize,
+    chapter_title: String,
+    video_title: String,
+    transcript_paragraphs: Vec<String>,
+    quiz_markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StudyGuideQuiz {
+    title: String,
+    markdown: String,
+}
+
+fn ensure_study_video<'a>(
+    videos: &'a mut Vec<StudyGuideVideo>,
+    chapter_index: usize,
+    video_index: usize,
+    chapter_title: &str,
+    video_title: &str,
+) -> &'a mut StudyGuideVideo {
+    if let Some(index) = videos
+        .iter()
+        .position(|video| video.chapter_index == chapter_index && video.video_index == video_index)
+    {
+        return &mut videos[index];
+    }
+
+    videos.push(StudyGuideVideo {
+        chapter_index,
+        video_index,
+        chapter_title: chapter_title.to_string(),
+        video_title: video_title.to_string(),
+        transcript_paragraphs: Vec::new(),
+        quiz_markdown: None,
+    });
+    videos.last_mut().expect("study video was just pushed")
+}
+
+fn assessment_quiz_path_segments(
+    course: &Course,
+    assessment: &CourseAssessment,
+    assessment_index: usize,
+) -> Vec<String> {
+    let file_name = format!(
+        "{:02} - {}.quiz.md",
+        assessment_index + 1,
+        safe_file_name(&assessment.title)
+    );
+    let chapter_dir = matching_assessment_chapter_dir(course, assessment);
+    let mut artifact_segments = vec![safe_file_name(&course.title)];
+    if let Some(chapter_dir) = chapter_dir {
+        artifact_segments.push(chapter_dir);
+    }
+    artifact_segments.push(file_name);
+    artifact_segments
+}
+
+fn matching_assessment_chapter_dir(
+    course: &Course,
+    assessment: &CourseAssessment,
+) -> Option<String> {
+    let assessment_title = assessment.title.to_ascii_lowercase();
+    course
+        .chapters
+        .iter()
+        .enumerate()
+        .find(|(_, chapter)| {
+            let chapter_title = chapter.title.to_ascii_lowercase();
+            assessment_title == chapter_title
+                || assessment_title.starts_with(&format!("{chapter_title} -"))
+        })
+        .map(|(index, chapter)| format!("{:02} - {}", index + 1, safe_file_name(&chapter.title)))
+}
+
+fn format_study_guide(
+    course: &Course,
+    videos: &[StudyGuideVideo],
+    assessments: &[StudyGuideQuiz],
+) -> Option<String> {
+    let has_study_content = !assessments.is_empty()
+        || videos
+            .iter()
+            .any(|video| !video.transcript_paragraphs.is_empty() || video.quiz_markdown.is_some());
+    if !has_study_content {
+        return None;
+    }
+
+    let mut markdown = String::new();
+    markdown.push_str("# ");
+    markdown.push_str(&course.title);
+    markdown.push_str("\n\n");
+    markdown.push_str("## Chapter Quizzes\n\n");
+
+    let mut quiz_index = 1;
+    for assessment in assessments {
+        append_study_quiz(
+            &mut markdown,
+            quiz_index,
+            &assessment.title,
+            &assessment.markdown,
+        );
+        quiz_index += 1;
+    }
+    for video in ordered_study_videos(videos)
+        .into_iter()
+        .filter(|video| video.quiz_markdown.is_some())
+    {
+        append_study_quiz(
+            &mut markdown,
+            quiz_index,
+            &video.video_title,
+            video.quiz_markdown.as_deref().unwrap_or_default(),
+        );
+        quiz_index += 1;
+    }
+    if quiz_index == 1 {
+        markdown.push_str("No quiz files were available for this course.\n\n");
+    }
+
+    markdown.push_str("## Transcripts\n\n");
+    let ordered_videos = ordered_study_videos(videos);
+    for (chapter_index, chapter) in course.chapters.iter().enumerate() {
+        markdown.push_str("### ");
+        markdown.push_str(&(chapter_index + 1).to_string());
+        markdown.push_str(". ");
+        markdown.push_str(&chapter.title);
+        markdown.push_str("\n\n");
+
+        let chapter_videos = ordered_videos
+            .iter()
+            .filter(|video| {
+                video.chapter_index == chapter_index && !video.transcript_paragraphs.is_empty()
+            })
+            .collect::<Vec<_>>();
+        if chapter_videos.is_empty() {
+            markdown.push_str("No transcripts were available for this chapter.\n\n");
+            continue;
+        }
+
+        for video in chapter_videos {
+            markdown.push_str("#### ");
+            markdown.push_str(&video.video_title);
+            markdown.push_str("\n\n");
+            for paragraph in &video.transcript_paragraphs {
+                markdown.push_str(paragraph);
+                markdown.push_str("\n\n");
             }
         }
     }
 
-    downloads
+    Some(markdown)
+}
+
+fn ordered_study_videos(videos: &[StudyGuideVideo]) -> Vec<&StudyGuideVideo> {
+    let mut ordered = videos.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|video| (video.chapter_index, video.video_index));
+    ordered
+}
+
+fn append_study_quiz(markdown: &mut String, quiz_index: usize, title: &str, quiz_markdown: &str) {
+    markdown.push_str("### ");
+    markdown.push_str(&quiz_index.to_string());
+    markdown.push_str(". ");
+    markdown.push_str(title.trim());
+    markdown.push_str("\n\n");
+    let quiz_body = quiz_questions_section(quiz_markdown)
+        .unwrap_or_else(|| quiz_markdown_without_title(quiz_markdown))
+        .trim();
+    if !quiz_body.is_empty() {
+        markdown.push_str(quiz_body);
+        markdown.push_str("\n\n");
+    }
+}
+
+fn quiz_questions_section(markdown: &str) -> Option<&str> {
+    markdown
+        .find("## Questions")
+        .or_else(|| markdown.find("## Extracted Questions"))
+        .map(|index| &markdown[index..])
+}
+
+fn quiz_markdown_without_title(markdown: &str) -> &str {
+    let trimmed = markdown.trim_start();
+    if !trimmed.starts_with("# ") {
+        return trimmed;
+    }
+
+    trimmed
+        .find("\n\n")
+        .map(|index| &trimmed[index + 2..])
+        .unwrap_or_default()
+}
+
+fn transcript_srt_to_paragraphs(srt: &str) -> Vec<String> {
+    let text = srt
+        .lines()
+        .filter_map(transcript_caption_line)
+        .collect::<Vec<_>>()
+        .join(" ");
+    split_transcript_paragraphs(&normalize_transcript_spacing(&text))
+}
+
+fn transcript_caption_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().all(|ch| ch.is_ascii_digit())
+        || trimmed.contains("-->")
+    {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn normalize_transcript_spacing(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_transcript_paragraphs(text: &str) -> Vec<String> {
+    const TARGET_PARAGRAPH_CHARS: usize = 560;
+    const MAX_PARAGRAPH_CHARS: usize = 900;
+
+    let mut paragraphs = Vec::new();
+    let mut current = String::new();
+
+    for sentence in split_transcript_sentences(text) {
+        if current.is_empty() {
+            current.push_str(&sentence);
+            continue;
+        }
+
+        let projected_len = current.len() + 1 + sentence.len();
+        if current.len() >= TARGET_PARAGRAPH_CHARS || projected_len > MAX_PARAGRAPH_CHARS {
+            paragraphs.push(current);
+            current = sentence;
+        } else {
+            current.push(' ');
+            current.push_str(&sentence);
+        }
+    }
+
+    if !current.trim().is_empty() {
+        paragraphs.push(current);
+    }
+
+    paragraphs
+}
+
+fn split_transcript_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let chars = text.char_indices().collect::<Vec<_>>();
+
+    for (position, (index, ch)) in chars.iter().enumerate() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+
+        let next_is_boundary = chars
+            .get(position + 1)
+            .map(|(_, next)| next.is_whitespace() || matches!(next, '"' | '\'' | ')' | ']'))
+            .unwrap_or(true);
+        if !next_is_boundary {
+            continue;
+        }
+
+        let end = index + ch.len_utf8();
+        let sentence = text[start..end].trim();
+        if !sentence.is_empty() {
+            sentences.push(sentence.to_string());
+        }
+        start = end;
+    }
+
+    let remaining = text[start..].trim();
+    if !remaining.is_empty() {
+        sentences.push(remaining.to_string());
+    }
+
+    sentences
 }
 
 fn exercise_artifact_type(file_name: &str) -> &'static str {
@@ -610,7 +950,7 @@ mod tests {
     use crate::cache::{
         get_course_cache_entry, initialize, insert_job, list_artifacts_for_job, list_job_events,
     };
-    use crate::course::CourseFetchError;
+    use crate::course::{Chapter, CourseFetchError, CourseVideo, ExerciseFile};
     use rusqlite::Connection;
     use std::collections::VecDeque;
     use std::fs;
@@ -647,20 +987,23 @@ mod tests {
 
         assert_eq!(processed.job_id, "job-1");
         assert_eq!(processed.course_slug, "sample-course");
-        assert_eq!(processed.planned_artifacts, 3);
+        assert_eq!(processed.planned_artifacts, 4);
         assert_eq!(active_jobs.len(), 1);
         assert_eq!(cached.title.as_deref(), Some("Sample Course"));
         assert!(cached.payload_json.contains(r#""has_download_url":true"#));
         assert!(cached.payload_json.contains(r#""has_transcript":true"#));
         assert!(!cached.payload_json.contains("fresh"));
         assert!(!cached.payload_json.contains("progressiveUrl"));
-        assert_eq!(artifacts.len(), 3);
+        assert_eq!(artifacts.len(), 4);
         assert!(artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "video"));
         assert!(artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "subtitle"));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "study_guide"));
         assert!(artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "exercise_zip"));
@@ -762,11 +1105,12 @@ mod tests {
             .join("Sample Course")
             .join("01 - Getting started")
             .join("01 - Welcome video.srt");
+        let study_path = output.path().join("Sample Course").join("Study.md");
 
         assert_eq!(
             summary,
             ArtifactDownloadSummary {
-                completed: 2,
+                completed: 3,
                 failed: 1,
                 cancelled: 0
             }
@@ -776,7 +1120,15 @@ mod tests {
         assert!(fs::read_to_string(&subtitle_path)
             .unwrap()
             .contains("Welcome."));
-        assert_eq!(artifacts.len(), 3);
+        let study = fs::read_to_string(study_path).unwrap();
+        assert!(study.contains("# Sample Course"));
+        assert!(study.contains("## Chapter Quizzes"));
+        assert!(study.contains("## Transcripts"));
+        assert!(study.contains("#### Welcome video"));
+        assert!(study.contains("Welcome."));
+        assert!(!study.contains("[Transcript]"));
+        assert!(!study.contains("[Video]"));
+        assert_eq!(artifacts.len(), 4);
         assert!(artifacts.iter().any(|artifact| artifact
             .path
             .ends_with("Sample Course\\01 - Getting started\\01 - Welcome video.mp4")
@@ -840,12 +1192,158 @@ mod tests {
             .join("Sample Course")
             .join("01 - Chapter Quiz.quiz.md");
 
-        assert_eq!(summary.completed, 3);
+        assert_eq!(summary.completed, 4);
         assert_eq!(summary.failed, 1);
         assert!(artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "quiz"));
         assert!(fs::read_to_string(quiz_path).unwrap().contains("Question?"));
+        let study =
+            fs::read_to_string(output.path().join("Sample Course").join("Study.md")).unwrap();
+        let quiz_index = study.find("## Chapter Quizzes").unwrap();
+        let transcripts_index = study.find("## Transcripts").unwrap();
+        assert!(quiz_index < transcripts_index);
+        assert!(study.contains("Question?"));
+        assert!(!study.contains("[Open quiz]"));
+        assert!(!study.contains(".quiz.md"));
+    }
+
+    #[test]
+    fn study_guide_is_planned_after_text_before_binary_artifacts_and_uses_course_order() {
+        let job = sample_job("job-1", "queued", 100);
+        let course = Course {
+            slug: "sample-course".to_string(),
+            title: "Sample Course".to_string(),
+            thumbnail_url: None,
+            chapters: vec![
+                Chapter {
+                    title: "First chapter".to_string(),
+                    videos: vec![CourseVideo {
+                        slug: "first-video".to_string(),
+                        title: Some("First video".to_string()),
+                        duration_seconds: Some(10),
+                        download_url: Some("https://cdn.example.test/first.mp4".to_string()),
+                        transcript_srt: Some(
+                            "1\n00:00:00,000 --> 00:00:03,000\nFirst sentence.\n\n2\n00:00:03,000 --> 00:00:06,000\nSecond sentence.\n\n".to_string(),
+                        ),
+                        quiz_markdown: None,
+                    }],
+                },
+                Chapter {
+                    title: "Second chapter".to_string(),
+                    videos: vec![CourseVideo {
+                        slug: "second-video".to_string(),
+                        title: Some("Second video".to_string()),
+                        duration_seconds: Some(10),
+                        download_url: Some("https://cdn.example.test/second.mp4".to_string()),
+                        transcript_srt: Some(
+                            "1\n00:00:00,000 --> 00:00:03,000\nThird sentence.\n\n2\n00:00:03,000 --> 00:00:06,000\nFourth sentence.\n\n".to_string(),
+                        ),
+                        quiz_markdown: Some(
+                            "# Second Quiz\n\n## Questions\n\n1. Second question?\n".to_string(),
+                        ),
+                    }],
+                },
+            ],
+            assessments: vec![CourseAssessment {
+                title: "First chapter - Chapter Quiz".to_string(),
+                entity_urn: Some("urn:li:learningApiAssessment:1".to_string()),
+                tracking_urn: Some("urn:li:lyndaAssessment:first".to_string()),
+                quiz_markdown: Some(
+                    "# First Quiz\n\n## Questions\n\n1. First question?\n".to_string(),
+                ),
+            }],
+            exercise_files: vec![ExerciseFile {
+                file_name: "exercise.zip".to_string(),
+                download_url: "https://cdn.example.test/exercise.zip".to_string(),
+                alternate_download_urls: Vec::new(),
+            }],
+        };
+
+        let downloads = build_initial_artifact_downloads(&job, &course, 200);
+        let types = downloads
+            .iter()
+            .map(|download| download.artifact.artifact_type.as_str())
+            .collect::<Vec<_>>();
+        let study = downloads
+            .iter()
+            .find(|download| download.artifact.artifact_type == "study_guide")
+            .unwrap();
+        let study_markdown = match &study.source {
+            ArtifactDownloadSource::Text(text) => text,
+            _ => panic!("study guide must be a text artifact"),
+        };
+
+        assert_eq!(
+            types,
+            vec![
+                "subtitle",
+                "subtitle",
+                "quiz",
+                "quiz",
+                "study_guide",
+                "video",
+                "video",
+                "exercise_zip"
+            ]
+        );
+        assert!(
+            study.artifact.path.ends_with("Sample Course\\Study.md")
+                || study.artifact.path.ends_with("Sample Course/Study.md")
+        );
+        assert!(
+            study_markdown.find("First question?").unwrap()
+                < study_markdown.find("Second question?").unwrap()
+        );
+        assert!(
+            study_markdown.find("## Chapter Quizzes").unwrap()
+                < study_markdown.find("## Transcripts").unwrap()
+        );
+        assert!(
+            study_markdown.find("First chapter").unwrap()
+                < study_markdown.find("Second chapter").unwrap()
+        );
+        assert!(study_markdown.contains("1. First question?"));
+        assert!(!study_markdown.contains("[Open quiz]"));
+        assert!(!study_markdown.contains(".quiz.md"));
+        assert!(study_markdown.contains("#### First video\n\nFirst sentence. Second sentence."));
+        assert!(study_markdown.contains("#### Second video\n\nThird sentence. Fourth sentence."));
+        assert!(!study_markdown.contains("[Transcript]"));
+        assert!(!study_markdown.contains(".srt"));
+        assert!(!study_markdown.contains("[Video]"));
+    }
+
+    #[test]
+    fn study_guide_is_not_planned_for_video_only_downloads() {
+        let mut job = sample_job("job-1", "queued", 100);
+        job.download_subtitles = false;
+        job.download_quizzes = false;
+        job.download_exercises = false;
+        let course = Course {
+            slug: "sample-course".to_string(),
+            title: "Sample Course".to_string(),
+            thumbnail_url: None,
+            chapters: vec![Chapter {
+                title: "Chapter".to_string(),
+                videos: vec![CourseVideo {
+                    slug: "welcome".to_string(),
+                    title: Some("Welcome".to_string()),
+                    duration_seconds: Some(10),
+                    download_url: Some("https://cdn.example.test/welcome.mp4".to_string()),
+                    transcript_srt: Some(
+                        "1\n00:00:00,000 --> 00:00:10,000\nWelcome.\n\n".to_string(),
+                    ),
+                    quiz_markdown: Some("# Quiz\n\n## Questions\n\n1. Hidden?\n".to_string()),
+                }],
+            }],
+            assessments: Vec::new(),
+            exercise_files: Vec::new(),
+        };
+
+        let downloads = build_initial_artifact_downloads(&job, &course, 200);
+
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].artifact.artifact_type, "video");
     }
 
     #[test]

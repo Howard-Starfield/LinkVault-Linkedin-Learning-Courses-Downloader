@@ -1,3 +1,5 @@
+#![deny(unused)]
+
 pub mod artifact_downloader;
 pub mod auth;
 pub mod browser_cookies;

@@ -162,6 +162,8 @@ pub struct ArtifactProgressCounts {
     subtitle_completed: usize,
     quiz_total: usize,
     quiz_completed: usize,
+    study_guide_total: usize,
+    study_guide_completed: usize,
     exercise_total: usize,
     exercise_completed: usize,
 }
@@ -725,6 +727,12 @@ fn summarize_artifacts(artifacts: &[crate::cache::ArtifactRecord]) -> ArtifactPr
                 counts.quiz_total += 1;
                 if artifact.status == "completed" {
                     counts.quiz_completed += 1;
+                }
+            }
+            "study_guide" => {
+                counts.study_guide_total += 1;
+                if artifact.status == "completed" {
+                    counts.study_guide_completed += 1;
                 }
             }
             "exercise_zip" | "exercise_file" => {

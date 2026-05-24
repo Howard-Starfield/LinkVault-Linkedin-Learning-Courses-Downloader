@@ -395,7 +395,6 @@ export function Popover({
       if (!triggerElement || !contentElement) return;
 
       const margin = 8;
-      const sideOffset = 8;
       const triggerRect = triggerElement.getBoundingClientRect();
       const contentRect = contentElement.getBoundingClientRect();
       const viewportWidth = window.innerWidth;
