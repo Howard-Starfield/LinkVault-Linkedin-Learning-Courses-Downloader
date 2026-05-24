@@ -33,7 +33,7 @@
     "longDescription": "LinkVault downloads LinkedIn Learning courses, subtitles, and exercise files into a local folder with a local SQLite activity cache.",
     "windows": {
       "nsis": {
-        "installMode": "perMachine",
+        "installMode": "currentUser",
         "installerIcon": "icons/icon.ico"
       }
     }

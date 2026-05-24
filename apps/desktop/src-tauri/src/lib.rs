@@ -11,6 +11,7 @@ pub mod live_clients;
 pub mod quality;
 pub mod quiz_hints;
 pub mod security;
+pub mod storage;
 pub mod token_store;
 
 use tauri::Manager;
@@ -34,9 +35,11 @@ pub fn run() {
             commands::start_download_jobs,
         ])
         .setup(|app| {
-            let app_data = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&app_data)?;
-            let db_path = app_data.join("linkvault.sqlite3");
+            let db_path = storage::resolve_db_path()?;
+            if let Some(data_dir) = db_path.parent() {
+                let legacy_app_data = app.path().app_data_dir()?;
+                storage::migrate_legacy_app_data(&legacy_app_data, data_dir)?;
+            }
             let connection = cache::open_or_initialize(&db_path)?;
             cache::reconcile_active_jobs_after_restart(
                 &connection,
