@@ -1,16 +1,26 @@
 # LinkVault
 
-LinkVault is a Tauri desktop app for archiving LinkedIn Learning courses into a local folder.
+LinkVault helps you save LinkedIn Learning courses you already have access to into a local folder, so your learning materials are easier to organize, revisit, and study offline.
 
-## Production App
+## What You Can Do
 
-The active production app lives in:
+- Download course videos into a folder you choose.
+- Save subtitles, exercise files, and quiz notes when available.
+- Queue multiple course links and track progress in one place.
+- Retry failed downloads without rebuilding the whole list.
+- Save your session once, then reuse it for future launches.
+- Keep app settings, history, and saved session data local to your machine.
 
-```text
-apps/desktop
-```
+## How To Use
 
-The old .NET/Avalonia project has been removed so production builds are unambiguous.
+1. Install LinkVault with the Windows installer.
+2. Open LinkVault.
+3. Paste one or more LinkedIn Learning course URLs.
+4. Choose the download folder and quality.
+5. Paste your LinkedIn `li_at` cookie once, or use a supported browser session.
+6. Click **Start Download**.
+
+Your downloads are saved into the folder you picked. Your saved session is protected with Windows encryption and stored locally.
 
 ## Requirements
 
@@ -19,22 +29,28 @@ The old .NET/Avalonia project has been removed so production builds are unambigu
 - Microsoft C++ Build Tools or Visual Studio Build Tools
 - Microsoft WebView2 Runtime
 
-## Install
+## Build The App
 
 ```powershell
 cd "C:\Users\howard\Downloads\Ai_script\Linkedin-Learning-Courses-Downloader-main"
 pnpm.cmd --dir apps\desktop install
+pnpm.cmd tauri build
 ```
 
-## Development
+Production outputs:
 
-Run the Tauri desktop app:
+```text
+apps\desktop\src-tauri\target\release\linkvault.exe
+apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.0_x64-setup.exe
+```
+
+## Run For Development
 
 ```powershell
 pnpm.cmd tauri dev
 ```
 
-Run a browser-only frontend preview:
+Browser-only preview:
 
 ```powershell
 pnpm.cmd dev
@@ -46,32 +62,12 @@ Then open:
 http://127.0.0.1:1420
 ```
 
-## Production Build
+## Verify A Release
 
-From the repo root:
-
-```powershell
-pnpm.cmd tauri build
-```
-
-Equivalent direct command:
+Useful checks before sharing a build:
 
 ```powershell
-pnpm.cmd --dir apps\desktop tauri build
-```
-
-Production outputs:
-
-```text
-apps\desktop\src-tauri\target\release\linkvault.exe
-apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.0_x64-setup.exe
-```
-
-## Verification
-
-Run the normal production verification set:
-
-```powershell
+pnpm.cmd cargo:test
 pnpm.cmd verify:visual
 pnpm.cmd verify:ui
 pnpm.cmd verify:release
@@ -79,26 +75,6 @@ pnpm.cmd verify:installer
 pnpm.cmd verify:release-manifest
 ```
 
-`verify:release` runs the Tauri production build, verifies the release executable and NSIS installer exist, and smoke-launches the built app.
-
-Backend tests:
-
-```powershell
-pnpm.cmd cargo:test
-```
-
-## Project Layout
-
-```text
-apps/
-  desktop/
-    src/              React frontend
-    src-tauri/        Rust/Tauri backend and bundle config
-    scripts/          UI, visual, release, and installer verification
-docs/
-  learning/           Personal learning notes and restored harness material
-```
-
-## Notes
+## Responsible Use
 
 Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions.
