@@ -75,6 +75,7 @@ pnpm.cmd verify:installer
 pnpm.cmd verify:release-manifest
 ```
 
-## Responsible Use
+## Responsible Use / Ownership
 
-Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions. All right reserved!
+Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions.
+Copyright (c) 2026 Howard Deng. All rights reserved.
