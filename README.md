@@ -8,8 +8,8 @@ LinkVault helps you save LinkedIn Learning courses you already have access to in
 - Save subtitles, exercise files, and quiz notes when available.
 - Queue multiple course links and track progress in one place.
 - Retry failed downloads without rebuilding the whole list.
-- Save your session once, then reuse it for future launches.
-- Keep app settings, history, and saved session data local to your machine.
+- Save your cookie once, then reuse it for future launches.
+- Keep data local to your machine.
 
 ## How To Use
 
@@ -77,4 +77,4 @@ pnpm.cmd verify:release-manifest
 
 ## Responsible Use
 
-Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions.
+Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions. All right reserved!
