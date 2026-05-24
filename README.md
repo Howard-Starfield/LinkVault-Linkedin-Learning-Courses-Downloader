@@ -95,6 +95,8 @@ apps/
     src/              React frontend
     src-tauri/        Rust/Tauri backend and bundle config
     scripts/          UI, visual, release, and installer verification
+docs/
+  learning/           Personal learning notes and restored harness material
 ```
 
 ## Notes
