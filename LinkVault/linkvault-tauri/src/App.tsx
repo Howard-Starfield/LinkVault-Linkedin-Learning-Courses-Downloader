@@ -17,6 +17,7 @@ import {
   X
 } from "lucide-react";
 import { IconBrandLinkedin, IconMovie, IconTool } from "@tabler/icons-react";
+import linkvaultLogo from "./assets/linkvault-wordmark.svg";
 import {
   ActivityEventRow,
   Button,
@@ -48,12 +49,6 @@ type ParsedCourse = {
   slug: string;
   quiz_urls: string[];
   assessment_urns: string[];
-};
-
-type ValidatedLinkedInSession = {
-  csrf_token: string;
-  enterprise_profile_hash: string | null;
-  request_headers: [string, string][];
 };
 
 type QueuedDownloadJob = {
@@ -173,7 +168,6 @@ export default function App() {
   const [downloadSubtitles, setDownloadSubtitles] = useState(true);
   const [downloadQuizzes, setDownloadQuizzes] = useState(true);
   const [parsedCourses, setParsedCourses] = useState<ParsedCourse[]>([]);
-  const [validatedSession, setValidatedSession] = useState<ValidatedLinkedInSession | null>(null);
   const [hasSavedToken, setHasSavedToken] = useState(false);
   const [isValidatingToken, setIsValidatingToken] = useState(false);
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
@@ -334,8 +328,8 @@ export default function App() {
   }
 
   const canStart = useMemo(
-    () => courseUrls.trim().length > 0 && folder.trim().length > 0 && (token.trim().length > 0 || validatedSession !== null || hasSavedToken) && !isProcessingDownload,
-    [courseUrls, folder, token, validatedSession, hasSavedToken, isProcessingDownload]
+    () => courseUrls.trim().length > 0 && folder.trim().length > 0 && (token.trim().length > 0 || hasSavedToken) && !isProcessingDownload,
+    [courseUrls, folder, token, hasSavedToken, isProcessingDownload]
   );
 
   const queueCounts = useMemo(
@@ -421,21 +415,20 @@ export default function App() {
   async function startDownload() {
     const parsed = await validateUrls();
     if (parsed.length === 0) return;
-    let session = validatedSession;
-    if (token.trim()) {
+    const enteredToken = token.trim();
+    if (enteredToken) {
       setIsValidatingToken(true);
       try {
-        session = await validateLinkedInToken(token);
-        await saveLinkedInToken(token);
+        await saveLinkedInToken(enteredToken);
         setHasSavedToken(true);
-        setValidatedSession(session);
+        setToken("");
       } catch (error) {
         toast.error("Token validation failed", { description: String(error) });
         setIsValidatingToken(false);
         return;
       }
       setIsValidatingToken(false);
-    } else if (!session && !hasSavedToken) {
+    } else if (!hasSavedToken) {
       toast.warning("LinkedIn token required", { description: "Paste li_at once; LinkVault will save it for future launches." });
       return;
     }
@@ -460,9 +453,7 @@ export default function App() {
       });
 
       const processResponse = await processQueuedDownloadWithLiveRefresh(() =>
-        token.trim()
-          ? processNextQueuedDownloadWithToken(token)
-          : processNextQueuedDownloadWithSavedToken()
+        processNextQueuedDownloadWithSavedToken()
       );
 
       setProcessingSummary(processResponse);
@@ -510,7 +501,6 @@ export default function App() {
       await clearSavedLinkedInToken();
       setHasSavedToken(false);
       setToken("");
-      setValidatedSession(null);
       toast.info("Saved token cleared", {
         description: "Paste a LinkedIn li_at token before the next download."
       });
@@ -564,7 +554,8 @@ export default function App() {
 
   async function retryDownloadJob(job: QueuedDownloadJob) {
     if (job.status !== "failed") return;
-    if (!token.trim() && !hasSavedToken) {
+    const enteredToken = token.trim();
+    if (!enteredToken && !hasSavedToken) {
       toast.warning("LinkedIn token required", {
         description: "Paste li_at once before retrying this failed course."
       });
@@ -574,6 +565,11 @@ export default function App() {
     try {
       setIsProcessingDownload(true);
       setProcessingSummary(null);
+      if (enteredToken) {
+        await saveLinkedInToken(enteredToken);
+        setHasSavedToken(true);
+        setToken("");
+      }
       await retryFailedDownloadJob(job.id);
       setQueuedJobs((jobs) =>
         jobs.map((candidate) =>
@@ -585,9 +581,7 @@ export default function App() {
       toast.info("Retry queued", { description: courseDisplayName(job) });
 
       const processResponse = await processQueuedDownloadWithLiveRefresh(() =>
-        token.trim()
-          ? processNextQueuedDownloadWithToken(token)
-          : processNextQueuedDownloadWithSavedToken()
+        processNextQueuedDownloadWithSavedToken()
       );
 
       setProcessingSummary(processResponse);
@@ -654,21 +648,18 @@ export default function App() {
       style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
       <aside className="lv-sidebar" aria-label="Primary navigation">
-        <div className="grid gap-0.5 border-b border-sidebar-border px-3 pb-7 pt-4">
-          <div className="flex h-7 items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-window-red" />
-              <span className="h-2.5 w-2.5 rounded-full bg-window-yellow" />
-              <span className="h-2.5 w-2.5 rounded-full bg-window-green" />
-            </div>
+        <div className="lv-sidebar-brand border-b border-sidebar-border">
+          <div className="lv-sidebar-trigger-wrap">
             <Tooltip label="Toggle sidebar">
               <IconButton className="lv-sidebar-trigger" aria-label="Toggle sidebar" aria-expanded={!isSidebarCollapsed} onClick={() => setIsSidebarCollapsed(true)}>
                 <PanelLeft aria-hidden="true" className="h-4 w-4" />
               </IconButton>
             </Tooltip>
           </div>
-          <h1 className="mt-5 text-sm font-semibold tracking-normal text-sidebar-foreground">LinkVault</h1>
-          <p className="text-xs text-sidebar-muted">Course and video archive</p>
+          <div className="lv-brand-logo" aria-label="LinkVault Course Downloader">
+            <img src={linkvaultLogo} alt="" width={470} height={117} />
+          </div>
+          <h1 className="sr-only">LinkVault</h1>
         </div>
 
         <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
@@ -736,8 +727,8 @@ export default function App() {
                   <p>Paste LinkedIn Learning course URLs and choose what to download.</p>
                 </div>
                 <div className="ml-auto flex shrink-0 items-center gap-2">
-                  <StatusBadge tone={hasSavedToken || validatedSession ? "success" : "muted"}>
-                    {hasSavedToken || validatedSession ? "Saved session active" : "Session required"}
+                  <StatusBadge tone={hasSavedToken ? "success" : "muted"}>
+                    {hasSavedToken ? "Saved session active" : "Session required"}
                   </StatusBadge>
                 </div>
               </div>
@@ -775,10 +766,7 @@ export default function App() {
                     <div className="field-action-grid token-grid">
                       <Input
                         value={token}
-                        onChange={(event) => {
-                          setToken(event.target.value);
-                          setValidatedSession(null);
-                        }}
+                        onChange={(event) => setToken(event.target.value)}
                         placeholder={hasSavedToken ? "Saved token available" : "Paste your LinkedIn li_at cookie value"}
                         type="password"
                         aria-label="LinkedIn li_at token"
@@ -1319,22 +1307,6 @@ function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-async function validateLinkedInToken(token: string) {
-  if (isTauriRuntime()) {
-    return invoke<ValidatedLinkedInSession>("validate_li_at_token", { token });
-  }
-
-  if (!token.trim()) {
-    throw new Error("LinkedIn token required");
-  }
-
-  return {
-    csrf_token: "preview-csrf-token",
-    enterprise_profile_hash: null,
-    request_headers: [["Csrf-Token", "preview-csrf-token"]]
-  } satisfies ValidatedLinkedInSession;
-}
-
 async function saveLinkedInToken(token: string) {
   if (isTauriRuntime()) {
     return invoke<{ has_saved_token: boolean }>("save_li_at_token", { token });
@@ -1395,14 +1367,6 @@ async function clearFailedDownloadJobs() {
     browser_sources: ["Chrome", "Edge", "Firefox"],
     default_resolution: "P720"
   } satisfies BootstrapState;
-}
-
-async function processNextQueuedDownloadWithToken(token: string) {
-  if (isTauriRuntime()) {
-    return invoke<ProcessQueuedDownloadResponse>("process_next_queued_download_with_li_at", { token });
-  }
-
-  return processNextQueuedDownloadForPreview();
 }
 
 async function openDownloadFolder(path: string) {

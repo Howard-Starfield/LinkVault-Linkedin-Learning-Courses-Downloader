@@ -287,7 +287,6 @@ async function verifyReferencePreviewDesktop(page, baseUrl) {
   const reference = await collectReferenceMetrics(page);
   const referenceText = `${reference.bodyText}\n${reference.placeholderText}\n${reference.fieldValueText}`;
   const expectedText = [
-    "Course and video archive",
     "Linkedin Course",
     "One course URL per line",
     "Paste your LinkedIn li_at cookie value",
@@ -303,6 +302,7 @@ async function verifyReferencePreviewDesktop(page, baseUrl) {
     assertVisual(referenceText.includes(text), `reference preview should render "${text}".`);
   }
   for (const removedText of [
+    "Course and video archive",
     "Service Desk Fundamentals",
     "Software Testing Foundations",
     "Chapter 2 of 5",
