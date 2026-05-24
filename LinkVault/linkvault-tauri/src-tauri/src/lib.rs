@@ -9,7 +9,9 @@ pub mod exercise_archive;
 mod linkedin;
 pub mod live_clients;
 pub mod quality;
+pub mod quiz_hints;
 pub mod security;
+pub mod token_store;
 
 use tauri::Manager;
 
@@ -20,10 +22,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap_state,
             commands::cancel_active_download,
+            commands::clear_failed_download_jobs,
+            commands::clear_saved_li_at_token,
             commands::parse_linkedin_course_urls,
             commands::process_next_queued_download_from_browser_source,
+            commands::process_next_queued_download_with_saved_token,
             commands::process_next_queued_download_with_li_at,
             commands::quality_fallback_order,
+            commands::retry_failed_download_job,
+            commands::save_download_preferences,
+            commands::save_li_at_token,
             commands::start_download_jobs,
             commands::validate_browser_token_source,
             commands::validate_li_at_token

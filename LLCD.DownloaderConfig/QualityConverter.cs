@@ -14,6 +14,8 @@ namespace LLCD.DownloaderConfig
             var value = serializer.Deserialize<string>(reader);
             switch (value)
             {
+                case "BestAvailable":
+                    return Quality.BestAvailable;
                 case "High":
                     return Quality.High;
                 case "Medium":
@@ -34,6 +36,9 @@ namespace LLCD.DownloaderConfig
             var value = (Quality)untypedValue;
             switch (value)
             {
+                case Quality.BestAvailable:
+                    serializer.Serialize(writer, "BestAvailable");
+                    return;
                 case Quality.High:
                     serializer.Serialize(writer, "High");
                     return;

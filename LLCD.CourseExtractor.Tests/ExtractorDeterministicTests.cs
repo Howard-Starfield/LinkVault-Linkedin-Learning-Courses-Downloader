@@ -175,6 +175,26 @@ namespace LLCD.CourseExtractor.Tests
         }
 
         [TestMethod]
+        public async Task GetCourse_WithBestAvailable_FallsBackWhen1080HasNoDownloadUrl()
+        {
+            var cookies = CreateCookiesWithSession();
+            var handler = new LinkedInCourseApiHandler(missingDownloadUrlResolution: "1080");
+            var extractor = new Extractor(
+                "https://www.linkedin.com/learning/sample-course/welcome",
+                Quality.BestAvailable,
+                "li-at-token",
+                new HttpClient(handler),
+                cookies);
+
+            var course = await extractor.GetCourse();
+
+            Assert.AreEqual("https://cdn.example.test/welcome.mp4", course.Chapters[0].Videos[0].DownloadUrl);
+            Assert.IsTrue(handler.RequestUris.Any(uri => uri.Contains("resolution=_1080")));
+            Assert.IsTrue(handler.RequestUris.Any(uri => uri.Contains("resolution=_720")));
+            Assert.IsFalse(handler.RequestUris.Any(uri => uri.Contains("resolution=_540")));
+        }
+
+        [TestMethod]
         public async Task GetCourse_WithVideoDetailsDisabled_SkipsSelectedVideoRequests()
         {
             var cookies = CreateCookiesWithSession();
@@ -243,8 +263,11 @@ namespace LLCD.CourseExtractor.Tests
 
         private class LinkedInCourseApiHandler : HttpMessageHandler
         {
-            public LinkedInCourseApiHandler()
+            private readonly string _missingDownloadUrlResolution;
+
+            public LinkedInCourseApiHandler(string missingDownloadUrlResolution = null)
             {
+                _missingDownloadUrlResolution = missingDownloadUrlResolution;
                 RequestUris = new List<string>();
             }
 
@@ -297,6 +320,18 @@ namespace LLCD.CourseExtractor.Tests
 
                 if (requestUri.Contains("fields=selectedVideo") && requestUri.Contains("videoSlug=welcome"))
                 {
+                    if (!String.IsNullOrWhiteSpace(_missingDownloadUrlResolution) && requestUri.Contains("resolution=_" + _missingDownloadUrlResolution))
+                    {
+                        return Response(@"{
+                            ""elements"": [{
+                                ""selectedVideo"": {
+                                    ""title"": ""Welcome video"",
+                                    ""durationInSeconds"": 3
+                                }
+                            }]
+                        }");
+                    }
+
                     return Response(@"{
                         ""elements"": [{
                             ""selectedVideo"": {

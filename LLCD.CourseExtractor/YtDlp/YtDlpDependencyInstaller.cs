@@ -171,7 +171,7 @@ namespace LLCD.CourseExtractor.YtDlp
         private static HttpClient CreateHttpClient()
         {
             var client = new HttpClient();
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("LLCD.DownloaderGUI/1.0");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("LinkVault/1.0");
             return client;
         }
     }

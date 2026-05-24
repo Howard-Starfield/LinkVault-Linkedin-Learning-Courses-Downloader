@@ -8,7 +8,8 @@ use crate::cache::{
     NewJobEvent,
 };
 use crate::course::{
-    fetch_course_with_selected_video_details, Course, CourseApiClient, CourseFetchError,
+    fetch_course_with_selected_video_details, Course, CourseApiClient, CourseAssessment,
+    CourseFetchError,
 };
 use crate::quality::VideoQuality;
 use rusqlite::Connection;
@@ -85,6 +86,24 @@ pub fn process_next_queued_job_and_download_artifacts(
     cancellation: &impl CancellationFlag,
     timestamp: i64,
 ) -> Result<Option<ArtifactDownloadSummary>, DownloadOrchestrationError> {
+    process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+        connection,
+        course_client,
+        artifact_client,
+        cancellation,
+        timestamp,
+        Vec::new(),
+    )
+}
+
+pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+    connection: &Connection,
+    course_client: &mut impl CourseApiClient,
+    artifact_client: &mut impl ArtifactHttpClient,
+    cancellation: &impl CancellationFlag,
+    timestamp: i64,
+    quiz_assessments: Vec<CourseAssessment>,
+) -> Result<Option<ArtifactDownloadSummary>, DownloadOrchestrationError> {
     let Some(queued_job) = list_jobs_by_status(connection, "queued")?
         .into_iter()
         .next()
@@ -115,20 +134,25 @@ pub fn process_next_queued_job_and_download_artifacts(
         }));
     }
 
-    let planned_job =
-        match plan_active_job_downloads(connection, course_client, &queued_job, timestamp) {
-            Ok(planned_job) => planned_job,
-            Err(error) => {
-                transition_job_status(
-                    connection,
-                    &queued_job.id,
-                    "failed",
-                    timestamp,
-                    Some("Course metadata fetch or artifact planning failed."),
-                )?;
-                return Err(error);
-            }
-        };
+    let planned_job = match plan_active_job_downloads(
+        connection,
+        course_client,
+        &queued_job,
+        timestamp,
+        quiz_assessments,
+    ) {
+        Ok(planned_job) => planned_job,
+        Err(error) => {
+            transition_job_status(
+                connection,
+                &queued_job.id,
+                "failed",
+                timestamp,
+                Some("Course metadata fetch or artifact planning failed."),
+            )?;
+            return Err(error);
+        }
+    };
 
     let summary = download_artifacts_for_active_job(
         connection,
@@ -148,7 +172,7 @@ fn plan_active_job(
     job: &JobRecord,
     timestamp: i64,
 ) -> Result<ProcessedQueuedJob, DownloadOrchestrationError> {
-    let planned_job = plan_active_job_downloads(connection, client, job, timestamp)?;
+    let planned_job = plan_active_job_downloads(connection, client, job, timestamp, Vec::new())?;
     let active_job = planned_job.active_job;
 
     Ok(ProcessedQueuedJob {
@@ -163,22 +187,35 @@ fn plan_active_job_downloads(
     client: &mut impl CourseApiClient,
     job: &JobRecord,
     timestamp: i64,
+    quiz_assessments: Vec<CourseAssessment>,
 ) -> Result<PlannedActiveJob, DownloadOrchestrationError> {
     let selected_quality = parse_selected_quality(&job.selected_quality)?;
-    let course = fetch_course_with_selected_video_details(
+    let mut course = fetch_course_with_selected_video_details(
         client,
         &job.course_slug,
         selected_quality,
         job.download_videos,
         job.download_subtitles,
+        job.download_quizzes,
     )?;
+    let merged_quiz_assessments = merge_browser_quiz_assessments(&mut course, quiz_assessments);
+    let quiz_assessment_count = course.assessments.len();
+    let quiz_markdown_count = course
+        .assessments
+        .iter()
+        .filter(|assessment| assessment.quiz_markdown.is_some())
+        .count();
     let safe_payload = serde_json::to_string(&CachedCoursePayload::from(&course))?;
 
     upsert_course_cache_entry(
         connection,
         &CourseCacheEntry {
             course_slug: course.slug.clone(),
-            source_url: linkedin_course_url(&course.slug),
+            source_url: if job.source_url.trim().is_empty() {
+                linkedin_course_url(&course.slug)
+            } else {
+                job.source_url.clone()
+            },
             title: Some(course.title.clone()),
             payload_json: safe_payload,
             fetched_at: timestamp,
@@ -195,6 +232,9 @@ fn plan_active_job_downloads(
                     "courseSlug": course.slug,
                     "chapterCount": course.chapters.len(),
                     "exerciseFileCount": course.exercise_files.len(),
+                    "quizAssessmentCount": quiz_assessment_count,
+                    "quizMarkdownCount": quiz_markdown_count,
+                    "browserQuizAssessmentCount": merged_quiz_assessments,
                 })
                 .to_string(),
             ),
@@ -218,6 +258,7 @@ fn plan_active_job_downloads(
                     "downloadVideos": job.download_videos,
                     "downloadExercises": job.download_exercises,
                     "downloadSubtitles": job.download_subtitles,
+                    "downloadQuizzes": job.download_quizzes,
                 })
                 .to_string(),
             ),
@@ -232,6 +273,51 @@ fn plan_active_job_downloads(
         active_job,
         downloads,
     })
+}
+
+pub fn merge_browser_quiz_assessments(
+    course: &mut Course,
+    quiz_assessments: Vec<CourseAssessment>,
+) -> usize {
+    let mut merged = 0;
+    for mut incoming in quiz_assessments {
+        if incoming
+            .quiz_markdown
+            .as_deref()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+
+        if let Some(existing) = course
+            .assessments
+            .iter_mut()
+            .find(|existing| same_assessment(existing, &incoming))
+        {
+            if existing.quiz_markdown.is_none() {
+                existing.quiz_markdown = incoming.quiz_markdown.take();
+                merged += 1;
+            }
+            continue;
+        }
+
+        course.assessments.push(incoming);
+        merged += 1;
+    }
+    merged
+}
+
+fn same_assessment(left: &CourseAssessment, right: &CourseAssessment) -> bool {
+    left.entity_urn
+        .as_deref()
+        .zip(right.entity_urn.as_deref())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        || left
+            .tracking_urn
+            .as_deref()
+            .zip(right.tracking_urn.as_deref())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 fn parse_selected_quality(value: &str) -> Result<VideoQuality, DownloadOrchestrationError> {
@@ -254,54 +340,80 @@ fn build_initial_artifact_downloads(
     let mut downloads = Vec::new();
     let course_dir = safe_file_name(&course.title);
 
-    for (video_index, video) in course
-        .chapters
-        .iter()
-        .flat_map(|chapter| chapter.videos.iter())
-        .enumerate()
-    {
-        let video_name = safe_file_name(video.title.as_deref().unwrap_or(&video.slug));
-        if job.download_videos {
-            if let Some(download_url) = &video.download_url {
-                downloads.push(PlannedArtifactDownload {
-                    artifact: ArtifactRecord {
-                        id: format!("artifact-{}-video-{video_index}", job.id),
-                        job_id: job.id.clone(),
-                        artifact_type: "video".to_string(),
-                        path: planned_path(
-                            &job.output_dir,
-                            &course_dir,
-                            &format!("{video_name}.mp4"),
-                        ),
-                        status: "pending".to_string(),
-                        size_bytes: None,
-                        created_at: timestamp,
-                        updated_at: timestamp,
-                    },
-                    source: ArtifactDownloadSource::Url(download_url.clone()),
-                });
+    let mut video_artifact_index = 0;
+    for (chapter_index, chapter) in course.chapters.iter().enumerate() {
+        let chapter_dir = format!(
+            "{:02} - {}",
+            chapter_index + 1,
+            safe_file_name(&chapter.title)
+        );
+        for (video_index, video) in chapter.videos.iter().enumerate() {
+            let video_name = format!(
+                "{:02} - {}",
+                video_index + 1,
+                safe_file_name(video.title.as_deref().unwrap_or(&video.slug))
+            );
+            if job.download_videos {
+                if let Some(download_url) = &video.download_url {
+                    downloads.push(PlannedArtifactDownload {
+                        artifact: ArtifactRecord {
+                            id: format!("artifact-{}-video-{video_artifact_index}", job.id),
+                            job_id: job.id.clone(),
+                            artifact_type: "video".to_string(),
+                            path: planned_path(
+                                &job.output_dir,
+                                &[&course_dir, &chapter_dir, &format!("{video_name}.mp4")],
+                            ),
+                            status: "pending".to_string(),
+                            size_bytes: None,
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                        },
+                        source: ArtifactDownloadSource::Url(download_url.clone()),
+                    });
+                }
             }
-        }
-        if job.download_subtitles {
-            if let Some(transcript_srt) = &video.transcript_srt {
-                downloads.push(PlannedArtifactDownload {
-                    artifact: ArtifactRecord {
-                        id: format!("artifact-{}-subtitle-{video_index}", job.id),
-                        job_id: job.id.clone(),
-                        artifact_type: "subtitle".to_string(),
-                        path: planned_path(
-                            &job.output_dir,
-                            &course_dir,
-                            &format!("{video_name}.srt"),
-                        ),
-                        status: "pending".to_string(),
-                        size_bytes: None,
-                        created_at: timestamp,
-                        updated_at: timestamp,
-                    },
-                    source: ArtifactDownloadSource::Text(transcript_srt.clone()),
-                });
+            if job.download_subtitles {
+                if let Some(transcript_srt) = &video.transcript_srt {
+                    downloads.push(PlannedArtifactDownload {
+                        artifact: ArtifactRecord {
+                            id: format!("artifact-{}-subtitle-{video_artifact_index}", job.id),
+                            job_id: job.id.clone(),
+                            artifact_type: "subtitle".to_string(),
+                            path: planned_path(
+                                &job.output_dir,
+                                &[&course_dir, &chapter_dir, &format!("{video_name}.srt")],
+                            ),
+                            status: "pending".to_string(),
+                            size_bytes: None,
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                        },
+                        source: ArtifactDownloadSource::Text(transcript_srt.clone()),
+                    });
+                }
             }
+            if job.download_quizzes {
+                if let Some(quiz_markdown) = &video.quiz_markdown {
+                    downloads.push(PlannedArtifactDownload {
+                        artifact: ArtifactRecord {
+                            id: format!("artifact-{}-quiz-{video_artifact_index}", job.id),
+                            job_id: job.id.clone(),
+                            artifact_type: "quiz".to_string(),
+                            path: planned_path(
+                                &job.output_dir,
+                                &[&course_dir, &chapter_dir, &format!("{video_name}.quiz.md")],
+                            ),
+                            status: "pending".to_string(),
+                            size_bytes: None,
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                        },
+                        source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                    });
+                }
+            }
+            video_artifact_index += 1;
         }
     }
 
@@ -313,14 +425,39 @@ fn build_initial_artifact_downloads(
                     id: format!("artifact-{}-exercise-{exercise_index}", job.id),
                     job_id: job.id.clone(),
                     artifact_type: exercise_artifact_type(&file_name).to_string(),
-                    path: planned_path(&job.output_dir, &course_dir, &file_name),
+                    path: planned_path(&job.output_dir, &[&course_dir, &file_name]),
                     status: "pending".to_string(),
                     size_bytes: None,
                     created_at: timestamp,
                     updated_at: timestamp,
                 },
-                source: ArtifactDownloadSource::Url(exercise_file.download_url.clone()),
+                source: ArtifactDownloadSource::Urls(exercise_download_urls(exercise_file)),
             });
+        }
+    }
+
+    if job.download_quizzes {
+        for (assessment_index, assessment) in course.assessments.iter().enumerate() {
+            if let Some(quiz_markdown) = &assessment.quiz_markdown {
+                let file_name = format!(
+                    "{:02} - {}.quiz.md",
+                    assessment_index + 1,
+                    safe_file_name(&assessment.title)
+                );
+                downloads.push(PlannedArtifactDownload {
+                    artifact: ArtifactRecord {
+                        id: format!("artifact-{}-assessment-{assessment_index}", job.id),
+                        job_id: job.id.clone(),
+                        artifact_type: "quiz".to_string(),
+                        path: planned_path(&job.output_dir, &[&course_dir, &file_name]),
+                        status: "pending".to_string(),
+                        size_bytes: None,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    },
+                    source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                });
+            }
         }
     }
 
@@ -335,10 +472,21 @@ fn exercise_artifact_type(file_name: &str) -> &'static str {
     }
 }
 
-fn planned_path(output_dir: &str, course_dir: &str, file_name: &str) -> String {
+fn exercise_download_urls(exercise_file: &crate::course::ExerciseFile) -> Vec<String> {
+    let mut urls = vec![exercise_file.download_url.clone()];
+    for alternate in &exercise_file.alternate_download_urls {
+        if !urls.iter().any(|url| url.eq_ignore_ascii_case(alternate)) {
+            urls.push(alternate.clone());
+        }
+    }
+    urls
+}
+
+fn planned_path(output_dir: &str, segments: &[&str]) -> String {
     let mut path = PathBuf::from(output_dir);
-    path.push(course_dir);
-    path.push(file_name);
+    for segment in segments {
+        path.push(segment);
+    }
     path.to_string_lossy().to_string()
 }
 
@@ -376,7 +524,9 @@ fn safe_file_name(value: &str) -> String {
 struct CachedCoursePayload<'a> {
     slug: &'a str,
     title: &'a str,
+    thumbnail_url: Option<&'a str>,
     chapters: Vec<CachedChapter<'a>>,
+    assessments: Vec<CachedAssessment<'a>>,
     exercise_files: Vec<CachedExerciseFile<'a>>,
 }
 
@@ -393,6 +543,7 @@ struct CachedVideo<'a> {
     duration_seconds: Option<u64>,
     has_download_url: bool,
     has_transcript: bool,
+    has_quiz: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -400,11 +551,19 @@ struct CachedExerciseFile<'a> {
     file_name: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct CachedAssessment<'a> {
+    title: &'a str,
+    entity_urn: Option<&'a str>,
+    has_quiz: bool,
+}
+
 impl<'a> From<&'a Course> for CachedCoursePayload<'a> {
     fn from(course: &'a Course) -> Self {
         Self {
             slug: &course.slug,
             title: &course.title,
+            thumbnail_url: course.thumbnail_url.as_deref(),
             chapters: course
                 .chapters
                 .iter()
@@ -419,8 +578,18 @@ impl<'a> From<&'a Course> for CachedCoursePayload<'a> {
                             duration_seconds: video.duration_seconds,
                             has_download_url: video.download_url.is_some(),
                             has_transcript: video.transcript_srt.is_some(),
+                            has_quiz: video.quiz_markdown.is_some(),
                         })
                         .collect(),
+                })
+                .collect(),
+            assessments: course
+                .assessments
+                .iter()
+                .map(|assessment| CachedAssessment {
+                    title: &assessment.title,
+                    entity_urn: assessment.entity_urn.as_deref(),
+                    has_quiz: assessment.quiz_markdown.is_some(),
                 })
                 .collect(),
             exercise_files: course
@@ -566,9 +735,10 @@ mod tests {
             ("https://cdn.example.test/welcome.mp4", 200, b"video"),
             (
                 "https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh",
-                404,
+                400,
                 b"",
             ),
+            ("https://cdn.example.test/exercise.zip", 404, b""),
         ]);
 
         let summary = process_next_queued_job_and_download_artifacts(
@@ -585,11 +755,13 @@ mod tests {
         let video_path = output
             .path()
             .join("Sample Course")
-            .join("Welcome video.mp4");
+            .join("01 - Getting started")
+            .join("01 - Welcome video.mp4");
         let subtitle_path = output
             .path()
             .join("Sample Course")
-            .join("Welcome video.srt");
+            .join("01 - Getting started")
+            .join("01 - Welcome video.srt");
 
         assert_eq!(
             summary,
@@ -605,6 +777,12 @@ mod tests {
             .unwrap()
             .contains("Welcome."));
         assert_eq!(artifacts.len(), 3);
+        assert!(artifacts.iter().any(|artifact| artifact
+            .path
+            .ends_with("Sample Course\\01 - Getting started\\01 - Welcome video.mp4")
+            || artifact
+                .path
+                .ends_with("Sample Course/01 - Getting started/01 - Welcome video.mp4")));
         assert_eq!(
             artifacts
                 .iter()
@@ -613,6 +791,61 @@ mod tests {
                 .status,
             "failed"
         );
+    }
+
+    #[test]
+    fn browser_quiz_assessments_are_merged_and_written_as_quiz_artifacts() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        let mut job = sample_job("job-1", "queued", 100);
+        job.output_dir = output.path().to_string_lossy().to_string();
+        insert_job(&connection, &job).unwrap();
+        let mut course_client = FakeCourseApiClient::new(vec![
+            ("fields=chapters,title,exerciseFiles", metadata_fixture()),
+            (
+                "https://www.linkedin.com/learning/sample-course",
+                r#"https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh"#,
+            ),
+            ("resolution=_1080", selected_video_fixture()),
+        ]);
+        let mut artifact_client = FakeArtifactClient::new(vec![
+            ("https://cdn.example.test/welcome.mp4", 200, b"video"),
+            (
+                "https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh",
+                400,
+                b"",
+            ),
+            ("https://cdn.example.test/exercise.zip", 404, b""),
+        ]);
+
+        let summary = process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+            &connection,
+            &mut course_client,
+            &mut artifact_client,
+            &NeverCancelled,
+            200,
+            vec![CourseAssessment {
+                title: "Chapter Quiz".to_string(),
+                entity_urn: Some("urn:li:learningApiAssessment:1".to_string()),
+                tracking_urn: Some("urn:li:lyndaAssessment:abc".to_string()),
+                quiz_markdown: Some("# Chapter Quiz\n\n1. Question?\n   - Option\n".to_string()),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        let quiz_path = output
+            .path()
+            .join("Sample Course")
+            .join("01 - Chapter Quiz.quiz.md");
+
+        assert_eq!(summary.completed, 3);
+        assert_eq!(summary.failed, 1);
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "quiz"));
+        assert!(fs::read_to_string(quiz_path).unwrap().contains("Question?"));
     }
 
     #[test]
@@ -720,11 +953,14 @@ mod tests {
         JobRecord {
             id: id.to_string(),
             course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
             status: status.to_string(),
             selected_quality: "1080".to_string(),
             download_videos: true,
             download_exercises: true,
             download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
             output_dir: "C:/downloads".to_string(),
             created_at: timestamp,
             updated_at: timestamp,

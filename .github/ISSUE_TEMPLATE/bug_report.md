@@ -14,4 +14,4 @@ A clear and concise description of what the bug is.
  [e.g. Windows 10]
 
 **Log File**
-Upload the latest log file present at `%localappdata%\Linkedin-Learning-Courses-Downloader\app-1.1.0\logs` here.
+Upload the latest LinkVault log file from the app `logs` folder here.

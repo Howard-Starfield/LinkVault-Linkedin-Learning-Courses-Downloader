@@ -1,33 +1,53 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import {
-  Activity,
-  Captions,
-  CheckCircle2,
-  ChevronDown,
   CircleHelp,
   Folder,
   History,
-  Import,
-  Pause,
+  PanelLeft,
   Play,
+  RotateCcw,
   Settings,
   SunMedium,
   Trash2,
-  Video,
-  Wand2,
-  X,
-  XCircle
+  X
 } from "lucide-react";
 import { IconBrandLinkedin, IconMovie, IconTool } from "@tabler/icons-react";
-import { Button, Checkbox, Dialog, Field, IconButton, Input, Panel, Popover, Progress, Select, Textarea, Tooltip, guardedToast } from "./components/primitives";
+import {
+  ActivityEventRow,
+  Button,
+  Checkbox,
+  DataTable,
+  DataTableHeader,
+  DataTableRow,
+  Dialog,
+  EmptyRow,
+  Field,
+  IconButton,
+  Input,
+  Panel,
+  Popover,
+  Progress,
+  Select,
+  SidebarItem,
+  StatusBadge,
+  SummaryChip,
+  Switch,
+  Textarea,
+  Tooltip,
+  guardedToast
+} from "./components/primitives";
 
 type ParsedCourse = {
   original: string;
   normalized_url: string;
   slug: string;
+  quiz_urls: string[];
+  assessment_urns: string[];
 };
 
 type ValidatedLinkedInSession = {
@@ -41,6 +61,7 @@ type QueuedDownloadJob = {
   course_slug: string;
   source_url: string;
   status: string;
+  thumbnail_url?: string | null;
   selected_quality?: string;
   output_dir?: string;
   updated_at?: number;
@@ -59,6 +80,8 @@ type ArtifactProgressCounts = {
   video_completed: number;
   subtitle_total: number;
   subtitle_completed: number;
+  quiz_total?: number;
+  quiz_completed?: number;
   exercise_total: number;
   exercise_completed: number;
 };
@@ -70,6 +93,8 @@ type PersistedJobEvent = {
   message: string;
   created_at: number;
 };
+
+type ActivityRow = [time: string, label: string, tone?: string];
 
 type StartDownloadResponse = {
   jobs: QueuedDownloadJob[];
@@ -84,6 +109,7 @@ type StartDownloadRequest = {
   downloadVideos: boolean;
   downloadExercises: boolean;
   downloadSubtitles: boolean;
+  downloadQuizzes: boolean;
 };
 
 type ProcessQueuedDownloadResponse = {
@@ -105,12 +131,14 @@ type SavedDownloadPreferences = {
   downloadVideos: boolean;
   downloadExercises: boolean;
   downloadSubtitles: boolean;
+  downloadQuizzes?: boolean;
 };
 
 type BootstrapState = {
   default_resolution: string;
   browser_sources: string[];
   stores_plaintext_tokens_in_sqlite: boolean;
+  has_saved_token: boolean;
   saved_download_preferences: SavedDownloadPreferences | null;
   persisted_jobs: QueuedDownloadJob[];
   recent_events: PersistedJobEvent[];
@@ -122,44 +150,131 @@ type PreviewCourseUrlError =
   | { type: "missingSlug"; line: number }
   | { type: "invalidUrl"; line: number };
 
+const SIDEBAR_MIN_WIDTH = 208;
+const SIDEBAR_MAX_WIDTH = 320;
+const SIDEBAR_DEFAULT_WIDTH = 220;
+const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
+
+function clampSidebarWidth(width: number) {
+  return Math.min(Math.max(width, SIDEBAR_MIN_WIDTH), SIDEBAR_MAX_WIDTH);
+}
+
 export default function App() {
   const [courseUrls, setCourseUrls] = useState("");
-  const [folder, setFolder] = useState("/Users/ian/Downloads/LinkedIn Courses");
+  const [folder, setFolder] = useState("");
   const [token, setToken] = useState("");
   const [resolution, setResolution] = useState("720");
   const [browserSource, setBrowserSource] = useState("Chrome");
+  const [browserSources, setBrowserSources] = useState(["Chrome", "Edge", "Firefox"]);
   const [delaySeconds, setDelaySeconds] = useState(0);
   const [downloadVideos, setDownloadVideos] = useState(true);
   const [downloadExercises, setDownloadExercises] = useState(true);
   const [downloadSubtitles, setDownloadSubtitles] = useState(true);
+  const [downloadQuizzes, setDownloadQuizzes] = useState(true);
   const [parsedCourses, setParsedCourses] = useState<ParsedCourse[]>([]);
   const [validatedSession, setValidatedSession] = useState<ValidatedLinkedInSession | null>(null);
-  const [isImportingToken, setIsImportingToken] = useState(false);
+  const [hasSavedToken, setHasSavedToken] = useState(false);
   const [isValidatingToken, setIsValidatingToken] = useState(false);
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
   const [isCancellingDownload, setIsCancellingDownload] = useState(false);
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
+  const sidebarDragStart = useRef({ x: 0, width: SIDEBAR_DEFAULT_WIDTH });
+  const sidebarDragCleanup = useRef<(() => void) | null>(null);
+  const wasSettingsOpen = useRef(false);
 
   useEffect(() => {
     refreshBootstrapState();
   }, []);
 
+  useEffect(() => {
+    const storedWidth = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+    if (Number.isFinite(storedWidth)) {
+      setSidebarWidth(clampSidebarWidth(storedWidth));
+    }
+    setIsSidebarCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true");
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(isSidebarCollapsed));
+  }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    if (wasSettingsOpen.current && !isSettingsOpen) {
+      window.requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>('[aria-label="Open settings"]')?.focus();
+      });
+    }
+    wasSettingsOpen.current = isSettingsOpen;
+  }, [isSettingsOpen]);
+
+  function startSidebarResize(event: ReactMouseEvent<HTMLButtonElement>) {
+    if (isSidebarCollapsed) return;
+    sidebarDragStart.current = { x: event.clientX, width: sidebarWidth };
+    setIsDraggingSidebar(true);
+    sidebarDragCleanup.current?.();
+
+    function handleMouseMove(moveEvent: MouseEvent) {
+      const nextWidth = sidebarDragStart.current.width + moveEvent.clientX - sidebarDragStart.current.x;
+      setSidebarWidth(clampSidebarWidth(nextWidth));
+    }
+
+    function stopDragging() {
+      setIsDraggingSidebar(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopDragging);
+      sidebarDragCleanup.current = null;
+    }
+
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopDragging);
+    sidebarDragCleanup.current = stopDragging;
+    event.preventDefault();
+  }
+
+  useEffect(() => {
+    return () => {
+      sidebarDragCleanup.current?.();
+    };
+  }, []);
+
   async function refreshBootstrapState() {
+    if (!isTauriRuntime()) {
+      const previewPreferences = readPreviewPreferences();
+      if (previewPreferences) {
+        applyDownloadPreferences(previewPreferences);
+      }
+      const previewState = getBrowserPreviewState();
+      if (previewState) {
+        setQueuedJobs(previewState.jobs);
+        setHasSavedToken(hasPreviewSavedToken());
+        setPersistedEvents(previewState.events);
+      }
+      return;
+    }
+
     try {
       const state = await invoke<BootstrapState>("bootstrap_state");
+      setBrowserSources(state.browser_sources.length > 0 ? state.browser_sources : browserSources);
       const preferences = state.saved_download_preferences;
       if (preferences) {
-        setFolder(preferences.outputDir);
-        setResolution(preferences.selectedQuality);
-        setDelaySeconds(preferences.delaySeconds);
-        setBrowserSource(preferences.browserSource);
-        setDownloadVideos(preferences.downloadVideos);
-        setDownloadExercises(preferences.downloadExercises);
-        setDownloadSubtitles(preferences.downloadSubtitles);
+        applyDownloadPreferences(preferences);
       } else if (state.default_resolution) {
         setResolution(String(state.default_resolution).replace("P", ""));
       }
@@ -169,26 +284,58 @@ export default function App() {
       } else {
         setQueuedJobs([]);
       }
+      setHasSavedToken(state.has_saved_token);
       setPersistedEvents(state.recent_events ?? []);
     } catch {
       // Browser-only Vite previews do not expose Tauri commands.
       const previewState = getBrowserPreviewState();
       if (previewState) {
-        if (getPreviewScenario() === "reference") {
-          setFolder("/Users/ian/Downloads/LinkedIn Courses");
-          setResolution("720");
-          setBrowserSource("Chrome");
-          setDelaySeconds(0);
-        }
         setQueuedJobs(previewState.jobs);
+        setHasSavedToken(hasPreviewSavedToken());
         setPersistedEvents(previewState.events);
       }
     }
   }
 
+  function markNextQueuedJobActiveForLiveStats() {
+    setQueuedJobs((jobs) => {
+      const queuedIndex = jobs.findIndex((job) => job.status === "queued");
+      if (queuedIndex < 0) return jobs;
+      return jobs.map((job, index) => (
+        index === queuedIndex
+          ? { ...job, status: "active", updated_at: Math.floor(Date.now() / 1000) }
+          : job
+      ));
+    });
+  }
+
+  function currentDownloadPreferences(): SavedDownloadPreferences {
+    return {
+      outputDir: folder,
+      selectedQuality: resolution,
+      delaySeconds,
+      browserSource,
+      downloadVideos,
+      downloadExercises,
+      downloadSubtitles,
+      downloadQuizzes
+    };
+  }
+
+  function applyDownloadPreferences(preferences: SavedDownloadPreferences) {
+    setFolder(preferences.outputDir);
+    setResolution(preferences.selectedQuality);
+    setDelaySeconds(preferences.delaySeconds);
+    setBrowserSource(preferences.browserSource);
+    setDownloadVideos(preferences.downloadVideos);
+    setDownloadExercises(preferences.downloadExercises);
+    setDownloadSubtitles(preferences.downloadSubtitles);
+    setDownloadQuizzes(preferences.downloadQuizzes ?? true);
+  }
+
   const canStart = useMemo(
-    () => courseUrls.trim().length > 0 && (token.trim().length > 0 || validatedSession !== null) && !isProcessingDownload,
-    [courseUrls, token, validatedSession, isProcessingDownload]
+    () => courseUrls.trim().length > 0 && folder.trim().length > 0 && (token.trim().length > 0 || validatedSession !== null || hasSavedToken) && !isProcessingDownload,
+    [courseUrls, folder, token, validatedSession, hasSavedToken, isProcessingDownload]
   );
 
   const queueCounts = useMemo(
@@ -203,25 +350,18 @@ export default function App() {
     [queuedJobs]
   );
 
-  const activeQueueJobs = queuedJobs.filter((job) => !isTerminalJob(job.status));
-  const terminalJobs = queuedJobs.filter((job) => isTerminalJob(job.status));
-  const referencePreview = getPreviewScenario() === "reference";
-  const displayedQueueJobs = referencePreview ? queuedJobs : activeQueueJobs;
-  const liveProgressJob = activeQueueJobs.find((job) => job.status === "active") ?? activeQueueJobs[0] ?? null;
-  const persistedActivityEvents = persistedEvents.map((event) => [
-    formatEventTime(event.created_at),
-    event.message,
-    eventTone(event.event_type)
-  ]);
+  const liveQueueJobs = queuedJobs.filter((job) => shouldShowInLiveQueue(job.status));
+  const completedJobs = completedCourseJobs(queuedJobs);
+  const displayedQueueJobs = liveQueueJobs;
+  const persistedActivityEvents = coalesceActivityEvents(persistedEvents);
 
   const queueSummary = queuedJobs.length > 0
-    ? [
+    ? ([
         queueCounts.active ? `${queueCounts.active} active` : null,
         queueCounts.queued ? `${queueCounts.queued} queued` : null,
-        queueCounts.completed ? `${queueCounts.completed} completed` : null,
         queueCounts.failed ? `${queueCounts.failed} failed` : null,
         queueCounts.cancelled ? `${queueCounts.cancelled} cancelled` : null
-      ].filter(Boolean).join(" • ")
+      ].filter(Boolean).join(" - ") || "0 active")
     : "No persisted jobs";
 
   const activityEvents = processingSummary?.processed
@@ -232,8 +372,30 @@ export default function App() {
           processingSummary.failed_artifacts > 0 ? "danger" : "success"
         ],
         ...persistedActivityEvents
-      ]
+      ] satisfies ActivityRow[]
     : persistedActivityEvents;
+
+  const activitySummary = {
+    active: queueCounts.active ?? 0,
+    completed: queueCounts.completed ?? 0,
+    failed: (queueCounts.failed ?? 0) + (queueCounts.cancelled ?? 0)
+  };
+
+  async function clearFailedQueueItems() {
+    if (activitySummary.failed === 0) return;
+    try {
+      const state = await clearFailedDownloadJobs();
+      setQueuedJobs(state.persisted_jobs);
+      setPersistedEvents(state.recent_events ?? []);
+      setHasSavedToken(state.has_saved_token);
+      setProcessingSummary(null);
+      toast.info("Failed queue cleared", {
+        description: "Failed and cancelled items were removed from the queue."
+      });
+    } catch (error) {
+      toast.error("Clear failed queue failed", { description: String(error) });
+    }
+  }
 
   async function validateUrls() {
     if (!courseUrls.trim()) {
@@ -264,6 +426,8 @@ export default function App() {
       setIsValidatingToken(true);
       try {
         session = await validateLinkedInToken(token);
+        await saveLinkedInToken(token);
+        setHasSavedToken(true);
         setValidatedSession(session);
       } catch (error) {
         toast.error("Token validation failed", { description: String(error) });
@@ -271,8 +435,8 @@ export default function App() {
         return;
       }
       setIsValidatingToken(false);
-    } else if (!session) {
-      toast.warning("LinkedIn token required", { description: "Paste li_at or import a browser token before starting." });
+    } else if (!session && !hasSavedToken) {
+      toast.warning("LinkedIn token required", { description: "Paste li_at once; LinkVault will save it for future launches." });
       return;
     }
     try {
@@ -286,16 +450,20 @@ export default function App() {
         browserSource,
         downloadVideos,
         downloadExercises,
-        downloadSubtitles
+        downloadSubtitles,
+        downloadQuizzes
       });
       setQueuedJobs(response.jobs);
+      setParsedCourses([]);
       toast.success("Download queued", {
         description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} persisted to the local queue.`
       });
 
-      const processResponse = token.trim()
-        ? await processNextQueuedDownloadWithToken(token)
-        : await processNextQueuedDownloadFromBrowserSource(browserSource);
+      const processResponse = await processQueuedDownloadWithLiveRefresh(() =>
+        token.trim()
+          ? processNextQueuedDownloadWithToken(token)
+          : processNextQueuedDownloadWithSavedToken()
+      );
 
       setProcessingSummary(processResponse);
       await refreshBootstrapState();
@@ -314,20 +482,65 @@ export default function App() {
     }
   }
 
-  async function importToken() {
-    setIsImportingToken(true);
+  async function processQueuedDownloadWithLiveRefresh(processOperation: () => Promise<ProcessQueuedDownloadResponse>) {
+    markNextQueuedJobActiveForLiveStats();
+    let settled = false;
+    const processPromise = processOperation().finally(() => {
+      settled = true;
+    });
+
+    void sleep(50).then(() => {
+      if (!settled) void refreshBootstrapState();
+    });
+
+    while (!settled) {
+      await sleep(150);
+      if (!settled) {
+        await refreshBootstrapState();
+      }
+    }
+
+    const response = await processPromise;
+    await refreshBootstrapState();
+    return response;
+  }
+
+  async function clearToken() {
     try {
-      const session = await invoke<ValidatedLinkedInSession>("validate_browser_token_source", { source: browserSource });
-      setValidatedSession(session);
-      toast.success("Browser token validated", {
-        description: `${browserSource} provided a usable LinkedIn Learning session.`
+      await clearSavedLinkedInToken();
+      setHasSavedToken(false);
+      setToken("");
+      setValidatedSession(null);
+      toast.info("Saved token cleared", {
+        description: "Paste a LinkedIn li_at token before the next download."
       });
     } catch (error) {
-      toast.error("Browser token import failed", {
-        description: String(error)
+      toast.error("Token clear failed", { description: String(error) });
+    }
+  }
+
+  async function saveSettings() {
+    if (!folder.trim()) {
+      toast.warning("Download folder required", { description: "Choose a default folder before saving settings." });
+      return;
+    }
+
+    setIsSavingSettings(true);
+    const startedAt = Date.now();
+    try {
+      const preferences = await saveDownloadPreferences(currentDownloadPreferences());
+      applyDownloadPreferences(preferences);
+      toast.success("Settings saved", {
+        description: "Download defaults will be restored the next time LinkVault opens."
       });
+    } catch (error) {
+      toast.error("Settings save failed", { description: String(error) });
     } finally {
-      setIsImportingToken(false);
+      const remaining = 320 - (Date.now() - startedAt);
+      if (remaining > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remaining));
+      }
+      setIsSavingSettings(false);
     }
   }
 
@@ -346,6 +559,68 @@ export default function App() {
       toast.error("Cancellation failed", { description: String(error) });
     } finally {
       setIsCancellingDownload(false);
+    }
+  }
+
+  async function retryDownloadJob(job: QueuedDownloadJob) {
+    if (job.status !== "failed") return;
+    if (!token.trim() && !hasSavedToken) {
+      toast.warning("LinkedIn token required", {
+        description: "Paste li_at once before retrying this failed course."
+      });
+      return;
+    }
+
+    try {
+      setIsProcessingDownload(true);
+      setProcessingSummary(null);
+      await retryFailedDownloadJob(job.id);
+      setQueuedJobs((jobs) =>
+        jobs.map((candidate) =>
+          candidate.id === job.id
+            ? { ...candidate, status: "queued", artifact_counts: emptyArtifactCounts() }
+            : candidate
+        )
+      );
+      toast.info("Retry queued", { description: courseDisplayName(job) });
+
+      const processResponse = await processQueuedDownloadWithLiveRefresh(() =>
+        token.trim()
+          ? processNextQueuedDownloadWithToken(token)
+          : processNextQueuedDownloadWithSavedToken()
+      );
+
+      setProcessingSummary(processResponse);
+      await refreshBootstrapState();
+      if (processResponse.processed) {
+        showProcessedDownloadToast(processResponse);
+      } else {
+        toast.info("No queued download to process", {
+          description: "The retry was queued, but no pending course was available."
+        });
+      }
+    } catch (error) {
+      await refreshBootstrapState();
+      toast.error("Retry failed", { description: String(error) });
+    } finally {
+      setIsProcessingDownload(false);
+    }
+  }
+
+  async function openCompletedFolder(job: QueuedDownloadJob) {
+    const outputDir = job.output_dir?.trim();
+    if (!outputDir) {
+      toast.warning("Folder unavailable", { description: "This completed course does not have a saved output folder." });
+      return;
+    }
+
+    try {
+      const opened = await openDownloadFolder(outputDir);
+      if (opened) {
+        toast.success("Folder opened", { description: outputDir });
+      }
+    } catch (error) {
+      toast.error("Open folder failed", { description: String(error) });
     }
   }
 
@@ -372,46 +647,43 @@ export default function App() {
 
   return (
     <>
-    <div className="lv-shell">
+    <div
+      className="lv-shell"
+      data-sidebar-dragging={isDraggingSidebar || undefined}
+      data-sidebar-state={isSidebarCollapsed ? "collapsed" : "expanded"}
+      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+    >
       <aside className="lv-sidebar" aria-label="Primary navigation">
         <div className="grid gap-0.5 border-b border-sidebar-border px-3 pb-7 pt-4">
-          <div className="flex h-7 items-center gap-2">
-            <span className="h-2.5 w-2.5 rounded-full bg-window-red" />
-            <span className="h-2.5 w-2.5 rounded-full bg-window-yellow" />
-            <span className="h-2.5 w-2.5 rounded-full bg-window-green" />
+          <div className="flex h-7 items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-window-red" />
+              <span className="h-2.5 w-2.5 rounded-full bg-window-yellow" />
+              <span className="h-2.5 w-2.5 rounded-full bg-window-green" />
+            </div>
+            <Tooltip label="Toggle sidebar">
+              <IconButton className="lv-sidebar-trigger" aria-label="Toggle sidebar" aria-expanded={!isSidebarCollapsed} onClick={() => setIsSidebarCollapsed(true)}>
+                <PanelLeft aria-hidden="true" className="h-4 w-4" />
+              </IconButton>
+            </Tooltip>
           </div>
-          <h1 className="mt-5 text-xl font-semibold tracking-normal text-sidebar-foreground">LinkVault</h1>
+          <h1 className="mt-5 text-sm font-semibold tracking-normal text-sidebar-foreground">LinkVault</h1>
           <p className="text-xs text-sidebar-muted">Course and video archive</p>
         </div>
 
-        <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-sm">
-          <button className="lv-nav-row active" type="button">
-            <IconBrandLinkedin aria-hidden="true" size={18} />
-            <span>LinkedIn Courses</span>
-          </button>
-          <button className="lv-nav-row disabled" type="button" aria-disabled="true" title="Unavailable in the LinkedIn Learning MVP">
-            <IconMovie aria-hidden="true" size={18} />
-            <span>Generic Video</span>
-          </button>
-          <button className="lv-nav-row" type="button">
-            <IconTool aria-hidden="true" size={18} />
-            <span>Tools</span>
-          </button>
-          <button className="lv-nav-row" type="button">
-            <History aria-hidden="true" />
-            <span>History</span>
-          </button>
+        <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
+          <SidebarItem active icon={<IconBrandLinkedin aria-hidden="true" size={18} />}>LinkedIn Courses</SidebarItem>
+          <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
+          <SidebarItem icon={<IconTool aria-hidden="true" size={18} />}>Tools</SidebarItem>
+          <SidebarItem icon={<History aria-hidden="true" />}>History</SidebarItem>
           <div className="mt-7 flex items-center justify-between border-t border-sidebar-border pt-6 text-xs text-sidebar-muted">
             <span>LinkedIn Scraper</span>
             <span className="rounded-full border border-sidebar-border px-2 py-0.5 text-[11px]">Coming Soon</span>
           </div>
-          <button className="lv-nav-row mt-5" type="button">
-            <Settings aria-hidden="true" />
-            <span>Settings</span>
-          </button>
+          <SidebarItem className="mt-5" icon={<Settings aria-hidden="true" />} aria-label="Open settings" onClick={() => setIsSettingsOpen(true)}>Settings</SidebarItem>
         </nav>
 
-        <div className="flex items-center justify-between px-6 py-4 text-xs text-sidebar-muted">
+        <div className="flex items-center justify-between py-4 pl-6 pr-0 text-xs text-sidebar-muted">
           <span>v1.2.0</span>
           <div className="flex items-center gap-2">
             <SunMedium aria-hidden="true" className="h-4 w-4" />
@@ -419,6 +691,8 @@ export default function App() {
               label="LinkVault help"
               open={isHelpOpen}
               onOpenChange={setIsHelpOpen}
+              side="right"
+              align="end"
               trigger={
                 <Tooltip label="Open help">
                   <IconButton aria-label="Open help" aria-expanded={isHelpOpen} onClick={() => setIsHelpOpen((open) => !open)}>
@@ -429,51 +703,48 @@ export default function App() {
             >
               <div className="text-xs font-semibold text-muted-strong">LinkedIn Courses MVP</div>
               <p className="mt-2 text-xs leading-5 text-muted">
-                Generic Video and LinkedIn Scraper are visible for context only. Course downloads use manual or browser-imported LinkedIn sessions.
+                Generic Video and LinkedIn Scraper are visible for context only. Course downloads use a saved local LinkedIn session after you paste li_at once.
               </p>
             </Popover>
           </div>
         </div>
+        <button
+          type="button"
+          className="lv-sidebar-rail"
+          aria-label="Resize sidebar"
+          tabIndex={-1}
+          onMouseDown={startSidebarResize}
+        />
       </aside>
-
       <main className="lv-main">
-        <header className="lv-header">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="grid h-6 w-6 place-items-center rounded-md border border-primary/50 bg-primary/10 text-primary">
-              <Play aria-hidden="true" className="h-3.5 w-3.5" />
-            </span>
-            <h2 className="truncate text-xl font-semibold text-foreground">LinkedIn Courses</h2>
-          </div>
-          <div className="ml-auto flex items-center gap-3">
-            <span className="inline-flex h-8 items-center gap-2 rounded-md border border-success/25 bg-success/10 px-3 text-xs text-foreground">
-              <span className="h-2 w-2 rounded-full bg-success" />
-              Downloader online
-            </span>
-            <Tooltip label="Open settings">
-              <IconButton aria-label="Open settings" onClick={() => setIsSettingsOpen(true)}>
-                <Settings aria-hidden="true" className="h-4 w-4" />
-              </IconButton>
-            </Tooltip>
-          </div>
-        </header>
-
         <div className="lv-content">
-          <div className="grid min-w-0 gap-3">
-            <Panel className="p-5">
-              <div className="mb-5 flex items-start gap-3">
-                <span className="mt-0.5 grid h-5 w-5 place-items-center rounded border border-primary/50 text-primary">
-                  <Video aria-hidden="true" className="h-3.5 w-3.5" />
-                </span>
+          <div className="lv-workspace">
+            <Panel className="command-panel">
+              <div className="section-heading command-section-heading">
+                <button
+                  type="button"
+                  className="lv-sidebar-reopen"
+                  aria-label="Show sidebar"
+                  aria-hidden={!isSidebarCollapsed}
+                  tabIndex={isSidebarCollapsed ? 0 : -1}
+                  onClick={() => setIsSidebarCollapsed(false)}
+                >
+                  <PanelLeft aria-hidden="true" className="h-4 w-4" />
+                </button>
                 <div className="min-w-0">
-                  <h3 className="text-base font-semibold text-foreground">Course Setup</h3>
-                  <p className="mt-1 text-xs text-muted">Configure your download and start archiving LinkedIn Learning courses.</p>
+                  <h3>Linkedin Course</h3>
+                  <p>Paste LinkedIn Learning course URLs and choose what to download.</p>
+                </div>
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  <StatusBadge tone={hasSavedToken || validatedSession ? "success" : "muted"}>
+                    {hasSavedToken || validatedSession ? "Saved session active" : "Session required"}
+                  </StatusBadge>
                 </div>
               </div>
 
-              <div className="grid gap-3">
+              <div className="command-grid">
                 <Field label="Course URLs">
-                  <div className="grid grid-cols-[36px_minmax(0,1fr)] overflow-hidden rounded-md border border-input bg-field">
-                    <div className="border-r border-input px-3 py-2 text-right text-xs leading-5 text-muted">1</div>
+                  <div className="course-url-field compact-url-field">
                     <Textarea
                       value={courseUrls}
                       onChange={(event) => {
@@ -483,46 +754,45 @@ export default function App() {
                       onBlur={validateUrls}
                       placeholder="One course URL per line"
                       spellCheck={false}
-                      className="min-h-20 border-0 bg-transparent focus:ring-0"
+                      className="course-url-textarea"
                       aria-label="Course URLs"
                     />
                   </div>
                 </Field>
 
-                <Field label="Download folder">
-                  <div className="field-action-grid">
-                    <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Download folder" />
-                    <Button type="button" onClick={browseDownloadFolder}>
-                      <Folder aria-hidden="true" className="h-4 w-4" />
-                      Browse
-                    </Button>
-                  </div>
-                </Field>
+                <div className="compact-field-row">
+                  <Field label="Download folder">
+                    <div className="field-action-grid">
+                      <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Download folder" />
+                      <Button type="button" onClick={browseDownloadFolder}>
+                        <Folder aria-hidden="true" className="h-3.5 w-3.5" />
+                        Browse
+                      </Button>
+                    </div>
+                  </Field>
 
-                <Field label="Token cookie">
-                  <div className="field-action-grid">
-                    <Input
-                      value={token}
-                      onChange={(event) => {
-                        setToken(event.target.value);
-                        setValidatedSession(null);
-                      }}
-                      placeholder="Paste your LinkedIn li_at cookie value"
-                      type="password"
-                      aria-label="LinkedIn li_at token"
-                    />
-                    <Button type="button" onClick={() => {
-                      setToken("");
-                      setValidatedSession(null);
-                    }}>
-                      <Trash2 aria-hidden="true" className="h-4 w-4" />
-                      Clear
-                    </Button>
-                  </div>
-                </Field>
+                  <Field label="Token cookie">
+                    <div className="field-action-grid token-grid">
+                      <Input
+                        value={token}
+                        onChange={(event) => {
+                          setToken(event.target.value);
+                          setValidatedSession(null);
+                        }}
+                        placeholder={hasSavedToken ? "Saved token available" : "Paste your LinkedIn li_at cookie value"}
+                        type="password"
+                        aria-label="LinkedIn li_at token"
+                      />
+                      <Button type="button" onClick={clearToken}>
+                        <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+                        Clear
+                      </Button>
+                    </div>
+                  </Field>
+                </div>
 
-                <div className="grid gap-3 md:grid-cols-2">
-                  <Field label="Video resolution">
+                <div className="option-row">
+                  <Field label="Quality">
                     <Select value={resolution} onChange={(event) => setResolution(event.target.value)} aria-label="Video resolution">
                       <option value="1080">1080 (Best)</option>
                       <option value="720">720 (High)</option>
@@ -530,24 +800,7 @@ export default function App() {
                       <option value="360">360 (Low)</option>
                     </Select>
                   </Field>
-                  <Field label="Browser token source">
-                    <Select
-                      value={browserSource}
-                      onChange={(event) => {
-                        setBrowserSource(event.target.value);
-                        setValidatedSession(null);
-                      }}
-                      aria-label="Browser token source"
-                    >
-                      <option>Chrome</option>
-                      <option>Edge</option>
-                      <option>Firefox</option>
-                    </Select>
-                  </Field>
-                </div>
-
-                <div className="grid gap-3 md:grid-cols-2">
-                  <Field label="Delay seconds">
+                  <Field label="Delay">
                     <Input
                       value={delaySeconds}
                       type="number"
@@ -556,99 +809,64 @@ export default function App() {
                       aria-label="Delay seconds"
                     />
                   </Field>
-                  <div className="grid content-end gap-1.5 pb-0.5">
-                    <Checkbox checked={downloadVideos} onChange={(event) => setDownloadVideos(event.target.checked)} label="Download videos" />
-                    <Checkbox checked={downloadExercises} onChange={(event) => setDownloadExercises(event.target.checked)} label="Download exercise files" />
-                    <Checkbox checked={downloadSubtitles} onChange={(event) => setDownloadSubtitles(event.target.checked)} label="Download subtitles" />
+                  <div className="download-toggles">
+                    <Checkbox checked={downloadVideos} onChange={(event) => setDownloadVideos(event.target.checked)} label="Videos" />
+                    <Checkbox checked={downloadExercises} onChange={(event) => setDownloadExercises(event.target.checked)} label="Exercises" />
+                    <Checkbox checked={downloadSubtitles} onChange={(event) => setDownloadSubtitles(event.target.checked)} label="Subtitles" />
+                    <Checkbox checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Quizzes" />
+                  </div>
+                  <div className="command-actions">
+                    <Button type="button" variant="primary" onClick={startDownload} disabled={!canStart || isValidatingToken || isProcessingDownload}>
+                      <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                      {isValidatingToken ? "Validating" : isProcessingDownload ? "Processing" : "Start Download"}
+                    </Button>
+                    <Button type="button" variant="outline" onClick={cancelDownload} disabled={!isProcessingDownload || isCancellingDownload}>
+                      <X aria-hidden="true" className="h-3.5 w-3.5" />
+                      {isCancellingDownload ? "Cancelling" : "Cancel"}
+                    </Button>
                   </div>
                 </div>
               </div>
-
-              <div className="mt-5 flex flex-wrap justify-end gap-2">
-                <Button type="button" onClick={importToken} disabled={isImportingToken || isValidatingToken || isProcessingDownload}>
-                  <Import aria-hidden="true" className="h-4 w-4" />
-                  {isImportingToken ? "Importing" : "Import Token"}
-                </Button>
-                <Button type="button" variant="primary" onClick={startDownload} disabled={!canStart || isImportingToken || isValidatingToken || isProcessingDownload}>
-                  <Play aria-hidden="true" className="h-4 w-4" />
-                  {isValidatingToken ? "Validating" : isProcessingDownload ? "Processing" : "Start Download"}
-                </Button>
-                <Button type="button" variant="outline" onClick={cancelDownload} disabled={!isProcessingDownload || isCancellingDownload}>
-                  <X aria-hidden="true" className="h-4 w-4" />
-                  {isCancellingDownload ? "Cancelling" : "Cancel"}
-                </Button>
-              </div>
             </Panel>
 
-            <Panel className="overflow-hidden">
-              <div className="flex h-12 items-center justify-between border-b border-border px-4">
-                <h3 className="text-sm font-semibold">Download Queue</h3>
-                {queuedJobs.length > 0 ? <span className="text-xs text-muted">{queueSummary}</span> : parsedCourses.length > 0 ? <span className="text-xs text-muted">{parsedCourses.length} validated</span> : null}
+            <Panel className="table-panel">
+              <div className="table-panel-header">
+                <h3>Download Queue</h3>
+                <div className="table-panel-header-status">
+                  <span>{queuedJobs.length > 0 ? queueSummary : parsedCourses.length > 0 ? `${parsedCourses.length} validated` : "0 active"}</span>
+                  {activitySummary.failed > 0 ? (
+                    <button
+                      type="button"
+                      className="queue-clear-button"
+                      aria-label="Clear failed queue items"
+                      onClick={clearFailedQueueItems}
+                    >
+                      Clear
+                    </button>
+                  ) : null}
+                </div>
               </div>
-              <div className="grid gap-2 p-3">
-                {displayedQueueJobs.length > 0 ? (
-                  displayedQueueJobs.map((job) => <PersistedQueueRow key={job.id} job={job} />)
-                ) : queuedJobs.length > 0 ? (
-                  <EmptyPanelText title="No active queue" description="Completed, failed, and cancelled jobs are shown in History." />
-                ) : parsedCourses.length > 0 ? (
-                  <ValidatedCoursePreview courses={parsedCourses} />
-                ) : (
-                  <EmptyPanelText title="No persisted jobs" description="Validated LinkedIn Learning courses will appear here after Start Download persists them." />
-                )}
-              </div>
-              <div className="flex min-h-12 items-center justify-between border-t border-border px-4 text-sm text-muted">
-                <span>{queueSummary}</span>
-                <Button size="sm">
-                  <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
-                  Clear completed
-                </Button>
-              </div>
+              <DownloadQueueTable jobs={displayedQueueJobs} parsedCourses={parsedCourses} hasPersistedJobs={queuedJobs.length > 0} onRetry={retryDownloadJob} />
             </Panel>
           </div>
 
-          <Panel className="lv-activity overflow-hidden">
-            <div className="flex h-14 items-center gap-3 border-b border-border px-4">
-              <Activity aria-hidden="true" className="h-4 w-4 text-primary" />
-              <h3 className="text-base font-semibold">Activity</h3>
+          <Panel className="lv-activity">
+            <div className="activity-summary-grid">
+              <ActivitySummaryChip label="Active" value={activitySummary.active} tone="primary" />
+              <ActivitySummaryChip label="Completed" value={activitySummary.completed} tone="success" />
+              <ActivitySummaryChip label="Failed" value={activitySummary.failed} tone="danger" />
             </div>
-            <div className="grid gap-3 p-4">
-              <div className="flex items-center justify-between">
-                <h4 className="text-sm font-semibold">Live Progress</h4>
-                <Button size="sm">View all</Button>
+            <div className="activity-section">
+              <div className="activity-section-header">
+                <h4>Recent Activity</h4>
               </div>
-              {liveProgressJob ? (
-                <LiveProgressCard job={liveProgressJob} />
-              ) : (
-                <EmptyPanelText title="No live download" description="The next active or queued course will show SQLite artifact counts here." />
-              )}
-
-              <div className="mt-1 flex items-center justify-between">
-                <h4 className="text-sm font-semibold">Recent Activity</h4>
-                <Button size="sm">Clear</Button>
+              <ActivityLog events={activityEvents} />
+            </div>
+            <div className="activity-section completed-section">
+              <div className="activity-section-header">
+                <h4>Completed</h4>
               </div>
-              <ol className="grid gap-0 border-l border-border pl-4">
-                {activityEvents.length > 0 ? activityEvents.map(([time, label, tone]) => (
-                  <li key={`${time}-${label}`} className="relative grid grid-cols-[64px_minmax(0,1fr)] gap-2 py-2 text-xs">
-                    <span className={`absolute -left-[19px] top-3.5 h-1.5 w-1.5 rounded-full ${activityDotClass(tone)}`} />
-                    <time className="text-muted">{time}</time>
-                    <span className="line-clamp-2 text-muted-strong">{label}</span>
-                  </li>
-                )) : (
-                  <li className="py-3 text-xs text-muted">No persisted activity yet.</li>
-                )}
-              </ol>
-
-              <div className="mt-2 flex items-center justify-between border-t border-border pt-4">
-                <h4 className="text-sm font-semibold">Completed</h4>
-                <Button size="sm">View all</Button>
-              </div>
-              <div className="grid gap-2">
-                {terminalJobs.length > 0 ? (
-                  terminalJobs.slice(0, 3).map((job) => <HistoryJobRow key={job.id} job={job} />)
-                ) : (
-                  <EmptyPanelText title="No completed jobs" description="Finished and failed downloads will appear here after processing." />
-                )}
-              </div>
+              <CompletedDownloadsTable jobs={completedJobs} onOpenFolder={openCompletedFolder} />
             </div>
           </Panel>
         </div>
@@ -658,26 +876,83 @@ export default function App() {
       open={isSettingsOpen}
       onOpenChange={setIsSettingsOpen}
       title="LinkVault settings"
-      description="Local downloader settings are restored from SQLite without storing plaintext LinkedIn tokens."
+      description="Save downloader defaults, session behavior, and artifact options without storing plaintext LinkedIn tokens."
     >
-      <div className="grid gap-3 text-sm">
-        <div className="rounded-md border border-border bg-field p-3">
-          <div className="text-xs font-semibold uppercase text-muted">Default output</div>
-          <div className="mt-1 truncate text-muted-strong" title={folder}>{folder}</div>
-        </div>
-        <div className="grid gap-2 rounded-md border border-border bg-field p-3 text-xs text-muted">
-          <div className="flex items-center justify-between gap-3">
-            <span>Default resolution</span>
-            <span className="font-medium text-muted-strong">{resolution}p</span>
+      <div className="settings-grid">
+        <section className="settings-section">
+          <div className="settings-section-title">Download defaults</div>
+          <Field label="Download folder">
+            <div className="field-action-grid">
+              <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Settings download folder" />
+              <Button type="button" onClick={browseDownloadFolder}>
+                <Folder aria-hidden="true" className="h-3.5 w-3.5" />
+                Browse
+              </Button>
+            </div>
+          </Field>
+          <div className="settings-two-column">
+            <Field label="Video quality">
+              <Select value={resolution} onChange={(event) => setResolution(event.target.value)} aria-label="Settings video quality">
+                <option value="1080">1080 (Best)</option>
+                <option value="720">720 (High)</option>
+                <option value="540">540 (Medium)</option>
+                <option value="360">360 (Low)</option>
+              </Select>
+            </Field>
+            <Field label="Delay seconds">
+              <Input value={delaySeconds} type="number" min={0} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Settings delay seconds" />
+            </Field>
           </div>
-          <div className="flex items-center justify-between gap-3">
-            <span>Browser source</span>
-            <span className="font-medium text-muted-strong">{browserSource}</span>
+          <Field label="Browser source">
+            <Select value={browserSource} onChange={(event) => setBrowserSource(event.target.value)} aria-label="Settings browser source">
+              {browserSources.map((source) => <option key={source} value={source}>{source}</option>)}
+            </Select>
+          </Field>
+        </section>
+
+        <section className="settings-section">
+          <div className="settings-section-title">Artifacts</div>
+          <div className="settings-switch-list">
+            <Switch checked={downloadVideos} onChange={(event) => setDownloadVideos(event.target.checked)} label="Download videos by default" />
+            <Switch checked={downloadExercises} onChange={(event) => setDownloadExercises(event.target.checked)} label="Download exercise files" />
+            <Switch checked={downloadSubtitles} onChange={(event) => setDownloadSubtitles(event.target.checked)} label="Download subtitles" />
+            <Switch checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Extract quiz questions" />
           </div>
-          <div className="flex items-center justify-between gap-3">
+        </section>
+
+        <section className="settings-section">
+          <div className="settings-section-title">LinkedIn session</div>
+          <div className="settings-row">
+            <span>Saved token</span>
+            <span className={hasSavedToken ? "text-success" : "text-muted"}>{hasSavedToken ? "Available" : "Not saved"}</span>
+          </div>
+          <div className="settings-row">
             <span>Plaintext token storage</span>
-            <span className="font-medium text-success">Disabled</span>
+            <span className="text-success">Disabled</span>
           </div>
+          <Button type="button" variant="outline" onClick={clearToken} disabled={!hasSavedToken && !token}>
+            <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+            Clear saved token
+          </Button>
+        </section>
+
+        <section className="settings-section">
+          <div className="settings-section-title">Application</div>
+          <div className="settings-row">
+            <span>Theme</span>
+            <span>Jan dark</span>
+          </div>
+          <div className="settings-row">
+            <span>Version</span>
+            <span>v1.2.0</span>
+          </div>
+        </section>
+
+        <div className="settings-actions">
+          <Button type="button" variant="ghost" onClick={() => setIsSettingsOpen(false)}>Close</Button>
+          <Button type="button" variant="primary" onClick={saveSettings} loading={isSavingSettings} loadingLabel="Saving">
+            Save settings
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -687,6 +962,23 @@ export default function App() {
 
 function isTerminalJob(status: string) {
   return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function shouldShowInLiveQueue(status: string) {
+  return status !== "completed" && status !== "cancelled";
+}
+
+function completedCourseJobs(jobs: QueuedDownloadJob[]) {
+  const latestByCourse = new Map<string, QueuedDownloadJob>();
+  for (const job of jobs) {
+    if (job.status !== "completed") continue;
+    const key = job.course_slug || job.output_dir || job.id;
+    const existing = latestByCourse.get(key);
+    if (!existing || (job.updated_at ?? 0) >= (existing.updated_at ?? 0)) {
+      latestByCourse.set(key, job);
+    }
+  }
+  return [...latestByCourse.values()].sort((first, second) => (second.updated_at ?? 0) - (first.updated_at ?? 0));
 }
 
 function formatEventTime(timestamp: number) {
@@ -713,214 +1005,218 @@ function activityDotClass(tone?: string) {
   return "bg-primary";
 }
 
-function ValidatedCoursePreview({ courses }: { courses: ParsedCourse[] }) {
-  return (
-    <div className="grid gap-2">
-      {courses.map((course, index) => (
-        <div key={`${course.slug}-${index}`} className="grid grid-cols-[32px_minmax(0,1fr)] items-center gap-3 rounded-lg border border-border bg-field p-3">
-          <div className="grid h-8 w-8 place-items-center rounded-md bg-primary/15 text-xs font-semibold text-primary">{index + 1}</div>
-          <div className="min-w-0">
-            <div className="truncate text-sm font-semibold" title={course.slug}>{courseDisplayNameFromSlug(course.slug)}</div>
-            <div className="mt-1 truncate text-xs text-muted" title={course.normalized_url}>{course.normalized_url}</div>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
+function coalesceActivityEvents(events: PersistedJobEvent[]): ActivityRow[] {
+  const rows: ActivityRow[] = [];
+  let groupedType: string | null = null;
+  let groupedRows: ActivityRow[] = [];
+
+  function flushGroup() {
+    if (!groupedType || groupedRows.length === 0) return;
+    if (groupedRows.length < 8) {
+      rows.push(...groupedRows);
+      groupedType = null;
+      groupedRows = [];
+      return;
+    }
+
+    const [time, , tone] = groupedRows[0];
+    const label = groupedType === "artifact.active"
+      ? `${groupedRows.length} artifact downloads started`
+      : `${groupedRows.length} artifacts completed`;
+    rows.push([time, label, tone]);
+    groupedType = null;
+    groupedRows = [];
+  }
+
+  for (const event of events.slice(0, 80)) {
+    if (event.event_type === "artifact.source.diagnostic") continue;
+
+    const groupable = event.event_type === "artifact.active" || event.event_type === "artifact.completed";
+    if (groupable) {
+      if (groupedType === event.event_type) {
+        groupedRows.push([formatEventTime(event.created_at), event.message, eventTone(event.event_type)]);
+        continue;
+      }
+      flushGroup();
+      groupedType = event.event_type;
+      groupedRows = [[formatEventTime(event.created_at), event.message, eventTone(event.event_type)]];
+      continue;
+    }
+
+    flushGroup();
+    rows.push([formatEventTime(event.created_at), event.message, eventTone(event.event_type)]);
+  }
+
+  flushGroup();
+  return rows;
 }
 
-function LiveProgressCard({ job }: { job: QueuedDownloadJob }) {
-  const counts = artifactCounts(job);
-  const progress = courseOverallProgress(job, counts);
-  const title = courseDisplayName(job);
-  const subtitle = courseSubtitle(job, counts);
-  const remaining = courseRemainingText(job, counts);
-
-  return (
-    <div className="rounded-lg border border-border bg-field p-3">
-      <div className="grid grid-cols-[104px_minmax(0,1fr)] gap-3">
-        <CourseTile title={title} status={job.status} />
-        <div className="min-w-0">
-          <div className="truncate text-sm font-semibold" title={title}>{title}</div>
-          <div className="mt-1 truncate text-xs text-muted" title={subtitle}>{subtitle}</div>
-          <div className="mt-4 grid grid-cols-[1fr_auto] items-center gap-3 text-xs">
-            <Progress value={progress} />
-            <span className="font-medium text-primary">{progress}%</span>
-          </div>
-          <div className="mt-1 text-xs text-muted">{remaining}</div>
-        </div>
-      </div>
-      <div className="mt-4 grid gap-2 text-sm text-muted">
-        <ProgressLine icon={<Video aria-hidden="true" />} label="Videos" completed={counts.video_completed} total={counts.video_total} />
-        <ProgressLine icon={<Captions aria-hidden="true" />} label="Subtitles" completed={counts.subtitle_completed} total={counts.subtitle_total} />
-        <ProgressLine icon={<Wand2 aria-hidden="true" />} label="Exercise files" completed={counts.exercise_completed} total={counts.exercise_total} />
-      </div>
-    </div>
-  );
+function ActivitySummaryChip({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} />;
 }
 
-function PersistedQueueRow({ job }: { job: QueuedDownloadJob }) {
-  const counts = artifactCounts(job);
-  const progress = courseOverallProgress(job, counts);
-  const title = courseDisplayName(job);
-  const isCompleted = job.status === "completed";
-  const subtitle = courseSubtitle(job, counts);
-  const statusLabel = jobStatusLabel(job.status);
-
+function ActivityLog({ events }: { events: ActivityRow[] }) {
   return (
-    <div className="queue-row queue-row-active">
-      <CourseTile title={title} status={job.status} />
-      <div className="min-w-0">
-        <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
-          <div className="truncate text-sm font-semibold" title={title}>{title}</div>
-          <span className="shrink-0 text-xs text-muted">{subtitle}</span>
-          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${jobStatusBadgeClass(job.status)}`}>{statusLabel}</span>
-        </div>
-        {!isCompleted ? (
-          <div className="mt-3 grid grid-cols-[104px_minmax(0,1fr)_58px_38px] items-center gap-3 text-xs text-muted">
-            <span>Overall Progress</span>
-            <Progress value={progress} />
-            <span>{counts.completed} / {counts.total}</span>
-            <span>{progress}%</span>
-            <QueueProgressLine label="Videos" completed={counts.video_completed} total={counts.video_total} />
-            <QueueProgressLine label="Subtitles" completed={counts.subtitle_completed} total={counts.subtitle_total} />
-            <QueueProgressLine label="Exercise files" completed={counts.exercise_completed} total={counts.exercise_total} />
-          </div>
-        ) : null}
-      </div>
-      <div className={`text-right text-sm font-semibold ${isCompleted ? "text-success" : "text-primary"}`}>{progress}%</div>
-      {isCompleted ? (
-        <>
-          <CheckCircle2 aria-hidden="true" className="h-5 w-5 text-success" />
-          <IconButton aria-label={`Actions for ${title}`} disabled>
-            <ChevronDown aria-hidden="true" className="h-4 w-4" />
-          </IconButton>
-        </>
-      ) : (
-        <>
-          <IconButton aria-label={`Pause ${title}`} disabled>
-            <Pause aria-hidden="true" className="h-4 w-4" />
-          </IconButton>
-          <IconButton aria-label={`Actions for ${title}`} disabled>
-            <ChevronDown aria-hidden="true" className="h-4 w-4" />
-          </IconButton>
-        </>
+    <ol className="activity-list">
+      {events.length > 0 ? events.map(([time, label, tone]) => (
+        <ActivityEventRow key={`${time}-${label}`} time={time} label={label} dotClassName={activityDotClass(tone)} />
+      )) : (
+        <li className="activity-empty-row">No persisted activity yet.</li>
       )}
-    </div>
+    </ol>
   );
 }
 
-function HistoryJobRow({ job }: { job: QueuedDownloadJob }) {
-  const failed = job.status === "failed";
-  const cancelled = job.status === "cancelled";
-  const Icon = failed || cancelled ? XCircle : CheckCircle2;
-  const iconClass = failed ? "text-danger" : cancelled ? "text-muted" : "text-success";
-  const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
-  const title = courseDisplayName(job);
+function DownloadQueueTable({
+  jobs,
+  parsedCourses,
+  hasPersistedJobs,
+  onRetry
+}: {
+  jobs: QueuedDownloadJob[];
+  parsedCourses: ParsedCourse[];
+  hasPersistedJobs: boolean;
+  onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+}) {
+  return (
+    <DataTable className="queue-table">
+      <DataTableHeader>
+        <span>Status</span>
+        <span>Course</span>
+        <span>Progress</span>
+      </DataTableHeader>
+      {jobs.length > 0 ? (
+        jobs.map((job) => <QueueJobRow key={job.id} job={job} onRetry={onRetry} />)
+      ) : parsedCourses.length > 0 ? (
+        parsedCourses.map((course, index) => <ValidatedQueueRow key={`${course.slug}-${index}`} course={course} />)
+      ) : (
+        <EmptyRow
+          title="No active downloads"
+          description={hasPersistedJobs ? "Finished courses are in Completed. Failed jobs stay here until handled." : "Active jobs and items needing attention appear here after Start Download."}
+        />
+      )}
+    </DataTable>
+  );
+}
+
+function QueueJobRow({ job, onRetry }: { job: QueuedDownloadJob; onRetry: (job: QueuedDownloadJob) => void | Promise<void> }) {
   const counts = artifactCounts(job);
-  const meta = completedHistoryMeta(job, counts, statusText);
+  const progress = courseOverallProgress(job, counts);
+  const title = courseDisplayName(job);
+  const queueLabel = queueCourseLabel(job, counts);
 
   return (
-    <div className="grid grid-cols-[24px_96px_minmax(0,1fr)] items-center gap-3 rounded-lg border border-border bg-field p-3">
-      <Icon aria-hidden="true" className={`h-5 w-5 ${iconClass}`} />
-      <CourseTile title={title} status={job.status} compact />
-      <div className="min-w-0">
-        <div className="truncate text-sm font-semibold" title={title}>{title}</div>
-        <div className="mt-1 truncate text-xs text-muted">{meta.primary}</div>
-        <div className="mt-1 truncate text-xs text-muted" title={meta.secondary}>{meta.secondary}</div>
+    <DataTableRow className="queue-table-row">
+      <QueueStatusBadge job={job} title={title} onRetry={onRetry} />
+      <div className="table-course-cell">
+        {job.thumbnail_url ? <MiniCourseArt title={title} thumbnailUrl={job.thumbnail_url} /> : <span className={`course-status-mark ${activityDotClass(eventTone(job.status))}`} />}
+        <div className="min-w-0">
+          <div className="truncate font-medium" title={title}>{queueLabel}</div>
+          <div className="truncate text-soft" title={job.source_url}>{filesSummaryText(counts, job.status)}</div>
+        </div>
       </div>
-    </div>
+      <div className="table-progress-cell">
+        <Progress value={progress} />
+        <span>{progress}%</span>
+      </div>
+    </DataTableRow>
   );
 }
 
-function EmptyPanelText({ title, description }: { title: string; description: string }) {
+function ValidatedQueueRow({ course }: { course: ParsedCourse }) {
+  const title = courseDisplayNameFromSlug(course.slug);
   return (
-    <div className="rounded-lg border border-dashed border-border bg-field/60 p-3">
-      <div className="text-sm font-semibold text-muted-strong">{title}</div>
-      <div className="mt-1 text-xs leading-5 text-muted">{description}</div>
-    </div>
+    <DataTableRow className="queue-table-row">
+      <StatusBadge tone="primary" dotClassName="bg-primary">Validated</StatusBadge>
+      <div className="table-course-cell">
+        <span className="course-status-mark bg-primary" />
+        <div className="min-w-0">
+          <div className="truncate font-medium" title={title}>Ready to queue</div>
+          <div className="truncate text-soft" title={course.normalized_url}>{course.normalized_url}</div>
+        </div>
+      </div>
+      <span className="text-muted">Waiting</span>
+    </DataTableRow>
   );
 }
 
-function CourseTile({ title, status, compact = false }: { title: string; status: string; compact?: boolean }) {
-  const tileClass = courseTileClass(title, status);
+function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; title: string; onRetry: (job: QueuedDownloadJob) => void | Promise<void> }) {
   return (
-    <div
-      className={`grid place-items-center rounded-md px-2 text-center font-semibold leading-tight text-white shadow-inner-card ${compact ? "h-12 text-[9px]" : "h-16 text-[11px]"} ${tileClass}`}
-      title={title}
-    >
-      <span className="text-[8px] uppercase tracking-normal opacity-80">Course</span>
-      <span className="line-clamp-2 break-words">{title}</span>
+    <StatusBadge className={jobStatusBadgeClass(job.status)} dotClassName={activityDotClass(eventTone(job.status))}>
+      <span>{jobStatusLabel(job.status)}</span>
+      {job.status === "failed" ? (
+        <button
+          type="button"
+          className="queue-status-retry"
+          aria-label={`Retry ${title}`}
+          onClick={() => onRetry(job)}
+        >
+          <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
+        </button>
+      ) : null}
+    </StatusBadge>
+  );
+}
+
+function CompletedDownloadsTable({ jobs, onOpenFolder }: { jobs: QueuedDownloadJob[]; onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void> }) {
+  return (
+    <DataTable className="completed-list completed-table">
+      {jobs.length > 0 ? jobs.map((job) => <CompletedDownloadRow key={job.id} job={job} onOpenFolder={onOpenFolder} />) : (
+        <EmptyRow compact title="No completed jobs" description="Finished courses will appear here after processing." />
+      )}
+    </DataTable>
+  );
+}
+
+function CompletedDownloadRow({ job, onOpenFolder }: { job: QueuedDownloadJob; onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void> }) {
+  const counts = artifactCounts(job);
+  const title = courseDisplayName(job);
+  const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+  const time = formatEventTime(job.updated_at ?? 0);
+  const outputDir = job.output_dir ?? "";
+
+  return (
+    <div className="completed-row">
+      <span className={`status-dot ${activityDotClass(eventTone(job.status))}`} />
+      <div className="min-w-0">
+        <div className="truncate font-medium" title={title}>{title}</div>
+        <div className="truncate text-soft" title={outputDir}>
+          {statusText} - {time} - {filesSummaryText(counts, job.status)}
+        </div>
+      </div>
+      <Button size="sm" variant="ghost" disabled={!outputDir} onClick={() => onOpenFolder(job)}>
+        Open Folder
+      </Button>
     </div>
   );
 }
 
-function courseTileClass(title: string, status: string) {
-  const lowerTitle = title.toLowerCase();
-  if (lowerTitle.includes("service desk fundamentals")) {
-    return "course-tile-service";
-  }
-  if (lowerTitle.includes("software testing foundations")) {
-    return "course-tile-testing";
-  }
-  if (status === "failed") return "bg-danger/40";
-  if (status === "cancelled") return "bg-muted/30";
-  if (status === "completed") return "bg-success/40";
-  return "bg-primary/30";
+function MiniCourseArt({ title, thumbnailUrl }: { title: string; thumbnailUrl: string }) {
+  return (
+    <span className="mini-course-art" title={title}>
+      <img src={thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
+    </span>
+  );
+}
+
+function courseInitials(title: string) {
+  const parts = title.split(/\s+/).filter(Boolean);
+  const initials = parts.slice(0, 3).map((part) => part.charAt(0).toUpperCase()).join("");
+  return initials || "LL";
 }
 
 function courseSubtitle(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
-  if (job.course_slug === "service-desk-fundamentals") return "Course 2 of 5";
-  if (job.course_slug === "software-testing-foundations") return "Course 1 of 5";
   return artifactSummaryText(counts, job.status);
 }
 
-function courseRemainingText(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
-  if (job.course_slug === "service-desk-fundamentals") return "18m 24s remaining";
-  return artifactSummaryText(counts, job.status);
+function queueCourseLabel(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
+  const subtitle = courseSubtitle(job, counts);
+  if (subtitle.startsWith("Course ")) return subtitle.replace("Course", "Chapter");
+  return courseDisplayName(job);
 }
 
 function courseOverallProgress(job: QueuedDownloadJob, counts: ArtifactProgressCounts) {
-  if (job.course_slug === "service-desk-fundamentals") return 64;
-  return artifactProgressPercent(counts.completed, counts.total, job.status);
-}
-
-function completedHistoryMeta(job: QueuedDownloadJob, counts: ArtifactProgressCounts, statusText: string) {
-  if (job.course_slug === "software-testing-foundations") {
-    return {
-      primary: "Completed • Today, 10:15 AM",
-      secondary: "5.2 GB • 52m 11s"
-    };
-  }
-
-  return {
-    primary: `${statusText} - ${formatEventTime(job.updated_at ?? 0)} - ${artifactSummaryText(counts, job.status)}`,
-    secondary: job.output_dir ?? job.source_url
-  };
-}
-
-function ProgressLine({ icon, label, completed, total }: { icon: React.ReactNode; label: string; completed: number; total: number }) {
-  const percent = artifactProgressPercent(completed, total, total === 0 ? "queued" : "active");
-  return (
-    <div className="grid grid-cols-[18px_minmax(0,1fr)_58px_38px] items-center gap-2">
-      <span className="[&_svg]:h-3.5 [&_svg]:w-3.5">{icon}</span>
-      <span className="truncate">{label}</span>
-      <span className="text-right">{completed} / {total}</span>
-      <span className="text-right">{percent}%</span>
-    </div>
-  );
-}
-
-function QueueProgressLine({ label, completed, total }: { label: string; completed: number; total: number }) {
-  const percent = artifactProgressPercent(completed, total, total === 0 ? "queued" : "active");
-  return (
-    <>
-      <span className="truncate">{label}</span>
-      <Progress value={percent} />
-      <span>{completed} / {total}</span>
-      <span>{percent}%</span>
-    </>
-  );
+  return artifactProgressPercent(counts.completed + counts.failed + counts.cancelled, counts.total, job.status);
 }
 
 function artifactCounts(job: QueuedDownloadJob): ArtifactProgressCounts {
@@ -936,6 +1232,8 @@ function artifactCounts(job: QueuedDownloadJob): ArtifactProgressCounts {
     video_completed: 0,
     subtitle_total: 0,
     subtitle_completed: 0,
+    quiz_total: 0,
+    quiz_completed: 0,
     exercise_total: 0,
     exercise_completed: 0
   };
@@ -954,6 +1252,17 @@ function artifactSummaryText(counts: ArtifactProgressCounts, status: string) {
   ].filter(Boolean);
   const problemText = problemParts.length > 0 ? `, ${problemParts.join(", ")}` : "";
   return `${counts.completed} of ${counts.total} artifacts complete${problemText}`;
+}
+
+function filesSummaryText(counts: ArtifactProgressCounts, status: string) {
+  if (counts.total === 0) return status === "queued" ? "Pending" : "0 files";
+  const issues = [
+    counts.failed > 0 ? `${counts.failed} failed` : null,
+    counts.cancelled > 0 ? `${counts.cancelled} cancelled` : null
+  ].filter(Boolean);
+  const issueText = issues.length > 0 ? `, ${issues.join(", ")}` : "";
+  if (status === "completed") return `${counts.completed} of ${counts.total} files${issueText}`;
+  return `${counts.completed}/${counts.total} files${issueText}`;
 }
 
 function courseDisplayName(job: QueuedDownloadJob) {
@@ -991,6 +1300,10 @@ function showProcessedDownloadToast(response: ProcessQueuedDownloadResponse) {
   toast.success("Queued download processed", { description });
 }
 
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 async function parseLinkedInCourseUrls(input: string) {
   try {
     return await invoke<ParsedCourse[]>("parse_linkedin_course_urls", { input });
@@ -1022,12 +1335,66 @@ async function validateLinkedInToken(token: string) {
   } satisfies ValidatedLinkedInSession;
 }
 
+async function saveLinkedInToken(token: string) {
+  if (isTauriRuntime()) {
+    return invoke<{ has_saved_token: boolean }>("save_li_at_token", { token });
+  }
+
+  setPreviewSavedToken(token.trim().length > 0);
+  return { has_saved_token: token.trim().length > 0 };
+}
+
+async function clearSavedLinkedInToken() {
+  if (isTauriRuntime()) {
+    return invoke<{ has_saved_token: boolean }>("clear_saved_li_at_token");
+  }
+
+  setPreviewSavedToken(false);
+  return { has_saved_token: false };
+}
+
+async function saveDownloadPreferences(preferences: SavedDownloadPreferences) {
+  if (isTauriRuntime()) {
+    return invoke<SavedDownloadPreferences>("save_download_preferences", { preferences });
+  }
+
+  writePreviewPreferences(preferences);
+  return preferences;
+}
+
 async function startDownloadJobs(request: StartDownloadRequest) {
   if (isTauriRuntime()) {
     return invoke<StartDownloadResponse>("start_download_jobs", { request });
   }
 
   return startDownloadJobsForPreview(request);
+}
+
+async function retryFailedDownloadJob(jobId: string) {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("retry_failed_download_job", { jobId });
+  }
+
+  return retryFailedDownloadJobForPreview(jobId);
+}
+
+async function clearFailedDownloadJobs() {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("clear_failed_download_jobs");
+  }
+
+  const jobs = readPreviewJobs().filter((job) => job.status !== "failed" && job.status !== "cancelled");
+  const events = readPreviewEvents();
+  writePreviewState(jobs, events);
+  return {
+    persisted_jobs: jobs,
+    recent_events: events,
+    has_saved_token: hasPreviewSavedToken(),
+    saved_download_preferences: readPreviewPreferences(),
+    stores_plaintext_tokens_in_sqlite: false,
+    browser_sources: ["Chrome", "Edge", "Firefox"],
+    default_resolution: "P720"
+  } satisfies BootstrapState;
 }
 
 async function processNextQueuedDownloadWithToken(token: string) {
@@ -1038,11 +1405,24 @@ async function processNextQueuedDownloadWithToken(token: string) {
   return processNextQueuedDownloadForPreview();
 }
 
-async function processNextQueuedDownloadFromBrowserSource(source: string) {
+async function openDownloadFolder(path: string) {
   if (isTauriRuntime()) {
-    return invoke<ProcessQueuedDownloadResponse>("process_next_queued_download_from_browser_source", { source });
+    await openPath(path);
+    return true;
   }
 
+  guardedToast("Folder opener unavailable in preview", path);
+  return false;
+}
+
+async function processNextQueuedDownloadWithSavedToken() {
+  if (isTauriRuntime()) {
+    return invoke<ProcessQueuedDownloadResponse>("process_next_queued_download_with_saved_token");
+  }
+
+  if (!hasPreviewSavedToken()) {
+    throw new Error("Saved LinkedIn token is unavailable");
+  }
   return processNextQueuedDownloadForPreview();
 }
 
@@ -1090,8 +1470,32 @@ function parseLinkedInCourseUrlForPreview(value: string, line: number): ParsedCo
   return {
     original: value,
     normalized_url: `https://www.linkedin.com/learning/${slug}`,
-    slug
+    slug,
+    quiz_urls: extractQuizUrlsForPreview(url, slug),
+    assessment_urns: extractAssessmentUrnsForPreview(url)
   };
+}
+
+function extractQuizUrlsForPreview(url: URL, slug: string): string[] {
+  const segments = url.pathname.split("/").filter(Boolean);
+  const quizIndex = segments.findIndex((segment) => segment.toLowerCase() === "quiz");
+  const assessment = quizIndex >= 0 ? segments[quizIndex + 1] : undefined;
+  if (!assessment) return [];
+
+  const normalized = new URL(`https://www.linkedin.com/learning/${slug}/quiz/${assessment}`);
+  for (const key of ["resume", "u"]) {
+    const value = url.searchParams.get(key);
+    if (value) normalized.searchParams.set(key, value);
+  }
+  return [normalized.toString()];
+}
+
+function extractAssessmentUrnsForPreview(url: URL): string[] {
+  const segments = url.pathname.split("/").filter(Boolean);
+  return segments
+    .flatMap((segment, index) => (segment.toLowerCase() === "quiz" ? [segments[index + 1]] : []))
+    .filter((segment): segment is string => Boolean(segment))
+    .filter((segment) => segment.startsWith("urn:li:learningApiAssessment:") || segment.startsWith("urn%3Ali%3AlearningApiAssessment%3A"));
 }
 
 function previewCourseUrlErrorMessage(error: PreviewCourseUrlError) {
@@ -1109,6 +1513,8 @@ function previewCourseUrlErrorMessage(error: PreviewCourseUrlError) {
 
 const previewJobsStorageKey = "linkvault.preview.jobs";
 const previewEventsStorageKey = "linkvault.preview.events";
+const previewSavedTokenStorageKey = "linkvault.preview.saved-token";
+const previewPreferencesStorageKey = "linkvault.preview.preferences";
 
 function getPreviewScenario() {
   if (typeof window === "undefined") return "";
@@ -1123,6 +1529,7 @@ function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownlo
     course_slug: course.slug,
     source_url: course.normalized_url,
     status: "queued",
+    thumbnail_url: previewThumbnailForSlug(course.slug),
     selected_quality: request.selectedQuality,
     output_dir: request.outputDir,
     updated_at: timestamp,
@@ -1133,9 +1540,55 @@ function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownlo
   return { jobs };
 }
 
-function processNextQueuedDownloadForPreview(): ProcessQueuedDownloadResponse {
+function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const jobs = readPreviewJobs();
+  const job = jobs.find((candidate) => candidate.id === jobId);
+  if (!job) {
+    throw new Error("Retry job was not found.");
+  }
+  if (job.status !== "failed") {
+    throw new Error("Only failed jobs can be retried.");
+  }
+
+  const retriedJobs = jobs.map((candidate) =>
+    candidate.id === jobId
+      ? {
+          ...candidate,
+          status: "queued",
+          updated_at: timestamp,
+          artifact_counts: emptyArtifactCounts()
+        }
+      : candidate
+  );
+  const retryEvent: PersistedJobEvent = {
+    id: timestamp,
+    job_id: jobId,
+    event_type: "job.retry",
+    message: "Retry requested; job returned to the queue.",
+    created_at: timestamp
+  };
+  const events = [retryEvent, ...readPreviewEvents()];
+  writePreviewState(retriedJobs, events);
+
+  return {
+    default_resolution: "P1080",
+    browser_sources: ["Chrome", "Edge", "Firefox"],
+    stores_plaintext_tokens_in_sqlite: false,
+    has_saved_token: hasPreviewSavedToken(),
+    saved_download_preferences: readPreviewPreferences(),
+    persisted_jobs: retriedJobs,
+    recent_events: events
+  };
+}
+
+async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownloadResponse> {
   const jobs = readPreviewJobs();
   const scenario = getPreviewScenario();
+  if (scenario === "live-polling-progress") {
+    return processLivePollingProgressForPreview(jobs);
+  }
+
   if (scenario === "metadata-shape-drift") {
     const timestamp = Math.floor(Date.now() / 1000);
     const unsafeRawMetadataBody = "{\"unexpected\":\"unsafe raw body\",\"secret\":\"do-not-render\"}";
@@ -1416,6 +1869,152 @@ function processNextQueuedDownloadForPreview(): ProcessQueuedDownloadResponse {
   };
 }
 
+async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[]): Promise<ProcessQueuedDownloadResponse> {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const unsafeStreamingToken = "do-not-render-live-polling-token";
+  void unsafeStreamingToken;
+
+  if (!jobs[0]) {
+    return {
+      processed: false,
+      completed_artifacts: 0,
+      failed_artifacts: 0,
+      cancelled_artifacts: 0
+    };
+  }
+
+  const activeJob = {
+    ...jobs[0],
+    status: "active",
+    updated_at: timestamp,
+    artifact_counts: {
+      total: 6,
+      completed: 1,
+      failed: 0,
+      cancelled: 0,
+      active: 1,
+      pending: 4,
+      skipped: 0,
+      video_total: 3,
+      video_completed: 1,
+      subtitle_total: 2,
+      subtitle_completed: 0,
+      exercise_total: 1,
+      exercise_completed: 0
+    }
+  };
+  const queuedJob = jobs[1]
+    ? {
+        ...jobs[1],
+        status: "queued",
+        updated_at: timestamp,
+        artifact_counts: {
+          total: 3,
+          completed: 0,
+          failed: 0,
+          cancelled: 0,
+          active: 0,
+          pending: 3,
+          skipped: 0,
+          video_total: 1,
+          video_completed: 0,
+          subtitle_total: 1,
+          subtitle_completed: 0,
+          exercise_total: 1,
+          exercise_completed: 0
+        }
+      }
+    : null;
+
+  writePreviewState([activeJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null), [
+    {
+      id: 1,
+      job_id: activeJob.id,
+      event_type: "job.active",
+      message: "Live polling course started.",
+      created_at: timestamp
+    },
+    {
+      id: 2,
+      job_id: activeJob.id,
+      event_type: "artifact.active",
+      message: "Live polling course video started.",
+      created_at: timestamp
+    }
+  ]);
+
+  await sleep(900);
+
+  const updatedActiveJob = {
+    ...activeJob,
+    updated_at: timestamp + 1,
+    artifact_counts: {
+      ...activeJob.artifact_counts,
+      completed: 3,
+      active: 1,
+      pending: 2,
+      video_completed: 2,
+      subtitle_completed: 1
+    }
+  };
+  writePreviewState([updatedActiveJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null), [
+    {
+      id: 3,
+      job_id: activeJob.id,
+      event_type: "artifact.completed",
+      message: "Live polling course video completed.",
+      created_at: timestamp + 1
+    },
+    {
+      id: 2,
+      job_id: activeJob.id,
+      event_type: "artifact.active",
+      message: "Live polling course subtitles started.",
+      created_at: timestamp
+    }
+  ]);
+
+  await sleep(900);
+
+  const completedJob = {
+    ...updatedActiveJob,
+    status: "completed",
+    updated_at: timestamp + 2,
+    artifact_counts: {
+      ...updatedActiveJob.artifact_counts,
+      completed: 6,
+      active: 0,
+      pending: 0,
+      video_completed: 3,
+      subtitle_completed: 2,
+      exercise_completed: 1
+    }
+  };
+  writePreviewState([completedJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null), [
+    {
+      id: 4,
+      job_id: activeJob.id,
+      event_type: "artifact.extracted",
+      message: "Live polling exercise archive extracted.",
+      created_at: timestamp + 2
+    },
+    {
+      id: 3,
+      job_id: activeJob.id,
+      event_type: "artifact.completed",
+      message: "Live polling course finished.",
+      created_at: timestamp + 1
+    }
+  ]);
+
+  return {
+    processed: true,
+    completed_artifacts: 6,
+    failed_artifacts: 0,
+    cancelled_artifacts: 0
+  };
+}
+
 function emptyArtifactCounts(): ArtifactProgressCounts {
   return {
     total: 0,
@@ -1429,6 +2028,8 @@ function emptyArtifactCounts(): ArtifactProgressCounts {
     video_completed: 0,
     subtitle_total: 0,
     subtitle_completed: 0,
+    quiz_total: 0,
+    quiz_completed: 0,
     exercise_total: 0,
     exercise_completed: 0
   };
@@ -1450,6 +2051,30 @@ function writePreviewState(jobs: QueuedDownloadJob[], events: PersistedJobEvent[
   window.sessionStorage.setItem(previewEventsStorageKey, JSON.stringify(events));
 }
 
+function readPreviewPreferences(): SavedDownloadPreferences | null {
+  if (typeof window === "undefined") return null;
+  return parseStoredPreviewValue<SavedDownloadPreferences | null>(window.sessionStorage.getItem(previewPreferencesStorageKey), null);
+}
+
+function writePreviewPreferences(preferences: SavedDownloadPreferences) {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.setItem(previewPreferencesStorageKey, JSON.stringify(preferences));
+}
+
+function hasPreviewSavedToken() {
+  if (typeof window === "undefined") return false;
+  return window.sessionStorage.getItem(previewSavedTokenStorageKey) === "true";
+}
+
+function setPreviewSavedToken(saved: boolean) {
+  if (typeof window === "undefined") return;
+  if (saved) {
+    window.sessionStorage.setItem(previewSavedTokenStorageKey, "true");
+  } else {
+    window.sessionStorage.removeItem(previewSavedTokenStorageKey);
+  }
+}
+
 function parseStoredPreviewValue<T>(value: string | null, fallback: T): T {
   if (!value) return fallback;
   try {
@@ -1463,177 +2088,25 @@ function getBrowserPreviewState(): { jobs: QueuedDownloadJob[]; events: Persiste
   if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
   const preview = params.get("preview");
-  if (preview === "reference") {
-    const activeUpdated = localTimestampToday(10, 32, 31);
-    const completedUpdated = localTimestampToday(10, 15, 0);
-    return {
-      jobs: [
-        {
-          id: "preview-reference-service-desk",
-          course_slug: "service-desk-fundamentals",
-          source_url: "https://www.linkedin.com/learning/service-desk-fundamentals",
-          status: "active",
-          selected_quality: "720",
-          output_dir: "/Users/ian/Downloads/LinkedIn Courses/Service Desk Fundamentals",
-          updated_at: activeUpdated,
-          artifact_counts: {
-            total: 52,
-            completed: 33,
-            failed: 0,
-            cancelled: 0,
-            active: 1,
-            pending: 18,
-            skipped: 0,
-            video_total: 52,
-            video_completed: 36,
-            subtitle_total: 52,
-            subtitle_completed: 36,
-            exercise_total: 18,
-            exercise_completed: 12
-          }
-        },
-        {
-          id: "preview-reference-software-testing",
-          course_slug: "software-testing-foundations",
-          source_url: "https://www.linkedin.com/learning/software-testing-foundations",
-          status: "completed",
-          selected_quality: "720",
-          output_dir: "/Users/ian/Downloads/LinkedIn Courses/Software Testing Foundations",
-          updated_at: completedUpdated,
-          artifact_counts: {
-            total: 52,
-            completed: 52,
-            failed: 0,
-            cancelled: 0,
-            active: 0,
-            pending: 0,
-            skipped: 0,
-            video_total: 26,
-            video_completed: 26,
-            subtitle_total: 25,
-            subtitle_completed: 25,
-            exercise_total: 1,
-            exercise_completed: 1
-          }
-        }
-      ],
-      events: [
-        {
-          id: 1,
-          job_id: "preview-reference-service-desk",
-          event_type: "artifact.active",
-          message: "Downloading video: Why managing time helps you serve customers better",
-          created_at: localTimestampToday(10, 32, 23)
-        },
-        {
-          id: 2,
-          job_id: "preview-reference-service-desk",
-          event_type: "artifact.active",
-          message: "Downloading exercise file: Ex_Files_Time_Management.zip",
-          created_at: localTimestampToday(10, 32, 24)
-        },
-        {
-          id: 3,
-          job_id: "preview-reference-service-desk",
-          event_type: "artifact.active",
-          message: "Downloading subtitles",
-          created_at: localTimestampToday(10, 32, 24)
-        },
-        {
-          id: 4,
-          job_id: "preview-reference-service-desk",
-          event_type: "artifact.active",
-          message: "Downloading video: Efficiently managing customer emails",
-          created_at: localTimestampToday(10, 32, 29)
-        },
-        {
-          id: 5,
-          job_id: "preview-reference-service-desk",
-          event_type: "artifact.active",
-          message: "Downloading video: Using calendar tools for task management",
-          created_at: localTimestampToday(10, 32, 31)
-        }
-      ]
-    };
-  }
-  if (preview && preview !== "long-labels") {
-    return { jobs: readPreviewJobs(), events: readPreviewEvents() };
-  }
-  if (preview !== "long-labels") return null;
-  const now = Math.floor(Date.now() / 1000);
-  const longSlug = "advanced-linkedin-learning-course-with-a-very-long-title-for-rendering-queue-progress-history-and-url-wrapping";
-  return {
-    jobs: [
-      {
-        id: "preview-active-long-label",
-        course_slug: longSlug,
-        source_url: `https://www.linkedin.com/learning/${longSlug}?trk=share&u=123456&context=long-render-check`,
-        status: "active",
-        selected_quality: "1080",
-        output_dir: "C:/Users/howard/Downloads/LinkedIn Courses/Advanced LinkedIn Learning Course With A Very Long Title",
-        updated_at: now,
-        artifact_counts: {
-          total: 37,
-          completed: 18,
-          failed: 1,
-          cancelled: 0,
-          active: 1,
-          pending: 17,
-          skipped: 0,
-          video_total: 18,
-          video_completed: 9,
-          subtitle_total: 18,
-          subtitle_completed: 8,
-          exercise_total: 1,
-          exercise_completed: 1
-        }
-      },
-      {
-        id: "preview-completed-long-label",
-        course_slug: "completed-course-with-long-output-folder-name-and-history-label",
-        source_url: "https://www.linkedin.com/learning/completed-course-with-long-output-folder-name-and-history-label",
-        status: "completed",
-        selected_quality: "720",
-        output_dir: "C:/Users/howard/Downloads/LinkedIn Courses/Completed Course With Long Output Folder Name And History Label",
-        updated_at: now - 240,
-        artifact_counts: {
-          total: 12,
-          completed: 12,
-          failed: 0,
-          cancelled: 0,
-          active: 0,
-          pending: 0,
-          skipped: 0,
-          video_total: 6,
-          video_completed: 6,
-          subtitle_total: 5,
-          subtitle_completed: 5,
-          exercise_total: 1,
-          exercise_completed: 1
-        }
-      }
-    ],
-    events: [
-      {
-        id: 1,
-        job_id: "preview-active-long-label",
-        event_type: "artifact.completed",
-        message: "Downloading video with an intentionally long chapter and lesson title that should clamp without pushing the activity panel wider.",
-        created_at: now
-      },
-      {
-        id: 2,
-        job_id: "preview-active-long-label",
-        event_type: "job.active",
-        message: `Started LinkedIn Learning course: https://www.linkedin.com/learning/${longSlug}?trk=share&u=123456&context=long-render-check`,
-        created_at: now - 60
-      }
-    ]
-  };
+  if (!preview) return null;
+  return { jobs: readPreviewJobs(), events: readPreviewEvents() };
 }
 
-function localTimestampToday(hour: number, minute: number, second: number) {
-  const date = new Date();
-  date.setHours(hour, minute, second, 0);
-  return Math.floor(date.getTime() / 1000);
+function previewThumbnailForSlug(slug: string) {
+  const title = courseDisplayNameFromSlug(slug);
+  const initials = courseInitials(title);
+  const color = hashColorForSlug(slug);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" fill="${color.background}"/><rect x="16" y="16" width="288" height="148" rx="14" fill="${color.panel}" opacity=".9"/><text x="160" y="104" fill="#ebe7de" font-family="Inter,Arial,sans-serif" font-size="48" font-weight="700" text-anchor="middle">${initials}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+function hashColorForSlug(slug: string) {
+  const palettes = [
+    { background: "#223843", panel: "#1a4f63" },
+    { background: "#2c3224", panel: "#44613d" },
+    { background: "#332b3c", panel: "#5c426d" },
+    { background: "#3a3026", panel: "#6a523c" }
+  ];
+  const index = [...slug].reduce((sum, char) => sum + char.charCodeAt(0), 0) % palettes.length;
+  return palettes[index];
 }

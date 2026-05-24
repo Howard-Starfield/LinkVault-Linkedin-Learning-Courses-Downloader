@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>LLCD.LinkVault</RootNamespace>
     <AssemblyName>LinkVault</AssemblyName>
-    <ApplicationIcon>..\LLCD.DownloaderGUI\linked-learning-favicon.ico</ApplicationIcon>
+    <ApplicationIcon>linked-learning-favicon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

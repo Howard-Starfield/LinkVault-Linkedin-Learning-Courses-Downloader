@@ -169,29 +169,58 @@ namespace LLCD.CourseExtractor
                 {
                     var video = chapter.Videos[i];
                     string slug = video.Slug;
-                    var videoResponse = await _client.GetAsync($"https://www.linkedin.com/learning-api/detailedCourses?courseSlug={_courseSlug}&resolution=_{_quality.ToHeight()}&q=slugs&fields=selectedVideo&videoSlug={video.Slug}");
-                    var videoResponseText = await videoResponse.Content.ReadAsStringAsync();
-                    try
-                    {
-                        video = Video.FromJson(videoResponseText);
-                    }
-                    catch (Exception)
-                    {
-                        Log.Error("Video Deserialization failed. \nResponse text : " + videoResponseText);
-                        throw;
-                    }
-                    video.Slug = slug;
-                    if (String.IsNullOrWhiteSpace(video.DownloadUrl))
-                    {
-                        var cookies = _cookieContainer.GetCookies(new Uri("https://www.linkedin.com/learning-api"));
-                        throw new ArgumentException("Failed to extract a course video. The provided token is probably invalid");
-                    }
+                    video = await GetVideoWithFallback(slug);
                     chapter.Videos[i] = video;
                     progress?.Report(j / totalCount);
                     await Task.Delay(_delay * 1000);
                 }
             }
             return course;
+        }
+
+        private async Task<Video> GetVideoWithFallback(string slug)
+        {
+            string lastResponseText = null;
+            Exception lastDeserializationException = null;
+
+            foreach (var height in _quality.ToHeights())
+            {
+                var videoResponse = await _client.GetAsync($"https://www.linkedin.com/learning-api/detailedCourses?courseSlug={_courseSlug}&resolution=_{height}&q=slugs&fields=selectedVideo&videoSlug={slug}");
+                lastResponseText = await videoResponse.Content.ReadAsStringAsync();
+                Video video;
+                try
+                {
+                    video = Video.FromJson(lastResponseText);
+                }
+                catch (Exception ex)
+                {
+                    lastDeserializationException = ex;
+                    Log.Warning(ex, "Video deserialization failed for requested LinkedIn resolution {Resolution}", height);
+                    continue;
+                }
+
+                if (video == null)
+                {
+                    Log.Warning("LinkedIn returned an empty selected video response for requested resolution {Resolution}", height);
+                    continue;
+                }
+
+                video.Slug = slug;
+                if (!String.IsNullOrWhiteSpace(video.DownloadUrl))
+                {
+                    return video;
+                }
+
+                Log.Information("LinkedIn video resolution {Resolution} was not available for {VideoSlug}; trying fallback", height, slug);
+            }
+
+            if (lastDeserializationException != null)
+            {
+                Log.Error(lastDeserializationException, "Video Deserialization failed. \nResponse text : " + lastResponseText);
+                throw lastDeserializationException;
+            }
+
+            throw new ArgumentException("Failed to extract a course video. The provided token is probably invalid or no requested resolution is available");
         }
 
         public async Task<bool> HasValidToken()

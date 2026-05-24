@@ -1,11 +1,10 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+using System;
 
 namespace LLCD.CourseContent
 {
     public enum Quality
     {
+        BestAvailable,
         High,
         Medium,
         Low
@@ -15,14 +14,21 @@ namespace LLCD.CourseContent
     {
         public static string ToHeight(this Quality q)
         {
+            return q.ToHeights()[0];
+        }
+
+        public static string[] ToHeights(this Quality q)
+        {
             switch (q)
             {
+                case Quality.BestAvailable:
+                    return new[] { "1080", "720", "540", "360" };
                 case Quality.High:
-                    return "720";
+                    return new[] { "720", "540", "360" };
                 case Quality.Medium:
-                    return "540";
+                    return new[] { "540", "360" };
                 case Quality.Low:
-                    return "360";
+                    return new[] { "360" };
                 default:
                     throw new ArgumentException("Undefined Quality");
             }

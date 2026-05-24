@@ -227,7 +227,9 @@ fn read_chromium_li_at_values(
 ) -> Result<Vec<String>, BrowserCookieError> {
     let mut values = Vec::new();
     for db_path in chromium_cookie_database_paths(user_data_path)? {
-        values.extend(read_chromium_li_at_values_from_db(&db_path, decoder)?);
+        if let Ok(db_values) = read_chromium_li_at_values_from_db(&db_path, decoder) {
+            values.extend(db_values);
+        }
     }
 
     Ok(distinct_non_empty(values))
@@ -236,7 +238,9 @@ fn read_chromium_li_at_values(
 fn read_firefox_li_at_values(profiles_path: &Path) -> Result<Vec<String>, BrowserCookieError> {
     let mut values = Vec::new();
     for db_path in firefox_cookie_database_paths(profiles_path)? {
-        values.extend(read_firefox_li_at_values_from_db(&db_path)?);
+        if let Ok(db_values) = read_firefox_li_at_values_from_db(&db_path) {
+            values.extend(db_values);
+        }
     }
 
     Ok(distinct_non_empty(values))
@@ -583,6 +587,43 @@ mod tests {
         let paths = chromium_cookie_database_paths(user_data).unwrap();
 
         assert_eq!(paths, vec![profile.join("Cookies")]);
+    }
+
+    #[test]
+    fn chromium_cookie_reader_skips_unreadable_profile_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_data = temp.path();
+        let locked_profile = user_data.join("Default").join("Network");
+        let readable_profile = user_data.join("Profile 1").join("Network");
+        fs::create_dir_all(locked_profile.join("Cookies")).unwrap();
+        fs::create_dir_all(&readable_profile).unwrap();
+        create_chromium_cookie_db(
+            &readable_profile.join("Cookies"),
+            &[(".www.linkedin.com", "li_at", "profile-token")],
+        );
+
+        let values =
+            read_chromium_li_at_values(user_data, &UnsupportedEncryptedCookieDecoder).unwrap();
+
+        assert_eq!(values, vec!["profile-token"]);
+    }
+
+    #[test]
+    fn firefox_cookie_reader_skips_unreadable_profile_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = temp.path();
+        let locked_profile = profiles.join("locked.default");
+        let readable_profile = profiles.join("readable.default");
+        fs::create_dir_all(locked_profile.join("cookies.sqlite")).unwrap();
+        fs::create_dir_all(&readable_profile).unwrap();
+        create_firefox_cookie_db(
+            &readable_profile.join("cookies.sqlite"),
+            &[(".www.linkedin.com", "li_at", "firefox-profile-token")],
+        );
+
+        let values = read_firefox_li_at_values(profiles).unwrap();
+
+        assert_eq!(values, vec!["firefox-profile-token"]);
     }
 
     fn create_chromium_cookie_db(path: &Path, rows: &[(&str, &str, &str)]) {

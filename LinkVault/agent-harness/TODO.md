@@ -19,7 +19,12 @@
 - [x] Complete Chrome/Edge encrypted cookie decryption for browser token import.
 - [x] Port course metadata parsing.
 - [x] Port selected-video fetch with 1080-first fallback.
+- [x] Guard Best Available against LinkedIn `_1080` responses that visibly encode a sub-720 stream before falling back to 720.
 - [x] Port exercise URL refresh, including escaped URLs and Ambry links.
+- [x] Decode HTML-entity encoded Ambry query separators such as `&#61;`.
+- [x] Skip empty Ambry placeholder URLs and keep non-empty Ambry links as exercise fallbacks.
+- [x] Preserve existing direct named exercise ZIP URLs instead of replacing them with unmatched Ambry URLs by count.
+- [x] Try alternate exercise artifact URLs when the first refreshed or metadata URL returns an HTTP failure.
 - [x] Port safe zip extraction. Initial unsafe archive path guard exists.
 - [x] Add SQLite repository functions for settings, course cache, jobs, job events, and artifacts.
 - [x] Run SQLite restart reconciliation during Tauri setup.
@@ -29,8 +34,17 @@
 - [x] Add deterministic artifact download execution with SQLite active/completed/failed/cancelled status updates.
 - [x] Handle exercise artifact 404 by failing only that artifact and continuing remaining downloads.
 - [x] Wire orchestration seam to live in-memory LinkedIn session and Tauri command boundary.
+- [x] Carry LinkedIn home-response cookies transiently for live metadata/course-page requests without serializing or storing them.
 - [x] Wire Start Download UI to invoke live queued-download processing and refresh queue/activity state.
 - [x] Auto-unzip downloaded exercise zips in the live artifact loop.
+- [x] Treat live exercise artifact download failures as non-fatal optional failures, not whole-course failures.
+- [x] Fetch third-party exercise/CDN artifact URLs without LinkedIn session headers or cookies.
+- [x] Fetch all file artifact URLs with legacy plain GET behavior, including LinkedIn Ambry exercise URLs.
+- [x] Retry LinkedIn-host artifact URLs with authenticated session headers when the legacy plain request is non-success.
+- [x] Treat successful `2xx` artifact responses such as `206 Partial Content` as downloadable files.
+- [x] Add safe exercise artifact source diagnostics without signed query values for future HTTP 400 failures.
+- [x] Record sanitized per-attempt HTTP statuses for failed exercise URL candidates.
+- [x] Restore C#-style chapter folders and numbered video/subtitle file names.
 - [x] Load persisted queued/reconciled jobs into bootstrap queue UI state.
 - [x] Load persisted completed/failed jobs into history UI state.
 - [x] Add cancellation-safe download state transitions.
@@ -50,6 +64,11 @@
 - [x] Assert checked-in Tauri bundle config in release verification.
 - [x] Generate release handoff manifest with artifact SHA-256 hashes.
 - [x] Replace visible demo progress streams with persisted active/completed/failed/cancelled job event state.
+- [x] Poll SQLite-backed bootstrap state while a live queued-download command is running so the UI can update during long artifact downloads.
+- [x] Add deterministic browser-preview coverage proving in-flight polling refreshes intermediate active artifact counts before completion.
+- [x] Scope reference-preview-only fake progress/copy to preview jobs; real jobs compute progress from persisted completed, failed, and cancelled artifact counts.
+- [x] Bound Recent Activity height and coalesce only long repeated artifact bursts so the activity panel does not keep growing forever.
+- [x] Tighten app-shell typography and dark tokens toward a dense Linear-style desktop UI without decorative glow backgrounds.
 - [x] Add repeatable Playwright visual assertions for desktop, laptop, narrow, long-label, disabled-scope, guarded-start, and masked-token checks.
 - [x] Add repeatable Playwright interaction assertions for URL parse errors, blank-line multi-URL order, guarded start, visible toasts, and no live LinkedIn calls.
 - [x] Validate desktop `1536x1024`, laptop `1280x800`, and narrow `390x844` layouts.
@@ -71,7 +90,9 @@
 - [x] Long course/chapter/video titles. Long course/title rendering is covered by the `?preview=long-labels` desktop and narrow scroll screenshots.
 - [x] Invalid token, expired token, no browser token found.
 - [x] Browser cookie DB locked. Cookie DB/WAL/SHM copy-before-read behavior is covered by deterministic tests.
+- [x] Browser cookie DB locked in one profile does not abort scanning other browser profiles.
 - [x] 1080 selected but only 720 is available.
+- [x] 1080 selected but LinkedIn returns a visibly lower stream URL.
 - [x] Exercise file 404 while videos remain downloadable.
 - [x] Zip with unsafe `../` path.
 - [x] Zip with single duplicate root folder.
