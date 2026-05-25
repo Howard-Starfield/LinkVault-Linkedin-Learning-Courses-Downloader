@@ -188,10 +188,7 @@ fn build_cookie_header(li_at: &str, cookies: &[LinkedInCookie], jsessionid: &str
 
 fn artifact_request_modes_for_url(url: &str) -> Vec<ArtifactRequestMode> {
     if is_linkedin_host(url) {
-        vec![
-            ArtifactRequestMode::Plain,
-            ArtifactRequestMode::Authenticated,
-        ]
+        vec![ArtifactRequestMode::Authenticated]
     } else {
         vec![ArtifactRequestMode::Plain]
     }
@@ -260,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_downloads_match_legacy_plain_file_requests_even_for_linkedin_hosts() {
+    fn non_linkedin_artifact_downloads_stay_plain() {
         let session = ValidatedLinkedInSession {
             csrf_token: "ajax:123".to_string(),
             enterprise_profile_hash: None,
@@ -272,13 +269,6 @@ mod tests {
         };
         let client = AuthenticatedLinkedInClient::new("li-at-token", &session).unwrap();
 
-        let linkedin_request = client
-            .build_artifact_get_request(
-                "https://www.linkedin.com/ambry/?x=1",
-                ArtifactRequestMode::Plain,
-            )
-            .build()
-            .unwrap();
         let cdn_request = client
             .build_artifact_get_request(
                 "https://files3.lynda.com/exercise.zip",
@@ -287,20 +277,15 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(linkedin_request.headers().get("Cookie").is_none());
-        assert!(linkedin_request.headers().get("Csrf-Token").is_none());
         assert!(cdn_request.headers().get("Cookie").is_none());
         assert!(cdn_request.headers().get("Csrf-Token").is_none());
     }
 
     #[test]
-    fn linkedin_artifact_urls_have_authenticated_retry_mode_after_plain_attempt() {
+    fn linkedin_artifact_urls_use_authenticated_request_directly() {
         assert_eq!(
             artifact_request_modes_for_url("https://www.linkedin.com/ambry/?x=1"),
-            vec![
-                ArtifactRequestMode::Plain,
-                ArtifactRequestMode::Authenticated
-            ]
+            vec![ArtifactRequestMode::Authenticated]
         );
         assert_eq!(
             artifact_request_modes_for_url("https://files3.lynda.com/exercise.zip"),

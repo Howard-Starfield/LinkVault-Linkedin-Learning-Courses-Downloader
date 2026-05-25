@@ -329,6 +329,7 @@ fn plan_active_job_downloads(
         &job.course_slug,
         selected_quality,
         job.download_videos,
+        job.download_exercises,
         job.download_subtitles,
         job.download_quizzes,
     )?;

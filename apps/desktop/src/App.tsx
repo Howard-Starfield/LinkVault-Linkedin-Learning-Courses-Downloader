@@ -59,6 +59,7 @@ type QueuedDownloadJob = {
   thumbnail_url?: string | null;
   selected_quality?: string;
   output_dir?: string;
+  created_at?: number;
   updated_at?: number;
   artifact_counts?: ArtifactProgressCounts;
 };
@@ -490,10 +491,7 @@ export default function App() {
         description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} persisted to the local queue.`
       });
 
-      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(
-        () => processNextQueuedDownloadWithSavedToken(),
-        delaySeconds
-      );
+      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds);
 
       setProcessingSummary(processResponse);
       await refreshBootstrapState();
@@ -535,14 +533,15 @@ export default function App() {
     return response;
   }
 
-  async function processQueuedDownloadBatchWithLiveRefresh(
-    processOperation: () => Promise<ProcessQueuedDownloadResponse>,
-    courseDelaySeconds: number
-  ) {
+  async function processQueuedDownloadBatchWithLiveRefresh(courseDelaySeconds: number) {
+    if (isTauriRuntime()) {
+      return processQueuedDownloadWithLiveRefresh(() => processQueuedDownloadBatchWithSavedToken(courseDelaySeconds));
+    }
+
     let summary = emptyProcessQueuedDownloadResponse();
 
     while (!cancellationRequestedRef.current) {
-      const response = await processQueuedDownloadWithLiveRefresh(processOperation);
+      const response = await processQueuedDownloadWithLiveRefresh(() => processNextQueuedDownloadWithSavedToken());
       summary = mergeProcessQueuedDownloadResponses(summary, response);
       setProcessingSummary(summary);
 
@@ -709,10 +708,7 @@ export default function App() {
       toast.info("Retry queued", { description: courseDisplayName(job) });
 
       cancellationRequestedRef.current = false;
-      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(
-        () => processNextQueuedDownloadWithSavedToken(),
-        delaySeconds
-      );
+      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds);
 
       setProcessingSummary(processResponse);
       await refreshBootstrapState();
@@ -1109,7 +1105,11 @@ function completedCourseJobs(jobs: QueuedDownloadJob[]) {
       latestByCourse.set(key, job);
     }
   }
-  return [...latestByCourse.values()].sort((first, second) => (second.updated_at ?? 0) - (first.updated_at ?? 0));
+  return [...latestByCourse.values()].sort(
+    (first, second) =>
+      (first.created_at ?? 0) - (second.created_at ?? 0) ||
+      (first.updated_at ?? 0) - (second.updated_at ?? 0)
+  );
 }
 
 function formatEventTime(timestamp: number) {
@@ -1581,13 +1581,26 @@ async function processNextQueuedDownloadWithSavedToken() {
   return processNextQueuedDownloadForPreview();
 }
 
+async function processQueuedDownloadBatchWithSavedToken(delaySeconds: number) {
+  if (isTauriRuntime()) {
+    return invoke<ProcessQueuedDownloadResponse>("process_queued_download_batch_with_saved_token", {
+      request: { delaySeconds }
+    });
+  }
+
+  return processNextQueuedDownloadWithSavedToken();
+}
+
 function parseLinkedInCourseUrlsForPreview(input: string): ParsedCourse[] {
   const courses: ParsedCourse[] = [];
   for (const [index, rawLine] of input.split(/\r?\n/).entries()) {
     const line = index + 1;
-    const trimmed = rawLine.trim();
-    if (!trimmed) continue;
-    courses.push(parseLinkedInCourseUrlForPreview(trimmed, line));
+    const candidates = courseUrlCandidatesForPreview(rawLine);
+    if (candidates.length === 0) {
+      if (!rawLine.trim()) continue;
+      throw previewCourseUrlErrorMessage({ type: "notLinkedInLearning", line });
+    }
+    courses.push(...candidates.map((candidate) => parseLinkedInCourseUrlForPreview(candidate, line)));
   }
 
   if (courses.length === 0) {
@@ -1595,6 +1608,20 @@ function parseLinkedInCourseUrlsForPreview(input: string): ParsedCourse[] {
   }
 
   return courses;
+}
+
+function courseUrlCandidatesForPreview(line: string): string[] {
+  const trimmed = line.trim();
+  if (!trimmed) return [];
+  const parts = trimmed.split(/\s+/);
+  if (parts.length === 1) return [trimCourseUrlTokenForPreview(parts[0])];
+  return parts
+    .map(trimCourseUrlTokenForPreview)
+    .filter((part) => part.toLowerCase().includes("linkedin.com/learning/"));
+}
+
+function trimCourseUrlTokenForPreview(token: string) {
+  return token.replace(/^[\s"'`<({\[]+|[\s"'`,>)}\]]+$/g, "");
 }
 
 function parseLinkedInCourseUrlForPreview(value: string, line: number): ParsedCourse {

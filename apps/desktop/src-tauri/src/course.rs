@@ -103,17 +103,29 @@ pub fn should_fetch_selected_video_details(
     download_videos || download_subtitles || download_quizzes
 }
 
+fn should_fetch_course_page_metadata(
+    download_exercises: bool,
+    download_quizzes: bool,
+    course: &Course,
+) -> bool {
+    (download_exercises && !course.exercise_files.is_empty())
+        || (download_quizzes && course.assessments.is_empty())
+}
+
 pub fn fetch_course_with_selected_video_details(
     client: &mut impl CourseApiClient,
     course_slug: &str,
     selected_quality: VideoQuality,
     download_videos: bool,
+    download_exercises: bool,
     download_subtitles: bool,
     download_quizzes: bool,
 ) -> Result<Course, CourseFetchError> {
     let metadata = client.get(&course_metadata_url(course_slug))?;
     let mut course = parse_course_metadata(&metadata, course_slug)?;
-    let _ = refresh_exercise_file_urls(client, course_slug, &mut course);
+    if should_fetch_course_page_metadata(download_exercises, download_quizzes, &course) {
+        let _ = refresh_exercise_file_urls(client, course_slug, &mut course);
+    }
     if download_quizzes {
         let _ = fetch_assessment_details(client, &mut course);
     }
@@ -1459,6 +1471,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         )
         .unwrap();
 
@@ -1538,6 +1551,7 @@ mod tests {
             "sample-course",
             VideoQuality::P1080,
             false,
+            true,
             false,
             false,
         )
@@ -1552,6 +1566,38 @@ mod tests {
             .requested
             .iter()
             .any(|url| url.contains("fields=selectedVideo")));
+    }
+
+    #[test]
+    fn fetch_course_skips_course_page_when_exercises_and_quizzes_are_disabled() {
+        let mut client = FakeCourseApiClient::new(vec![
+            ("fields=chapters,title,exerciseFiles", metadata_fixture()),
+            (
+                "resolution=_1080",
+                selected_video_fixture_with_download_url(),
+            ),
+        ]);
+
+        let course = fetch_course_with_selected_video_details(
+            &mut client,
+            "sample-course",
+            VideoQuality::P1080,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(course.title, "Sample Course");
+        assert!(client
+            .requested
+            .iter()
+            .any(|url| url.contains("fields=selectedVideo")));
+        assert!(!client
+            .requested
+            .iter()
+            .any(|url| url == "https://www.linkedin.com/learning/sample-course"));
     }
 
     #[test]
@@ -1600,6 +1646,7 @@ mod tests {
             &mut client,
             "sample-course",
             VideoQuality::P1080,
+            true,
             true,
             true,
             true,
@@ -1775,6 +1822,7 @@ mod tests {
             &mut client,
             "sample-course",
             VideoQuality::P1080,
+            true,
             true,
             false,
             false,

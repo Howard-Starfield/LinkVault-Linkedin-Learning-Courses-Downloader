@@ -1,7 +1,7 @@
 #![deny(unused)]
 
-pub mod artifact_downloader;
 mod app_updates;
+pub mod artifact_downloader;
 pub mod auth;
 pub mod browser_cookies;
 pub mod cache;
@@ -34,6 +34,7 @@ pub fn run() {
             commands::parse_linkedin_course_urls,
             commands::process_next_queued_download_from_browser_source,
             commands::process_next_queued_download_with_saved_token,
+            commands::process_queued_download_batch_with_saved_token,
             commands::quality_fallback_order,
             commands::retry_failed_download_job,
             commands::save_download_preferences,

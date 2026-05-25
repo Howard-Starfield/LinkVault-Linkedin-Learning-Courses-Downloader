@@ -480,13 +480,13 @@ pub fn retry_failed_job(
         "UPDATE jobs SET status = 'queued', updated_at = ?2 WHERE id = ?1",
         params![job_id, retried_at],
     )?;
-    connection.execute("DELETE FROM artifacts WHERE job_id = ?1", params![job_id])?;
     append_job_event(
         connection,
         &NewJobEvent {
             job_id: job_id.to_string(),
             event_type: "job.retry".to_string(),
-            message: "Retry requested; job returned to the queue.".to_string(),
+            message: "Retry requested; completed artifacts will be reused when present."
+                .to_string(),
             payload_json: None,
             created_at: retried_at,
         },
@@ -647,8 +647,14 @@ pub fn upsert_artifact(connection: &Connection, artifact: &ArtifactRecord) -> Ca
             job_id = excluded.job_id,
             artifact_type = excluded.artifact_type,
             path = excluded.path,
-            status = excluded.status,
-            size_bytes = excluded.size_bytes,
+            status = CASE
+                WHEN artifacts.status = 'completed' AND excluded.status = 'pending' THEN artifacts.status
+                ELSE excluded.status
+            END,
+            size_bytes = CASE
+                WHEN artifacts.status = 'completed' AND excluded.status = 'pending' THEN artifacts.size_bytes
+                ELSE excluded.size_bytes
+            END,
             updated_at = excluded.updated_at
         "#,
         params![
@@ -900,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_failed_job_returns_job_to_queue_and_clears_artifacts() {
+    fn retry_failed_job_returns_job_to_queue_and_preserves_artifacts_for_resume() {
         let connection = initialized_connection();
         insert_job(&connection, &sample_job("job-1", "failed", 100)).unwrap();
         upsert_artifact(
@@ -922,9 +928,9 @@ mod tests {
 
         assert_eq!(retried.status, "queued");
         assert_eq!(retried.updated_at, 200);
-        assert!(list_artifacts_for_job(&connection, "job-1")
-            .unwrap()
-            .is_empty());
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].status, "failed");
         let events = list_job_events(&connection, "job-1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "job.retry");
@@ -1111,13 +1117,27 @@ mod tests {
         )
         .unwrap();
         update_artifact_status(&connection, "artifact-1", "completed", Some(2048), 130).unwrap();
+        upsert_artifact(
+            &connection,
+            &ArtifactRecord {
+                id: "artifact-1".to_string(),
+                job_id: "job-1".to_string(),
+                artifact_type: "video".to_string(),
+                path: "C:/downloads/sample/welcome.mp4".to_string(),
+                status: "pending".to_string(),
+                size_bytes: None,
+                created_at: 110,
+                updated_at: 140,
+            },
+        )
+        .unwrap();
 
         let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].status, "completed");
         assert_eq!(artifacts[0].size_bytes, Some(2048));
-        assert_eq!(artifacts[0].updated_at, 130);
+        assert_eq!(artifacts[0].updated_at, 140);
 
         connection
             .execute("DELETE FROM jobs WHERE id = ?1", params!["job-1"])
