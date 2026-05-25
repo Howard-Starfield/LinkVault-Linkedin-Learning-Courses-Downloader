@@ -529,7 +529,7 @@ textarea {
 }
 
 .token-grid {
-  grid-template-columns: minmax(0, 1fr) 88px;
+  grid-template-columns: minmax(0, 1fr) 92px 88px;
 }
 
 .option-row {
@@ -1063,6 +1063,44 @@ textarea {
   gap: 8px;
 }
 
+.token-guide-dialog {
+  max-width: min(860px, calc(100vw - 32px));
+}
+
+.token-guide-content {
+  display: grid;
+  gap: 14px;
+}
+
+.token-guide-content img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--color-field);
+}
+
+.token-guide-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 18px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.token-guide-steps li::marker {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.token-guide-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .line-clamp-2 {
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -1169,6 +1207,7 @@ textarea {
   .lv-sidebar nav,
   .field-action-grid,
   .token-grid,
+  .token-guide-steps,
   .settings-two-column {
     grid-template-columns: 1fr;
   }

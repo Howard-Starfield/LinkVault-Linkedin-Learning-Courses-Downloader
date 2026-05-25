@@ -1,5 +1,7 @@
 # LinkVault
 
+![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)
+
 LinkVault helps you save LinkedIn Learning courses you already have access to into a local folder, so your learning materials are easier to organize, revisit, and study offline.
 
 ## What You Can Do
@@ -34,7 +36,7 @@ Your downloads are saved into the folder you picked. Your saved session is prote
 Use this when you want to work on the app from source.
 
 ```powershell
-git clone https://github.com/Howard-Starfield/Linkedin-Learning-Courses-Downloader.git LinkVault
+git clone https://github.com/Howard-Starfield/LinkVault-Linkedin-Learning-Courses-Downloader.git LinkVault
 cd LinkVault
 pnpm.cmd --dir apps\desktop install
 pnpm.cmd tauri dev
@@ -58,7 +60,7 @@ Production outputs:
 
 ```text
 apps\desktop\src-tauri\target\release\linkvault.exe
-apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.0_x64-setup.exe
+apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.3_x64-setup.exe
 ```
 
 ## Frontend-Only Preview
