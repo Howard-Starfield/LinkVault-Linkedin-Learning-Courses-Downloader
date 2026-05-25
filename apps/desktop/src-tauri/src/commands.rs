@@ -9,8 +9,9 @@ use crate::browser_cookies::{
 };
 use crate::cache::{
     append_job_event, clear_failed_jobs, get_course_cache_entry, get_setting, insert_job,
-    list_artifacts_for_job, list_job_events, list_jobs_by_status, list_recent_jobs,
-    open_or_initialize, retry_failed_job, upsert_setting_json, JobRecord, NewJobEvent,
+    list_artifacts_for_job, list_download_history, list_job_events, list_jobs_by_status,
+    list_recent_jobs, open_or_initialize, retry_failed_job, upsert_setting_json,
+    DownloadHistoryEntry, JobRecord, NewJobEvent,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
@@ -22,7 +23,9 @@ use crate::token_store;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -96,6 +99,8 @@ pub struct BootstrapState {
     saved_download_preferences: Option<SavedDownloadPreferences>,
     persisted_jobs: Vec<PersistedDownloadJob>,
     recent_events: Vec<PersistedJobEvent>,
+    download_history: Vec<DownloadHistoryEntry>,
+    download_history_file_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -142,9 +147,11 @@ pub struct PersistedDownloadJob {
     course_slug: String,
     source_url: String,
     status: String,
+    title: Option<String>,
     thumbnail_url: Option<String>,
     selected_quality: String,
     output_dir: String,
+    created_at: i64,
     updated_at: i64,
     artifact_counts: ArtifactProgressCounts,
 }
@@ -208,11 +215,22 @@ pub struct SavedTokenStatus {
     has_saved_token: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenDownloadFolderResponse {
+    path: String,
+}
+
 #[tauri::command]
 pub fn bootstrap_state(state: tauri::State<'_, LinkVaultState>) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
-    load_bootstrap_state(&connection, token_store::has_saved_token(&state.token_path))
-        .map_err(|error| error.to_string())
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -267,8 +285,14 @@ pub fn retry_failed_download_job(
     let connection = state.connection()?;
     retry_failed_job(&connection, &job_id, now_unix_timestamp())
         .map_err(|error| error.to_string())?;
-    load_bootstrap_state(&connection, token_store::has_saved_token(&state.token_path))
-        .map_err(|error| error.to_string())
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -277,8 +301,14 @@ pub fn clear_failed_download_jobs(
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
     clear_failed_jobs(&connection).map_err(|error| error.to_string())?;
-    load_bootstrap_state(&connection, token_store::has_saved_token(&state.token_path))
-        .map_err(|error| error.to_string())
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -307,6 +337,24 @@ pub fn clear_saved_li_at_token(
     token_store::clear_token(&state.token_path).map_err(|error| error.to_string())?;
     Ok(SavedTokenStatus {
         has_saved_token: false,
+    })
+}
+
+#[tauri::command]
+pub fn open_download_folder(
+    state: tauri::State<'_, LinkVaultState>,
+    job_id: String,
+) -> Result<OpenDownloadFolderResponse, String> {
+    let connection = state.connection()?;
+    let job = crate::cache::get_job(&connection, &job_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Download job was not found.".to_string())?;
+    let artifacts =
+        list_artifacts_for_job(&connection, &job.id).map_err(|error| error.to_string())?;
+    let folder = download_folder_for_job(&job, &artifacts);
+    open_folder_in_file_explorer(&folder)?;
+    Ok(OpenDownloadFolderResponse {
+        path: folder.to_string_lossy().to_string(),
     })
 }
 
@@ -429,14 +477,16 @@ fn process_queued_download_batch_with_validated_token(
         AuthenticatedLinkedInClient::new(&token, &session).map_err(|error| error.to_string())?;
     let mut artifact_client = course_client.clone();
 
-    process_queued_download_batch_with_clients(
+    let response = process_queued_download_batch_with_clients(
         &connection,
         &mut course_client,
         &mut artifact_client,
         timestamp,
         delay_seconds,
         &cancellation,
-    )
+    )?;
+    let _ = sync_download_history_file(&connection, &download_history_file_path_for_db(&db_path));
+    Ok(response)
 }
 
 fn process_next_queued_download_with_validated_token(
@@ -452,14 +502,16 @@ fn process_next_queued_download_with_validated_token(
         AuthenticatedLinkedInClient::new(&token, &session).map_err(|error| error.to_string())?;
     let mut artifact_client = course_client.clone();
 
-    process_next_queued_download_with_clients(
+    let response = process_next_queued_download_with_clients(
         &connection,
         &mut course_client,
         &mut artifact_client,
         timestamp,
         &cancellation,
         quiz_assessments,
-    )
+    )?;
+    let _ = sync_download_history_file(&connection, &download_history_file_path_for_db(&db_path));
+    Ok(response)
 }
 
 fn process_queued_download_batch_with_clients(
@@ -561,6 +613,125 @@ fn sleep_between_queued_courses(delay_seconds: u32, cancellation: &impl Cancella
         }
         thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+fn download_folder_for_job(job: &JobRecord, artifacts: &[crate::cache::ArtifactRecord]) -> PathBuf {
+    let output_dir = PathBuf::from(job.output_dir.trim());
+    for artifact in artifacts {
+        let artifact_path = PathBuf::from(artifact.path.trim());
+        if let Some(course_folder) = course_folder_from_artifact_path(&output_dir, &artifact_path) {
+            if course_folder.is_dir() {
+                return course_folder;
+            }
+        }
+    }
+    output_dir
+}
+
+fn course_folder_from_artifact_path(output_dir: &Path, artifact_path: &Path) -> Option<PathBuf> {
+    let relative = artifact_path.strip_prefix(output_dir).ok()?;
+    let first = relative
+        .components()
+        .find_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })?;
+    Some(output_dir.join(first))
+}
+
+fn open_folder_in_file_explorer(folder: &Path) -> Result<(), String> {
+    if !folder.is_dir() {
+        return Err(format!(
+            "Folder does not exist yet: {}",
+            folder.to_string_lossy()
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(folder)
+            .spawn()
+            .map_err(|error| format!("Failed to open File Explorer: {error}"))?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("open")
+            .arg(folder)
+            .spawn()
+            .or_else(|_| Command::new("xdg-open").arg(folder).spawn())
+            .map_err(|error| format!("Failed to open folder: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn download_history_file_path_for_db(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("download-history.md")
+}
+
+fn sync_download_history_file(connection: &Connection, path: &Path) -> Result<(), String> {
+    let entries = list_download_history(connection).map_err(|error| error.to_string())?;
+    write_download_history_file(path, &entries).map_err(|error| error.to_string())
+}
+
+fn write_download_history_file(
+    path: &Path,
+    entries: &[DownloadHistoryEntry],
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut markdown = String::from("# LinkVault Download History\n\n");
+    markdown.push_str("| Date downloaded | Course | URL |\n");
+    markdown.push_str("| --- | --- | --- |\n");
+    for entry in entries {
+        markdown.push_str(&format!(
+            "| {} | {} | {} |\n",
+            format_unix_timestamp_utc(entry.completed_at),
+            escape_markdown_table_cell(&entry.course_title),
+            escape_markdown_table_cell(&history_source_url(entry))
+        ));
+    }
+    fs::write(path, markdown)
+}
+
+fn history_source_url(entry: &DownloadHistoryEntry) -> String {
+    if entry.source_url.trim().is_empty() {
+        format!("https://www.linkedin.com/learning/{}", entry.course_slug)
+    } else {
+        entry.source_url.clone()
+    }
+}
+
+fn escape_markdown_table_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn format_unix_timestamp_utc(timestamp: i64) -> String {
+    let timestamp = timestamp.max(0);
+    let days = timestamp / 86_400;
+    let seconds = timestamp % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 async fn extract_quizzes_for_next_job(
@@ -731,6 +902,7 @@ fn default_download_quizzes() -> bool {
 fn load_bootstrap_state(
     connection: &Connection,
     has_saved_token: bool,
+    download_history_file_path: &Path,
 ) -> Result<BootstrapState, String> {
     let saved_download_preferences = get_setting(connection, "download.preferences")
         .map_err(|error| error.to_string())?
@@ -764,9 +936,11 @@ fn load_bootstrap_state(
         let artifacts =
             list_artifacts_for_job(connection, &job.id).map_err(|error| error.to_string())?;
         let artifact_counts = summarize_artifacts(&artifacts);
-        let thumbnail_url = get_course_cache_entry(connection, &job.course_slug)
+        let cached_course = get_course_cache_entry(connection, &job.course_slug)
             .ok()
-            .flatten()
+            .flatten();
+        let thumbnail_url = cached_course
+            .as_ref()
             .and_then(|entry| cached_course_thumbnail_url(&entry.payload_json));
         persisted_jobs.push(PersistedDownloadJob {
             source_url: if job.source_url.trim().is_empty() {
@@ -774,16 +948,19 @@ fn load_bootstrap_state(
             } else {
                 job.source_url.clone()
             },
+            title: cached_course.and_then(|entry| entry.title),
             id: job.id,
             course_slug: job.course_slug,
             status: job.status,
             thumbnail_url,
             selected_quality: job.selected_quality,
             output_dir: job.output_dir,
+            created_at: job.created_at,
             updated_at: job.updated_at,
             artifact_counts,
         });
     }
+    let download_history = list_download_history(connection).map_err(|error| error.to_string())?;
 
     Ok(BootstrapState {
         default_resolution: VideoQuality::P1080,
@@ -793,6 +970,8 @@ fn load_bootstrap_state(
         saved_download_preferences,
         persisted_jobs,
         recent_events,
+        download_history,
+        download_history_file_path: download_history_file_path.to_string_lossy().to_string(),
     })
 }
 
@@ -1105,7 +1284,12 @@ mod tests {
             .unwrap();
         }
 
-        let bootstrap = load_bootstrap_state(&connection, true).unwrap();
+        let bootstrap = load_bootstrap_state(
+            &connection,
+            true,
+            Path::new("C:/downloads/download-history.md"),
+        )
+        .unwrap();
         let preferences = bootstrap.saved_download_preferences.unwrap();
 
         assert_eq!(bootstrap.default_resolution, VideoQuality::P1080);
@@ -1186,7 +1370,12 @@ mod tests {
         )
         .unwrap();
 
-        let bootstrap = load_bootstrap_state(&connection, true).unwrap();
+        let bootstrap = load_bootstrap_state(
+            &connection,
+            true,
+            Path::new("C:/downloads/download-history.md"),
+        )
+        .unwrap();
 
         assert_eq!(bootstrap.persisted_jobs.len(), 105);
         assert_eq!(
@@ -1251,6 +1440,69 @@ mod tests {
                 cancelled_artifacts: 0,
             }
         );
+    }
+
+    #[test]
+    fn download_folder_for_job_prefers_course_folder_from_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let course_dir = temp.path().join("Sample Course");
+        std::fs::create_dir_all(&course_dir).unwrap();
+        let job = JobRecord {
+            id: "job-1".to_string(),
+            course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+            status: "completed".to_string(),
+            selected_quality: "720".to_string(),
+            download_videos: true,
+            download_exercises: true,
+            download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
+            output_dir: temp.path().to_string_lossy().to_string(),
+            created_at: 100,
+            updated_at: 200,
+        };
+        let artifacts = vec![crate::cache::ArtifactRecord {
+            id: "artifact-1".to_string(),
+            job_id: "job-1".to_string(),
+            artifact_type: "video".to_string(),
+            path: course_dir
+                .join("01 - Intro")
+                .join("01 - Welcome.mp4")
+                .to_string_lossy()
+                .to_string(),
+            status: "completed".to_string(),
+            size_bytes: Some(10),
+            created_at: 100,
+            updated_at: 200,
+        }];
+
+        assert_eq!(download_folder_for_job(&job, &artifacts), course_dir);
+    }
+
+    #[test]
+    fn download_history_file_is_user_readable_markdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let history_path = temp.path().join("download-history.md");
+        write_download_history_file(
+            &history_path,
+            &[DownloadHistoryEntry {
+                job_id: "job-1".to_string(),
+                course_slug: "sample-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+                course_title: "Sample | Course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                completed_at: 1_700_000_000,
+            }],
+        )
+        .unwrap();
+
+        let markdown = std::fs::read_to_string(history_path).unwrap();
+
+        assert!(markdown.contains("# LinkVault Download History"));
+        assert!(markdown.contains("2023-11-14 22:13 UTC"));
+        assert!(markdown.contains("Sample \\| Course"));
+        assert!(markdown.contains("https://www.linkedin.com/learning/sample-course"));
     }
 
     #[test]

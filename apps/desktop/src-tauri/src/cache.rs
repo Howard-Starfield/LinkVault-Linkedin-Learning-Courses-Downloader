@@ -257,6 +257,16 @@ pub struct ArtifactRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DownloadHistoryEntry {
+    pub job_id: String,
+    pub course_slug: String,
+    pub source_url: String,
+    pub course_title: String,
+    pub output_dir: String,
+    pub completed_at: i64,
+}
+
 pub fn upsert_setting_json(
     connection: &Connection,
     key: &str,
@@ -588,6 +598,37 @@ pub fn list_recent_jobs(connection: &Connection, limit: usize) -> CacheResult<Ve
     Ok(jobs)
 }
 
+pub fn list_download_history(connection: &Connection) -> CacheResult<Vec<DownloadHistoryEntry>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            jobs.id,
+            jobs.course_slug,
+            jobs.source_url,
+            COALESCE(NULLIF(course_cache.title, ''), jobs.course_slug),
+            jobs.output_dir,
+            jobs.updated_at
+        FROM jobs
+        LEFT JOIN course_cache ON course_cache.course_slug = jobs.course_slug
+        WHERE jobs.status = 'completed'
+        ORDER BY jobs.updated_at DESC, jobs.created_at DESC, jobs.id
+        "#,
+    )?;
+    let entries = statement
+        .query_map([], |row| {
+            Ok(DownloadHistoryEntry {
+                job_id: row.get(0)?,
+                course_slug: row.get(1)?,
+                source_url: row.get(2)?,
+                course_title: row.get(3)?,
+                output_dir: row.get(4)?,
+                completed_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
 pub fn append_job_event(connection: &Connection, event: &NewJobEvent) -> CacheResult<i64> {
     connection.execute(
         r#"
@@ -903,6 +944,31 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].id, "job-new");
         assert_eq!(recent[1].id, "job-middle");
+    }
+
+    #[test]
+    fn download_history_lists_completed_courses_with_cached_titles() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("job-queued", "queued", 100)).unwrap();
+        insert_job(&connection, &sample_job("job-done", "completed", 200)).unwrap();
+        upsert_course_cache_entry(
+            &connection,
+            &CourseCacheEntry {
+                course_slug: "sample-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+                title: Some("Sample Course".to_string()),
+                payload_json: "{}".to_string(),
+                fetched_at: 200,
+            },
+        )
+        .unwrap();
+
+        let history = list_download_history(&connection).unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].job_id, "job-done");
+        assert_eq!(history[0].course_title, "Sample Course");
+        assert_eq!(history[0].completed_at, 200);
     }
 
     #[test]
