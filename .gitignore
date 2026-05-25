@@ -196,6 +196,7 @@ PublishScripts/
 
 # Local research clones / agent scratch data
 agent-harness/
+docs/learning/
 
 # Legacy project tree left behind by local Windows file locks after migration.
 LinkVault/
