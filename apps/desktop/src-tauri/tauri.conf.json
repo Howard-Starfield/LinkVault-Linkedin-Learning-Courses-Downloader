@@ -29,8 +29,8 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "publisher": "LinkVault",
-    "shortDescription": "LinkedIn Learning course downloader",
-    "longDescription": "LinkVault downloads LinkedIn Learning courses, subtitles, and exercise files into a local folder with a local SQLite activity cache.",
+    "shortDescription": "LinkVault offline learning archive",
+    "longDescription": "LinkVault saves courses, subtitles, quizzes, study guides, and exercise files you can access into a local learning archive.",
     "windows": {
       "nsis": {
         "installMode": "currentUser",

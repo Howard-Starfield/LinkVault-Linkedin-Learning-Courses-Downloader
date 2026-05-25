@@ -34,8 +34,8 @@ Your downloads are saved into the folder you picked. Your saved session is prote
 Use this when you want to work on the app from source.
 
 ```powershell
-git clone https://github.com/Howard-Starfield/Linkedin-Learning-Courses-Downloader.git
-cd Linkedin-Learning-Courses-Downloader
+git clone https://github.com/Howard-Starfield/Linkedin-Learning-Courses-Downloader.git LinkVault
+cd LinkVault
 pnpm.cmd --dir apps\desktop install
 pnpm.cmd tauri dev
 ```

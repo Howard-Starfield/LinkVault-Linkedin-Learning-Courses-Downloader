@@ -1,7 +1,7 @@
 [package]
 name = "linkvault"
 version = "0.1.0"
-description = "LinkedIn Learning course downloader"
+description = "LinkVault desktop app"
 authors = ["LinkVault"]
 license = ""
 repository = ""
@@ -36,3 +36,10 @@ thiserror = "2"
 url = "2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+panic = "abort"
+strip = true
