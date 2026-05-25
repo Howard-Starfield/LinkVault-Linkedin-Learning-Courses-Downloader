@@ -178,7 +178,7 @@ async function verifySavedTokenReuse(page, baseUrl) {
 
   const text = await bodyText(page);
   const placeholder = await token.getAttribute("placeholder");
-  assertUi(placeholder === "Saved token available", "saved token placeholder should make the persisted session state visible without showing the token.");
+  assertUi(placeholder === "••••••••••••••••", "saved token placeholder should make the persisted session state visible without showing the token.");
   assertUi(!text.includes("preview-li-at-token"), "saved-token UI must not expose the pasted token value.");
 
   await page.screenshot({ path: path.join(outputDir, "linkvault-ui-saved-token-reuse.png") });
@@ -270,18 +270,20 @@ async function verifyMultiCourseProgress(page, baseUrl) {
   await clickStartDownload(startButton);
   await page.getByText("Download queued").waitFor();
   await page.getByText("Queued download processed").waitFor();
-  await page.getByText("Started first queued course before continuing to the next course.").waitFor();
+  await page.getByText("12 completed, 0 failed, 0 cancelled.").waitFor();
+  await page.getByText("Completed one queued course before continuing to the next course.").waitFor();
 
   const text = await bodyText(page);
-  const firstIndex = text.indexOf("First Lifecycle Course");
-  const secondIndex = text.indexOf("Second Lifecycle Course");
+  const completedTitles = await page.locator(".completed-row .font-medium").allTextContents();
 
-  assertUi(text.includes("1 active - 1 queued"), "multi-course queue summary should show one active and one queued course.");
-  assertUi(firstIndex >= 0, "first lifecycle course should be visible in the queue.");
-  assertUi(secondIndex >= 0, "second lifecycle course should be visible in the queue.");
-  assertUi(firstIndex < secondIndex, "multiple-course lifecycle should preserve visible queue order.");
-  assertUi(text.includes("50%"), "first course should expose computed progress percentage.");
-  assertUi(text.includes("3/6 files") && text.includes("0/4 files"), "compact queue table should expose merged course/file progress summaries.");
+  assertUi(text.includes("0 active"), "multi-course queue summary should be drained after the batch finishes.");
+  assertUi(completedTitles.includes("First Lifecycle Course"), "first lifecycle course should be visible in completed history.");
+  assertUi(completedTitles.includes("Second Lifecycle Course"), "second lifecycle course should be visible in completed history.");
+  assertUi(
+    completedTitles.indexOf("First Lifecycle Course") < completedTitles.indexOf("Second Lifecycle Course"),
+    "multiple-course lifecycle should preserve visible completed-history order."
+  );
+  assertUi(text.includes("Completed"), "completed courses should move into terminal history after the batch drains.");
   assertUi(!text.includes("do-not-render-queue-secret"), "multi-course UI must not expose internal queue-only values.");
   assertUi(!text.includes("preview-li-at-token"), "multi-course UI must not expose the manual token value.");
 
@@ -313,12 +315,12 @@ async function verifyLivePollingProgress(page, baseUrl) {
 
   let text = await bodyText(page);
   assertUi(text.includes("1 active - 1 queued"), "live polling should refresh to one active and one queued course before completion.");
-  assertUi(text.includes("1/6 files") && text.includes("0/3 files"), "live polling should expose intermediate compact file progress.");
+  assertUi(text.includes("1/6 files"), "live polling should expose intermediate compact file progress.");
 
   await page.getByText("Queued download processed").waitFor({ timeout: 5000 });
-  await page.getByText("6 completed, 0 failed, 0 cancelled.").waitFor();
+  await page.getByText("12 completed, 0 failed, 0 cancelled.").waitFor();
   text = await bodyText(page);
-  assertUi(text.includes("1 queued"), "live polling completion should leave only the next course in the live queue summary.");
+  assertUi(text.includes("0 active"), "live polling batch completion should drain the remaining queued course.");
   assertUi(text.includes("Live polling exercise archive extracted."), "live polling should preserve the exercise extraction terminal event.");
   assertUi(!text.includes("do-not-render-live-polling-token"), "live polling UI must not expose token-like preview internals.");
   assertUi(!text.includes("preview-li-at-token"), "live polling UI must not expose the manual token value.");
@@ -344,7 +346,7 @@ async function verifyFailedCourseLifecycle(page, baseUrl) {
 
   await clickStartDownload(startButton);
   await page.getByText("Download queued").waitFor();
-  await page.getByText("Queued download processed").waitFor();
+  await page.getByText("Download processing failed").waitFor();
   await page.getByText("First queued course failed before artifact planning; remaining courses stay queued.").waitFor();
 
   const text = await bodyText(page);

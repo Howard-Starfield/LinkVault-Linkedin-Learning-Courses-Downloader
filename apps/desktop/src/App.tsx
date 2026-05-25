@@ -141,6 +141,11 @@ type BootstrapState = {
   recent_events: PersistedJobEvent[];
 };
 
+type UpdateMetadata = {
+  version: string;
+  current_version: string;
+};
+
 type PreviewCourseUrlError =
   | { type: "empty" }
   | { type: "notLinkedInLearning"; line: number }
@@ -152,6 +157,7 @@ const SIDEBAR_MAX_WIDTH = 320;
 const SIDEBAR_DEFAULT_WIDTH = 220;
 const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
+const APP_VERSION = "0.1.0";
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
@@ -176,20 +182,28 @@ export default function App() {
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
   const [isCancellingDownload, setIsCancellingDownload] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
+  const cancellationRequestedRef = useRef(false);
   const sidebarDragStart = useRef({ x: 0, width: SIDEBAR_DEFAULT_WIDTH });
   const sidebarDragCleanup = useRef<(() => void) | null>(null);
   const wasSettingsOpen = useRef(false);
 
   useEffect(() => {
     refreshBootstrapState();
+  }, []);
+
+  useEffect(() => {
+    checkForUpdatesOnLaunch();
   }, []);
 
   useEffect(() => {
@@ -251,7 +265,7 @@ export default function App() {
     };
   }, []);
 
-  async function refreshBootstrapState() {
+  async function refreshBootstrapState(): Promise<BootstrapState | null> {
     if (!isTauriRuntime()) {
       const previewPreferences = readPreviewPreferences();
       if (previewPreferences) {
@@ -262,8 +276,17 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setHasSavedToken(hasPreviewSavedToken());
         setPersistedEvents(previewState.events);
+        return {
+          default_resolution: "P720",
+          browser_sources: ["Chrome", "Edge", "Firefox"],
+          stores_plaintext_tokens_in_sqlite: false,
+          has_saved_token: hasPreviewSavedToken(),
+          saved_download_preferences: previewPreferences,
+          persisted_jobs: previewState.jobs,
+          recent_events: previewState.events
+        };
       }
-      return;
+      return null;
     }
 
     try {
@@ -283,6 +306,7 @@ export default function App() {
       }
       setHasSavedToken(state.has_saved_token);
       setPersistedEvents(state.recent_events ?? []);
+      return state;
     } catch {
       // Browser-only Vite previews do not expose Tauri commands.
       const previewState = getBrowserPreviewState();
@@ -290,7 +314,17 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setHasSavedToken(hasPreviewSavedToken());
         setPersistedEvents(previewState.events);
+        return {
+          default_resolution: "P720",
+          browser_sources: ["Chrome", "Edge", "Firefox"],
+          stores_plaintext_tokens_in_sqlite: false,
+          has_saved_token: hasPreviewSavedToken(),
+          saved_download_preferences: readPreviewPreferences(),
+          persisted_jobs: previewState.jobs,
+          recent_events: previewState.events
+        };
       }
+      return null;
     }
   }
 
@@ -437,6 +471,7 @@ export default function App() {
     }
     try {
       setIsProcessingDownload(true);
+      cancellationRequestedRef.current = false;
       setProcessingSummary(null);
       const response = await startDownloadJobs({
         courseUrls,
@@ -455,8 +490,9 @@ export default function App() {
         description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} persisted to the local queue.`
       });
 
-      const processResponse = await processQueuedDownloadWithLiveRefresh(() =>
-        processNextQueuedDownloadWithSavedToken()
+      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(
+        () => processNextQueuedDownloadWithSavedToken(),
+        delaySeconds
       );
 
       setProcessingSummary(processResponse);
@@ -499,6 +535,36 @@ export default function App() {
     return response;
   }
 
+  async function processQueuedDownloadBatchWithLiveRefresh(
+    processOperation: () => Promise<ProcessQueuedDownloadResponse>,
+    courseDelaySeconds: number
+  ) {
+    let summary = emptyProcessQueuedDownloadResponse();
+
+    while (!cancellationRequestedRef.current) {
+      const response = await processQueuedDownloadWithLiveRefresh(processOperation);
+      summary = mergeProcessQueuedDownloadResponses(summary, response);
+      setProcessingSummary(summary);
+
+      const state = await refreshBootstrapState();
+      if (!response.processed || response.cancelled_artifacts > 0 || cancellationRequestedRef.current) {
+        return summary;
+      }
+
+      const hasRemainingQueuedJobs = state?.persisted_jobs.some((job) => job.status === "queued") ?? false;
+      if (!hasRemainingQueuedJobs) {
+        return summary;
+      }
+
+      const delayMs = Math.max(0, courseDelaySeconds) * 1000;
+      if (delayMs > 0) {
+        await sleepUntilNextQueueItem(delayMs, () => cancellationRequestedRef.current);
+      }
+    }
+
+    return summary;
+  }
+
   async function clearToken() {
     try {
       await clearSavedLinkedInToken();
@@ -537,8 +603,67 @@ export default function App() {
     }
   }
 
+  async function checkForUpdates() {
+    setIsCheckingUpdate(true);
+    try {
+      const update = await checkForAppUpdate();
+      setPendingUpdate(update);
+      if (update) {
+        toast.success("Update available", {
+          description: `LinkVault ${update.version} is ready to install.`
+        });
+        return;
+      }
+      toast.info("LinkVault is up to date", {
+        description: `Current version ${APP_VERSION} is installed.`
+      });
+    } catch (error) {
+      toast.error("Update check failed", { description: String(error) });
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  }
+
+  async function checkForUpdatesOnLaunch() {
+    if (!isTauriRuntime()) return;
+
+    try {
+      const update = await checkForAppUpdate();
+      setPendingUpdate(update);
+      if (update) {
+        toast.info("Update available", {
+          description: `LinkVault ${update.version} can be installed from Settings.`
+        });
+      }
+    } catch {
+      // Startup checks should never block downloading courses.
+    }
+  }
+
+  async function installUpdate() {
+    if (!pendingUpdate) {
+      toast.warning("No update selected", {
+        description: "Check for updates before installing."
+      });
+      return;
+    }
+
+    setIsInstallingUpdate(true);
+    try {
+      await installAppUpdate();
+      toast.success("Update installed", {
+        description: "Restart LinkVault to finish using the new version."
+      });
+    } catch (error) {
+      toast.error("Update install failed", { description: String(error) });
+    } finally {
+      setIsInstallingUpdate(false);
+    }
+  }
+
   async function cancelDownload() {
     if (!isProcessingDownload) return;
+    cancellationRequestedRef.current = true;
     setIsCancellingDownload(true);
     try {
       const response = await invoke<CancelDownloadResponse>("cancel_active_download");
@@ -583,8 +708,10 @@ export default function App() {
       );
       toast.info("Retry queued", { description: courseDisplayName(job) });
 
-      const processResponse = await processQueuedDownloadWithLiveRefresh(() =>
-        processNextQueuedDownloadWithSavedToken()
+      cancellationRequestedRef.current = false;
+      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(
+        () => processNextQueuedDownloadWithSavedToken(),
+        delaySeconds
       );
 
       setProcessingSummary(processResponse);
@@ -936,7 +1063,23 @@ export default function App() {
           </div>
           <div className="settings-row">
             <span>Version</span>
-            <span>v1.2.0</span>
+            <span>v{pendingUpdate?.current_version ?? APP_VERSION}</span>
+          </div>
+          <div className="settings-row">
+            <span>Update status</span>
+            <span className={pendingUpdate ? "text-success" : "text-muted"}>
+              {pendingUpdate ? `v${pendingUpdate.version} available` : "No pending update"}
+            </span>
+          </div>
+          <div className="settings-button-row">
+            <Button type="button" variant="outline" onClick={checkForUpdates} loading={isCheckingUpdate} loadingLabel="Checking">
+              <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
+              Check for updates
+            </Button>
+            <Button type="button" variant="primary" onClick={installUpdate} disabled={!pendingUpdate} loading={isInstallingUpdate} loadingLabel="Installing">
+              <Play aria-hidden="true" className="h-3.5 w-3.5" />
+              Install update
+            </Button>
           </div>
         </section>
 
@@ -1294,6 +1437,34 @@ function sleep(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
+async function sleepUntilNextQueueItem(milliseconds: number, shouldStop?: () => boolean) {
+  const deadline = Date.now() + milliseconds;
+  while (Date.now() < deadline && !shouldStop?.()) {
+    await sleep(Math.min(500, Math.max(0, deadline - Date.now())));
+  }
+}
+
+function emptyProcessQueuedDownloadResponse(): ProcessQueuedDownloadResponse {
+  return {
+    processed: false,
+    completed_artifacts: 0,
+    failed_artifacts: 0,
+    cancelled_artifacts: 0
+  };
+}
+
+function mergeProcessQueuedDownloadResponses(
+  left: ProcessQueuedDownloadResponse,
+  right: ProcessQueuedDownloadResponse
+): ProcessQueuedDownloadResponse {
+  return {
+    processed: left.processed || right.processed,
+    completed_artifacts: left.completed_artifacts + right.completed_artifacts,
+    failed_artifacts: left.failed_artifacts + right.failed_artifacts,
+    cancelled_artifacts: left.cancelled_artifacts + right.cancelled_artifacts
+  };
+}
+
 async function parseLinkedInCourseUrls(input: string) {
   try {
     return await invoke<ParsedCourse[]>("parse_linkedin_course_urls", { input });
@@ -1369,6 +1540,24 @@ async function clearFailedDownloadJobs() {
     browser_sources: ["Chrome", "Edge", "Firefox"],
     default_resolution: "P720"
   } satisfies BootstrapState;
+}
+
+async function checkForAppUpdate() {
+  if (isTauriRuntime()) {
+    return invoke<UpdateMetadata | null>("check_for_app_update");
+  }
+
+  return null;
+}
+
+async function installAppUpdate() {
+  if (isTauriRuntime()) {
+    await invoke("install_app_update");
+    return true;
+  }
+
+  guardedToast("Updater unavailable in preview", "Installers can only update inside the packaged desktop app.");
+  return false;
 }
 
 async function openDownloadFolder(path: string) {
@@ -1551,8 +1740,18 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
 async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownloadResponse> {
   const jobs = readPreviewJobs();
   const scenario = getPreviewScenario();
+  const queuedIndex = jobs.findIndex((job) => job.status === "queued");
+  if (queuedIndex < 0) {
+    return {
+      processed: false,
+      completed_artifacts: 0,
+      failed_artifacts: 0,
+      cancelled_artifacts: 0
+    };
+  }
+
   if (scenario === "live-polling-progress") {
-    return processLivePollingProgressForPreview(jobs);
+    return processLivePollingProgressForPreview(jobs, queuedIndex);
   }
 
   if (scenario === "metadata-shape-drift") {
@@ -1645,74 +1844,47 @@ async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownl
     const unsafeQueueSecret = "do-not-render-queue-secret";
     void unsafeQueueSecret;
 
-    const activeJob = jobs[0]
-      ? {
-          ...jobs[0],
-          status: "active",
-          updated_at: timestamp,
-          artifact_counts: {
-            total: 6,
-            completed: 3,
-            failed: 0,
-            cancelled: 0,
-            active: 1,
-            pending: 2,
-            skipped: 0,
-            video_total: 3,
-            video_completed: 2,
-            subtitle_total: 2,
-            subtitle_completed: 1,
-            exercise_total: 1,
-            exercise_completed: 0
-          }
-        }
-      : null;
-    const queuedJob = jobs[1]
-      ? {
-          ...jobs[1],
-          status: "queued",
-          updated_at: timestamp - 1,
-          artifact_counts: {
-            total: 4,
-            completed: 0,
-            failed: 0,
-            cancelled: 0,
-            active: 0,
-            pending: 4,
-            skipped: 0,
-            video_total: 2,
-            video_completed: 0,
-            subtitle_total: 1,
-            subtitle_completed: 0,
-            exercise_total: 1,
-            exercise_completed: 0
-          }
-        }
-      : null;
-
-    const nextJobs = [activeJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null);
-    if (nextJobs.length > 0) {
-      writePreviewState(nextJobs, [
+    const completedJob = {
+      ...jobs[queuedIndex],
+      status: "completed",
+      updated_at: timestamp,
+      artifact_counts: {
+        total: 6,
+        completed: 6,
+        failed: 0,
+        cancelled: 0,
+        active: 0,
+        pending: 0,
+        skipped: 0,
+        video_total: 3,
+        video_completed: 3,
+        subtitle_total: 2,
+        subtitle_completed: 2,
+        exercise_total: 1,
+        exercise_completed: 1
+      }
+    };
+    const nextJobs = jobs.map((job, index) => (index === queuedIndex ? completedJob : job));
+    writePreviewState(nextJobs, [
         {
           id: 1,
-          job_id: nextJobs[0].id,
-          event_type: "job.active",
-          message: "Started first queued course before continuing to the next course.",
+          job_id: completedJob.id,
+          event_type: "job.completed",
+          message: "Completed one queued course before continuing to the next course.",
           created_at: timestamp
         },
         {
           id: 2,
-          job_id: nextJobs[0].id,
+          job_id: completedJob.id,
           event_type: "artifact.completed",
-          message: "First course video and subtitle artifacts are progressing.",
+          message: "Course video, subtitle, and exercise artifacts completed.",
           created_at: timestamp - 1
         }
-      ]);
-    }
+    ]);
 
     return {
-      processed: nextJobs.length > 0,
-      completed_artifacts: activeJob ? 3 : 0,
+      processed: true,
+      completed_artifacts: 6,
       failed_artifacts: 0,
       cancelled_artifacts: 0
     };
@@ -1767,12 +1939,7 @@ async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownl
       ]);
     }
 
-    return {
-      processed: nextJobs.length > 0,
-      completed_artifacts: 0,
-      failed_artifacts: failedJob ? 1 : 0,
-      cancelled_artifacts: 0
-    };
+    throw new Error("Course metadata fetch or artifact planning failed.");
   }
 
   if (scenario === "repetitive-artifact-failures") {
@@ -1827,30 +1994,52 @@ async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownl
     };
   }
 
+  const timestamp = Math.floor(Date.now() / 1000);
+  const completedJob = {
+    ...jobs[queuedIndex],
+    status: "completed",
+    updated_at: timestamp,
+    artifact_counts: {
+      total: 1,
+      completed: 1,
+      failed: 0,
+      cancelled: 0,
+      active: 0,
+      pending: 0,
+      skipped: 0,
+      video_total: 1,
+      video_completed: 1,
+      subtitle_total: 0,
+      subtitle_completed: 0,
+      exercise_total: 0,
+      exercise_completed: 0
+    }
+  };
+  writePreviewState(jobs.map((job, index) => (index === queuedIndex ? completedJob : job)), [
+    {
+      id: timestamp,
+      job_id: completedJob.id,
+      event_type: "job.completed",
+      message: "Preview queued course completed.",
+      created_at: timestamp
+    }
+  ]);
+
   return {
-    processed: jobs.length > 0,
-    completed_artifacts: 0,
+    processed: true,
+    completed_artifacts: 1,
     failed_artifacts: 0,
     cancelled_artifacts: 0
   };
 }
 
-async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[]): Promise<ProcessQueuedDownloadResponse> {
+async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[], queuedIndex: number): Promise<ProcessQueuedDownloadResponse> {
   const timestamp = Math.floor(Date.now() / 1000);
   const unsafeStreamingToken = "do-not-render-live-polling-token";
   void unsafeStreamingToken;
 
-  if (!jobs[0]) {
-    return {
-      processed: false,
-      completed_artifacts: 0,
-      failed_artifacts: 0,
-      cancelled_artifacts: 0
-    };
-  }
-
   const activeJob = {
-    ...jobs[0],
+    ...jobs[queuedIndex],
     status: "active",
     updated_at: timestamp,
     artifact_counts: {
@@ -1869,30 +2058,7 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[]): 
       exercise_completed: 0
     }
   };
-  const queuedJob = jobs[1]
-    ? {
-        ...jobs[1],
-        status: "queued",
-        updated_at: timestamp,
-        artifact_counts: {
-          total: 3,
-          completed: 0,
-          failed: 0,
-          cancelled: 0,
-          active: 0,
-          pending: 3,
-          skipped: 0,
-          video_total: 1,
-          video_completed: 0,
-          subtitle_total: 1,
-          subtitle_completed: 0,
-          exercise_total: 1,
-          exercise_completed: 0
-        }
-      }
-    : null;
-
-  writePreviewState([activeJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null), [
+  writePreviewState(jobs.map((job, index) => (index === queuedIndex ? activeJob : job)), [
     {
       id: 1,
       job_id: activeJob.id,
@@ -1923,7 +2089,7 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[]): 
       subtitle_completed: 1
     }
   };
-  writePreviewState([updatedActiveJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null), [
+  writePreviewState(jobs.map((job, index) => (index === queuedIndex ? updatedActiveJob : job)), [
     {
       id: 3,
       job_id: activeJob.id,
@@ -1956,7 +2122,7 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[]): 
       exercise_completed: 1
     }
   };
-  writePreviewState([completedJob, queuedJob, ...jobs.slice(2)].filter((job): job is QueuedDownloadJob => job !== null), [
+  writePreviewState(jobs.map((job, index) => (index === queuedIndex ? completedJob : job)), [
     {
       id: 4,
       job_id: activeJob.id,

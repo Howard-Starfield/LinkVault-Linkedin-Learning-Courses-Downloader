@@ -1,6 +1,7 @@
 #![deny(unused)]
 
 pub mod artifact_downloader;
+mod app_updates;
 pub mod auth;
 pub mod browser_cookies;
 pub mod cache;
@@ -22,7 +23,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            app_updates::check_for_app_update,
+            app_updates::install_app_update,
             commands::bootstrap_state,
             commands::cancel_active_download,
             commands::clear_failed_download_jobs,
@@ -49,6 +53,7 @@ pub fn run() {
             )?;
             drop(connection);
             app.manage(commands::LinkVaultState::new(db_path));
+            app.manage(app_updates::PendingUpdate::default());
             Ok(())
         })
         .run(tauri::generate_context!())
