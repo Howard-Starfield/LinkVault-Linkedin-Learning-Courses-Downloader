@@ -36,12 +36,11 @@ const version = config.version;
 const expectedPrefix = `${productName}_${version}_`;
 
 assertInstaller(productName === "LinkVault", `expected productName LinkVault, saw ${productName}.`);
-assertInstaller(version === "0.1.0", `expected version 0.1.0, saw ${version}.`);
 
-const installers = await listNsisInstallers();
+const installers = (await listNsisInstallers()).filter((installer) => path.basename(installer).startsWith(expectedPrefix));
 assertInstaller(
   installers.length > 0,
-  `expected at least one NSIS setup executable under ${nsisDir}; run pnpm.cmd run verify:release first.`
+  `expected at least one ${expectedPrefix} NSIS setup executable under ${nsisDir}; run pnpm.cmd run verify:release first.`
 );
 
 for (const installer of installers) {

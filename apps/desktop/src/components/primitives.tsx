@@ -484,13 +484,15 @@ export function Dialog({
   onOpenChange,
   title,
   description,
-  children
+  children,
+  className
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
   description?: string;
   children: ReactNode;
+  className?: string;
 }) {
   const titleId = useId();
   const descriptionId = useId();
@@ -521,7 +523,10 @@ export function Dialog({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? descriptionId : undefined}
-        className="relative grid max-h-[85vh] w-full max-w-lg gap-4 overflow-y-auto rounded-lg border border-border bg-background p-6 text-foreground shadow-panel"
+        className={cn(
+          "relative grid max-h-[85vh] w-full max-w-lg gap-4 overflow-y-auto rounded-lg border border-border bg-background p-6 text-foreground shadow-panel",
+          className
+        )}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <button

@@ -411,6 +411,7 @@ async function verifyKeyboardNavigation(page, baseUrl) {
     "Download folder",
     "Browse",
     "LinkedIn li_at token",
+    "Guide",
     "Clear",
     "Video resolution",
     "Delay seconds",
@@ -471,6 +472,22 @@ async function verifyPrimitiveOverlays(page, baseUrl) {
   await page.keyboard.press("Escape");
   await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-label="LinkVault help"]'));
 
+  await page.getByRole("button", { name: "Guide" }).click();
+  const tokenGuide = page.getByRole("dialog", { name: "Find your LinkedIn li_at cookie" });
+  await tokenGuide.waitFor();
+  const tokenGuideText = await tokenGuide.innerText();
+  for (const expected of [
+    "Press F12",
+    "Application tab",
+    "Cookies",
+    "li_at"
+  ]) {
+    assertUi(tokenGuideText.includes(expected), `token guide dialog should include "${expected}".`);
+  }
+  assertUi(await tokenGuide.locator('img[alt*="Chrome DevTools"]').count() === 1, "token guide dialog should render the instruction image.");
+  await page.getByRole("button", { name: "Got it" }).click();
+  await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-modal="true"]'));
+
   await page.getByLabel("Open settings").click();
   await page.getByRole("dialog", { name: "LinkVault settings" }).waitFor();
   let focused = await focusedSignature(page);
@@ -497,6 +514,7 @@ async function verifyPrimitiveOverlays(page, baseUrl) {
   assertUi(await page.locator("[data-sonner-toast].lv-toast").count() >= 1, "toasts should use the LinkVault themed Sonner class.");
   await page.keyboard.press("Escape");
   await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-modal="true"]'));
+  await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Open settings");
   focused = await focusedSignature(page);
   assertUi(focused.includes("Open settings"), `settings dialog should return focus to its trigger, saw "${focused}".`);
 

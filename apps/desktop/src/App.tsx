@@ -16,6 +16,7 @@ import {
   X
 } from "lucide-react";
 import { IconBrandLinkedin, IconMovie, IconTool } from "@tabler/icons-react";
+import liAtCookieGuide from "./assets/guide.png";
 import linkvaultLogo from "./assets/linkvault-wordmark.svg";
 import {
   ActivityEventRow,
@@ -169,7 +170,8 @@ const SIDEBAR_MAX_WIDTH = 320;
 const SIDEBAR_DEFAULT_WIDTH = 220;
 const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
-const APP_VERSION = "0.1.0";
+const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
+const APP_VERSION = "0.1.3";
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
@@ -198,6 +200,7 @@ export default function App() {
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [isTokenGuideOpen, setIsTokenGuideOpen] = useState(false);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
@@ -214,7 +217,16 @@ export default function App() {
   const wasSettingsOpen = useRef(false);
 
   useEffect(() => {
-    refreshBootstrapState();
+    void refreshBootstrapState().then((state) => {
+      if (
+        isTauriRuntime() &&
+        state &&
+        !state.has_saved_token &&
+        window.localStorage.getItem(TOKEN_GUIDE_DISMISSED_STORAGE_KEY) !== "true"
+      ) {
+        setIsTokenGuideOpen(true);
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -450,6 +462,13 @@ export default function App() {
       });
     } catch (error) {
       toast.error("Clear failed queue failed", { description: String(error) });
+    }
+  }
+
+  function handleTokenGuideOpenChange(open: boolean) {
+    setIsTokenGuideOpen(open);
+    if (!open) {
+      window.localStorage.setItem(TOKEN_GUIDE_DISMISSED_STORAGE_KEY, "true");
     }
   }
 
@@ -933,6 +952,10 @@ export default function App() {
                         aria-label="LinkedIn li_at token"
                         title={hasSavedToken && !token ? "Saved LinkedIn session is available" : undefined}
                       />
+                      <Button type="button" variant="outline" onClick={() => setIsTokenGuideOpen(true)}>
+                        <CircleHelp aria-hidden="true" className="h-3.5 w-3.5" />
+                        Guide
+                      </Button>
                       <Button type="button" onClick={clearToken}>
                         <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
                         Clear
@@ -1120,6 +1143,28 @@ export default function App() {
           <Button type="button" variant="ghost" onClick={() => setIsSettingsOpen(false)}>Close</Button>
           <Button type="button" variant="primary" onClick={saveSettings} loading={isSavingSettings} loadingLabel="Saving">
             Save settings
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+    <Dialog
+      open={isTokenGuideOpen}
+      onOpenChange={handleTokenGuideOpenChange}
+      title="Find your LinkedIn li_at cookie"
+      description="Use this only with a LinkedIn Learning account you are allowed to access. LinkVault saves the cookie locally with Windows encryption."
+      className="token-guide-dialog"
+    >
+      <div className="token-guide-content">
+        <img src={liAtCookieGuide} alt="Chrome DevTools showing the Application tab, Cookies storage, and the li_at cookie row." />
+        <ol className="token-guide-steps">
+          <li>Open LinkedIn Learning in your browser and sign in.</li>
+          <li>Press F12, then open the Application tab.</li>
+          <li>Under Storage, open Cookies and choose https://www.linkedin.com.</li>
+          <li>Find li_at, copy its full Value, and paste it into LinkVault.</li>
+        </ol>
+        <div className="token-guide-actions">
+          <Button type="button" variant="primary" onClick={() => handleTokenGuideOpenChange(false)}>
+            Got it
           </Button>
         </div>
       </div>

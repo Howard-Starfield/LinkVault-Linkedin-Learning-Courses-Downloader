@@ -72,8 +72,9 @@ function artifactRecord(filePath, kind) {
 }
 
 const config = JSON.parse(await readFile(configPath, "utf8"));
-const installers = await listNsisInstallers();
-const signatures = await listUpdaterSignatures();
+const expectedPrefix = `${config.productName}_${config.version}_`;
+const installers = (await listNsisInstallers()).filter((installer) => path.basename(installer).startsWith(expectedPrefix));
+const signatures = (await listUpdaterSignatures()).filter((signature) => path.basename(signature).startsWith(expectedPrefix));
 
 assertManifest(existsSync(releaseExe), `release executable missing at ${releaseExe}; run pnpm.cmd run verify:release first.`);
 assertManifest(installers.length > 0, `NSIS installer missing under ${nsisDir}; run pnpm.cmd run verify:release first.`);
@@ -104,7 +105,6 @@ const manifest = {
 };
 
 assertManifest(manifest.productName === "LinkVault", `expected productName LinkVault, saw ${manifest.productName}.`);
-assertManifest(manifest.version === "0.1.0", `expected version 0.1.0, saw ${manifest.version}.`);
 assertManifest(manifest.bundleTargets.includes("nsis"), "manifest should include nsis bundle target.");
 assertManifest(config.bundle?.createUpdaterArtifacts === true, "release config should create updater artifacts.");
 
