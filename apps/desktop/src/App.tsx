@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import {
   CircleHelp,
@@ -56,6 +55,7 @@ type QueuedDownloadJob = {
   course_slug: string;
   source_url: string;
   status: string;
+  title?: string | null;
   thumbnail_url?: string | null;
   selected_quality?: string;
   output_dir?: string;
@@ -132,6 +132,15 @@ type SavedDownloadPreferences = {
   downloadQuizzes?: boolean;
 };
 
+type DownloadHistoryEntry = {
+  job_id: string;
+  course_slug: string;
+  source_url: string;
+  course_title: string;
+  output_dir: string;
+  completed_at: number;
+};
+
 type BootstrapState = {
   default_resolution: string;
   browser_sources: string[];
@@ -140,6 +149,8 @@ type BootstrapState = {
   saved_download_preferences: SavedDownloadPreferences | null;
   persisted_jobs: QueuedDownloadJob[];
   recent_events: PersistedJobEvent[];
+  download_history: DownloadHistoryEntry[];
+  download_history_file_path: string;
 };
 
 type UpdateMetadata = {
@@ -190,6 +201,9 @@ export default function App() {
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
+  const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
+  const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
+  const [activeView, setActiveView] = useState<"downloads" | "history">("downloads");
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -277,6 +291,8 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setHasSavedToken(hasPreviewSavedToken());
         setPersistedEvents(previewState.events);
+        setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
+        setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
           default_resolution: "P720",
           browser_sources: ["Chrome", "Edge", "Firefox"],
@@ -284,7 +300,9 @@ export default function App() {
           has_saved_token: hasPreviewSavedToken(),
           saved_download_preferences: previewPreferences,
           persisted_jobs: previewState.jobs,
-          recent_events: previewState.events
+          recent_events: previewState.events,
+          download_history: downloadHistoryFromJobs(previewState.jobs),
+          download_history_file_path: previewDownloadHistoryFilePath()
         };
       }
       return null;
@@ -307,6 +325,8 @@ export default function App() {
       }
       setHasSavedToken(state.has_saved_token);
       setPersistedEvents(state.recent_events ?? []);
+      setDownloadHistory(state.download_history ?? []);
+      setDownloadHistoryFilePath(state.download_history_file_path ?? "");
       return state;
     } catch {
       // Browser-only Vite previews do not expose Tauri commands.
@@ -315,6 +335,8 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setHasSavedToken(hasPreviewSavedToken());
         setPersistedEvents(previewState.events);
+        setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
+        setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
           default_resolution: "P720",
           browser_sources: ["Chrome", "Edge", "Firefox"],
@@ -322,7 +344,9 @@ export default function App() {
           has_saved_token: hasPreviewSavedToken(),
           saved_download_preferences: readPreviewPreferences(),
           persisted_jobs: previewState.jobs,
-          recent_events: previewState.events
+          recent_events: previewState.events,
+          download_history: downloadHistoryFromJobs(previewState.jobs),
+          download_history_file_path: previewDownloadHistoryFilePath()
         };
       }
       return null;
@@ -728,16 +752,19 @@ export default function App() {
   }
 
   async function openCompletedFolder(job: QueuedDownloadJob) {
-    const outputDir = job.output_dir?.trim();
-    if (!outputDir) {
+    await openCompletedFolderByJobId(job.id, job.output_dir);
+  }
+
+  async function openCompletedFolderByJobId(jobId: string, fallbackPath?: string) {
+    if (!jobId.trim() && !fallbackPath?.trim()) {
       toast.warning("Folder unavailable", { description: "This completed course does not have a saved output folder." });
       return;
     }
 
     try {
-      const opened = await openDownloadFolder(outputDir);
+      const opened = await openDownloadFolder(jobId, fallbackPath);
       if (opened) {
-        toast.success("Folder opened", { description: outputDir });
+        toast.success("Folder opened", { description: opened.path });
       }
     } catch (error) {
       toast.error("Open folder failed", { description: String(error) });
@@ -789,10 +816,10 @@ export default function App() {
         </div>
 
         <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
-          <SidebarItem active icon={<IconBrandLinkedin aria-hidden="true" size={18} />}>LinkedIn Courses</SidebarItem>
+          <SidebarItem active={activeView === "downloads"} icon={<IconBrandLinkedin aria-hidden="true" size={18} />} onClick={() => setActiveView("downloads")}>LinkedIn Courses</SidebarItem>
           <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
           <SidebarItem icon={<IconTool aria-hidden="true" size={18} />}>Tools</SidebarItem>
-          <SidebarItem icon={<History aria-hidden="true" />}>History</SidebarItem>
+          <SidebarItem active={activeView === "history"} icon={<History aria-hidden="true" />} onClick={() => setActiveView("history")}>History</SidebarItem>
           <div className="mt-7 flex items-center justify-between border-t border-sidebar-border pt-6 text-xs text-sidebar-muted">
             <span>LinkedIn Scraper</span>
             <span className="rounded-full border border-sidebar-border px-2 py-0.5 text-[11px]">Coming Soon</span>
@@ -835,6 +862,14 @@ export default function App() {
       </aside>
       <main className="lv-main">
         <div className="lv-content">
+          {activeView === "history" ? (
+            <HistoryPage
+              entries={downloadHistory}
+              historyFilePath={downloadHistoryFilePath}
+              onOpenFolderByJobId={openCompletedFolderByJobId}
+            />
+          ) : (
+          <>
           <div className="lv-workspace">
             <Panel className="command-panel">
               <div className="section-heading command-section-heading">
@@ -984,6 +1019,8 @@ export default function App() {
               <CompletedDownloadsTable jobs={completedJobs} onOpenFolder={openCompletedFolder} />
             </div>
           </Panel>
+          </>
+          )}
         </div>
       </main>
     </div>
@@ -1299,6 +1336,48 @@ function CompletedDownloadsTable({ jobs, onOpenFolder }: { jobs: QueuedDownloadJ
   );
 }
 
+function HistoryPage({
+  entries,
+  historyFilePath,
+  onOpenFolderByJobId
+}: {
+  entries: DownloadHistoryEntry[];
+  historyFilePath: string;
+  onOpenFolderByJobId: (jobId: string, fallbackPath?: string) => void | Promise<void>;
+}) {
+  return (
+    <Panel className="history-page-panel">
+      <div className="history-page-header">
+        <div>
+          <h3>Download History</h3>
+          <p>{entries.length} completed course{entries.length === 1 ? "" : "s"}</p>
+        </div>
+        {historyFilePath ? (
+          <div className="history-file-path" title={historyFilePath}>
+            {historyFilePath}
+          </div>
+        ) : null}
+      </div>
+      <DataTable className="history-table">
+        {entries.length > 0 ? entries.map((entry) => (
+          <DataTableRow key={entry.job_id} className="history-row">
+            <div className="min-w-0">
+              <div className="truncate font-medium" title={entry.course_title}>{entry.course_title}</div>
+              <div className="truncate text-soft" title={entry.source_url}>{entry.source_url}</div>
+            </div>
+            <div className="history-date">{formatEventTime(entry.completed_at)}</div>
+            <Button size="sm" variant="ghost" onClick={() => onOpenFolderByJobId(entry.job_id, entry.output_dir)}>
+              Open Folder
+            </Button>
+          </DataTableRow>
+        )) : (
+          <EmptyRow title="No downloaded courses" description="Completed course downloads will appear here and in download-history.md." />
+        )}
+      </DataTable>
+    </Panel>
+  );
+}
+
 function CompletedDownloadRow({ job, onOpenFolder }: { job: QueuedDownloadJob; onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void> }) {
   const counts = artifactCounts(job);
   const title = courseDisplayName(job);
@@ -1399,6 +1478,7 @@ function filesSummaryText(counts: ArtifactProgressCounts, status: string) {
 }
 
 function courseDisplayName(job: QueuedDownloadJob) {
+  if (job.title?.trim()) return job.title.trim();
   return courseDisplayNameFromSlug(job.course_slug);
 }
 
@@ -1538,7 +1618,9 @@ async function clearFailedDownloadJobs() {
     saved_download_preferences: readPreviewPreferences(),
     stores_plaintext_tokens_in_sqlite: false,
     browser_sources: ["Chrome", "Edge", "Firefox"],
-    default_resolution: "P720"
+    default_resolution: "P720",
+    download_history: downloadHistoryFromJobs(jobs),
+    download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
 }
 
@@ -1560,14 +1642,13 @@ async function installAppUpdate() {
   return false;
 }
 
-async function openDownloadFolder(path: string) {
+async function openDownloadFolder(jobId: string, previewPath?: string) {
   if (isTauriRuntime()) {
-    await openPath(path);
-    return true;
+    return invoke<{ path: string }>("open_download_folder", { jobId });
   }
 
-  guardedToast("Folder opener unavailable in preview", path);
-  return false;
+  guardedToast("Folder opener unavailable in preview", previewPath || jobId);
+  return null;
 }
 
 async function processNextQueuedDownloadWithSavedToken() {
@@ -1760,7 +1841,9 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
     has_saved_token: hasPreviewSavedToken(),
     saved_download_preferences: readPreviewPreferences(),
     persisted_jobs: retriedJobs,
-    recent_events: events
+    recent_events: events,
+    download_history: downloadHistoryFromJobs(retriedJobs),
+    download_history_file_path: previewDownloadHistoryFilePath()
   };
 }
 
@@ -2208,6 +2291,24 @@ function writePreviewState(jobs: QueuedDownloadJob[], events: PersistedJobEvent[
   if (typeof window === "undefined") return;
   window.sessionStorage.setItem(previewJobsStorageKey, JSON.stringify(jobs));
   window.sessionStorage.setItem(previewEventsStorageKey, JSON.stringify(events));
+}
+
+function downloadHistoryFromJobs(jobs: QueuedDownloadJob[]): DownloadHistoryEntry[] {
+  return jobs
+    .filter((job) => job.status === "completed")
+    .map((job) => ({
+      job_id: job.id,
+      course_slug: job.course_slug,
+      source_url: job.source_url || `https://www.linkedin.com/learning/${job.course_slug}`,
+      course_title: courseDisplayName(job),
+      output_dir: job.output_dir || "",
+      completed_at: job.updated_at ?? 0
+    }))
+    .sort((left, right) => right.completed_at - left.completed_at);
+}
+
+function previewDownloadHistoryFilePath() {
+  return "Preview/LinkVaultData/download-history.md";
 }
 
 function readPreviewPreferences(): SavedDownloadPreferences | null {
