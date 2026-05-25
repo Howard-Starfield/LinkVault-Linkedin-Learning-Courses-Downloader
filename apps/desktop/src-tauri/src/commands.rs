@@ -21,11 +21,13 @@ use crate::quiz_hints::{quiz_hints_from_json, quiz_hints_json, QuizHints};
 use crate::token_store;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct LinkVaultState {
@@ -190,6 +192,12 @@ pub struct ProcessQueuedDownloadResponse {
     cancelled_artifacts: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessQueuedBatchRequest {
+    delay_seconds: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CancelDownloadResponse {
     cancellation_requested: bool,
@@ -322,13 +330,9 @@ pub async fn process_next_queued_download_with_saved_token(
     .map_err(|error| error.to_string())??;
 
     let (token, session) = token_and_session;
-    let quiz_assessments = extract_quizzes_for_next_job(
-        app,
-        db_path.clone(),
-        session.clone(),
-        now_unix_timestamp(),
-    )
-    .await;
+    let quiz_assessments =
+        extract_quizzes_for_next_job(app, db_path.clone(), session.clone(), now_unix_timestamp())
+            .await;
     tauri::async_runtime::spawn_blocking(move || {
         process_next_queued_download_with_validated_token(
             db_path,
@@ -337,6 +341,33 @@ pub async fn process_next_queued_download_with_saved_token(
             now_unix_timestamp(),
             cancellation,
             quiz_assessments,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn process_queued_download_batch_with_saved_token(
+    state: tauri::State<'_, LinkVaultState>,
+    request: ProcessQueuedBatchRequest,
+) -> Result<ProcessQueuedDownloadResponse, String> {
+    let db_path = state.db_path.clone();
+    let token_path = state.token_path.clone();
+    let cancellation = state.reset_download_cancellation();
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = token_store::load_token(&token_path).map_err(|error| error.to_string())?;
+        let mut home_client =
+            ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
+        let session = validate_li_at_with_client(&token, &mut home_client)
+            .map_err(|error| error.to_string())?;
+        process_queued_download_batch_with_validated_token(
+            db_path,
+            token,
+            session,
+            request.delay_seconds,
+            now_unix_timestamp(),
+            cancellation,
         )
     })
     .await
@@ -368,13 +399,9 @@ pub async fn process_next_queued_download_from_browser_source(
     .map_err(|error| error.to_string())??;
 
     let (token, session) = token_and_session;
-    let quiz_assessments = extract_quizzes_for_next_job(
-        app,
-        db_path.clone(),
-        session.clone(),
-        now_unix_timestamp(),
-    )
-    .await;
+    let quiz_assessments =
+        extract_quizzes_for_next_job(app, db_path.clone(), session.clone(), now_unix_timestamp())
+            .await;
     tauri::async_runtime::spawn_blocking(move || {
         process_next_queued_download_with_validated_token(
             db_path,
@@ -387,6 +414,29 @@ pub async fn process_next_queued_download_from_browser_source(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn process_queued_download_batch_with_validated_token(
+    db_path: PathBuf,
+    token: String,
+    session: ValidatedLinkedInSession,
+    delay_seconds: u32,
+    timestamp: i64,
+    cancellation: DownloadCancellation,
+) -> Result<ProcessQueuedDownloadResponse, String> {
+    let connection = open_or_initialize(&db_path).map_err(|error| error.to_string())?;
+    let mut course_client =
+        AuthenticatedLinkedInClient::new(&token, &session).map_err(|error| error.to_string())?;
+    let mut artifact_client = course_client.clone();
+
+    process_queued_download_batch_with_clients(
+        &connection,
+        &mut course_client,
+        &mut artifact_client,
+        timestamp,
+        delay_seconds,
+        &cancellation,
+    )
 }
 
 fn process_next_queued_download_with_validated_token(
@@ -410,6 +460,54 @@ fn process_next_queued_download_with_validated_token(
         &cancellation,
         quiz_assessments,
     )
+}
+
+fn process_queued_download_batch_with_clients(
+    connection: &Connection,
+    course_client: &mut impl CourseApiClient,
+    artifact_client: &mut impl ArtifactHttpClient,
+    timestamp: i64,
+    delay_seconds: u32,
+    cancellation: &impl CancellationFlag,
+) -> Result<ProcessQueuedDownloadResponse, String> {
+    let mut combined = ProcessQueuedDownloadResponse {
+        processed: false,
+        completed_artifacts: 0,
+        failed_artifacts: 0,
+        cancelled_artifacts: 0,
+    };
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(combined);
+        }
+
+        let quiz_assessments = record_quiz_metadata_discovery_for_next_job(connection, timestamp);
+        let response = process_next_queued_download_with_clients(
+            connection,
+            course_client,
+            artifact_client,
+            timestamp,
+            cancellation,
+            quiz_assessments,
+        )?;
+        merge_process_response(&mut combined, &response);
+
+        if !response.processed || response.cancelled_artifacts > 0 || cancellation.is_cancelled() {
+            return Ok(combined);
+        }
+
+        let has_remaining_queued_jobs = list_jobs_by_status(connection, "queued")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .is_some();
+        if !has_remaining_queued_jobs {
+            return Ok(combined);
+        }
+
+        sleep_between_queued_courses(delay_seconds, cancellation);
+    }
 }
 
 fn process_next_queued_download_with_clients(
@@ -446,6 +544,25 @@ fn process_next_queued_download_with_clients(
     })
 }
 
+fn merge_process_response(
+    combined: &mut ProcessQueuedDownloadResponse,
+    response: &ProcessQueuedDownloadResponse,
+) {
+    combined.processed |= response.processed;
+    combined.completed_artifacts += response.completed_artifacts;
+    combined.failed_artifacts += response.failed_artifacts;
+    combined.cancelled_artifacts += response.cancelled_artifacts;
+}
+
+fn sleep_between_queued_courses(delay_seconds: u32, cancellation: &impl CancellationFlag) {
+    for _ in 0..delay_seconds {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 async fn extract_quizzes_for_next_job(
     _app: tauri::AppHandle,
     db_path: PathBuf,
@@ -455,6 +572,13 @@ async fn extract_quizzes_for_next_job(
     let Ok(connection) = open_or_initialize(&db_path) else {
         return Vec::new();
     };
+    record_quiz_metadata_discovery_for_next_job(&connection, timestamp)
+}
+
+fn record_quiz_metadata_discovery_for_next_job(
+    connection: &Connection,
+    timestamp: i64,
+) -> Vec<crate::course::CourseAssessment> {
     let Ok(Some(job)) =
         list_jobs_by_status(&connection, "queued").map(|jobs| jobs.into_iter().next())
     else {
@@ -611,7 +735,7 @@ fn load_bootstrap_state(
     let saved_download_preferences = get_setting(connection, "download.preferences")
         .map_err(|error| error.to_string())?
         .and_then(|setting| serde_json::from_str(&setting.value_json).ok());
-    let recent_jobs = list_recent_jobs(connection, 20).map_err(|error| error.to_string())?;
+    let recent_jobs = bootstrap_jobs(connection).map_err(|error| error.to_string())?;
     let mut recent_events = Vec::new();
     for job in &recent_jobs {
         recent_events.extend(
@@ -670,6 +794,26 @@ fn load_bootstrap_state(
         persisted_jobs,
         recent_events,
     })
+}
+
+fn bootstrap_jobs(connection: &Connection) -> Result<Vec<JobRecord>, crate::cache::CacheError> {
+    let mut jobs = Vec::new();
+    let mut seen = HashSet::new();
+
+    for status in ["active", "queued", "failed", "cancelled"] {
+        for job in list_jobs_by_status(connection, status)? {
+            seen.insert(job.id.clone());
+            jobs.push(job);
+        }
+    }
+
+    for job in list_recent_jobs(connection, 20)? {
+        if seen.insert(job.id.clone()) {
+            jobs.push(job);
+        }
+    }
+
+    Ok(jobs)
 }
 
 fn cached_course_thumbnail_url(payload_json: &str) -> Option<String> {
@@ -1018,6 +1162,44 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_state_keeps_large_pending_queue_uncapped() {
+        let connection = initialized_connection();
+        let course_urls = (0..105)
+            .map(|index| format!("https://www.linkedin.com/learning/course-{index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls,
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let bootstrap = load_bootstrap_state(&connection, true).unwrap();
+
+        assert_eq!(bootstrap.persisted_jobs.len(), 105);
+        assert_eq!(
+            bootstrap
+                .persisted_jobs
+                .iter()
+                .filter(|job| job.status == "queued")
+                .count(),
+            105
+        );
+    }
+
+    #[test]
     fn process_next_queued_download_with_clients_reports_no_work_without_network() {
         let connection = initialized_connection();
         let mut course_client = NoopCourseClient;
@@ -1030,6 +1212,33 @@ mod tests {
             200,
             &NeverCancelled,
             Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response,
+            ProcessQueuedDownloadResponse {
+                processed: false,
+                completed_artifacts: 0,
+                failed_artifacts: 0,
+                cancelled_artifacts: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn process_queued_download_batch_with_clients_reports_no_work_without_network() {
+        let connection = initialized_connection();
+        let mut course_client = NoopCourseClient;
+        let mut artifact_client = NoopArtifactClient;
+
+        let response = process_queued_download_batch_with_clients(
+            &connection,
+            &mut course_client,
+            &mut artifact_client,
+            200,
+            0,
+            &NeverCancelled,
         )
         .unwrap();
 

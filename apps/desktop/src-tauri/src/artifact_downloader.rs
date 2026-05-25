@@ -1,6 +1,6 @@
 use crate::cache::{
-    append_job_event, get_job, update_artifact_status, upsert_artifact, ArtifactRecord, CacheError,
-    NewJobEvent,
+    append_job_event, get_job, list_artifacts_for_job, update_artifact_status, upsert_artifact,
+    ArtifactRecord, CacheError, NewJobEvent,
 };
 use crate::exercise_archive::{extract_zip_and_delete_archive, ExerciseArchiveExtractionResult};
 use rusqlite::Connection;
@@ -102,6 +102,7 @@ pub fn download_artifacts_for_active_job(
         failed: 0,
         cancelled: 0,
     };
+    let existing_artifacts = list_artifacts_for_job(connection, &job.id)?;
 
     for (index, download) in downloads.iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -118,6 +119,29 @@ pub fn download_artifacts_for_active_job(
         }
 
         upsert_artifact(connection, &download.artifact)?;
+        if let Some(size_bytes) = reusable_artifact_size(&existing_artifacts, download) {
+            update_artifact_status(
+                connection,
+                &download.artifact.id,
+                "completed",
+                size_bytes,
+                timestamp,
+            )?;
+            append_artifact_event(
+                connection,
+                &job.id,
+                "artifact.completed",
+                format!(
+                    "Reused existing {}.",
+                    artifact_display_name(&download.artifact)
+                ),
+                &download.artifact.id,
+                timestamp,
+            )?;
+            summary.completed += 1;
+            continue;
+        }
+
         update_artifact_status(connection, &download.artifact.id, "active", None, timestamp)?;
         append_artifact_event(
             connection,
@@ -330,6 +354,34 @@ pub fn download_artifacts_for_active_job(
         Some("All required artifacts finished."),
     )?;
     Ok(summary)
+}
+
+fn reusable_artifact_size(
+    existing_artifacts: &[ArtifactRecord],
+    download: &PlannedArtifactDownload,
+) -> Option<Option<i64>> {
+    let previous_completed = existing_artifacts
+        .iter()
+        .any(|artifact| artifact.id == download.artifact.id && artifact.status == "completed");
+
+    if previous_completed && is_exercise_zip_artifact(&download.artifact) {
+        return Some(download.artifact.size_bytes.or_else(|| {
+            existing_artifacts
+                .iter()
+                .find(|artifact| artifact.id == download.artifact.id)
+                .and_then(|artifact| artifact.size_bytes)
+        }));
+    }
+
+    file_size_if_reusable(Path::new(&download.artifact.path)).map(Some)
+}
+
+fn file_size_if_reusable(path: &Path) -> Option<i64> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return None;
+    }
+    i64::try_from(metadata.len()).ok()
 }
 
 fn write_artifact(
@@ -710,6 +762,67 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "job.completed"));
+    }
+
+    #[test]
+    fn existing_downloaded_files_are_reused_on_retry_without_network_request() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let existing_video_path = output.path().join("Sample Course").join("welcome.mp4");
+        let missing_video_path = output.path().join("Sample Course").join("next.mp4");
+        fs::create_dir_all(existing_video_path.parent().unwrap()).unwrap();
+        fs::write(&existing_video_path, b"already downloaded").unwrap();
+        let downloads = vec![
+            planned_url(
+                "artifact-existing-video",
+                "job-1",
+                "video",
+                &existing_video_path,
+                "https://cdn/existing.mp4",
+            ),
+            planned_url(
+                "artifact-missing-video",
+                "job-1",
+                "video",
+                &missing_video_path,
+                "https://cdn/missing.mp4",
+            ),
+        ];
+        let mut client = FakeArtifactClient::new(vec![("https://cdn/missing.mp4", 200, b"new")]);
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        let events = list_job_events(&connection, "job-1").unwrap();
+
+        assert_eq!(
+            summary,
+            ArtifactDownloadSummary {
+                completed: 2,
+                failed: 0,
+                cancelled: 0
+            }
+        );
+        assert_eq!(
+            fs::read(&existing_video_path).unwrap(),
+            b"already downloaded"
+        );
+        assert_eq!(fs::read(&missing_video_path).unwrap(), b"new");
+        assert!(artifacts
+            .iter()
+            .all(|artifact| artifact.status == "completed"));
+        assert!(events
+            .iter()
+            .any(|event| event.message == "Reused existing welcome.mp4."));
     }
 
     #[test]

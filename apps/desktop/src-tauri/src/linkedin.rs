@@ -27,12 +27,18 @@ pub fn parse_course_urls(input: &str) -> Result<Vec<CourseUrl>, CourseUrlError> 
     let mut courses = Vec::new();
 
     for (index, raw_line) in input.lines().enumerate() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
-            continue;
+        let line = index + 1;
+        let candidates = course_url_candidates(raw_line);
+        if candidates.is_empty() {
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            return Err(CourseUrlError::NotLinkedInLearning { line });
         }
 
-        courses.push(parse_course_url(trimmed, index + 1)?);
+        for candidate in candidates {
+            courses.push(parse_course_url(&candidate, line)?);
+        }
     }
 
     if courses.is_empty() {
@@ -40,6 +46,35 @@ pub fn parse_course_urls(input: &str) -> Result<Vec<CourseUrl>, CourseUrlError> 
     }
 
     Ok(courses)
+}
+
+fn course_url_candidates(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    if parts.len() == 1 {
+        return vec![trim_course_url_token(parts[0]).to_string()];
+    }
+
+    parts
+        .into_iter()
+        .map(trim_course_url_token)
+        .filter(|part| part.to_ascii_lowercase().contains("linkedin.com/learning/"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn trim_course_url_token(token: &str) -> &str {
+    token.trim_matches(|character: char| {
+        character.is_ascii_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+            )
+    })
 }
 
 fn parse_course_url(value: &str, line: usize) -> Result<CourseUrl, CourseUrlError> {
@@ -218,5 +253,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first-course", "second-course"]
         );
+    }
+
+    #[test]
+    fn extracts_many_course_urls_from_space_separated_paste() {
+        let input = (0..105)
+            .map(|index| format!("https://www.linkedin.com/learning/course-{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let parsed = parse_course_urls(&input).unwrap();
+
+        assert_eq!(parsed.len(), 105);
+        assert_eq!(parsed[0].slug, "course-000");
+        assert_eq!(parsed[104].slug, "course-104");
     }
 }
