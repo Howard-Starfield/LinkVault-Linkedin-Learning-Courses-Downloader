@@ -35,12 +35,16 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir apps/desktop install --frozen-lockfile
 
-      - name: Build LinkVault installer
-        run: pnpm --dir apps/desktop tauri build
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+      - name: Build and publish GitHub release
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          name: LinkVault ${{ github.ref_name }}
-          generate_release_notes: true
-          files: apps/desktop/src-tauri/target/release/bundle/nsis/LinkVault_*_x64-setup.exe
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: LinkVault ${{ github.ref_name }}
+          generateReleaseNotes: true
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true

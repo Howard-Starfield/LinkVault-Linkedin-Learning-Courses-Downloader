@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,11 +20,27 @@ function assertRelease(condition, message) {
   }
 }
 
+function releaseBuildEnv() {
+  const env = { ...process.env };
+  const keyPath = path.join(homedir(), ".tauri", "linkvault-updater.key");
+  const passwordPath = path.join(homedir(), ".tauri", "linkvault-updater.key.password.txt");
+
+  if (!env.TAURI_SIGNING_PRIVATE_KEY && existsSync(keyPath)) {
+    env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(keyPath, "utf8");
+  }
+  if (!env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD && existsSync(passwordPath)) {
+    env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = readFileSync(passwordPath, "utf8");
+  }
+
+  return env;
+}
+
 function runReleaseBuild() {
   const command = process.platform === "win32" ? "cmd.exe" : "pnpm";
   const args = process.platform === "win32" ? ["/d", "/s", "/c", "pnpm.cmd", "tauri", "build"] : ["tauri", "build"];
   const result = spawnSync(command, args, {
     cwd: root,
+    env: releaseBuildEnv(),
     stdio: "inherit",
     shell: false,
     windowsHide: true
@@ -42,8 +59,14 @@ async function assertBundleConfig() {
 
   assertRelease(config.bundle?.active === true, "Tauri bundle.active must be true.");
   assertRelease(targets.includes("nsis"), "Tauri bundle.targets must include nsis.");
+  assertRelease(config.bundle?.createUpdaterArtifacts === true, "Tauri bundle.createUpdaterArtifacts must be true.");
   assertRelease(icons.includes("icons/icon.ico"), "Tauri bundle.icon must include icons/icon.ico.");
   assertRelease(config.bundle?.windows?.nsis?.installerIcon === "icons/icon.ico", "NSIS installerIcon must use icons/icon.ico.");
+  assertRelease(typeof config.plugins?.updater?.pubkey === "string" && config.plugins.updater.pubkey.length > 0, "Updater public key must be configured.");
+  assertRelease(
+    config.plugins?.updater?.endpoints?.includes("https://github.com/Howard-Starfield/Linkedin-Learning-Courses-Downloader/releases/latest/download/latest.json"),
+    "Updater endpoint must point at the latest GitHub release manifest."
+  );
 }
 
 async function listFilesRecursive(directory) {
@@ -104,8 +127,9 @@ const nsisInstallers = (await listFilesRecursive(nsisDir)).filter((artifact) => 
 });
 const shareableArtifacts = [releaseExe, ...bundleFiles].filter((artifact) => {
   const extension = path.extname(artifact).toLowerCase();
-  return [".exe", ".msi", ".zip"].includes(extension);
+  return [".exe", ".msi", ".zip", ".sig"].includes(extension);
 });
+const updaterSignatures = bundleFiles.filter((artifact) => path.extname(artifact).toLowerCase() === ".sig");
 
 process.stdout.write("LinkVault release build passed.\n");
 process.stdout.write(`Release executable: ${releaseExe} (${formatBytes(releaseExeSize)})\n`);
@@ -121,6 +145,7 @@ if (bundleFiles.length > 0) {
 
 assertRelease(shareableArtifacts.length > 0, "release build must produce at least one shareable artifact.");
 assertRelease(nsisInstallers.length > 0, `NSIS setup executable must exist under ${nsisDir}.`);
+assertRelease(updaterSignatures.length > 0, "release build must produce updater signature artifacts.");
 
 process.stdout.write("NSIS installers:\n");
 for (const installer of nsisInstallers) {

@@ -51,6 +51,16 @@ async function listNsisInstallers() {
     .sort();
 }
 
+async function listUpdaterSignatures() {
+  if (!existsSync(nsisDir)) return [];
+
+  const entries = await readdir(nsisDir, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".sig"))
+    .map((entry) => path.join(nsisDir, entry.name))
+    .sort();
+}
+
 function artifactRecord(filePath, kind) {
   const stats = statSync(filePath);
   return {
@@ -63,13 +73,16 @@ function artifactRecord(filePath, kind) {
 
 const config = JSON.parse(await readFile(configPath, "utf8"));
 const installers = await listNsisInstallers();
+const signatures = await listUpdaterSignatures();
 
 assertManifest(existsSync(releaseExe), `release executable missing at ${releaseExe}; run pnpm.cmd run verify:release first.`);
 assertManifest(installers.length > 0, `NSIS installer missing under ${nsisDir}; run pnpm.cmd run verify:release first.`);
+assertManifest(signatures.length > 0, `Updater signature missing under ${nsisDir}; run pnpm.cmd run verify:release first.`);
 
 const artifacts = [
   artifactRecord(releaseExe, "release-exe"),
-  ...installers.map((installer) => artifactRecord(installer, "nsis-installer"))
+  ...installers.map((installer) => artifactRecord(installer, "nsis-installer")),
+  ...signatures.map((signature) => artifactRecord(signature, "updater-signature"))
 ];
 
 for (const artifact of artifacts) {
@@ -93,6 +106,7 @@ const manifest = {
 assertManifest(manifest.productName === "LinkVault", `expected productName LinkVault, saw ${manifest.productName}.`);
 assertManifest(manifest.version === "0.1.0", `expected version 0.1.0, saw ${manifest.version}.`);
 assertManifest(manifest.bundleTargets.includes("nsis"), "manifest should include nsis bundle target.");
+assertManifest(config.bundle?.createUpdaterArtifacts === true, "release config should create updater artifacts.");
 
 await mkdir(outputDir, { recursive: true });
 await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");

@@ -995,6 +995,12 @@ textarea {
   font-weight: 500;
 }
 
+.settings-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .settings-actions {
   display: flex;
   justify-content: flex-end;
