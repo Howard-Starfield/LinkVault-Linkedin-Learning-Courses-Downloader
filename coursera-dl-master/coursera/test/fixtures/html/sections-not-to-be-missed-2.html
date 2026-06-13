@@ -4170,7 +4170,7 @@ Summary (2:50)</a>
                   userId =
                       (Math.random() * 10000000000).toFixed() + '-' +
                       (new Date()).getTime();
-                  window.Cookie.set("ab-session-id", userId, { expires: 36500 });
+                  window.Cookie.set("ab-session-id", userId, { expires: 36500, secure: true });
               }
           }
 
