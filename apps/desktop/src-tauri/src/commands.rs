@@ -10,8 +10,8 @@ use crate::browser_cookies::{
 use crate::cache::{
     append_job_event, clear_failed_jobs, get_course_cache_entry, get_setting, insert_job,
     list_artifacts_for_job, list_download_history, list_job_events, list_jobs_by_status,
-    list_recent_jobs, open_or_initialize, retry_failed_job, upsert_setting_json,
-    DownloadHistoryEntry, JobRecord, NewJobEvent,
+    list_recent_jobs, open_or_initialize, remove_download_job, retry_failed_job,
+    upsert_setting_json, DownloadHistoryEntry, JobRecord, NewJobEvent,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
@@ -301,6 +301,23 @@ pub fn clear_failed_download_jobs(
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
     clear_failed_jobs(&connection).map_err(|error| error.to_string())?;
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn remove_download_queue_item(
+    state: tauri::State<'_, LinkVaultState>,
+    job_id: String,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    remove_download_job(&connection, &job_id).map_err(|error| error.to_string())?;
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(

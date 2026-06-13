@@ -43,6 +43,7 @@ pub fn run() {
             commands::process_next_queued_download_with_saved_token,
             commands::process_queued_download_batch_with_saved_token,
             commands::quality_fallback_order,
+            commands::remove_download_queue_item,
             commands::retry_failed_download_job,
             commands::save_download_preferences,
             commands::save_li_at_token,

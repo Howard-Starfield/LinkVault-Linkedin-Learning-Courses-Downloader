@@ -1,11 +1,12 @@
 use crate::auth::{BrowserSource, TokenCandidate};
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use rusqlite::{params, Connection};
+use rusqlite::{backup::Backup, params, Connection};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 use thiserror::Error;
 
@@ -319,6 +320,10 @@ pub fn copy_sqlite_database_files(
     source_db_path: &Path,
     destination_db_path: &Path,
 ) -> Result<(), BrowserCookieError> {
+    if backup_sqlite_database_file(source_db_path, destination_db_path).is_ok() {
+        return Ok(());
+    }
+
     fs::copy(source_db_path, destination_db_path)?;
     copy_if_exists(
         &source_db_path.with_extension("sqlite-wal"),
@@ -336,6 +341,18 @@ pub fn copy_sqlite_database_files(
         PathBuf::from(format!("{}-shm", source_db_path.display())).as_path(),
         PathBuf::from(format!("{}-shm", destination_db_path.display())).as_path(),
     )?;
+    Ok(())
+}
+
+fn backup_sqlite_database_file(
+    source_db_path: &Path,
+    destination_db_path: &Path,
+) -> Result<(), BrowserCookieError> {
+    let source =
+        Connection::open_with_flags(source_db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut destination = Connection::open(destination_db_path)?;
+    let backup = Backup::new(&source, &mut destination)?;
+    backup.run_to_completion(25, Duration::from_millis(50), None)?;
     Ok(())
 }
 
@@ -555,25 +572,18 @@ mod tests {
     }
 
     #[test]
-    fn copies_sqlite_wal_and_shm_sidecars_before_reading() {
+    fn copies_readable_sqlite_snapshot_before_reading() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("Cookies");
         let destination = temp.path().join("Copied");
-        fs::write(&source, "db").unwrap();
-        fs::write(temp.path().join("Cookies-wal"), "wal").unwrap();
-        fs::write(temp.path().join("Cookies-shm"), "shm").unwrap();
+        create_chromium_cookie_db(&source, &[(".www.linkedin.com", "li_at", "source-token")]);
 
         copy_sqlite_database_files(&source, &destination).unwrap();
 
-        assert_eq!(fs::read_to_string(&destination).unwrap(), "db");
-        assert_eq!(
-            fs::read_to_string(temp.path().join("Copied-wal")).unwrap(),
-            "wal"
-        );
-        assert_eq!(
-            fs::read_to_string(temp.path().join("Copied-shm")).unwrap(),
-            "shm"
-        );
+        let values =
+            read_chromium_li_at_values_from_db(&destination, &UnsupportedEncryptedCookieDecoder)
+                .unwrap();
+        assert_eq!(values, vec!["source-token"]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -47,6 +48,8 @@ pub enum TokenValidationError {
     EmptyToken,
     #[error("LinkedIn returned a trial prompt for this account")]
     TrialPrompt,
+    #[error("LinkedIn did not accept this session. Please refresh the li_at cookie.")]
+    GuestSession,
     #[error("LinkedIn session did not include JSESSIONID")]
     MissingSessionCookie,
     #[error("no valid browser token candidates were found")]
@@ -121,6 +124,9 @@ pub fn validate_li_at_with_client(
     if has_trial_prompt(&html) {
         return Err(TokenValidationError::TrialPrompt);
     }
+    if has_guest_learning_page(&html) {
+        return Err(TokenValidationError::GuestSession);
+    }
 
     let csrf_token = response
         .cookies
@@ -165,18 +171,31 @@ pub fn has_trial_prompt(html: &str) -> bool {
         .is_some()
 }
 
+pub fn has_guest_learning_page(html: &str) -> bool {
+    let normalized = html.to_lowercase();
+    normalized.contains("content=\"d_learning_course_guest\"")
+        || normalized.contains("content=\"d_learning_home_guest\"")
+        || normalized.contains("data-service-name=\"learning-guest-frontend\"")
+        || normalized.contains("data-multiproduct-name=\"learning-guest-frontend\"")
+}
+
 pub fn extract_enterprise_profile_hash(html: &str) -> Option<String> {
     let decoded = decode_linkedin_html(html);
-    let marker = "\"enterpriseProfileHash\":\"";
-    let start = decoded.find(marker)? + marker.len();
+    if let Some(value) = extract_json_string_field(&decoded, "enterpriseProfileHash") {
+        return Some(value);
+    }
+    extract_json_string_field(&decoded, "enterpriseProfile")
+        .filter(|value| value.starts_with("urn:li:enterpriseProfile:"))
+        .map(|value| BASE64.encode(value))
+}
+
+fn extract_json_string_field(decoded: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\":\"");
+    let start = decoded.find(&marker)? + marker.len();
     let rest = &decoded[start..];
     let end = rest.find('"')?;
     let value = rest[..end].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn distinct_non_empty_candidates(candidates: &[TokenCandidate]) -> Vec<TokenCandidate> {
@@ -267,6 +286,18 @@ mod tests {
     }
 
     #[test]
+    fn guest_learning_page_rejects_token_even_with_session_cookie() {
+        let mut client = FakeHomeClient::new(vec![Ok(home(
+            r#"<meta name="pageKey" content="d_learning_course_guest"><meta id="config" data-service-name="learning-guest-frontend">"#,
+            &[("JSESSIONID", "ajax:123")],
+        ))]);
+
+        let error = validate_li_at_with_client("li-at-token", &mut client).unwrap_err();
+
+        assert_eq!(error, TokenValidationError::GuestSession);
+    }
+
+    #[test]
     fn missing_jsessionid_rejects_token() {
         let mut client = FakeHomeClient::new(vec![Ok(home("<html>signed in shell</html>", &[]))]);
 
@@ -283,6 +314,35 @@ mod tests {
             extract_enterprise_profile_hash(html),
             Some("urn-li-enterprise-profile".to_string())
         );
+    }
+
+    #[test]
+    fn enterprise_profile_urn_is_encoded_for_identity_header() {
+        let html = r#"<script>{"enterpriseProfile":"urn:li:enterpriseProfile:(urn:li:enterpriseAccount:52983649,54285356)"}</script>"#;
+
+        assert_eq!(
+            extract_enterprise_profile_hash(html),
+            Some(
+                "dXJuOmxpOmVudGVycHJpc2VQcm9maWxlOih1cm46bGk6ZW50ZXJwcmlzZUFjY291bnQ6NTI5ODM2NDksNTQyODUzNTYp"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn validation_sets_identity_header_from_enterprise_profile_urn() {
+        let mut client = FakeHomeClient::new(vec![Ok(home(
+            r#"<script>{"enterpriseProfile":"urn:li:enterpriseProfile:(urn:li:enterpriseAccount:52983649,54285356)"}</script>"#,
+            &[("JSESSIONID", "ajax:123")],
+        ))]);
+
+        let session = validate_li_at_with_client("li-at-token", &mut client).unwrap();
+
+        assert!(session.request_headers.iter().any(|(name, value)| {
+            name == "x-li-identity"
+                && value
+                    == "dXJuOmxpOmVudGVycHJpc2VQcm9maWxlOih1cm46bGk6ZW50ZXJwcmlzZUFjY291bnQ6NTI5ODM2NDksNTQyODUzNTYp"
+        }));
     }
 
     #[test]
