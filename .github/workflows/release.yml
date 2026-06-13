@@ -17,23 +17,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install frontend dependencies
-        run: pnpm --dir apps/desktop install --frozen-lockfile
+        run: npm ci --prefix apps/desktop
 
       - name: Build and publish GitHub release
         uses: tauri-apps/tauri-action@v0.6.2

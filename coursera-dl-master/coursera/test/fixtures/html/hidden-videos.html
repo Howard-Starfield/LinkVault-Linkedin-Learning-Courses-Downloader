@@ -486,7 +486,7 @@ Nathan Kutz</div>
                   userId =
                       (Math.random() * 10000000000).toFixed() + '-' +
                       (new Date()).getTime();
-                  cookie.set("ab-session-id", userId, { expires: 36500 });
+                  cookie.set("ab-session-id", userId, { expires: 36500, secure: true });
               }
           }
 

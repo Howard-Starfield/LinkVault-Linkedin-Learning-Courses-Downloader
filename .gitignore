@@ -198,6 +198,21 @@ PublishScripts/
 agent-harness/
 docs/learning/
 
+# JavaScript / Tauri generated outputs
+apps/desktop/pnpm-lock.yaml
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+apps/desktop/.vite/
+apps/desktop/.tauri/
+apps/desktop/npm-debug.log*
+apps/desktop/yarn-debug.log*
+apps/desktop/yarn-error.log*
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
 # Legacy project tree left behind by local Windows file locks after migration.
 LinkVault/
 
