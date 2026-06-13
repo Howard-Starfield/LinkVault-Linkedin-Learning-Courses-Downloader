@@ -55,6 +55,34 @@ CREATE TABLE IF NOT EXISTS artifacts (
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS coursera_jobs (
+    id TEXT PRIMARY KEY NOT NULL,
+    class_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    output_dir TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    counts_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS coursera_job_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES coursera_jobs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS coursera_settings (
+    key TEXT PRIMARY KEY NOT NULL,
+    value_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_coursera_jobs_status ON coursera_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_coursera_events_job ON coursera_job_events(job_id);
 "#;
 
 pub fn open_or_initialize(path: &Path) -> Result<Connection> {

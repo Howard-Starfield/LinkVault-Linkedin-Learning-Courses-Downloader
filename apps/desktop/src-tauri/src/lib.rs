@@ -17,6 +17,12 @@ pub mod security;
 pub mod storage;
 pub mod token_store;
 
+// Coursera tab: fully isolated sibling. The Tauri command surface is
+// registered below alongside the LinkedIn handlers. Per
+// `docs/learning/agent-harness-coursera/ISOLATION_RULES.md`, the
+// LinkedIn command surface in `commands::*` is unchanged.
+pub mod coursera;
+
 use tauri::Manager;
 
 pub fn run() {
@@ -41,6 +47,23 @@ pub fn run() {
             commands::save_download_preferences,
             commands::save_li_at_token,
             commands::start_download_jobs,
+            coursera::commands::bootstrap_coursera_state,
+            coursera::commands::parse_coursera_class_input,
+            coursera::commands::coursera_login,
+            coursera::commands::save_coursera_token,
+            coursera::commands::clear_saved_coursera_token,
+            coursera::commands::has_saved_coursera_token,
+            coursera::commands::save_coursera_preferences,
+            coursera::commands::load_coursera_preferences,
+            coursera::commands::start_coursera_download_jobs,
+            coursera::commands::process_next_queued_coursera_job,
+            coursera::commands::process_queued_coursera_batch,
+            coursera::commands::cancel_active_coursera_download,
+            coursera::commands::retry_failed_coursera_job,
+            coursera::commands::clear_failed_coursera_jobs,
+            coursera::commands::list_coursera_history,
+            coursera::commands::open_coursera_download_folder,
+            coursera::commands::fetch_coursera_syllabus_preview,
         ])
         .setup(|app| {
             let db_path = storage::resolve_db_path()?;
@@ -54,7 +77,8 @@ pub fn run() {
                 commands::now_unix_timestamp(),
             )?;
             drop(connection);
-            app.manage(commands::LinkVaultState::new(db_path));
+            app.manage(commands::LinkVaultState::new(db_path.clone()));
+            app.manage(coursera::commands::CourseraState::new(db_path));
             app.manage(app_updates::PendingUpdate::default());
             Ok(())
         })
