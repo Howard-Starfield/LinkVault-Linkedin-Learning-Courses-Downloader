@@ -514,7 +514,7 @@ fn build_initial_artifact_downloads(
                     ensure_study_video(
                         &mut study_videos,
                         chapter_index,
-                        video_artifact_index,
+                        video_index,
                         &chapter.title,
                         video.title.as_deref().unwrap_or(&video.slug),
                     );
@@ -538,10 +538,14 @@ fn build_initial_artifact_downloads(
                         },
                         source: ArtifactDownloadSource::Text(transcript_srt.clone()),
                     });
+                }
+            }
+            if should_merge_transcript_into_study_guide(job) {
+                if let Some(transcript_srt) = &video.transcript_srt {
                     ensure_study_video(
                         &mut study_videos,
                         chapter_index,
-                        video_artifact_index,
+                        video_index,
                         &chapter.title,
                         video.title.as_deref().unwrap_or(&video.slug),
                     )
@@ -570,7 +574,7 @@ fn build_initial_artifact_downloads(
                     ensure_study_video(
                         &mut study_videos,
                         chapter_index,
-                        video_artifact_index,
+                        video_index,
                         &chapter.title,
                         video.title.as_deref().unwrap_or(&video.slug),
                     )
@@ -652,6 +656,10 @@ fn build_initial_artifact_downloads(
     downloads.extend(video_downloads);
     downloads.extend(exercise_downloads);
     downloads
+}
+
+fn should_merge_transcript_into_study_guide(job: &JobRecord) -> bool {
+    job.download_subtitles || job.download_quizzes
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1533,6 +1541,53 @@ mod tests {
 
         assert_eq!(downloads.len(), 1);
         assert_eq!(downloads[0].artifact.artifact_type, "video");
+    }
+
+    #[test]
+    fn study_guide_can_merge_transcripts_without_planning_subtitle_files() {
+        let mut job = sample_job("job-1", "queued", 100);
+        job.download_videos = false;
+        job.download_subtitles = false;
+        job.download_quizzes = true;
+        job.download_exercises = false;
+        let course = Course {
+            slug: "sample-course".to_string(),
+            title: "Sample Course".to_string(),
+            thumbnail_url: None,
+            chapters: vec![Chapter {
+                title: "Chapter".to_string(),
+                videos: vec![CourseVideo {
+                    slug: "welcome".to_string(),
+                    title: Some("Welcome".to_string()),
+                    duration_seconds: Some(10),
+                    download_url: Some("https://cdn.example.test/welcome.mp4".to_string()),
+                    transcript_srt: Some(
+                        "1\n00:00:00,000 --> 00:00:04,000\nTranscript sentence.\n\n".to_string(),
+                    ),
+                    quiz_markdown: Some("# Quiz\n\n## Questions\n\n1. Checkpoint?\n".to_string()),
+                }],
+            }],
+            assessments: Vec::new(),
+            exercise_files: Vec::new(),
+        };
+
+        let downloads = build_initial_artifact_downloads(&job, &course, 200);
+        let types = downloads
+            .iter()
+            .map(|download| download.artifact.artifact_type.as_str())
+            .collect::<Vec<_>>();
+        let study = downloads
+            .iter()
+            .find(|download| download.artifact.artifact_type == "study_guide")
+            .unwrap();
+        let study_markdown = match &study.source {
+            ArtifactDownloadSource::Text(text) => text,
+            _ => panic!("study guide must be a text artifact"),
+        };
+
+        assert_eq!(types, vec!["quiz", "study_guide"]);
+        assert!(study_markdown.contains("Transcript sentence."));
+        assert!(study_markdown.contains("1. Checkpoint?"));
     }
 
     #[test]

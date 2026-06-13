@@ -215,6 +215,8 @@ pub enum CacheError {
     SecretSettingKey(String),
     #[error("invalid job transition from {from} to {to}")]
     InvalidJobTransition { from: String, to: String },
+    #[error("job cannot be removed while status is {status}")]
+    JobRemovalBlocked { status: String },
     #[error("job not found: {0}")]
     JobNotFound(String),
 }
@@ -540,6 +542,19 @@ pub fn clear_failed_jobs(connection: &Connection) -> CacheResult<usize> {
             [],
         )
         .map_err(CacheError::from)
+}
+
+pub fn remove_download_job(connection: &Connection, job_id: &str) -> CacheResult<JobRecord> {
+    let current =
+        get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))?;
+    if current.status == "active" || current.status == "completed" {
+        return Err(CacheError::JobRemovalBlocked {
+            status: current.status,
+        });
+    }
+
+    connection.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])?;
+    Ok(current)
 }
 
 pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobRecord>> {
@@ -1046,6 +1061,69 @@ mod tests {
             get_job(&connection, "queued-job").unwrap().unwrap().status,
             "queued"
         );
+    }
+
+    #[test]
+    fn remove_download_job_deletes_queued_job_events_and_artifacts() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("queued-job", "queued", 100)).unwrap();
+        append_job_event(
+            &connection,
+            &NewJobEvent {
+                job_id: "queued-job".to_string(),
+                event_type: "job.queued".to_string(),
+                message: "Queued.".to_string(),
+                payload_json: None,
+                created_at: 100,
+            },
+        )
+        .unwrap();
+        upsert_artifact(
+            &connection,
+            &ArtifactRecord {
+                id: "artifact-1".to_string(),
+                job_id: "queued-job".to_string(),
+                artifact_type: "video".to_string(),
+                path: "C:/downloads/sample/welcome.mp4".to_string(),
+                status: "pending".to_string(),
+                size_bytes: None,
+                created_at: 100,
+                updated_at: 100,
+            },
+        )
+        .unwrap();
+
+        let removed = remove_download_job(&connection, "queued-job").unwrap();
+
+        assert_eq!(removed.status, "queued");
+        assert!(get_job(&connection, "queued-job").unwrap().is_none());
+        assert!(list_job_events(&connection, "queued-job")
+            .unwrap()
+            .is_empty());
+        assert!(list_artifacts_for_job(&connection, "queued-job")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn remove_download_job_blocks_active_and_completed_jobs() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("active-job", "active", 100)).unwrap();
+        insert_job(&connection, &sample_job("completed-job", "completed", 100)).unwrap();
+
+        let active_error = remove_download_job(&connection, "active-job").unwrap_err();
+        let completed_error = remove_download_job(&connection, "completed-job").unwrap_err();
+
+        assert!(matches!(
+            active_error,
+            CacheError::JobRemovalBlocked { status } if status == "active"
+        ));
+        assert!(matches!(
+            completed_error,
+            CacheError::JobRemovalBlocked { status } if status == "completed"
+        ));
+        assert!(get_job(&connection, "active-job").unwrap().is_some());
+        assert!(get_job(&connection, "completed-job").unwrap().is_some());
     }
 
     #[test]

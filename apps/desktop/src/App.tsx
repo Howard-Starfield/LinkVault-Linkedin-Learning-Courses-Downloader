@@ -466,6 +466,31 @@ export default function App() {
     }
   }
 
+  async function removeQueueItem(job: QueuedDownloadJob) {
+    if (job.status === "active") {
+      toast.warning("Active download cannot be removed", {
+        description: "Cancel the active download before removing it from the queue."
+      });
+      return;
+    }
+
+    const shouldRemove = window.confirm(`Remove ${courseDisplayName(job)} from the download queue?`);
+    if (!shouldRemove) return;
+
+    try {
+      const state = await removeDownloadQueueItem(job.id);
+      setQueuedJobs(state.persisted_jobs);
+      setPersistedEvents(state.recent_events ?? []);
+      setHasSavedToken(state.has_saved_token);
+      setProcessingSummary(null);
+      toast.info("Queue item removed", {
+        description: courseDisplayName(job)
+      });
+    } catch (error) {
+      toast.error("Remove queue item failed", { description: String(error) });
+    }
+  }
+
   function handleTokenGuideOpenChange(open: boolean) {
     setIsTokenGuideOpen(open);
     if (!open) {
@@ -510,11 +535,13 @@ export default function App() {
       }
     }
     const enteredToken = token.trim();
+    let shouldUseSavedToken = Boolean(hasSavedToken);
     if (enteredToken) {
       setIsValidatingToken(true);
       try {
         await saveLinkedInToken(enteredToken);
         setHasSavedToken(true);
+        shouldUseSavedToken = true;
         setToken("");
       } catch (error) {
         toast.error("Token validation failed", { description: String(error) });
@@ -522,12 +549,10 @@ export default function App() {
         return;
       }
       setIsValidatingToken(false);
-    } else if (!hasSavedToken) {
-      toast.warning("LinkedIn token required", {
-        description: "Paste your li_at cookie value; LinkVault will save it for future launches."
+    } else if (!shouldUseSavedToken) {
+      toast.info("Using browser session", {
+        description: `LinkVault will read the ${browserSource} LinkedIn session for this download.`
       });
-      document.querySelector<HTMLElement>('[aria-label="LinkedIn li_at token"]')?.focus();
-      return;
     }
     const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
     const alreadyDownloaded = parsed
@@ -560,7 +585,7 @@ export default function App() {
         description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} persisted to the local queue.`
       });
 
-      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds);
+      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds, shouldUseSavedToken);
 
       setProcessingSummary(processResponse);
       await refreshBootstrapState();
@@ -602,15 +627,17 @@ export default function App() {
     return response;
   }
 
-  async function processQueuedDownloadBatchWithLiveRefresh(courseDelaySeconds: number) {
-    if (isTauriRuntime()) {
+  async function processQueuedDownloadBatchWithLiveRefresh(courseDelaySeconds: number, useSavedToken: boolean) {
+    if (isTauriRuntime() && useSavedToken) {
       return processQueuedDownloadWithLiveRefresh(() => processQueuedDownloadBatchWithSavedToken(courseDelaySeconds));
     }
 
     let summary = emptyProcessQueuedDownloadResponse();
 
     while (!cancellationRequestedRef.current) {
-      const response = await processQueuedDownloadWithLiveRefresh(() => processNextQueuedDownloadWithSavedToken());
+      const response = await processQueuedDownloadWithLiveRefresh(() =>
+        useSavedToken ? processNextQueuedDownloadWithSavedToken() : processNextQueuedDownloadWithBrowserSource(browserSource)
+      );
       summary = mergeProcessQueuedDownloadResponses(summary, response);
       setProcessingSummary(summary);
 
@@ -751,12 +778,7 @@ export default function App() {
   async function retryDownloadJob(job: QueuedDownloadJob) {
     if (job.status !== "failed") return;
     const enteredToken = token.trim();
-    if (!enteredToken && !hasSavedToken) {
-      toast.warning("LinkedIn token required", {
-        description: "Paste li_at once before retrying this failed course."
-      });
-      return;
-    }
+    let shouldUseSavedToken = Boolean(hasSavedToken);
 
     try {
       setIsProcessingDownload(true);
@@ -764,7 +786,12 @@ export default function App() {
       if (enteredToken) {
         await saveLinkedInToken(enteredToken);
         setHasSavedToken(true);
+        shouldUseSavedToken = true;
         setToken("");
+      } else if (!shouldUseSavedToken) {
+        toast.info("Using browser session", {
+          description: `LinkVault will read the ${browserSource} LinkedIn session for this retry.`
+        });
       }
       await retryFailedDownloadJob(job.id);
       setQueuedJobs((jobs) =>
@@ -777,7 +804,7 @@ export default function App() {
       toast.info("Retry queued", { description: courseDisplayName(job) });
 
       cancellationRequestedRef.current = false;
-      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds);
+      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds, shouldUseSavedToken);
 
       setProcessingSummary(processResponse);
       await refreshBootstrapState();
@@ -1050,7 +1077,7 @@ export default function App() {
                   ) : null}
                 </div>
               </div>
-              <DownloadQueueTable jobs={displayedQueueJobs} parsedCourses={parsedCourses} hasPersistedJobs={queuedJobs.length > 0} onRetry={retryDownloadJob} />
+              <DownloadQueueTable jobs={displayedQueueJobs} parsedCourses={parsedCourses} hasPersistedJobs={queuedJobs.length > 0} onRetry={retryDownloadJob} onRemove={removeQueueItem} />
             </Panel>
           </div>
 
@@ -1315,12 +1342,14 @@ function DownloadQueueTable({
   jobs,
   parsedCourses,
   hasPersistedJobs,
-  onRetry
+  onRetry,
+  onRemove
 }: {
   jobs: QueuedDownloadJob[];
   parsedCourses: ParsedCourse[];
   hasPersistedJobs: boolean;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+  onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
 }) {
   return (
     <DataTable className="queue-table">
@@ -1330,7 +1359,7 @@ function DownloadQueueTable({
         <span>Progress</span>
       </DataTableHeader>
       {jobs.length > 0 ? (
-        jobs.map((job) => <QueueJobRow key={job.id} job={job} onRetry={onRetry} />)
+        jobs.map((job) => <QueueJobRow key={job.id} job={job} onRetry={onRetry} onRemove={onRemove} />)
       ) : parsedCourses.length > 0 ? (
         parsedCourses.map((course, index) => <ValidatedQueueRow key={`${course.slug}-${index}`} course={course} />)
       ) : (
@@ -1343,11 +1372,20 @@ function DownloadQueueTable({
   );
 }
 
-function QueueJobRow({ job, onRetry }: { job: QueuedDownloadJob; onRetry: (job: QueuedDownloadJob) => void | Promise<void> }) {
+function QueueJobRow({
+  job,
+  onRetry,
+  onRemove
+}: {
+  job: QueuedDownloadJob;
+  onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+  onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
+}) {
   const counts = artifactCounts(job);
   const progress = courseOverallProgress(job, counts);
   const title = courseDisplayName(job);
   const queueLabel = queueCourseLabel(job, counts);
+  const canRemove = job.status !== "active";
 
   return (
     <DataTableRow className="queue-table-row">
@@ -1362,6 +1400,18 @@ function QueueJobRow({ job, onRetry }: { job: QueuedDownloadJob; onRetry: (job: 
       <div className="table-progress-cell">
         <Progress value={progress} />
         <span>{progress}%</span>
+        {canRemove ? (
+          <Tooltip label="Remove from queue">
+            <IconButton
+              type="button"
+              aria-label={`Remove ${title} from queue`}
+              onClick={() => onRemove(job)}
+              className="queue-remove-button"
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+            </IconButton>
+          </Tooltip>
+        ) : null}
       </div>
     </DataTableRow>
   );
@@ -1700,6 +1750,27 @@ async function clearFailedDownloadJobs() {
   } satisfies BootstrapState;
 }
 
+async function removeDownloadQueueItem(jobId: string) {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("remove_download_queue_item", { jobId });
+  }
+
+  const jobs = readPreviewJobs().filter((job) => job.id !== jobId || job.status === "active");
+  const events = readPreviewEvents().filter((event) => event.job_id !== jobId);
+  writePreviewState(jobs, events);
+  return {
+    persisted_jobs: jobs,
+    recent_events: events,
+    has_saved_token: hasPreviewSavedToken(),
+    saved_download_preferences: readPreviewPreferences(),
+    stores_plaintext_tokens_in_sqlite: false,
+    browser_sources: ["Chrome", "Edge", "Firefox"],
+    default_resolution: "P720",
+    download_history: downloadHistoryFromJobs(jobs),
+    download_history_file_path: previewDownloadHistoryFilePath()
+  } satisfies BootstrapState;
+}
+
 async function checkForAppUpdate() {
   if (isTauriRuntime()) {
     return invoke<UpdateMetadata | null>("check_for_app_update");
@@ -1736,6 +1807,14 @@ async function processNextQueuedDownloadWithSavedToken() {
     throw new Error("Saved LinkedIn token is unavailable");
   }
   return processNextQueuedDownloadForPreview();
+}
+
+async function processNextQueuedDownloadWithBrowserSource(source: string) {
+  if (isTauriRuntime()) {
+    return invoke<ProcessQueuedDownloadResponse>("process_next_queued_download_from_browser_source", { source });
+  }
+
+  throw new Error("Browser session downloads are only available in the desktop app");
 }
 
 async function processQueuedDownloadBatchWithSavedToken(delaySeconds: number) {

@@ -46,6 +46,13 @@ pub struct CourseAssessment {
     pub quiz_markdown: Option<String>,
 }
 
+#[derive(Debug)]
+struct ParsedSelectedVideo {
+    video: CourseVideo,
+    _streaming_url: Option<String>,
+    transcript_partial: bool,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CourseParseError {
     #[error("LinkedIn token is expired. Please use a new one.")]
@@ -70,6 +77,14 @@ pub enum CourseFetchError {
 
 pub trait CourseApiClient {
     fn get(&mut self, url: &str) -> Result<String, CourseFetchError>;
+
+    fn get_with_headers(
+        &mut self,
+        url: &str,
+        _headers: &[(String, String)],
+    ) -> Result<String, CourseFetchError> {
+        self.get(url)
+    }
 }
 
 pub fn course_metadata_url(course_slug: &str) -> String {
@@ -81,6 +96,12 @@ pub fn course_metadata_url(course_slug: &str) -> String {
 pub fn selected_video_url(course_slug: &str, video_slug: &str, height: u16) -> String {
     format!(
         "https://www.linkedin.com/learning-api/detailedCourses?courseSlug={course_slug}&resolution=_{height}&q=slugs&fields=selectedVideo&videoSlug={video_slug}"
+    )
+}
+
+pub fn selected_video_graphql_url(course_slug: &str, video_slug: &str) -> String {
+    format!(
+        "https://www.linkedin.com/learning-api/graphql?includeWebMetadata=true&variables=(courseSlug:{course_slug},videoSlug:{video_slug})&queryId=videos.eb0cecfaa25dcd83d23769c32e492c1e"
     )
 }
 
@@ -153,20 +174,23 @@ pub fn fetch_selected_video_with_fallback(
     video_slug: &str,
     selected_quality: VideoQuality,
 ) -> Result<CourseVideo, CourseFetchError> {
+    let mut last_details = None;
     for quality in fallback_order(selected_quality) {
         let response = client.get(&selected_video_url(
             course_slug,
             video_slug,
             quality_height(quality),
         ))?;
-        let video = parse_selected_video(&response, video_slug)?;
-        if video
+        let mut details = parse_selected_video_details(&response, video_slug)?;
+        if details
+            .video
             .download_url
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty())
         {
             if selected_quality == VideoQuality::P1080 && quality == VideoQuality::P1080 {
-                if video
+                if details
+                    .video
                     .download_url
                     .as_deref()
                     .and_then(infer_video_height_from_url)
@@ -175,8 +199,15 @@ pub fn fetch_selected_video_with_fallback(
                     continue;
                 }
             }
-            return Ok(video);
+            hydrate_selected_video_transcript(client, course_slug, video_slug, &mut details);
+            return Ok(details.video);
         }
+        last_details = Some(details);
+    }
+
+    if let Some(mut details) = last_details {
+        hydrate_selected_video_transcript(client, course_slug, video_slug, &mut details);
+        return Ok(details.video);
     }
 
     Err(CourseFetchError::NoDownloadableVideo {
@@ -763,6 +794,13 @@ fn normalize_thumbnail_url(value: &str) -> Option<String> {
 }
 
 pub fn parse_selected_video(json: &str, slug: &str) -> Result<CourseVideo, CourseParseError> {
+    parse_selected_video_details(json, slug).map(|details| details.video)
+}
+
+fn parse_selected_video_details(
+    json: &str,
+    slug: &str,
+) -> Result<ParsedSelectedVideo, CourseParseError> {
     if json.contains("CSRF check failed") {
         return Err(CourseParseError::ExpiredToken);
     }
@@ -776,23 +814,106 @@ pub fn parse_selected_video(json: &str, slug: &str) -> Result<CourseVideo, Cours
         .and_then(|element| element.selected_video)
         .ok_or(CourseParseError::InvalidSelectedVideoShape)?;
 
-    let transcript_srt = selected
+    let transcript_lines = selected
         .transcript
         .as_ref()
-        .map(|transcript| format_transcript_srt(&transcript.lines, selected.duration_in_seconds));
+        .map(|transcript| transcript.lines.as_slice())
+        .unwrap_or_default();
+    let transcript_partial =
+        transcript_lines_are_partial(transcript_lines, selected.duration_in_seconds);
+    let transcript_srt = if transcript_lines.is_empty() || transcript_partial {
+        None
+    } else {
+        Some(format_transcript_srt(
+            transcript_lines,
+            selected.duration_in_seconds,
+        ))
+    };
     let title = non_empty(selected.title);
     let quiz_markdown = selected.transcript.as_ref().and_then(|transcript| {
         format_quiz_markdown(title.as_deref().unwrap_or(slug), slug, &transcript.lines)
     });
+    let streaming_url = selected
+        .url
+        .as_ref()
+        .and_then(|url| url.streaming_url.clone().and_then(non_empty));
+    let download_url = selected
+        .url
+        .and_then(|url| url.progressive_url.and_then(non_empty));
 
-    Ok(CourseVideo {
-        slug: slug.to_string(),
-        title,
-        duration_seconds: Some(selected.duration_in_seconds),
-        download_url: selected.url.and_then(|url| non_empty(url.progressive_url)),
-        transcript_srt,
-        quiz_markdown,
+    Ok(ParsedSelectedVideo {
+        video: CourseVideo {
+            slug: slug.to_string(),
+            title,
+            duration_seconds: Some(selected.duration_in_seconds),
+            download_url,
+            transcript_srt,
+            quiz_markdown,
+        },
+        _streaming_url: streaming_url,
+        transcript_partial,
     })
+}
+
+fn hydrate_selected_video_transcript(
+    client: &mut impl CourseApiClient,
+    course_slug: &str,
+    video_slug: &str,
+    details: &mut ParsedSelectedVideo,
+) {
+    if !details.transcript_partial {
+        return;
+    }
+
+    let Some(duration_seconds) = details.video.duration_seconds else {
+        return;
+    };
+    let Ok(response) = client.get_with_headers(
+        &selected_video_graphql_url(course_slug, video_slug),
+        &selected_video_graphql_headers(course_slug, video_slug),
+    ) else {
+        return;
+    };
+    let Some(lines) = parse_graphql_transcript_lines(&response, duration_seconds) else {
+        return;
+    };
+
+    details.video.transcript_srt = Some(format_transcript_srt(&lines, duration_seconds));
+    details.video.quiz_markdown = format_quiz_markdown(
+        details.video.title.as_deref().unwrap_or(video_slug),
+        video_slug,
+        &lines,
+    );
+    details.transcript_partial = false;
+}
+
+fn selected_video_graphql_headers(course_slug: &str, video_slug: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "Accept".to_string(),
+            "application/vnd.linkedin.normalized+json+2.1".to_string(),
+        ),
+        (
+            "Referer".to_string(),
+            format!("https://www.linkedin.com/learning/{course_slug}/{video_slug}"),
+        ),
+        ("x-li-lang".to_string(), "en_US".to_string()),
+        (
+            "x-li-pem-metadata".to_string(),
+            "Learning Exp - Video=classroom-video-load,Learning Exp - Course Scenario=classroom-video-load"
+                .to_string(),
+        ),
+        ("x-lil-intl-library".to_string(), "en_US".to_string()),
+        (
+            "x-li-track".to_string(),
+            r#"{"clientVersion":"1.1.14336","mpVersion":"1.1.14336","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","mpName":"learning-web","epApp":"learning","displayDensity":1,"displayWidth":1280,"displayHeight":720}"#
+                .to_string(),
+        ),
+        (
+            "x-restli-protocol-version".to_string(),
+            "2.0.0".to_string(),
+        ),
+    ]
 }
 
 fn format_quiz_markdown(title: &str, slug: &str, lines: &[TranscriptLine]) -> Option<String> {
@@ -904,6 +1025,80 @@ fn trim_quiz_segment_tail(segment: &str) -> String {
 
 fn normalize_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn transcript_lines_are_partial(lines: &[TranscriptLine], duration_seconds: u64) -> bool {
+    let Some(last_start_ms) = lines.iter().map(|line| line.starts_at).max() else {
+        return false;
+    };
+    let duration_ms = duration_seconds.saturating_mul(1000);
+    if duration_ms < 60_000 {
+        return false;
+    }
+
+    last_start_ms.saturating_add(20_000) < duration_ms
+        && last_start_ms < duration_ms.saturating_mul(80) / 100
+}
+
+fn parse_graphql_transcript_lines(
+    json: &str,
+    duration_seconds: u64,
+) -> Option<Vec<TranscriptLine>> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut candidates = Vec::new();
+    collect_transcript_line_candidates(&value, &mut candidates);
+    candidates
+        .into_iter()
+        .filter(|lines| !transcript_lines_are_partial(lines, duration_seconds))
+        .max_by_key(|lines| {
+            (
+                lines.iter().map(|line| line.starts_at).max().unwrap_or(0),
+                lines.len(),
+            )
+        })
+}
+
+fn collect_transcript_line_candidates(
+    value: &serde_json::Value,
+    candidates: &mut Vec<Vec<TranscriptLine>>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(lines) = object
+                .get("lines")
+                .and_then(|lines| lines.as_array())
+                .and_then(|lines| parse_transcript_lines_from_array(lines))
+            {
+                candidates.push(lines);
+            }
+            for child in object.values() {
+                collect_transcript_line_candidates(child, candidates);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_transcript_line_candidates(child, candidates);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_transcript_lines_from_array(lines: &[serde_json::Value]) -> Option<Vec<TranscriptLine>> {
+    let parsed = lines
+        .iter()
+        .filter_map(|line| {
+            Some(TranscriptLine {
+                caption: non_empty(line.get("caption")?.as_str()?.to_string())?,
+                starts_at: line.get("transcriptStartAt")?.as_u64()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
 }
 
 fn format_transcript_srt(lines: &[TranscriptLine], duration_seconds: u64) -> String {
@@ -1091,8 +1286,10 @@ struct SelectedVideo {
 
 #[derive(Debug, Deserialize)]
 struct SelectedVideoUrl {
-    #[serde(rename = "progressiveUrl")]
-    progressive_url: String,
+    #[serde(default, rename = "progressiveUrl")]
+    progressive_url: Option<String>,
+    #[serde(default, rename = "streamingUrl")]
+    streaming_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1101,7 +1298,7 @@ struct Transcript {
     lines: Vec<TranscriptLine>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TranscriptLine {
     caption: String,
     #[serde(rename = "transcriptStartAt")]
@@ -1346,6 +1543,63 @@ mod tests {
     }
 
     #[test]
+    fn clipped_selected_video_transcript_does_not_produce_misleading_srt() {
+        let video = parse_selected_video(
+            r#"{
+                "elements": [{
+                    "selectedVideo": {
+                        "title": "Clipped transcript",
+                        "durationInSeconds": 300,
+                        "url": {
+                            "progressiveUrl": "https://cdn.example.test/clipped.mp4"
+                        },
+                        "transcript": {
+                            "lines": [{
+                                "caption": "Opening sentence",
+                                "transcriptStartAt": 250
+                            }, {
+                                "caption": "Still only the intro",
+                                "transcriptStartAt": 57000
+                            }]
+                        }
+                    }
+                }]
+            }"#,
+            "clipped",
+        )
+        .unwrap();
+
+        assert_eq!(video.duration_seconds, Some(300));
+        assert_eq!(video.transcript_srt, None);
+    }
+
+    #[test]
+    fn parses_graphql_transcript_lines_from_normalized_response() {
+        let lines = parse_graphql_transcript_lines(
+            r#"{
+                "included": [{
+                    "entityUrn": "urn:li:learningTranscript",
+                    "lines": [{
+                        "caption": "Opening sentence",
+                        "transcriptStartAt": 250
+                    }, {
+                        "caption": "Middle sentence",
+                        "transcriptStartAt": 120000
+                    }, {
+                        "caption": "Closing sentence",
+                        "transcriptStartAt": 280000
+                    }]
+                }]
+            }"#,
+            300,
+        )
+        .unwrap();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].caption, "Closing sentence");
+    }
+
+    #[test]
     fn parses_quiz_video_transcript_into_markdown_questions() {
         let video = parse_selected_video(
             r#"{
@@ -1439,6 +1693,10 @@ mod tests {
         assert_eq!(
             selected_video_url("sample-course", "welcome", 720),
             "https://www.linkedin.com/learning-api/detailedCourses?courseSlug=sample-course&resolution=_720&q=slugs&fields=selectedVideo&videoSlug=welcome"
+        );
+        assert_eq!(
+            selected_video_graphql_url("sample-course", "welcome"),
+            "https://www.linkedin.com/learning-api/graphql?includeWebMetadata=true&variables=(courseSlug:sample-course,videoSlug:welcome)&queryId=videos.eb0cecfaa25dcd83d23769c32e492c1e"
         );
         assert_eq!(
             detailed_assessment_url("urn:li:lyndaAssessment:abc"),
@@ -1537,6 +1795,81 @@ mod tests {
     }
 
     #[test]
+    fn fetch_selected_video_replaces_clipped_rest_transcript_with_graphql_transcript() {
+        let mut client = FakeCourseApiClient::new(vec![
+            (
+                "resolution=_720",
+                r#"{
+                    "elements": [{
+                        "selectedVideo": {
+                            "title": "Welcome video",
+                            "durationInSeconds": 300,
+                            "url": {
+                                "progressiveUrl": "https://cdn.example.test/1280x720/welcome.mp4"
+                            },
+                            "transcript": {
+                                "lines": [{
+                                    "caption": "Opening sentence",
+                                    "transcriptStartAt": 250
+                                }, {
+                                    "caption": "Still only the intro",
+                                    "transcriptStartAt": 57000
+                                }]
+                            }
+                        }
+                    }]
+                }"#,
+            ),
+            (
+                "learning-api/graphql",
+                r#"{
+                    "included": [{
+                        "lines": [{
+                            "caption": "Opening sentence",
+                            "transcriptStartAt": 250
+                        }, {
+                            "caption": "Middle sentence",
+                            "transcriptStartAt": 120000
+                        }, {
+                            "caption": "Closing sentence",
+                            "transcriptStartAt": 280000
+                        }]
+                    }]
+                }"#,
+            ),
+        ]);
+
+        let video = fetch_selected_video_with_fallback(
+            &mut client,
+            "sample-course",
+            "welcome",
+            VideoQuality::P720,
+        )
+        .unwrap();
+
+        let srt = video.transcript_srt.unwrap();
+        assert!(srt.contains("Opening sentence"));
+        assert!(srt.contains("Closing sentence"));
+        assert!(srt.contains("00:04:40,000 --> 00:05:00,000"));
+        assert!(client
+            .requested
+            .iter()
+            .any(|url| url.contains("learning-api/graphql")));
+        assert!(client
+            .requested_headers
+            .iter()
+            .flatten()
+            .any(|(name, value)| name == "Accept"
+                && value == "application/vnd.linkedin.normalized+json+2.1"));
+        assert!(client
+            .requested_headers
+            .iter()
+            .flatten()
+            .any(|(name, value)| name == "x-li-pem-metadata"
+                && value.contains("classroom-video-load")));
+    }
+
+    #[test]
     fn fetch_course_skips_selected_video_requests_when_videos_and_subtitles_are_disabled() {
         let mut client = FakeCourseApiClient::new(vec![
             ("fields=chapters,title,exerciseFiles", metadata_fixture()),
@@ -1601,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_video_fallback_reports_when_no_resolution_has_download_url() {
+    fn selected_video_fallback_returns_metadata_when_no_resolution_has_download_url() {
         let mut client = FakeCourseApiClient::new(vec![
             (
                 "resolution=_1080",
@@ -1621,18 +1954,17 @@ mod tests {
             ),
         ]);
 
-        let error = fetch_selected_video_with_fallback(
+        let video = fetch_selected_video_with_fallback(
             &mut client,
             "sample-course",
             "welcome",
             VideoQuality::P1080,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(
-            error,
-            CourseFetchError::NoDownloadableVideo { video_slug } if video_slug == "welcome"
-        ));
+        assert_eq!(video.slug, "welcome");
+        assert_eq!(video.title.as_deref(), Some("Welcome video"));
+        assert_eq!(video.download_url, None);
     }
 
     #[test]
@@ -1846,6 +2178,7 @@ mod tests {
     struct FakeCourseApiClient {
         responses: VecDeque<(&'static str, String)>,
         requested: Vec<String>,
+        requested_headers: Vec<Vec<(String, String)>>,
     }
 
     impl FakeCourseApiClient {
@@ -1856,6 +2189,7 @@ mod tests {
                     .map(|(expected_url_part, body)| (expected_url_part, body.into()))
                     .collect(),
                 requested: Vec::new(),
+                requested_headers: Vec::new(),
             }
         }
     }
@@ -1863,6 +2197,23 @@ mod tests {
     impl CourseApiClient for FakeCourseApiClient {
         fn get(&mut self, url: &str) -> Result<String, CourseFetchError> {
             self.requested.push(url.to_string());
+            self.requested_headers.push(Vec::new());
+            self.next_response(url)
+        }
+
+        fn get_with_headers(
+            &mut self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<String, CourseFetchError> {
+            self.requested.push(url.to_string());
+            self.requested_headers.push(headers.to_vec());
+            self.next_response(url)
+        }
+    }
+
+    impl FakeCourseApiClient {
+        fn next_response(&mut self, url: &str) -> Result<String, CourseFetchError> {
             let Some((expected_url_part, _body)) = self.responses.front() else {
                 return Err(CourseFetchError::Api(format!("unexpected request: {url}")));
             };

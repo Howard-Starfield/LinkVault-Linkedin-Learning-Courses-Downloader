@@ -98,6 +98,25 @@ impl CourseApiClient for AuthenticatedLinkedInClient {
             .text()
             .map_err(|error| CourseFetchError::Api(error.to_string()))
     }
+
+    fn get_with_headers(
+        &mut self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<String, CourseFetchError> {
+        let response = apply_session_headers(self.build_get_request(url), headers)
+            .send()
+            .map_err(|error| CourseFetchError::Api(classify_reqwest_error(&error)))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(CourseFetchError::Http {
+                status: status.as_u16(),
+            });
+        }
+        response
+            .text()
+            .map_err(|error| CourseFetchError::Api(error.to_string()))
+    }
 }
 
 impl ArtifactHttpClient for AuthenticatedLinkedInClient {
