@@ -15,7 +15,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { IconBrandLinkedin, IconMovie, IconTool } from "@tabler/icons-react";
+import { IconBrandLinkedin, IconCertificate, IconMovie, IconTool } from "@tabler/icons-react";
 import liAtCookieGuide from "./assets/guide.png";
 import linkvaultLogo from "./assets/linkvault-wordmark.svg";
 import {
@@ -42,6 +42,7 @@ import {
   Tooltip,
   guardedToast
 } from "./components/primitives";
+import { CourseraView } from "./components/coursera/CourseraView";
 
 type ParsedCourse = {
   original: string;
@@ -206,7 +207,7 @@ export default function App() {
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
   const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
-  const [activeView, setActiveView] = useState<"downloads" | "history">("downloads");
+  const [activeView, setActiveView] = useState<"downloads" | "coursera" | "history">("downloads");
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -402,8 +403,8 @@ export default function App() {
   }
 
   const canStart = useMemo(
-    () => courseUrls.trim().length > 0 && folder.trim().length > 0 && (token.trim().length > 0 || hasSavedToken) && !isProcessingDownload,
-    [courseUrls, folder, token, hasSavedToken, isProcessingDownload]
+    () => courseUrls.trim().length > 0 && !isProcessingDownload,
+    [courseUrls, isProcessingDownload]
   );
 
   const queueCounts = useMemo(
@@ -496,6 +497,18 @@ export default function App() {
   async function startDownload() {
     const parsed = await validateUrls();
     if (parsed.length === 0) return;
+    let outputDir = folder.trim();
+    if (!outputDir) {
+      toast.warning("Download folder required", {
+        description: "Choose where to save these courses, then LinkVault will continue."
+      });
+      const selectedFolder = await browseDownloadFolder();
+      outputDir = selectedFolder?.trim() ?? "";
+      if (!outputDir) {
+        document.querySelector<HTMLElement>('[aria-label="Download folder"]')?.focus();
+        return;
+      }
+    }
     const enteredToken = token.trim();
     if (enteredToken) {
       setIsValidatingToken(true);
@@ -510,8 +523,21 @@ export default function App() {
       }
       setIsValidatingToken(false);
     } else if (!hasSavedToken) {
-      toast.warning("LinkedIn token required", { description: "Paste li_at once; LinkVault will save it for future launches." });
+      toast.warning("LinkedIn token required", {
+        description: "Paste your li_at cookie value; LinkVault will save it for future launches."
+      });
+      document.querySelector<HTMLElement>('[aria-label="LinkedIn li_at token"]')?.focus();
       return;
+    }
+    const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
+    const alreadyDownloaded = parsed
+      .map((course) => course.slug)
+      .filter((slug) => completedSlugs.has(slug));
+    if (alreadyDownloaded.length > 0) {
+      const shouldDownloadAgain = window.confirm(
+        `LinkVault has already completed ${alreadyDownloaded.length} selected LinkedIn course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
+      );
+      if (!shouldDownloadAgain) return;
     }
     try {
       setIsProcessingDownload(true);
@@ -519,7 +545,7 @@ export default function App() {
       setProcessingSummary(null);
       const response = await startDownloadJobs({
         courseUrls,
-        outputDir: folder,
+        outputDir,
         selectedQuality: resolution,
         delaySeconds,
         browserSource,
@@ -790,10 +816,10 @@ export default function App() {
     }
   }
 
-  async function browseDownloadFolder() {
+  async function browseDownloadFolder(): Promise<string | null> {
     if (!isTauriRuntime()) {
       guardedToast("Folder picker unavailable in preview", "The native folder picker is available in the Tauri desktop runtime.");
-      return;
+      return null;
     }
 
     try {
@@ -805,10 +831,12 @@ export default function App() {
       if (typeof selectedFolder === "string" && selectedFolder.trim()) {
         setFolder(selectedFolder);
         toast.success("Download folder selected", { description: selectedFolder });
+        return selectedFolder;
       }
     } catch (error) {
       toast.error("Folder picker failed", { description: String(error) });
     }
+    return null;
   }
 
   return (
@@ -836,6 +864,7 @@ export default function App() {
 
         <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
           <SidebarItem active={activeView === "downloads"} icon={<IconBrandLinkedin aria-hidden="true" size={18} />} onClick={() => setActiveView("downloads")}>LinkedIn Courses</SidebarItem>
+          <SidebarItem active={activeView === "coursera"} icon={<IconCertificate aria-hidden="true" size={18} />} onClick={() => setActiveView("coursera")}>Coursera Courses</SidebarItem>
           <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
           <SidebarItem icon={<IconTool aria-hidden="true" size={18} />}>Tools</SidebarItem>
           <SidebarItem active={activeView === "history"} icon={<History aria-hidden="true" />} onClick={() => setActiveView("history")}>History</SidebarItem>
@@ -881,7 +910,9 @@ export default function App() {
       </aside>
       <main className="lv-main">
         <div className="lv-content">
-          {activeView === "history" ? (
+          {activeView === "coursera" ? (
+            <CourseraView />
+          ) : activeView === "history" ? (
             <HistoryPage
               entries={downloadHistory}
               historyFilePath={downloadHistoryFilePath}

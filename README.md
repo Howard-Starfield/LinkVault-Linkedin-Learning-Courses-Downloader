@@ -26,7 +26,7 @@ Your downloads are saved into the folder you picked. Your saved session is prote
 
 ## Requirements
 
-- Node.js with pnpm
+- Node.js with npm
 - Rust toolchain
 - Microsoft C++ Build Tools or Visual Studio Build Tools
 - Microsoft WebView2 Runtime
@@ -38,8 +38,20 @@ Use this when you want to work on the app from source.
 ```powershell
 git clone https://github.com/Howard-Starfield/LinkVault-Linkedin-Learning-Courses-Downloader.git LinkVault
 cd LinkVault
-pnpm.cmd --dir apps\desktop install
-pnpm.cmd tauri dev
+npm --prefix apps\desktop install
+npm run dev
+```
+
+If PowerShell blocks `npm.ps1`, either run this once:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+or use the `.cmd` shim:
+
+```powershell
+npm.cmd run dev
 ```
 
 The desktop app opens from Tauri. The Vite frontend runs at:
@@ -53,7 +65,7 @@ http://127.0.0.1:1420
 Use this when you want a production executable or Windows installer.
 
 ```powershell
-pnpm.cmd tauri build
+npm run tauri -- build
 ```
 
 Production outputs:
@@ -68,7 +80,7 @@ apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.3_x64-setup.exe
 This is useful for UI work, but desktop-only features need Tauri.
 
 ```powershell
-pnpm.cmd dev
+npm run web:dev
 # open:
 http://127.0.0.1:1420
 ```
@@ -78,12 +90,12 @@ http://127.0.0.1:1420
 Useful checks before sharing a build:
 
 ```powershell
-pnpm.cmd cargo:test
-pnpm.cmd verify:visual
-pnpm.cmd verify:ui
-pnpm.cmd verify:release
-pnpm.cmd verify:installer
-pnpm.cmd verify:release-manifest
+npm run cargo:test
+npm run verify:visual
+npm run verify:ui
+npm run verify:release
+npm run verify:installer
+npm run verify:release-manifest
 ```
 
 ## Responsible Use / Ownership
