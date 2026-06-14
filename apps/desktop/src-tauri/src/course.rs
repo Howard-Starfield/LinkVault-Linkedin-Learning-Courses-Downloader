@@ -105,6 +105,12 @@ pub fn selected_video_graphql_url(course_slug: &str, video_slug: &str) -> String
     )
 }
 
+pub fn course_graphql_url(course_slug: &str) -> String {
+    format!(
+        "https://www.linkedin.com/learning-api/graphql?includeWebMetadata=true&variables=(slug:{course_slug})&queryId=courses.7cd8dafe4728f0b6e7d53bf1990affce"
+    )
+}
+
 pub fn detailed_assessment_url(tracking_urn: &str) -> String {
     format!(
         "https://www.linkedin.com/learning-api/detailedAssessments/{}",
@@ -129,8 +135,7 @@ fn should_fetch_course_page_metadata(
     download_quizzes: bool,
     course: &Course,
 ) -> bool {
-    (download_exercises && !course.exercise_files.is_empty())
-        || (download_quizzes && course.assessments.is_empty())
+    download_exercises || (download_quizzes && course.assessments.is_empty())
 }
 
 pub fn fetch_course_with_selected_video_details(
@@ -227,10 +232,20 @@ pub fn refresh_exercise_file_urls(
     if course.assessments.is_empty() {
         course.assessments = extract_course_assessments_from_html(&html);
     }
-    if course.exercise_files.is_empty() {
-        return Ok(0);
+    let mut refreshed = 0;
+    if let Ok(json) = client.get_with_headers(
+        &course_graphql_url(course_slug),
+        &course_graphql_headers(course_slug),
+    ) {
+        refreshed += refresh_exercise_files_from_candidates(
+            course,
+            extract_exercise_files_from_graphql(&json),
+        );
     }
-    Ok(refresh_exercise_file_urls_from_html(course, &html))
+    if course.exercise_files.is_empty() {
+        return Ok(refreshed);
+    }
+    Ok(refreshed + refresh_exercise_file_urls_from_html(course, &html))
 }
 
 pub fn fetch_assessment_details(
@@ -316,6 +331,109 @@ pub fn refresh_exercise_file_urls_from_html(course: &mut Course, course_page_htm
     }
 
     refreshed
+}
+
+fn refresh_exercise_files_from_candidates(
+    course: &mut Course,
+    candidates: Vec<ExerciseFile>,
+) -> usize {
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    if course.exercise_files.is_empty() {
+        let count = candidates.len();
+        course.exercise_files = candidates;
+        return count;
+    }
+
+    let mut refreshed = 0;
+    for candidate in candidates {
+        let Some(existing) = course.exercise_files.iter_mut().find(|file| {
+            file.file_name
+                .trim()
+                .eq_ignore_ascii_case(candidate.file_name.trim())
+        }) else {
+            course.exercise_files.push(candidate);
+            refreshed += 1;
+            continue;
+        };
+
+        if !existing
+            .download_url
+            .trim()
+            .eq_ignore_ascii_case(candidate.download_url.trim())
+        {
+            push_distinct_url(
+                &mut existing.alternate_download_urls,
+                existing.download_url.clone(),
+            );
+            existing.download_url = candidate.download_url;
+            refreshed += 1;
+        }
+        for alternate in candidate.alternate_download_urls {
+            push_distinct_url(&mut existing.alternate_download_urls, alternate);
+        }
+    }
+    refreshed
+}
+
+pub fn extract_exercise_files_from_graphql(json: &str) -> Vec<ExerciseFile> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    collect_graphql_exercise_files(&value, &mut files);
+    let mut seen = HashSet::new();
+    files
+        .into_iter()
+        .filter(|file| {
+            seen.insert(format!(
+                "{}\n{}",
+                file.file_name.to_ascii_lowercase(),
+                file.download_url.to_ascii_lowercase()
+            ))
+        })
+        .collect()
+}
+
+fn collect_graphql_exercise_files(value: &serde_json::Value, files: &mut Vec<ExerciseFile>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(items) = object
+                .get("exerciseFiles")
+                .and_then(|value| value.as_array())
+            {
+                for item in items {
+                    if let Some(file) = parse_graphql_exercise_file(item) {
+                        files.push(file);
+                    }
+                }
+            }
+            for child in object.values() {
+                collect_graphql_exercise_files(child, files);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_graphql_exercise_files(child, files);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_graphql_exercise_file(value: &serde_json::Value) -> Option<ExerciseFile> {
+    let file_name = non_empty(value.get("name")?.as_str()?.to_string())?;
+    let download_url = value
+        .get("url")
+        .and_then(|url| url.as_str())
+        .and_then(normalize_exercise_artifact_url)?;
+    Some(ExerciseFile {
+        file_name,
+        download_url,
+        alternate_download_urls: Vec::new(),
+    })
 }
 
 pub fn extract_exercise_file_urls_from_html(html: &str) -> Vec<String> {
@@ -902,6 +1020,34 @@ fn selected_video_graphql_headers(course_slug: &str, video_slug: &str) -> Vec<(S
             "x-li-pem-metadata".to_string(),
             "Learning Exp - Video=classroom-video-load,Learning Exp - Course Scenario=classroom-video-load"
                 .to_string(),
+        ),
+        ("x-lil-intl-library".to_string(), "en_US".to_string()),
+        (
+            "x-li-track".to_string(),
+            r#"{"clientVersion":"1.1.14336","mpVersion":"1.1.14336","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","mpName":"learning-web","epApp":"learning","displayDensity":1,"displayWidth":1280,"displayHeight":720}"#
+                .to_string(),
+        ),
+        (
+            "x-restli-protocol-version".to_string(),
+            "2.0.0".to_string(),
+        ),
+    ]
+}
+
+fn course_graphql_headers(course_slug: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "Accept".to_string(),
+            "application/vnd.linkedin.normalized+json+2.1".to_string(),
+        ),
+        (
+            "Referer".to_string(),
+            format!("https://www.linkedin.com/learning/{course_slug}"),
+        ),
+        ("x-li-lang".to_string(), "en_US".to_string()),
+        (
+            "x-li-pem-metadata".to_string(),
+            "Learning Exp - Course=classroom-course-load".to_string(),
         ),
         ("x-lil-intl-library".to_string(), "en_US".to_string()),
         (
@@ -2013,6 +2159,91 @@ mod tests {
             urls,
             vec!["https://www.linkedin.com/ambry/?x-li-ambry-ep=AQK123&download=true"]
         );
+    }
+
+    #[test]
+    fn extracts_exercise_files_from_course_graphql_response() {
+        let files = extract_exercise_files_from_graphql(
+            r#"{
+                "included": [{
+                    "exerciseFiles": [{
+                        "name": "Glossary.zip",
+                        "sizeInBytes": 627727,
+                        "url": "https://www.linkedin.com/ambry/?x-li-ambry-ep=AQK123"
+                    }]
+                }]
+            }"#,
+        );
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name, "Glossary.zip");
+        assert_eq!(
+            files[0].download_url,
+            "https://www.linkedin.com/ambry/?x-li-ambry-ep=AQK123"
+        );
+    }
+
+    #[test]
+    fn graphql_exercise_refresh_adds_file_when_rest_url_is_empty() {
+        let mut client = FakeCourseApiClient::new(vec![
+            (
+                "fields=chapters,title,exerciseFiles",
+                r#"{
+                    "elements": [{
+                        "title": "Sample Course",
+                        "exerciseFiles": [{
+                            "name": "Glossary.zip",
+                            "url": ""
+                        }],
+                        "chapters": []
+                    }]
+                }"#,
+            ),
+            (
+                "https://www.linkedin.com/learning/sample-course",
+                "<html></html>",
+            ),
+            (
+                "queryId=courses.7cd8dafe4728f0b6e7d53bf1990affce",
+                r#"{
+                    "included": [{
+                        "exerciseFiles": [{
+                            "name": "Glossary.zip",
+                            "url": "https://www.linkedin.com/ambry/?x-li-ambry-ep=FRESH"
+                        }]
+                    }]
+                }"#,
+            ),
+        ]);
+
+        let course = fetch_course_with_selected_video_details(
+            &mut client,
+            "sample-course",
+            VideoQuality::P720,
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(course.exercise_files.len(), 1);
+        assert_eq!(course.exercise_files[0].file_name, "Glossary.zip");
+        assert_eq!(
+            course.exercise_files[0].download_url,
+            "https://www.linkedin.com/ambry/?x-li-ambry-ep=FRESH"
+        );
+        assert!(client
+            .requested
+            .iter()
+            .any(|url| url.contains("learning-api/graphql")
+                && url.contains("queryId=courses.7cd8dafe4728f0b6e7d53bf1990affce")));
+        assert!(client
+            .requested_headers
+            .iter()
+            .flatten()
+            .any(|(name, value)| name == "x-li-pem-metadata"
+                && value.contains("Course=classroom-course-load")));
     }
 
     #[test]
