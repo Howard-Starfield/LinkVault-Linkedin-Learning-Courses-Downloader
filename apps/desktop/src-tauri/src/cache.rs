@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     download_quizzes INTEGER NOT NULL DEFAULT 1,
     quiz_hints_json TEXT NOT NULL DEFAULT '[]',
     output_dir TEXT NOT NULL,
+    scheduled_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -97,6 +98,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     migrate_jobs_download_quizzes(connection)?;
     migrate_jobs_source_url(connection)?;
     migrate_jobs_quiz_hints(connection)?;
+    migrate_jobs_scheduled_at(connection)?;
     migrate_artifacts_known_types(connection)?;
     Ok(())
 }
@@ -136,6 +138,14 @@ fn migrate_jobs_quiz_hints(connection: &Connection) -> Result<()> {
             "ALTER TABLE jobs ADD COLUMN quiz_hints_json TEXT NOT NULL DEFAULT '[]'",
             [],
         )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_jobs_scheduled_at(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "jobs", "scheduled_at")? {
+        connection.execute("ALTER TABLE jobs ADD COLUMN scheduled_at INTEGER", [])?;
     }
 
     Ok(())
@@ -252,6 +262,7 @@ pub struct JobRecord {
     pub download_quizzes: bool,
     pub quiz_hints_json: String,
     pub output_dir: String,
+    pub scheduled_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -401,10 +412,11 @@ pub fn insert_job(connection: &Connection, job: &JobRecord) -> CacheResult<()> {
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            scheduled_at,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
         params![
             &job.id,
@@ -418,6 +430,7 @@ pub fn insert_job(connection: &Connection, job: &JobRecord) -> CacheResult<()> {
             job.download_quizzes,
             &job.quiz_hints_json,
             &job.output_dir,
+            job.scheduled_at,
             job.created_at,
             job.updated_at
         ],
@@ -451,7 +464,7 @@ pub fn transition_job_status(
     }
 
     connection.execute(
-        "UPDATE jobs SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        "UPDATE jobs SET status = ?2, scheduled_at = CASE WHEN ?2 = 'active' THEN NULL ELSE scheduled_at END, updated_at = ?3 WHERE id = ?1",
         params![job_id, next_status, updated_at],
     )?;
     let updated =
@@ -517,7 +530,7 @@ pub fn retry_failed_job(
     }
 
     connection.execute(
-        "UPDATE jobs SET status = 'queued', updated_at = ?2 WHERE id = ?1",
+        "UPDATE jobs SET status = 'queued', scheduled_at = NULL, updated_at = ?2 WHERE id = ?1",
         params![job_id, retried_at],
     )?;
     append_job_event(
@@ -557,6 +570,38 @@ pub fn remove_download_job(connection: &Connection, job_id: &str) -> CacheResult
     Ok(current)
 }
 
+pub fn clear_job_schedule(
+    connection: &Connection,
+    job_id: &str,
+    updated_at: i64,
+) -> CacheResult<JobRecord> {
+    let current =
+        get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))?;
+    if current.status != "queued" || current.scheduled_at.is_none() {
+        return Err(CacheError::InvalidJobTransition {
+            from: current.status,
+            to: "queued-now".to_string(),
+        });
+    }
+
+    connection.execute(
+        "UPDATE jobs SET scheduled_at = NULL, updated_at = ?2 WHERE id = ?1",
+        params![job_id, updated_at],
+    )?;
+    append_job_event(
+        connection,
+        &NewJobEvent {
+            job_id: job_id.to_string(),
+            event_type: "job.schedule.override".to_string(),
+            message: "Scheduled course was moved to the immediate download queue.".to_string(),
+            payload_json: None,
+            created_at: updated_at,
+        },
+    )?;
+
+    get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))
+}
+
 pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobRecord>> {
     let job = connection
         .query_row(
@@ -573,6 +618,7 @@ pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobR
                 download_quizzes,
                 quiz_hints_json,
                 output_dir,
+                scheduled_at,
                 created_at,
                 updated_at
             FROM jobs
@@ -600,6 +646,7 @@ pub fn list_jobs_by_status(connection: &Connection, status: &str) -> CacheResult
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            scheduled_at,
             created_at,
             updated_at
         FROM jobs
@@ -628,6 +675,7 @@ pub fn list_recent_jobs(connection: &Connection, limit: usize) -> CacheResult<Ve
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            scheduled_at,
             created_at,
             updated_at
         FROM jobs
@@ -637,6 +685,38 @@ pub fn list_recent_jobs(connection: &Connection, limit: usize) -> CacheResult<Ve
     )?;
     let jobs = statement
         .query_map(params![limit as i64], job_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(jobs)
+}
+
+pub fn list_ready_queued_jobs(
+    connection: &Connection,
+    ready_at: i64,
+) -> CacheResult<Vec<JobRecord>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            id,
+            course_slug,
+            source_url,
+            status,
+            selected_quality,
+            download_videos,
+            download_exercises,
+            download_subtitles,
+            download_quizzes,
+            quiz_hints_json,
+            output_dir,
+            scheduled_at,
+            created_at,
+            updated_at
+        FROM jobs
+        WHERE status = 'queued' AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+        ORDER BY COALESCE(scheduled_at, created_at), created_at, id
+        "#,
+    )?;
+    let jobs = statement
+        .query_map(params![ready_at], job_from_row)?
         .collect::<Result<Vec<_>>>()?;
     Ok(jobs)
 }
@@ -804,8 +884,9 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> Result<JobRecord> {
         download_quizzes: row.get(8)?,
         quiz_hints_json: row.get(9)?,
         output_dir: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        scheduled_at: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -973,6 +1054,46 @@ mod tests {
             list_jobs_by_status(&connection, "active").unwrap(),
             vec![updated]
         );
+    }
+
+    #[test]
+    fn scheduled_jobs_are_not_ready_until_due_and_can_be_moved_to_now() {
+        let connection = initialized_connection();
+        let mut scheduled = sample_job("job-scheduled", "queued", 100);
+        scheduled.scheduled_at = Some(500);
+        insert_job(&connection, &scheduled).unwrap();
+
+        assert!(list_ready_queued_jobs(&connection, 499).unwrap().is_empty());
+        assert_eq!(
+            list_ready_queued_jobs(&connection, 500).unwrap()[0].id,
+            "job-scheduled"
+        );
+
+        clear_job_schedule(&connection, "job-scheduled", 300).unwrap();
+        let moved = get_job(&connection, "job-scheduled").unwrap().unwrap();
+        let events = list_job_events(&connection, "job-scheduled").unwrap();
+
+        assert_eq!(moved.scheduled_at, None);
+        assert_eq!(moved.status, "queued");
+        assert_eq!(events.last().unwrap().event_type, "job.schedule.override");
+        assert_eq!(
+            list_ready_queued_jobs(&connection, 300).unwrap()[0].id,
+            "job-scheduled"
+        );
+    }
+
+    #[test]
+    fn starting_a_due_scheduled_job_consumes_its_schedule_timestamp() {
+        let connection = initialized_connection();
+        let mut scheduled = sample_job("job-scheduled", "queued", 100);
+        scheduled.scheduled_at = Some(200);
+        insert_job(&connection, &scheduled).unwrap();
+
+        transition_job_status(&connection, "job-scheduled", "active", 200, None).unwrap();
+        let active = get_job(&connection, "job-scheduled").unwrap().unwrap();
+
+        assert_eq!(active.status, "active");
+        assert_eq!(active.scheduled_at, None);
     }
 
     #[test]
@@ -1345,6 +1466,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: "C:/downloads".to_string(),
+            scheduled_at: None,
             created_at: timestamp,
             updated_at: timestamp,
         }

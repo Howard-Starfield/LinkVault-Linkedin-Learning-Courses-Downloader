@@ -1,9 +1,9 @@
 [package]
 name = "linkvault"
-version = "0.1.4"
+version = "0.1.5"
 description = "LinkVault desktop app"
 authors = ["LinkVault"]
-license = ""
+license-file = "../../../LICENSE"
 repository = ""
 edition = "2021"
 rust-version = "1.77.2"

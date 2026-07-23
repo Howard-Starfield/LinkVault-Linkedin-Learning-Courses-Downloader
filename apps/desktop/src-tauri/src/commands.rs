@@ -8,10 +8,11 @@ use crate::browser_cookies::{
     ChromiumCookieDecoder,
 };
 use crate::cache::{
-    append_job_event, clear_failed_jobs, get_course_cache_entry, get_setting, insert_job,
-    list_artifacts_for_job, list_download_history, list_job_events, list_jobs_by_status,
-    list_recent_jobs, open_or_initialize, remove_download_job, retry_failed_job,
-    upsert_setting_json, DownloadHistoryEntry, JobRecord, NewJobEvent,
+    append_job_event, clear_failed_jobs, clear_job_schedule, get_course_cache_entry, get_job,
+    get_setting, insert_job, list_artifacts_for_job, list_download_history, list_job_events,
+    list_jobs_by_status, list_ready_queued_jobs, list_recent_jobs, open_or_initialize,
+    remove_download_job, retry_failed_job, upsert_setting_json, DownloadHistoryEntry, JobRecord,
+    NewJobEvent,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
@@ -130,6 +131,16 @@ pub struct StartDownloadRequest {
     download_subtitles: bool,
     #[serde(default = "default_download_quizzes")]
     download_quizzes: bool,
+    #[serde(default)]
+    schedule: Option<DownloadScheduleRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadScheduleRequest {
+    window_hours: u32,
+    min_wait_minutes: u32,
+    max_wait_minutes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -139,6 +150,7 @@ pub struct QueuedDownloadJob {
     source_url: String,
     status: String,
     thumbnail_url: Option<String>,
+    scheduled_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -151,6 +163,7 @@ pub struct PersistedDownloadJob {
     thumbnail_url: Option<String>,
     selected_quality: String,
     output_dir: String,
+    scheduled_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
     artifact_counts: ArtifactProgressCounts,
@@ -320,6 +333,23 @@ pub fn remove_download_queue_item(
     remove_download_job(&connection, &job_id).map_err(|error| error.to_string())?;
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn download_scheduled_job_now(
+    state: tauri::State<'_, LinkVaultState>,
+    job_id: String,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    clear_job_schedule(&connection, &job_id, now_unix_timestamp())
+        .map_err(|error| error.to_string())?;
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
     load_bootstrap_state(
         &connection,
         token_store::has_saved_token(&state.token_path),
@@ -566,7 +596,7 @@ fn process_queued_download_batch_with_clients(
             return Ok(combined);
         }
 
-        let has_remaining_queued_jobs = list_jobs_by_status(connection, "queued")
+        let has_remaining_queued_jobs = list_ready_queued_jobs(connection, timestamp)
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
@@ -768,7 +798,7 @@ fn record_quiz_metadata_discovery_for_next_job(
     timestamp: i64,
 ) -> Vec<crate::course::CourseAssessment> {
     let Ok(Some(job)) =
-        list_jobs_by_status(&connection, "queued").map(|jobs| jobs.into_iter().next())
+        list_ready_queued_jobs(&connection, timestamp).map(|jobs| jobs.into_iter().next())
     else {
         return Vec::new();
     };
@@ -816,13 +846,13 @@ fn queue_download_jobs(
         &SavedDownloadPreferences::from(&request),
         created_at,
     )?;
+    let scheduled_times =
+        scheduled_download_times(request.schedule.as_ref(), &courses, created_at)?;
 
     let mut jobs = Vec::with_capacity(courses.len());
     for (index, course) in courses.iter().enumerate() {
-        let job_id = format!(
-            "job-{created_at}-{}-{index}",
-            sanitize_identifier_fragment(&course.slug)
-        );
+        let scheduled_at = scheduled_times[index];
+        let job_id = unique_job_id(connection, created_at, &course.slug, index)?;
         insert_job(
             connection,
             &JobRecord {
@@ -837,6 +867,7 @@ fn queue_download_jobs(
                 download_quizzes: request.download_quizzes,
                 quiz_hints_json: course_quiz_hints_json(course),
                 output_dir: request.output_dir.clone(),
+                scheduled_at,
                 created_at,
                 updated_at: created_at,
             },
@@ -846,14 +877,28 @@ fn queue_download_jobs(
             connection,
             &NewJobEvent {
                 job_id: job_id.clone(),
-                event_type: "job.queued".to_string(),
-                message: format!("Queued LinkedIn Learning course: {}", course.slug),
+                event_type: if scheduled_at.is_some() {
+                    "job.scheduled"
+                } else {
+                    "job.queued"
+                }
+                .to_string(),
+                message: if let Some(run_at) = scheduled_at {
+                    format!(
+                        "Scheduled LinkedIn Learning course {} for {}.",
+                        course.slug,
+                        format_unix_timestamp_utc(run_at)
+                    )
+                } else {
+                    format!("Queued LinkedIn Learning course: {}", course.slug)
+                },
                 payload_json: Some(
                     serde_json::json!({
                         "sourceUrl": course.normalized_url,
                         "quizUrls": course.quiz_urls,
                         "assessmentUrns": course.assessment_urns,
                         "delaySeconds": request.delay_seconds,
+                        "scheduledAt": scheduled_at,
                     })
                     .to_string(),
                 ),
@@ -868,10 +913,113 @@ fn queue_download_jobs(
             source_url: course.normalized_url.clone(),
             status: "queued".to_string(),
             thumbnail_url: None,
+            scheduled_at,
         });
     }
 
     Ok(StartDownloadResponse { jobs })
+}
+
+fn unique_job_id(
+    connection: &Connection,
+    created_at: i64,
+    course_slug: &str,
+    index: usize,
+) -> Result<String, String> {
+    let base = format!(
+        "job-{created_at}-{}-{index}",
+        sanitize_identifier_fragment(course_slug)
+    );
+    if get_job(connection, &base)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Ok(base);
+    }
+
+    for suffix in 2..=10_000 {
+        let candidate = format!("{base}-{suffix}");
+        if get_job(connection, &candidate)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Ok(candidate);
+        }
+    }
+    Err("Could not allocate a unique download job identifier.".to_string())
+}
+
+fn scheduled_download_times(
+    schedule: Option<&DownloadScheduleRequest>,
+    courses: &[CourseUrl],
+    created_at: i64,
+) -> Result<Vec<Option<i64>>, String> {
+    let Some(schedule) = schedule else {
+        return Ok(vec![None; courses.len()]);
+    };
+    if schedule.window_hours == 0 || schedule.window_hours > 168 {
+        return Err("Schedule window must be between 1 and 168 hours.".to_string());
+    }
+    if schedule.min_wait_minutes == 0 || schedule.min_wait_minutes > 1_440 {
+        return Err("Minimum random wait must be between 1 and 1440 minutes.".to_string());
+    }
+    if schedule.max_wait_minutes < schedule.min_wait_minutes || schedule.max_wait_minutes > 1_440 {
+        return Err(
+            "Maximum random wait must be at least the minimum and no more than 1440 minutes."
+                .to_string(),
+        );
+    }
+
+    let window_minutes = u64::from(schedule.window_hours) * 60;
+    let minimum_required = u64::from(schedule.min_wait_minutes) * courses.len() as u64;
+    if minimum_required > window_minutes {
+        return Err(format!(
+            "The schedule needs at least {} hours for {} courses at a {} minute minimum wait.",
+            (minimum_required + 59) / 60,
+            courses.len(),
+            schedule.min_wait_minutes
+        ));
+    }
+
+    let mut elapsed_minutes = 0_u64;
+    let mut times = Vec::with_capacity(courses.len());
+    for (index, course) in courses.iter().enumerate() {
+        let remaining_courses = courses.len().saturating_sub(index + 1) as u64;
+        let reserved_minimum = remaining_courses * u64::from(schedule.min_wait_minutes);
+        let available_for_this_wait = window_minutes
+            .saturating_sub(elapsed_minutes)
+            .saturating_sub(reserved_minimum);
+        let max_wait = u64::from(schedule.max_wait_minutes).min(available_for_this_wait);
+        let min_wait = u64::from(schedule.min_wait_minutes);
+        let wait = pseudo_random_inclusive(
+            schedule_seed(created_at, index, &course.slug),
+            min_wait,
+            max_wait.max(min_wait),
+        );
+        elapsed_minutes += wait;
+        times.push(Some(created_at + (elapsed_minutes * 60) as i64));
+    }
+    Ok(times)
+}
+
+fn schedule_seed(created_at: i64, index: usize, slug: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64 ^ created_at as u64 ^ index as u64;
+    for byte in slug.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn pseudo_random_inclusive(mut seed: u64, min: u64, max: u64) -> u64 {
+    if max <= min {
+        return min;
+    }
+    seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+    seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d049bb133111eb);
+    seed ^= seed >> 31;
+    min + seed % (max - min + 1)
 }
 
 fn persist_download_preferences(
@@ -972,6 +1120,7 @@ fn load_bootstrap_state(
             thumbnail_url,
             selected_quality: job.selected_quality,
             output_dir: job.output_dir,
+            scheduled_at: job.scheduled_at,
             created_at: job.created_at,
             updated_at: job.updated_at,
             artifact_counts,
@@ -1136,6 +1285,7 @@ mod tests {
                 download_exercises: true,
                 download_subtitles: false,
                 download_quizzes: true,
+                schedule: None,
             },
             1_700_000_000,
         )
@@ -1172,6 +1322,88 @@ mod tests {
     }
 
     #[test]
+    fn queue_download_jobs_persists_randomized_schedule_inside_window() {
+        let connection = initialized_connection();
+        let created_at = 1_700_000_000;
+
+        let response = queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/first-course\nhttps://www.linkedin.com/learning/second-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: Some(DownloadScheduleRequest {
+                    window_hours: 2,
+                    min_wait_minutes: 10,
+                    max_wait_minutes: 30,
+                }),
+            },
+            created_at,
+        )
+        .unwrap();
+
+        let jobs = list_jobs_by_status(&connection, "queued").unwrap();
+        assert_eq!(response.jobs.len(), 2);
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.scheduled_at.is_some()));
+        assert!(jobs[0].scheduled_at.unwrap() >= created_at + 10 * 60);
+        assert!(jobs[1].scheduled_at.unwrap() > jobs[0].scheduled_at.unwrap());
+        assert!(jobs[1].scheduled_at.unwrap() <= created_at + 2 * 60 * 60);
+        assert!(list_ready_queued_jobs(&connection, created_at + 9 * 60)
+            .unwrap()
+            .is_empty());
+        let events = list_job_events(&connection, &jobs[0].id).unwrap();
+        assert_eq!(events[0].event_type, "job.scheduled");
+        assert!(events[0]
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains("scheduledAt"));
+    }
+
+    #[test]
+    fn queue_download_jobs_rejects_schedule_window_shorter_than_minimum_waits() {
+        let connection = initialized_connection();
+        let course_urls = (0..5)
+            .map(|index| format!("https://www.linkedin.com/learning/course-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let error = queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls,
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: Some(DownloadScheduleRequest {
+                    window_hours: 1,
+                    min_wait_minutes: 15,
+                    max_wait_minutes: 30,
+                }),
+            },
+            100,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("at least 2 hours"));
+        assert!(list_jobs_by_status(&connection, "queued")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn queue_download_jobs_persists_direct_quiz_hints() {
         let connection = initialized_connection();
 
@@ -1187,6 +1419,7 @@ mod tests {
                 download_exercises: true,
                 download_subtitles: true,
                 download_quizzes: true,
+                schedule: None,
             },
             100,
         )
@@ -1232,6 +1465,7 @@ mod tests {
                 download_exercises: true,
                 download_subtitles: true,
                 download_quizzes: true,
+                schedule: None,
             },
             100,
         )
@@ -1258,6 +1492,7 @@ mod tests {
                 download_exercises: false,
                 download_subtitles: true,
                 download_quizzes: true,
+                schedule: None,
             },
             1_700_000_000,
         )
@@ -1382,6 +1617,7 @@ mod tests {
                 download_exercises: true,
                 download_subtitles: true,
                 download_quizzes: true,
+                schedule: None,
             },
             1_700_000_000,
         )
@@ -1460,6 +1696,82 @@ mod tests {
     }
 
     #[test]
+    fn immediate_queue_processing_leaves_future_scheduled_jobs_untouched() {
+        let connection = initialized_connection();
+        let scheduled_response = queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/scheduled-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: Some(DownloadScheduleRequest {
+                    window_hours: 2,
+                    min_wait_minutes: 30,
+                    max_wait_minutes: 30,
+                }),
+            },
+            100,
+        )
+        .unwrap();
+        let immediate_response = queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/immediate-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+            },
+            100,
+        )
+        .unwrap();
+
+        let ready = list_ready_queued_jobs(&connection, 100).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, immediate_response.jobs[0].id);
+
+        let scheduled = get_job(&connection, &scheduled_response.jobs[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduled.status, "queued");
+        assert_eq!(scheduled.scheduled_at, Some(100 + 30 * 60));
+    }
+
+    #[test]
+    fn duplicate_course_requests_in_the_same_second_keep_distinct_jobs() {
+        let connection = initialized_connection();
+        let request = || StartDownloadRequest {
+            course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
+            output_dir: "C:/downloads".to_string(),
+            selected_quality: "1080".to_string(),
+            delay_seconds: 0,
+            browser_source: "Chrome".to_string(),
+            download_videos: true,
+            download_exercises: true,
+            download_subtitles: true,
+            download_quizzes: true,
+            schedule: None,
+        };
+
+        let first = queue_download_jobs(&connection, request(), 100).unwrap();
+        let second = queue_download_jobs(&connection, request(), 100).unwrap();
+
+        assert_ne!(first.jobs[0].id, second.jobs[0].id);
+        assert_eq!(list_jobs_by_status(&connection, "queued").unwrap().len(), 2);
+    }
+
+    #[test]
     fn download_folder_for_job_prefers_course_folder_from_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let course_dir = temp.path().join("Sample Course");
@@ -1476,6 +1788,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: temp.path().to_string_lossy().to_string(),
+            scheduled_at: None,
             created_at: 100,
             updated_at: 200,
         };

@@ -4,11 +4,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
+  CalendarClock,
   CircleHelp,
+  Clock3,
   Folder,
   History,
   PanelLeft,
   Play,
+  Plus,
   RotateCcw,
   Settings,
   SunMedium,
@@ -61,6 +64,7 @@ type QueuedDownloadJob = {
   thumbnail_url?: string | null;
   selected_quality?: string;
   output_dir?: string;
+  scheduled_at?: number | null;
   created_at?: number;
   updated_at?: number;
   artifact_counts?: ArtifactProgressCounts;
@@ -95,6 +99,7 @@ type PersistedJobEvent = {
 };
 
 type ActivityRow = [time: string, label: string, tone?: string];
+type ActivityFilter = "active" | "completed" | "failed";
 
 type StartDownloadResponse = {
   jobs: QueuedDownloadJob[];
@@ -110,6 +115,13 @@ type StartDownloadRequest = {
   downloadExercises: boolean;
   downloadSubtitles: boolean;
   downloadQuizzes: boolean;
+  schedule?: DownloadScheduleRequest;
+};
+
+type DownloadScheduleRequest = {
+  windowHours: number;
+  minWaitMinutes: number;
+  maxWaitMinutes: number;
 };
 
 type ProcessQueuedDownloadResponse = {
@@ -172,7 +184,8 @@ const SIDEBAR_DEFAULT_WIDTH = 220;
 const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
-const APP_VERSION = "0.1.3";
+const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
+const APP_VERSION = "0.1.5";
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
@@ -194,6 +207,7 @@ export default function App() {
   const [parsedCourses, setParsedCourses] = useState<ParsedCourse[]>([]);
   const [hasSavedToken, setHasSavedToken] = useState(false);
   const [isValidatingToken, setIsValidatingToken] = useState(false);
+  const [isQueueingDownload, setIsQueueingDownload] = useState(false);
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
   const [isCancellingDownload, setIsCancellingDownload] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
@@ -201,18 +215,27 @@ export default function App() {
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [isScheduleOpen, setIsScheduleOpen] = useState(false);
+  const [scheduleStep, setScheduleStep] = useState<"configure" | "confirm">("configure");
+  const [scheduleWindowHours, setScheduleWindowHours] = useState(6);
+  const [scheduleMinWaitMinutes, setScheduleMinWaitMinutes] = useState(15);
+  const [scheduleMaxWaitMinutes, setScheduleMaxWaitMinutes] = useState(45);
+  const [scheduleCourseCount, setScheduleCourseCount] = useState(0);
   const [isTokenGuideOpen, setIsTokenGuideOpen] = useState(false);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
   const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
+  const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>(null);
   const [activeView, setActiveView] = useState<"downloads" | "coursera" | "history">("downloads");
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
   const cancellationRequestedRef = useRef(false);
+  const queueSubmissionRef = useRef(false);
+  const downloadProcessingPromiseRef = useRef<Promise<ProcessQueuedDownloadResponse> | null>(null);
   const sidebarDragStart = useRef({ x: 0, width: SIDEBAR_DEFAULT_WIDTH });
   const sidebarDragCleanup = useRef<(() => void) | null>(null);
   const wasSettingsOpen = useRef(false);
@@ -233,6 +256,26 @@ export default function App() {
   useEffect(() => {
     checkForUpdatesOnLaunch();
   }, []);
+
+  useEffect(() => {
+    if (!hasSavedToken) return;
+    let disposed = false;
+
+    async function checkDueSchedules() {
+      const state = await refreshBootstrapState();
+      if (disposed || !state) return;
+      if (hasReadyQueuedJobs(state.persisted_jobs)) {
+        ensureDownloadProcessing(true);
+      }
+    }
+
+    void checkDueSchedules();
+    const intervalId = window.setInterval(() => void checkDueSchedules(), 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [hasSavedToken, delaySeconds]);
 
   useEffect(() => {
     const storedWidth = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
@@ -403,8 +446,8 @@ export default function App() {
   }
 
   const canStart = useMemo(
-    () => courseUrls.trim().length > 0 && !isProcessingDownload,
-    [courseUrls, isProcessingDownload]
+    () => courseUrls.trim().length > 0 && !isQueueingDownload,
+    [courseUrls, isQueueingDownload]
   );
 
   const queueCounts = useMemo(
@@ -422,12 +465,14 @@ export default function App() {
   const liveQueueJobs = queuedJobs.filter((job) => shouldShowInLiveQueue(job.status));
   const completedJobs = completedCourseJobs(queuedJobs);
   const displayedQueueJobs = liveQueueJobs;
+  const scheduledCount = queuedJobs.filter(isScheduledJob).length;
   const persistedActivityEvents = coalesceActivityEvents(persistedEvents);
 
   const queueSummary = queuedJobs.length > 0
     ? ([
         queueCounts.active ? `${queueCounts.active} active` : null,
-        queueCounts.queued ? `${queueCounts.queued} queued` : null,
+        (queueCounts.queued ?? 0) - scheduledCount > 0 ? `${(queueCounts.queued ?? 0) - scheduledCount} queued` : null,
+        scheduledCount ? `${scheduledCount} scheduled` : null,
         queueCounts.failed ? `${queueCounts.failed} failed` : null,
         queueCounts.cancelled ? `${queueCounts.cancelled} cancelled` : null
       ].filter(Boolean).join(" - ") || "0 active")
@@ -449,6 +494,7 @@ export default function App() {
     completed: queueCounts.completed ?? 0,
     failed: (queueCounts.failed ?? 0) + (queueCounts.cancelled ?? 0)
   };
+  const filteredActivityJobs = activityFilter ? jobsForActivityFilter(queuedJobs, activityFilter) : [];
 
   async function clearFailedQueueItems() {
     if (activitySummary.failed === 0) return;
@@ -491,6 +537,20 @@ export default function App() {
     }
   }
 
+  async function downloadScheduledNow(job: QueuedDownloadJob) {
+    if (!isScheduledJob(job)) return;
+    try {
+      const state = await downloadScheduledJobNow(job.id);
+      setQueuedJobs(state.persisted_jobs);
+      setPersistedEvents(state.recent_events ?? []);
+      setDownloadHistory(state.download_history ?? []);
+      toast.info("Moved to immediate queue", { description: courseDisplayName(job) });
+      ensureDownloadProcessing(state.has_saved_token);
+    } catch (error) {
+      toast.error("Could not start scheduled course", { description: String(error) });
+    }
+  }
+
   function handleTokenGuideOpenChange(open: boolean) {
     setIsTokenGuideOpen(open);
     if (!open) {
@@ -519,55 +579,89 @@ export default function App() {
     }
   }
 
-  async function startDownload() {
+  function openScheduleDialog() {
+    setScheduleStep("configure");
+    setIsScheduleOpen(true);
+  }
+
+  async function reviewDownloadSchedule() {
+    if (scheduleWindowHours < 1 || scheduleWindowHours > 168) {
+      toast.warning("Choose a valid schedule window", { description: "Use a window between 1 hour and 7 days." });
+      return;
+    }
+    if (scheduleMinWaitMinutes < 1 || scheduleMaxWaitMinutes < scheduleMinWaitMinutes) {
+      toast.warning("Choose a valid random wait", { description: "The maximum wait must be greater than or equal to the minimum wait." });
+      return;
+    }
     const parsed = await validateUrls();
     if (parsed.length === 0) return;
-    let outputDir = folder.trim();
-    if (!outputDir) {
-      toast.warning("Download folder required", {
-        description: "Choose where to save these courses, then LinkVault will continue."
+    if (scheduleMinWaitMinutes * parsed.length > scheduleWindowHours * 60) {
+      toast.warning("Schedule window is too short", {
+        description: `At least ${Math.ceil((scheduleMinWaitMinutes * parsed.length) / 60)} hours are needed for ${parsed.length} courses at this minimum wait.`
       });
-      const selectedFolder = await browseDownloadFolder();
-      outputDir = selectedFolder?.trim() ?? "";
-      if (!outputDir) {
-        document.querySelector<HTMLElement>('[aria-label="Download folder"]')?.focus();
-        return;
-      }
+      return;
     }
-    const enteredToken = token.trim();
-    let shouldUseSavedToken = Boolean(hasSavedToken);
-    if (enteredToken) {
-      setIsValidatingToken(true);
-      try {
-        await saveLinkedInToken(enteredToken);
-        setHasSavedToken(true);
-        shouldUseSavedToken = true;
-        setToken("");
-      } catch (error) {
-        toast.error("Token validation failed", { description: String(error) });
-        setIsValidatingToken(false);
-        return;
-      }
-      setIsValidatingToken(false);
-    } else if (!shouldUseSavedToken) {
-      toast.info("Using browser session", {
-        description: `LinkVault will read the ${browserSource} LinkedIn session for this download.`
-      });
-    }
-    const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
-    const alreadyDownloaded = parsed
-      .map((course) => course.slug)
-      .filter((slug) => completedSlugs.has(slug));
-    if (alreadyDownloaded.length > 0) {
-      const shouldDownloadAgain = window.confirm(
-        `LinkVault has already completed ${alreadyDownloaded.length} selected LinkedIn course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
-      );
-      if (!shouldDownloadAgain) return;
-    }
+    setScheduleCourseCount(parsed.length);
+    setScheduleStep("confirm");
+  }
+
+  async function queueDownloads(schedule?: DownloadScheduleRequest) {
+    if (queueSubmissionRef.current) return;
+    queueSubmissionRef.current = true;
+    setIsQueueingDownload(true);
+
     try {
-      setIsProcessingDownload(true);
-      cancellationRequestedRef.current = false;
-      setProcessingSummary(null);
+      const addingToActiveQueue = Boolean(downloadProcessingPromiseRef.current) || isProcessingDownload;
+      const parsed = await validateUrls();
+      if (parsed.length === 0) return;
+      let outputDir = folder.trim();
+      if (!outputDir) {
+        toast.warning("Download folder required", {
+          description: "Choose where to save these courses, then LinkVault will continue."
+        });
+        const selectedFolder = await browseDownloadFolder();
+        outputDir = selectedFolder?.trim() ?? "";
+        if (!outputDir) {
+          document.querySelector<HTMLElement>('[aria-label="Download folder"]')?.focus();
+          return;
+        }
+      }
+      const enteredToken = token.trim();
+      let shouldUseSavedToken = Boolean(hasSavedToken);
+      if (enteredToken) {
+        setIsValidatingToken(true);
+        try {
+          await saveLinkedInToken(enteredToken);
+          setHasSavedToken(true);
+          shouldUseSavedToken = true;
+          setToken("");
+        } catch (error) {
+          toast.error("Token validation failed", { description: String(error) });
+          return;
+        } finally {
+          setIsValidatingToken(false);
+        }
+      } else if (schedule && !shouldUseSavedToken) {
+        toast.warning("Saved session required", {
+          description: "Paste and save your LinkedIn token before confirming an automatic schedule."
+        });
+        return;
+      } else if (!shouldUseSavedToken) {
+        toast.info("Using browser session", {
+          description: `LinkVault will read the ${browserSource} LinkedIn session for this download.`
+        });
+      }
+      const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
+      const alreadyDownloaded = parsed
+        .map((course) => course.slug)
+        .filter((slug) => completedSlugs.has(slug));
+      if (alreadyDownloaded.length > 0) {
+        const shouldDownloadAgain = window.confirm(
+          `LinkVault has already completed ${alreadyDownloaded.length} selected LinkedIn course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
+        );
+        if (!shouldDownloadAgain) return;
+      }
+
       const response = await startDownloadJobs({
         courseUrls,
         outputDir,
@@ -577,31 +671,85 @@ export default function App() {
         downloadVideos,
         downloadExercises,
         downloadSubtitles,
-        downloadQuizzes
+        downloadQuizzes,
+        schedule
       });
-      setQueuedJobs(response.jobs);
+      setQueuedJobs((jobs) => mergeQueuedJobs(jobs, response.jobs));
+      setCourseUrls("");
       setParsedCourses([]);
-      toast.success("Download queued", {
-        description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} persisted to the local queue.`
-      });
-
-      const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds, shouldUseSavedToken);
-
-      setProcessingSummary(processResponse);
       await refreshBootstrapState();
-      if (processResponse.processed) {
-        showProcessedDownloadToast(processResponse);
-      } else {
-        toast.info("No queued download to process", {
-          description: "The local queue did not contain a pending LinkedIn course."
+      if (schedule) {
+        setIsScheduleOpen(false);
+        setScheduleStep("configure");
+        toast.success("Courses scheduled", {
+          description: `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will download automatically within ${schedule.windowHours} hour${schedule.windowHours === 1 ? "" : "s"}.`
         });
+      } else {
+        toast.success(addingToActiveQueue ? "Added to download queue" : "Download queued", {
+          description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} ${addingToActiveQueue ? "added behind the active download" : "persisted to the local queue"}.`
+        });
+        ensureDownloadProcessing(shouldUseSavedToken);
       }
     } catch (error) {
       await refreshBootstrapState();
-      toast.error("Download processing failed", { description: String(error) });
+      toast.error("Could not add download", { description: String(error) });
     } finally {
-      setIsProcessingDownload(false);
+      queueSubmissionRef.current = false;
+      setIsQueueingDownload(false);
     }
+  }
+
+  async function startDownload() {
+    await queueDownloads();
+  }
+
+  async function confirmDownloadSchedule() {
+    await queueDownloads({
+      windowHours: scheduleWindowHours,
+      minWaitMinutes: scheduleMinWaitMinutes,
+      maxWaitMinutes: scheduleMaxWaitMinutes
+    });
+  }
+
+  function ensureDownloadProcessing(useSavedToken: boolean) {
+    if (downloadProcessingPromiseRef.current) return;
+
+    cancellationRequestedRef.current = false;
+    setIsProcessingDownload(true);
+    setProcessingSummary(null);
+    let processingFailed = false;
+    const processPromise = processQueuedDownloadBatchWithLiveRefresh(delaySeconds, useSavedToken);
+    downloadProcessingPromiseRef.current = processPromise;
+
+    void processPromise
+      .then((processResponse) => {
+        setProcessingSummary(processResponse);
+        if (processResponse.processed) {
+          showProcessedDownloadToast(processResponse);
+        } else {
+          toast.info("No queued download to process", {
+            description: "The local queue did not contain a pending LinkedIn course."
+          });
+        }
+      })
+      .catch(async (error) => {
+        processingFailed = true;
+        await refreshBootstrapState();
+        toast.error("Download processing failed", { description: String(error) });
+      })
+      .finally(async () => {
+        if (downloadProcessingPromiseRef.current === processPromise) {
+          downloadProcessingPromiseRef.current = null;
+        }
+
+        const state = await refreshBootstrapState();
+        const hasQueuedCourses = state ? hasReadyQueuedJobs(state.persisted_jobs) : false;
+        if (!processingFailed && !cancellationRequestedRef.current && hasQueuedCourses) {
+          ensureDownloadProcessing(useSavedToken);
+          return;
+        }
+        setIsProcessingDownload(false);
+      });
   }
 
   async function processQueuedDownloadWithLiveRefresh(processOperation: () => Promise<ProcessQueuedDownloadResponse>) {
@@ -646,7 +794,7 @@ export default function App() {
         return summary;
       }
 
-      const hasRemainingQueuedJobs = state?.persisted_jobs.some((job) => job.status === "queued") ?? false;
+      const hasRemainingQueuedJobs = state ? hasReadyQueuedJobs(state.persisted_jobs) : false;
       if (!hasRemainingQueuedJobs) {
         return summary;
       }
@@ -1047,9 +1195,17 @@ export default function App() {
                     <Checkbox checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Quizzes" />
                   </div>
                   <div className="command-actions">
-                    <Button type="button" variant="primary" onClick={startDownload} disabled={!canStart || isValidatingToken || isProcessingDownload}>
-                      <Play aria-hidden="true" className="h-3.5 w-3.5" />
-                      {isValidatingToken ? "Validating" : isProcessingDownload ? "Processing" : "Start Download"}
+                    <Button type="button" variant="primary" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                      {isProcessingDownload ? <Plus aria-hidden="true" className="h-3.5 w-3.5" /> : <Play aria-hidden="true" className="h-3.5 w-3.5" />}
+                      {isValidatingToken
+                        ? "Validating"
+                        : isQueueingDownload
+                          ? isProcessingDownload ? "Adding" : "Queueing"
+                          : isProcessingDownload ? "Add to queue" : "Start Download"}
+                    </Button>
+                    <Button type="button" variant="outline" onClick={openScheduleDialog} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                      <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
+                      Schedule
                     </Button>
                     <Button type="button" variant="outline" onClick={cancelDownload} disabled={!isProcessingDownload || isCancellingDownload}>
                       <X aria-hidden="true" className="h-3.5 w-3.5" />
@@ -1077,34 +1233,106 @@ export default function App() {
                   ) : null}
                 </div>
               </div>
-              <DownloadQueueTable jobs={displayedQueueJobs} parsedCourses={parsedCourses} hasPersistedJobs={queuedJobs.length > 0} onRetry={retryDownloadJob} onRemove={removeQueueItem} />
+              <DownloadQueueTable jobs={displayedQueueJobs} parsedCourses={parsedCourses} hasPersistedJobs={queuedJobs.length > 0} onRetry={retryDownloadJob} onRemove={removeQueueItem} onDownloadNow={downloadScheduledNow} />
             </Panel>
           </div>
 
-          <Panel className="lv-activity">
+          <Panel className={`lv-activity${activityFilter ? " activity-filtered" : ""}`}>
             <div className="activity-summary-grid">
-              <ActivitySummaryChip label="Active" value={activitySummary.active} tone="primary" />
-              <ActivitySummaryChip label="Completed" value={activitySummary.completed} tone="success" />
-              <ActivitySummaryChip label="Failed" value={activitySummary.failed} tone="danger" />
+              <ActivitySummaryChip label="Active" value={activitySummary.active} tone="primary" selected={activityFilter === "active"} onClick={() => setActivityFilter((current) => current === "active" ? null : "active")} />
+              <ActivitySummaryChip label="Completed" value={activitySummary.completed} tone="success" selected={activityFilter === "completed"} onClick={() => setActivityFilter((current) => current === "completed" ? null : "completed")} />
+              <ActivitySummaryChip label="Failed" value={activitySummary.failed} tone="danger" selected={activityFilter === "failed"} onClick={() => setActivityFilter((current) => current === "failed" ? null : "failed")} />
             </div>
-            <div className="activity-section">
-              <div className="activity-section-header">
-                <h4>Recent Activity</h4>
+            {activityFilter ? (
+              <div className="activity-section activity-filter-section">
+                <div className="activity-section-header">
+                  <h4>{activityFilterLabel(activityFilter)}</h4>
+                  <button type="button" onClick={() => setActivityFilter(null)}>Show overview</button>
+                </div>
+                <FilteredTaskList
+                  jobs={filteredActivityJobs}
+                  filter={activityFilter}
+                  onOpenFolder={openCompletedFolder}
+                  onRetry={retryDownloadJob}
+                />
               </div>
-              <ActivityLog events={activityEvents} />
-            </div>
-            <div className="activity-section completed-section">
-              <div className="activity-section-header">
-                <h4>Completed</h4>
-              </div>
-              <CompletedDownloadsTable jobs={completedJobs} onOpenFolder={openCompletedFolder} />
-            </div>
+            ) : (
+              <>
+                <div className="activity-section">
+                  <div className="activity-section-header">
+                    <h4>Recent Activity</h4>
+                  </div>
+                  <ActivityLog events={activityEvents} />
+                </div>
+                <div className="activity-section completed-section">
+                  <div className="activity-section-header">
+                    <h4>Completed</h4>
+                  </div>
+                  <CompletedDownloadsTable jobs={completedJobs} onOpenFolder={openCompletedFolder} />
+                </div>
+              </>
+            )}
           </Panel>
           </>
           )}
         </div>
       </main>
     </div>
+    <Dialog
+      open={isScheduleOpen}
+      onOpenChange={(open) => {
+        setIsScheduleOpen(open);
+        if (!open) setScheduleStep("configure");
+      }}
+      title={scheduleStep === "configure" ? "Schedule course downloads" : "Confirm automatic schedule"}
+      description={scheduleStep === "configure"
+        ? "Spread these courses across a safe time window with a randomized pause before each download."
+        : "Review the queue behavior before LinkVault saves the schedule."}
+      className="schedule-dialog"
+    >
+      {scheduleStep === "configure" ? (
+        <div className="schedule-config">
+          <div className="schedule-field-grid">
+            <Field label="Finish within (hours)">
+              <Input type="number" min={1} max={168} value={scheduleWindowHours} onChange={(event) => setScheduleWindowHours(Number(event.target.value))} />
+            </Field>
+            <Field label="Minimum wait (minutes)">
+              <Input type="number" min={1} max={1440} value={scheduleMinWaitMinutes} onChange={(event) => setScheduleMinWaitMinutes(Number(event.target.value))} />
+            </Field>
+            <Field label="Maximum wait (minutes)">
+              <Input type="number" min={1} max={1440} value={scheduleMaxWaitMinutes} onChange={(event) => setScheduleMaxWaitMinutes(Number(event.target.value))} />
+            </Field>
+          </div>
+          <div className="schedule-note">
+            <Clock3 aria-hidden="true" />
+            <div>
+              <strong>Persistent queue</strong>
+              <span>Schedules survive app restarts and new immediate downloads. LinkVault runs due work while open and resumes overdue items the next time it launches.</span>
+            </div>
+          </div>
+          <div className="schedule-actions">
+            <Button type="button" variant="ghost" onClick={() => setIsScheduleOpen(false)}>Cancel</Button>
+            <Button type="button" variant="primary" onClick={() => void reviewDownloadSchedule()}>Review schedule</Button>
+          </div>
+        </div>
+      ) : (
+        <div className="schedule-confirmation">
+          <div className="schedule-confirmation-grid">
+            <div><span>Courses</span><strong>{scheduleCourseCount}</strong></div>
+            <div><span>Finish within</span><strong>{scheduleWindowHours}h</strong></div>
+            <div><span>Random wait</span><strong>{scheduleMinWaitMinutes}–{scheduleMaxWaitMinutes}m</strong></div>
+          </div>
+          <p>The first course receives a randomized delay, and every following course stays inside the selected window. Each item can still be started manually from the queue.</p>
+          <div className="schedule-actions">
+            <Button type="button" variant="ghost" onClick={() => setScheduleStep("configure")}>Back</Button>
+            <Button type="button" variant="primary" loading={isQueueingDownload} loadingLabel="Scheduling" onClick={() => void confirmDownloadSchedule()}>
+              <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
+              Confirm schedule
+            </Button>
+          </div>
+        </div>
+      )}
+    </Dialog>
     <Dialog
       open={isSettingsOpen}
       onOpenChange={setIsSettingsOpen}
@@ -1235,6 +1463,30 @@ function shouldShowInLiveQueue(status: string) {
   return status !== "completed" && status !== "cancelled";
 }
 
+function isScheduledJob(job: QueuedDownloadJob) {
+  return job.status === "queued" && typeof job.scheduled_at === "number";
+}
+
+function hasReadyQueuedJobs(jobs: QueuedDownloadJob[]) {
+  const now = Math.floor(Date.now() / 1000);
+  return jobs.some((job) => job.status === "queued" && (!job.scheduled_at || job.scheduled_at <= now));
+}
+
+function formatScheduledDate(timestamp: number) {
+  if (!timestamp) return "schedule pending";
+  return new Date(timestamp * 1000).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+}
+
+function formatScheduledTime(timestamp: number) {
+  if (!timestamp) return "--:--";
+  return new Date(timestamp * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
 function completedCourseJobs(jobs: QueuedDownloadJob[]) {
   const latestByCourse = new Map<string, QueuedDownloadJob>();
   for (const job of jobs) {
@@ -1247,8 +1499,40 @@ function completedCourseJobs(jobs: QueuedDownloadJob[]) {
   }
   return [...latestByCourse.values()].sort(
     (first, second) =>
-      (first.created_at ?? 0) - (second.created_at ?? 0) ||
-      (first.updated_at ?? 0) - (second.updated_at ?? 0)
+      (second.updated_at ?? 0) - (first.updated_at ?? 0) ||
+      (second.created_at ?? 0) - (first.created_at ?? 0) ||
+      second.id.localeCompare(first.id)
+  );
+}
+
+function jobsForActivityFilter(jobs: QueuedDownloadJob[], filter: ActivityFilter) {
+  const matchingJobs = jobs.filter((job) => {
+    if (filter === "failed") return job.status === "failed" || job.status === "cancelled";
+    return job.status === filter;
+  });
+  return filter === "completed" ? completedCourseJobs(matchingJobs) : matchingJobs.sort(
+    (first, second) =>
+      (second.updated_at ?? 0) - (first.updated_at ?? 0) ||
+      second.id.localeCompare(first.id)
+  );
+}
+
+function activityFilterLabel(filter: ActivityFilter) {
+  if (filter === "active") return "Active downloads";
+  if (filter === "completed") return "Completed downloads";
+  return "Failed downloads";
+}
+
+function mergeQueuedJobs(currentJobs: QueuedDownloadJob[], addedJobs: QueuedDownloadJob[]) {
+  const jobsById = new Map(currentJobs.map((job) => [job.id, job]));
+  for (const job of addedJobs) {
+    jobsById.set(job.id, job);
+  }
+  return [...jobsById.values()].sort(
+    (first, second) =>
+      (second.updated_at ?? 0) - (first.updated_at ?? 0) ||
+      (second.created_at ?? 0) - (first.created_at ?? 0) ||
+      second.id.localeCompare(first.id)
   );
 }
 
@@ -1322,8 +1606,20 @@ function coalesceActivityEvents(events: PersistedJobEvent[]): ActivityRow[] {
   return rows;
 }
 
-function ActivitySummaryChip({ label, value, tone }: { label: string; value: number; tone: string }) {
-  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} />;
+function ActivitySummaryChip({
+  label,
+  value,
+  tone,
+  selected,
+  onClick
+}: {
+  label: string;
+  value: number;
+  tone: "primary" | "success" | "danger";
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} tone={tone} selected={selected} onClick={onClick} />;
 }
 
 function ActivityLog({ events }: { events: ActivityRow[] }) {
@@ -1343,13 +1639,15 @@ function DownloadQueueTable({
   parsedCourses,
   hasPersistedJobs,
   onRetry,
-  onRemove
+  onRemove,
+  onDownloadNow
 }: {
   jobs: QueuedDownloadJob[];
   parsedCourses: ParsedCourse[];
   hasPersistedJobs: boolean;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
   onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
+  onDownloadNow: (job: QueuedDownloadJob) => void | Promise<void>;
 }) {
   return (
     <DataTable className="queue-table">
@@ -1359,7 +1657,7 @@ function DownloadQueueTable({
         <span>Progress</span>
       </DataTableHeader>
       {jobs.length > 0 ? (
-        jobs.map((job) => <QueueJobRow key={job.id} job={job} onRetry={onRetry} onRemove={onRemove} />)
+        jobs.map((job) => <QueueJobRow key={job.id} job={job} onRetry={onRetry} onRemove={onRemove} onDownloadNow={onDownloadNow} />)
       ) : parsedCourses.length > 0 ? (
         parsedCourses.map((course, index) => <ValidatedQueueRow key={`${course.slug}-${index}`} course={course} />)
       ) : (
@@ -1375,17 +1673,20 @@ function DownloadQueueTable({
 function QueueJobRow({
   job,
   onRetry,
-  onRemove
+  onRemove,
+  onDownloadNow
 }: {
   job: QueuedDownloadJob;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
   onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
+  onDownloadNow: (job: QueuedDownloadJob) => void | Promise<void>;
 }) {
   const counts = artifactCounts(job);
   const progress = courseOverallProgress(job, counts);
   const title = courseDisplayName(job);
   const queueLabel = queueCourseLabel(job, counts);
   const canRemove = job.status !== "active";
+  const scheduled = isScheduledJob(job);
 
   return (
     <DataTableRow className="queue-table-row">
@@ -1394,12 +1695,25 @@ function QueueJobRow({
         {job.thumbnail_url ? <MiniCourseArt title={title} thumbnailUrl={job.thumbnail_url} /> : <span className={`course-status-mark ${activityDotClass(eventTone(job.status))}`} />}
         <div className="min-w-0">
           <div className="truncate font-medium" title={title}>{queueLabel}</div>
-          <div className="truncate text-soft" title={job.source_url}>{filesSummaryText(counts, job.status)}</div>
+          <div className="truncate text-soft" title={scheduled ? formatScheduledDate(job.scheduled_at ?? 0) : job.source_url}>
+            {scheduled ? `Runs ${formatScheduledDate(job.scheduled_at ?? 0)}` : filesSummaryText(counts, job.status)}
+          </div>
         </div>
       </div>
       <div className="table-progress-cell">
-        <Progress value={progress} />
-        <span>{progress}%</span>
+        {scheduled ? <span className="scheduled-time-compact">{formatScheduledTime(job.scheduled_at ?? 0)}</span> : <><Progress value={progress} /><span>{progress}%</span></>}
+        {scheduled ? (
+          <Tooltip label="Download now">
+            <IconButton
+              type="button"
+              aria-label={`Download ${title} now`}
+              onClick={() => onDownloadNow(job)}
+              className="scheduled-download-now"
+            >
+              <Play aria-hidden="true" className="h-3.5 w-3.5" />
+            </IconButton>
+          </Tooltip>
+        ) : null}
         {canRemove ? (
           <Tooltip label="Remove from queue">
             <IconButton
@@ -1414,6 +1728,48 @@ function QueueJobRow({
         ) : null}
       </div>
     </DataTableRow>
+  );
+}
+
+function FilteredTaskList({
+  jobs,
+  filter,
+  onOpenFolder,
+  onRetry
+}: {
+  jobs: QueuedDownloadJob[];
+  filter: ActivityFilter;
+  onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void>;
+  onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+}) {
+  if (jobs.length === 0) {
+    return <div className="status-task-empty">No {filter} downloads.</div>;
+  }
+
+  return (
+    <div className="status-task-list">
+      {jobs.map((job) => {
+        const counts = artifactCounts(job);
+        const title = courseDisplayName(job);
+        const progress = courseOverallProgress(job, counts);
+        return (
+          <div className="status-task-row" key={job.id}>
+            <span className={`status-dot ${activityDotClass(eventTone(job.status))}`} />
+            <div className="min-w-0">
+              <div className="truncate font-medium" title={title}>{title}</div>
+              <div className="truncate text-soft">
+                {filter === "active" ? `${progress}% · ${filesSummaryText(counts, job.status)}` : `${jobStatusLabel(job.status)} · ${formatEventTime(job.updated_at ?? 0)}`}
+              </div>
+            </div>
+            {filter === "completed" ? (
+              <Button size="xs" variant="ghost" onClick={() => onOpenFolder(job)}>Open</Button>
+            ) : filter === "failed" && job.status === "failed" ? (
+              <Button size="xs" variant="ghost" onClick={() => onRetry(job)}>Retry</Button>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1435,6 +1791,14 @@ function ValidatedQueueRow({ course }: { course: ParsedCourse }) {
 }
 
 function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; title: string; onRetry: (job: QueuedDownloadJob) => void | Promise<void> }) {
+  if (isScheduledJob(job)) {
+    return (
+      <StatusBadge className="scheduled-status-pill" dotClassName="bg-primary">
+        <Clock3 aria-hidden="true" className="h-3 w-3" />
+        <span>Scheduled</span>
+      </StatusBadge>
+    );
+  }
   return (
     <StatusBadge className={jobStatusBadgeClass(job.status)} dotClassName={activityDotClass(eventTone(job.status))}>
       <span>{jobStatusLabel(job.status)}</span>
@@ -1453,11 +1817,48 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
 }
 
 function CompletedDownloadsTable({ jobs, onOpenFolder }: { jobs: QueuedDownloadJob[]; onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void> }) {
+  const [visibleCount, setVisibleCount] = useState(COMPLETED_DOWNLOAD_PAGE_SIZE);
+  const loadMoreRef = useRef<HTMLButtonElement>(null);
+  const visibleJobs = jobs.slice(0, visibleCount);
+  const remainingCount = Math.max(0, jobs.length - visibleJobs.length);
+
+  useEffect(() => {
+    setVisibleCount((current) => Math.max(
+      COMPLETED_DOWNLOAD_PAGE_SIZE,
+      Math.min(current, jobs.length || COMPLETED_DOWNLOAD_PAGE_SIZE)
+    ));
+  }, [jobs.length]);
+
+  useEffect(() => {
+    const loadMoreButton = loadMoreRef.current;
+    if (!loadMoreButton || remainingCount === 0 || typeof IntersectionObserver === "undefined") return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) return;
+        setVisibleCount((current) => Math.min(current + COMPLETED_DOWNLOAD_PAGE_SIZE, jobs.length));
+      },
+      { threshold: 0.15 }
+    );
+    observer.observe(loadMoreButton);
+    return () => observer.disconnect();
+  }, [jobs.length, remainingCount]);
+
   return (
     <DataTable className="completed-list completed-table">
-      {jobs.length > 0 ? jobs.map((job) => <CompletedDownloadRow key={job.id} job={job} onOpenFolder={onOpenFolder} />) : (
+      {jobs.length > 0 ? visibleJobs.map((job) => <CompletedDownloadRow key={job.id} job={job} onOpenFolder={onOpenFolder} />) : (
         <EmptyRow compact title="No completed jobs" description="Finished courses will appear here after processing." />
       )}
+      {remainingCount > 0 ? (
+        <button
+          ref={loadMoreRef}
+          type="button"
+          className="completed-load-more"
+          onClick={() => setVisibleCount((current) => Math.min(current + COMPLETED_DOWNLOAD_PAGE_SIZE, jobs.length))}
+        >
+          Show {Math.min(COMPLETED_DOWNLOAD_PAGE_SIZE, remainingCount)} more
+        </button>
+      ) : null}
     </DataTable>
   );
 }
@@ -1750,6 +2151,38 @@ async function clearFailedDownloadJobs() {
   } satisfies BootstrapState;
 }
 
+async function downloadScheduledJobNow(jobId: string) {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("download_scheduled_job_now", { jobId });
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const jobs = readPreviewJobs().map((job) => job.id === jobId ? { ...job, scheduled_at: null, updated_at: timestamp } : job);
+  const events = [{
+    id: timestamp,
+    job_id: jobId,
+    event_type: "job.schedule.override",
+    message: "Scheduled course was moved to the immediate download queue.",
+    created_at: timestamp
+  }, ...readPreviewEvents()];
+  writePreviewState(jobs, events);
+  return previewBootstrapState(jobs, events);
+}
+
+function previewBootstrapState(jobs: QueuedDownloadJob[], events: PersistedJobEvent[]): BootstrapState {
+  return {
+    default_resolution: "P720",
+    browser_sources: ["Chrome", "Edge", "Firefox"],
+    stores_plaintext_tokens_in_sqlite: false,
+    has_saved_token: hasPreviewSavedToken(),
+    saved_download_preferences: readPreviewPreferences(),
+    persisted_jobs: jobs,
+    recent_events: events,
+    download_history: downloadHistoryFromJobs(jobs),
+    download_history_file_path: previewDownloadHistoryFilePath()
+  };
+}
+
 async function removeDownloadQueueItem(jobId: string) {
   if (isTauriRuntime()) {
     return invoke<BootstrapState>("remove_download_queue_item", { jobId });
@@ -1942,20 +2375,38 @@ function getPreviewScenario() {
 function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownloadResponse {
   const parsed = parseLinkedInCourseUrlsForPreview(request.courseUrls);
   const timestamp = Math.floor(Date.now() / 1000);
+  const requestId = Date.now();
+  const scheduledTimes = previewScheduledTimes(request.schedule, parsed.length, timestamp);
   const jobs = parsed.map((course, index) => ({
-    id: `preview-job-${index + 1}-${course.slug}`,
+    id: `preview-job-${requestId}-${index + 1}-${course.slug}`,
     course_slug: course.slug,
     source_url: course.normalized_url,
     status: "queued",
     thumbnail_url: previewThumbnailForSlug(course.slug),
     selected_quality: request.selectedQuality,
     output_dir: request.outputDir,
+    scheduled_at: scheduledTimes[index],
     updated_at: timestamp,
     artifact_counts: emptyArtifactCounts()
   }));
 
-  writePreviewState(jobs, []);
+  writePreviewState([...jobs, ...readPreviewJobs()], readPreviewEvents());
   return { jobs };
+}
+
+function previewScheduledTimes(schedule: DownloadScheduleRequest | undefined, courseCount: number, timestamp: number) {
+  if (!schedule) return Array.from({ length: courseCount }, () => null as number | null);
+  const windowMinutes = schedule.windowHours * 60;
+  let elapsedMinutes = 0;
+  return Array.from({ length: courseCount }, (_, index) => {
+    const remainingCourses = courseCount - index - 1;
+    const available = Math.max(schedule.minWaitMinutes, windowMinutes - elapsedMinutes - remainingCourses * schedule.minWaitMinutes);
+    const maxWait = Math.min(schedule.maxWaitMinutes, available);
+    const range = Math.max(1, maxWait - schedule.minWaitMinutes + 1);
+    const wait = schedule.minWaitMinutes + ((timestamp + index * 17) % range);
+    elapsedMinutes += wait;
+    return timestamp + elapsedMinutes * 60;
+  });
 }
 
 function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
@@ -2005,7 +2456,8 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
 async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownloadResponse> {
   const jobs = readPreviewJobs();
   const scenario = getPreviewScenario();
-  const queuedIndex = jobs.findIndex((job) => job.status === "queued");
+  const readyAt = Math.floor(Date.now() / 1000);
+  const queuedIndex = jobs.findIndex((job) => job.status === "queued" && (!job.scheduled_at || job.scheduled_at <= readyAt));
   if (queuedIndex < 0) {
     return {
       processed: false,

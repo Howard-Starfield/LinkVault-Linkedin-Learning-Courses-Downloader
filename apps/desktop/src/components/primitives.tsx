@@ -259,12 +259,41 @@ export function DataTableRow({ className, children, ...props }: HTMLAttributes<H
   );
 }
 
-export function SummaryChip({ label, value, dotClassName }: { label: string; value: number; dotClassName: string }) {
-  return (
-    <div className="summary-chip">
+export function SummaryChip({
+  label,
+  value,
+  dotClassName,
+  tone,
+  selected = false,
+  onClick
+}: {
+  label: string;
+  value: number;
+  dotClassName: string;
+  tone: "primary" | "success" | "danger";
+  selected?: boolean;
+  onClick?: () => void;
+}) {
+  const content = (
+    <>
       <span className={cn("summary-dot", dotClassName)} />
       <span className="summary-label">{label}</span>
       <strong>{value}</strong>
+    </>
+  );
+  const className = cn("summary-chip", `summary-chip-${tone}`, value > 0 && "summary-chip-live", onClick && "summary-chip-interactive", selected && "summary-chip-selected");
+
+  if (onClick) {
+    return (
+      <button type="button" className={className} aria-label={`${label}: ${value}`} aria-pressed={selected} onClick={onClick}>
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    <div className={className} aria-label={`${label}: ${value}`}>
+      {content}
     </div>
   );
 }
