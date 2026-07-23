@@ -1210,6 +1210,65 @@ textarea {
   gap: 10px;
 }
 
+.schedule-window-field input {
+  border-color: rgb(240 138 93 / 0.34);
+  background: rgb(240 138 93 / 0.055);
+}
+
+.schedule-auto-control {
+  position: relative;
+}
+
+.schedule-auto-input {
+  width: 100%;
+  padding-right: 48px;
+  color: var(--text-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.schedule-auto-control > span {
+  position: absolute;
+  right: 9px;
+  top: 50%;
+  border: 1px solid rgb(240 138 93 / 0.2);
+  border-radius: 999px;
+  background: rgb(240 138 93 / 0.07);
+  padding: 2px 6px;
+  color: var(--accent);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 11px;
+  pointer-events: none;
+  text-transform: uppercase;
+  transform: translateY(-50%);
+}
+
+.schedule-pacing-preview {
+  display: flex;
+  min-height: 34px;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+  padding: 8px 2px;
+}
+
+.schedule-pacing-preview span {
+  flex: 0 0 auto;
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.schedule-pacing-preview strong {
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 16px;
+  text-align: right;
+}
+
 .schedule-note {
   display: grid;
   grid-template-columns: 30px minmax(0, 1fr);

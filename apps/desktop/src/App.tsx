@@ -124,6 +124,12 @@ type DownloadScheduleRequest = {
   maxWaitMinutes: number;
 };
 
+type AutomaticScheduleWaitRange = {
+  targetWaitMinutes: number;
+  minWaitMinutes: number;
+  maxWaitMinutes: number;
+};
+
 type ProcessQueuedDownloadResponse = {
   processed: boolean;
   completed_artifacts: number;
@@ -185,11 +191,31 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.1.5";
+const APP_VERSION = "0.1.6";
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
   return Math.min(Math.max(width, SIDEBAR_MIN_WIDTH), SIDEBAR_MAX_WIDTH);
+}
+
+function calculateAutomaticScheduleWaitRange(windowHours: number, courseCount: number): AutomaticScheduleWaitRange {
+  const normalizedHours = Number.isFinite(windowHours)
+    ? Math.min(168, Math.max(1, windowHours))
+    : 1;
+  const normalizedCourseCount = Math.max(1, Math.floor(courseCount));
+  const windowMinutes = Math.round(normalizedHours * 60);
+  const targetWaitMinutes = windowMinutes / normalizedCourseCount;
+  const minWaitMinutes = Math.max(1, Math.min(1_440, Math.floor(targetWaitMinutes * 0.7)));
+  const maxWaitMinutes = Math.max(
+    minWaitMinutes,
+    Math.min(1_440, Math.ceil(targetWaitMinutes * 1.3))
+  );
+
+  return {
+    targetWaitMinutes: Math.max(1, Math.round(targetWaitMinutes)),
+    minWaitMinutes,
+    maxWaitMinutes
+  };
 }
 
 export default function App() {
@@ -218,8 +244,6 @@ export default function App() {
   const [isScheduleOpen, setIsScheduleOpen] = useState(false);
   const [scheduleStep, setScheduleStep] = useState<"configure" | "confirm">("configure");
   const [scheduleWindowHours, setScheduleWindowHours] = useState(6);
-  const [scheduleMinWaitMinutes, setScheduleMinWaitMinutes] = useState(15);
-  const [scheduleMaxWaitMinutes, setScheduleMaxWaitMinutes] = useState(45);
   const [scheduleCourseCount, setScheduleCourseCount] = useState(0);
   const [isTokenGuideOpen, setIsTokenGuideOpen] = useState(false);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
@@ -239,6 +263,12 @@ export default function App() {
   const sidebarDragStart = useRef({ x: 0, width: SIDEBAR_DEFAULT_WIDTH });
   const sidebarDragCleanup = useRef<(() => void) | null>(null);
   const wasSettingsOpen = useRef(false);
+  const automaticScheduleWaitRange = useMemo(
+    () => calculateAutomaticScheduleWaitRange(scheduleWindowHours, scheduleCourseCount),
+    [scheduleWindowHours, scheduleCourseCount]
+  );
+  const scheduleMinWaitMinutes = automaticScheduleWaitRange.minWaitMinutes;
+  const scheduleMaxWaitMinutes = automaticScheduleWaitRange.maxWaitMinutes;
 
   useEffect(() => {
     void refreshBootstrapState().then((state) => {
@@ -579,14 +609,17 @@ export default function App() {
     }
   }
 
-  function openScheduleDialog() {
+  async function openScheduleDialog() {
+    const parsed = parsedCourses.length > 0 ? parsedCourses : await validateUrls();
+    if (parsed.length === 0) return;
+    setScheduleCourseCount(parsed.length);
     setScheduleStep("configure");
     setIsScheduleOpen(true);
   }
 
   async function reviewDownloadSchedule() {
-    if (scheduleWindowHours < 1 || scheduleWindowHours > 168) {
-      toast.warning("Choose a valid schedule window", { description: "Use a window between 1 hour and 7 days." });
+    if (!Number.isInteger(scheduleWindowHours) || scheduleWindowHours < 1 || scheduleWindowHours > 168) {
+      toast.warning("Choose a valid schedule window", { description: "Use a whole number between 1 hour and 7 days." });
       return;
     }
     if (scheduleMinWaitMinutes < 1 || scheduleMaxWaitMinutes < scheduleMinWaitMinutes) {
@@ -1203,7 +1236,7 @@ export default function App() {
                           ? isProcessingDownload ? "Adding" : "Queueing"
                           : isProcessingDownload ? "Add to queue" : "Start Download"}
                     </Button>
-                    <Button type="button" variant="outline" onClick={openScheduleDialog} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                    <Button type="button" variant="outline" onClick={() => void openScheduleDialog()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
                       <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
                       Schedule
                     </Button>
@@ -1286,22 +1319,59 @@ export default function App() {
       }}
       title={scheduleStep === "configure" ? "Schedule course downloads" : "Confirm automatic schedule"}
       description={scheduleStep === "configure"
-        ? "Spread these courses across a safe time window with a randomized pause before each download."
+        ? `Choose when ${scheduleCourseCount} course${scheduleCourseCount === 1 ? "" : "s"} should finish. LinkVault calculates the randomized pacing.`
         : "Review the queue behavior before LinkVault saves the schedule."}
       className="schedule-dialog"
     >
       {scheduleStep === "configure" ? (
         <div className="schedule-config">
           <div className="schedule-field-grid">
-            <Field label="Finish within (hours)">
-              <Input type="number" min={1} max={168} value={scheduleWindowHours} onChange={(event) => setScheduleWindowHours(Number(event.target.value))} />
+            <Field label="Finish within (hours)" className="schedule-window-field">
+              <Input
+                type="number"
+                min={1}
+                max={168}
+                step={1}
+                value={scheduleWindowHours}
+                aria-label="Finish within hours"
+                onChange={(event) => setScheduleWindowHours(Number(event.target.value))}
+              />
             </Field>
             <Field label="Minimum wait (minutes)">
-              <Input type="number" min={1} max={1440} value={scheduleMinWaitMinutes} onChange={(event) => setScheduleMinWaitMinutes(Number(event.target.value))} />
+              <div className="schedule-auto-control">
+                <Input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={scheduleMinWaitMinutes}
+                  aria-label="Automatic minimum wait minutes"
+                  className="schedule-auto-input"
+                  readOnly
+                />
+                <span>Auto</span>
+              </div>
             </Field>
             <Field label="Maximum wait (minutes)">
-              <Input type="number" min={1} max={1440} value={scheduleMaxWaitMinutes} onChange={(event) => setScheduleMaxWaitMinutes(Number(event.target.value))} />
+              <div className="schedule-auto-control">
+                <Input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={scheduleMaxWaitMinutes}
+                  aria-label="Automatic maximum wait minutes"
+                  className="schedule-auto-input"
+                  readOnly
+                />
+                <span>Auto</span>
+              </div>
             </Field>
+          </div>
+          <div className="schedule-pacing-preview" aria-live="polite">
+            <span>Calculated pace</span>
+            <strong>
+              About {formatScheduleDuration(automaticScheduleWaitRange.targetWaitMinutes)} per course,
+              randomized from {formatScheduleDuration(scheduleMinWaitMinutes)} to {formatScheduleDuration(scheduleMaxWaitMinutes)}.
+            </strong>
           </div>
           <div className="schedule-note">
             <Clock3 aria-hidden="true" />
@@ -1485,6 +1555,13 @@ function formatScheduledDate(timestamp: number) {
 function formatScheduledTime(timestamp: number) {
   if (!timestamp) return "--:--";
   return new Date(timestamp * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatScheduleDuration(minutes: number) {
+  if (minutes < 60) return `${minutes} min`;
+  const hours = minutes / 60;
+  const formattedHours = Number.isInteger(hours) ? String(hours) : hours.toFixed(1);
+  return `${formattedHours} hr`;
 }
 
 function completedCourseJobs(jobs: QueuedDownloadJob[]) {
