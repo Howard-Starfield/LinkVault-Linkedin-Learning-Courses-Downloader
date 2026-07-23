@@ -72,12 +72,12 @@ Production outputs:
 
 ```text
 apps\desktop\src-tauri\target\release\linkvault.exe
-apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.5_x64-setup.exe
+apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.6_x64-setup.exe
 ```
 
 ## Publish An Update
 
-The release workflow runs when you push a version tag like `v0.1.5`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
+The release workflow runs when you push a version tag like `v0.1.6`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
 
 1. Bump the version in `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, and `apps/desktop/src-tauri/tauri.conf.json`.
 2. Run:
@@ -91,9 +91,9 @@ npm run cargo:test
 4. Create and push the tag:
 
 ```powershell
-git tag v0.1.5
+git tag v0.1.6
 git push origin main
-git push origin v0.1.5
+git push origin v0.1.6
 ```
 
 Users on older signed builds can use the in-app update button after the GitHub release finishes.
