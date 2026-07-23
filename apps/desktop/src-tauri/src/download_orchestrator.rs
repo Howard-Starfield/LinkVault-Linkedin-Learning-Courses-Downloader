@@ -134,6 +134,7 @@ pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
         Some("Started course metadata fetch."),
     )?;
 
+    cancellation.wait_if_paused();
     if cancellation.is_cancelled() {
         transition_job_status(
             connection,
@@ -1705,6 +1706,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: "C:/downloads".to_string(),
+            paused: false,
             scheduled_at: None,
             created_at: timestamp,
             updated_at: timestamp,
