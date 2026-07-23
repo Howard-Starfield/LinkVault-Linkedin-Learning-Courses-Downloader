@@ -3,7 +3,7 @@ use crate::artifact_downloader::{
     ArtifactDownloadSummary, ArtifactHttpClient, CancellationFlag, PlannedArtifactDownload,
 };
 use crate::cache::{
-    append_job_event, get_job, list_jobs_by_status, transition_job_status, upsert_artifact,
+    append_job_event, get_job, list_ready_queued_jobs, transition_job_status, upsert_artifact,
     upsert_course_cache_entry, ArtifactRecord, CacheError, CourseCacheEntry, JobRecord,
     NewJobEvent,
 };
@@ -56,7 +56,7 @@ pub fn process_next_queued_job(
     client: &mut impl CourseApiClient,
     timestamp: i64,
 ) -> Result<Option<ProcessedQueuedJob>, DownloadOrchestrationError> {
-    let Some(queued_job) = list_jobs_by_status(connection, "queued")?
+    let Some(queued_job) = list_ready_queued_jobs(connection, timestamp)?
         .into_iter()
         .next()
     else {
@@ -119,7 +119,7 @@ pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
     timestamp: i64,
     quiz_assessments: Vec<CourseAssessment>,
 ) -> Result<Option<ArtifactDownloadSummary>, DownloadOrchestrationError> {
-    let Some(queued_job) = list_jobs_by_status(connection, "queued")?
+    let Some(queued_job) = list_ready_queued_jobs(connection, timestamp)?
         .into_iter()
         .next()
     else {
@@ -1092,6 +1092,7 @@ mod tests {
     use crate::artifact_downloader::{ArtifactHttpResponse, NeverCancelled};
     use crate::cache::{
         get_course_cache_entry, initialize, insert_job, list_artifacts_for_job, list_job_events,
+        list_jobs_by_status,
     };
     use crate::course::{Chapter, CourseFetchError, CourseVideo, ExerciseFile};
     use rusqlite::Connection;
@@ -1704,6 +1705,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: "C:/downloads".to_string(),
+            scheduled_at: None,
             created_at: timestamp,
             updated_at: timestamp,
         }

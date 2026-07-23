@@ -37,6 +37,7 @@ pub fn run() {
             commands::cancel_active_download,
             commands::clear_failed_download_jobs,
             commands::clear_saved_li_at_token,
+            commands::download_scheduled_job_now,
             commands::open_download_folder,
             commands::parse_linkedin_course_urls,
             commands::process_next_queued_download_from_browser_source,

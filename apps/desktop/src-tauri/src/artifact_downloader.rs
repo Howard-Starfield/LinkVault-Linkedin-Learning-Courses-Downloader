@@ -1723,6 +1723,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: output_dir.to_string_lossy().to_string(),
+            scheduled_at: None,
             created_at: 100,
             updated_at: 100,
         }

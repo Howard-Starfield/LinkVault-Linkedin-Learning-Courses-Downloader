@@ -1064,8 +1064,8 @@ function buildActivityRows(events: PersistedCourseraEvent[]): ActivityRow[] {
   });
 }
 
-function ActivitySummaryChip({ label, value, tone }: { label: string; value: number; tone: string }) {
-  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} />;
+function ActivitySummaryChip({ label, value, tone }: { label: string; value: number; tone: "primary" | "success" | "danger" }) {
+  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} tone={tone} />;
 }
 
 function ActivityLog({ events }: { events: ActivityRow[] }) {
