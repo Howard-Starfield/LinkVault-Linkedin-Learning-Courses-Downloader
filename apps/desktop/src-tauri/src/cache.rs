@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     download_quizzes INTEGER NOT NULL DEFAULT 1,
     quiz_hints_json TEXT NOT NULL DEFAULT '[]',
     output_dir TEXT NOT NULL,
+    paused INTEGER NOT NULL DEFAULT 0,
     scheduled_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -98,6 +99,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     migrate_jobs_download_quizzes(connection)?;
     migrate_jobs_source_url(connection)?;
     migrate_jobs_quiz_hints(connection)?;
+    migrate_jobs_paused(connection)?;
     migrate_jobs_scheduled_at(connection)?;
     migrate_artifacts_known_types(connection)?;
     Ok(())
@@ -146,6 +148,17 @@ fn migrate_jobs_quiz_hints(connection: &Connection) -> Result<()> {
 fn migrate_jobs_scheduled_at(connection: &Connection) -> Result<()> {
     if !table_has_column(connection, "jobs", "scheduled_at")? {
         connection.execute("ALTER TABLE jobs ADD COLUMN scheduled_at INTEGER", [])?;
+    }
+
+    Ok(())
+}
+
+fn migrate_jobs_paused(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "jobs", "paused")? {
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
 
     Ok(())
@@ -227,6 +240,8 @@ pub enum CacheError {
     InvalidJobTransition { from: String, to: String },
     #[error("job cannot be removed while status is {status}")]
     JobRemovalBlocked { status: String },
+    #[error("job cannot be paused or resumed while status is {status}")]
+    JobPauseBlocked { status: String },
     #[error("job not found: {0}")]
     JobNotFound(String),
 }
@@ -262,6 +277,7 @@ pub struct JobRecord {
     pub download_quizzes: bool,
     pub quiz_hints_json: String,
     pub output_dir: String,
+    pub paused: bool,
     pub scheduled_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -412,11 +428,12 @@ pub fn insert_job(connection: &Connection, job: &JobRecord) -> CacheResult<()> {
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            paused,
             scheduled_at,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         "#,
         params![
             &job.id,
@@ -430,6 +447,7 @@ pub fn insert_job(connection: &Connection, job: &JobRecord) -> CacheResult<()> {
             job.download_quizzes,
             &job.quiz_hints_json,
             &job.output_dir,
+            job.paused,
             job.scheduled_at,
             job.created_at,
             job.updated_at
@@ -570,6 +588,22 @@ pub fn remove_download_job(connection: &Connection, job_id: &str) -> CacheResult
     Ok(current)
 }
 
+pub fn remove_completed_download_job(
+    connection: &Connection,
+    job_id: &str,
+) -> CacheResult<JobRecord> {
+    let current =
+        get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))?;
+    if current.status != "completed" {
+        return Err(CacheError::JobRemovalBlocked {
+            status: current.status,
+        });
+    }
+
+    connection.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])?;
+    Ok(current)
+}
+
 pub fn clear_job_schedule(
     connection: &Connection,
     job_id: &str,
@@ -602,6 +636,67 @@ pub fn clear_job_schedule(
     get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))
 }
 
+pub fn set_download_job_paused(
+    connection: &Connection,
+    job_id: &str,
+    paused: bool,
+    updated_at: i64,
+) -> CacheResult<JobRecord> {
+    let current =
+        get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))?;
+    if current.status != "queued" && current.status != "active" {
+        return Err(CacheError::JobPauseBlocked {
+            status: current.status,
+        });
+    }
+
+    connection.execute(
+        "UPDATE jobs SET paused = ?2, updated_at = ?3 WHERE id = ?1",
+        params![job_id, paused, updated_at],
+    )?;
+    append_job_event(
+        connection,
+        &NewJobEvent {
+            job_id: job_id.to_string(),
+            event_type: if paused {
+                "job.paused".to_string()
+            } else {
+                "job.resumed".to_string()
+            },
+            message: if paused {
+                "Download paused by user.".to_string()
+            } else {
+                "Download resumed by user.".to_string()
+            },
+            payload_json: None,
+            created_at: updated_at,
+        },
+    )?;
+
+    get_job(connection, job_id)?.ok_or_else(|| CacheError::JobNotFound(job_id.to_string()))
+}
+
+pub fn set_all_download_jobs_paused(
+    connection: &Connection,
+    paused: bool,
+    updated_at: i64,
+) -> CacheResult<usize> {
+    let jobs = ["active", "queued"]
+        .into_iter()
+        .map(|status| list_jobs_by_status(connection, status))
+        .collect::<CacheResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .filter(|job| job.paused != paused)
+        .collect::<Vec<_>>();
+
+    for job in &jobs {
+        set_download_job_paused(connection, &job.id, paused, updated_at)?;
+    }
+
+    Ok(jobs.len())
+}
+
 pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobRecord>> {
     let job = connection
         .query_row(
@@ -618,6 +713,7 @@ pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobR
                 download_quizzes,
                 quiz_hints_json,
                 output_dir,
+                paused,
                 scheduled_at,
                 created_at,
                 updated_at
@@ -646,6 +742,7 @@ pub fn list_jobs_by_status(connection: &Connection, status: &str) -> CacheResult
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            paused,
             scheduled_at,
             created_at,
             updated_at
@@ -675,6 +772,7 @@ pub fn list_recent_jobs(connection: &Connection, limit: usize) -> CacheResult<Ve
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            paused,
             scheduled_at,
             created_at,
             updated_at
@@ -707,11 +805,12 @@ pub fn list_ready_queued_jobs(
             download_quizzes,
             quiz_hints_json,
             output_dir,
+            paused,
             scheduled_at,
             created_at,
             updated_at
         FROM jobs
-        WHERE status = 'queued' AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+        WHERE status = 'queued' AND paused = 0 AND (scheduled_at IS NULL OR scheduled_at <= ?1)
         ORDER BY COALESCE(scheduled_at, created_at), created_at, id
         "#,
     )?;
@@ -884,9 +983,10 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> Result<JobRecord> {
         download_quizzes: row.get(8)?,
         quiz_hints_json: row.get(9)?,
         output_dir: row.get(10)?,
-        scheduled_at: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        paused: row.get(11)?,
+        scheduled_at: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -1248,9 +1348,44 @@ mod tests {
     }
 
     #[test]
+    fn remove_completed_download_job_only_removes_completed_jobs_and_cascades() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("active-job", "active", 100)).unwrap();
+        insert_job(&connection, &sample_job("completed-job", "completed", 100)).unwrap();
+        upsert_artifact(
+            &connection,
+            &ArtifactRecord {
+                id: "artifact-1".to_string(),
+                job_id: "completed-job".to_string(),
+                artifact_type: "video".to_string(),
+                path: "C:/downloads/sample/welcome.mp4".to_string(),
+                status: "completed".to_string(),
+                size_bytes: Some(10),
+                created_at: 100,
+                updated_at: 100,
+            },
+        )
+        .unwrap();
+
+        let active_error = remove_completed_download_job(&connection, "active-job").unwrap_err();
+        assert!(matches!(
+            active_error,
+            CacheError::JobRemovalBlocked { status } if status == "active"
+        ));
+
+        let removed = remove_completed_download_job(&connection, "completed-job").unwrap();
+        assert_eq!(removed.status, "completed");
+        assert!(get_job(&connection, "completed-job").unwrap().is_none());
+        assert!(list_artifacts_for_job(&connection, "completed-job")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn job_lifecycle_allows_only_cancellation_safe_transitions() {
         let connection = initialized_connection();
         insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
+        insert_job(&connection, &sample_job("job-2", "queued", 100)).unwrap();
 
         let active = transition_job_status(
             &connection,
@@ -1279,6 +1414,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            get_job(&connection, "job-2").unwrap().unwrap().status,
+            "queued"
+        );
         assert!(matches!(
             transition_job_status(&connection, "job-1", "completed", 140, None),
             Err(CacheError::InvalidJobTransition { from, to })
@@ -1291,6 +1430,52 @@ mod tests {
         assert_eq!(events[0].message, "Started metadata fetch.");
         assert_eq!(events[1].event_type, "job.cancelled");
         assert_eq!(events[1].message, "Cancelled during video download.");
+    }
+
+    #[test]
+    fn paused_jobs_are_persistent_and_excluded_from_the_ready_queue() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
+        insert_job(&connection, &sample_job("job-2", "queued", 100)).unwrap();
+
+        let paused = set_download_job_paused(&connection, "job-1", true, 110).unwrap();
+        assert!(paused.paused);
+        assert_eq!(
+            list_ready_queued_jobs(&connection, 110)
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            vec!["job-2"]
+        );
+
+        let resumed = set_download_job_paused(&connection, "job-1", false, 120).unwrap();
+        assert!(!resumed.paused);
+        assert_eq!(list_ready_queued_jobs(&connection, 120).unwrap().len(), 2);
+        let events = list_job_events(&connection, "job-1").unwrap();
+        assert_eq!(events[0].event_type, "job.paused");
+        assert_eq!(events[1].event_type, "job.resumed");
+    }
+
+    #[test]
+    fn pause_all_changes_only_active_and_queued_jobs() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("active-job", "active", 100)).unwrap();
+        insert_job(&connection, &sample_job("queued-job", "queued", 100)).unwrap();
+        insert_job(&connection, &sample_job("completed-job", "completed", 100)).unwrap();
+
+        assert_eq!(
+            set_all_download_jobs_paused(&connection, true, 110).unwrap(),
+            2
+        );
+        assert!(get_job(&connection, "active-job").unwrap().unwrap().paused);
+        assert!(get_job(&connection, "queued-job").unwrap().unwrap().paused);
+        assert!(
+            !get_job(&connection, "completed-job")
+                .unwrap()
+                .unwrap()
+                .paused
+        );
     }
 
     #[test]
@@ -1466,6 +1651,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: "C:/downloads".to_string(),
+            paused: false,
             scheduled_at: None,
             created_at: timestamp,
             updated_at: timestamp,

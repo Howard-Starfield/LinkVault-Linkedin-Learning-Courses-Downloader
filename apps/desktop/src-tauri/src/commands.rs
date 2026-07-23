@@ -11,8 +11,9 @@ use crate::cache::{
     append_job_event, clear_failed_jobs, clear_job_schedule, get_course_cache_entry, get_job,
     get_setting, insert_job, list_artifacts_for_job, list_download_history, list_job_events,
     list_jobs_by_status, list_ready_queued_jobs, list_recent_jobs, open_or_initialize,
-    remove_download_job, retry_failed_job, upsert_setting_json, DownloadHistoryEntry, JobRecord,
-    NewJobEvent,
+    remove_completed_download_job, remove_download_job, retry_failed_job,
+    set_all_download_jobs_paused, set_download_job_paused, upsert_setting_json,
+    DownloadHistoryEntry, JobRecord, NewJobEvent,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
@@ -38,6 +39,7 @@ pub struct LinkVaultState {
     db_path: PathBuf,
     token_path: PathBuf,
     download_cancellation: Arc<AtomicBool>,
+    download_paused: Arc<AtomicBool>,
 }
 
 impl LinkVaultState {
@@ -47,6 +49,7 @@ impl LinkVaultState {
             db_path,
             token_path,
             download_cancellation: Arc::new(AtomicBool::new(false)),
+            download_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -56,6 +59,7 @@ impl LinkVaultState {
 
     fn reset_download_cancellation(&self) -> DownloadCancellation {
         self.download_cancellation.store(false, Ordering::SeqCst);
+        self.download_paused.store(false, Ordering::SeqCst);
         self.download_cancellation()
     }
 
@@ -66,7 +70,12 @@ impl LinkVaultState {
     fn download_cancellation(&self) -> DownloadCancellation {
         DownloadCancellation {
             cancelled: Arc::clone(&self.download_cancellation),
+            paused: Arc::clone(&self.download_paused),
         }
+    }
+
+    fn set_download_paused(&self, paused: bool) {
+        self.download_paused.store(paused, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -83,11 +92,16 @@ impl LinkVaultState {
 #[derive(Clone)]
 struct DownloadCancellation {
     cancelled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl CancellationFlag for DownloadCancellation {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 }
 
@@ -163,6 +177,7 @@ pub struct PersistedDownloadJob {
     thumbnail_url: Option<String>,
     selected_quality: String,
     output_dir: String,
+    paused: bool,
     scheduled_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
@@ -285,9 +300,47 @@ pub fn cancel_active_download(
     state: tauri::State<'_, LinkVaultState>,
 ) -> Result<CancelDownloadResponse, String> {
     state.request_download_cancellation();
+    state.set_download_paused(false);
     Ok(CancelDownloadResponse {
         cancellation_requested: true,
     })
+}
+
+#[tauri::command]
+pub fn set_download_job_pause(
+    state: tauri::State<'_, LinkVaultState>,
+    job_id: String,
+    paused: bool,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    let job = set_download_job_paused(&connection, &job_id, paused, now_unix_timestamp())
+        .map_err(|error| error.to_string())?;
+    if job.status == "active" {
+        state.set_download_paused(paused);
+    }
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+}
+
+#[tauri::command]
+pub fn set_all_downloads_paused(
+    state: tauri::State<'_, LinkVaultState>,
+    paused: bool,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    set_all_download_jobs_paused(&connection, paused, now_unix_timestamp())
+        .map_err(|error| error.to_string())?;
+    state.set_download_paused(paused);
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
 }
 
 #[tauri::command]
@@ -331,6 +384,34 @@ pub fn remove_download_queue_item(
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
     remove_download_job(&connection, &job_id).map_err(|error| error.to_string())?;
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    load_bootstrap_state(
+        &connection,
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn delete_completed_download(
+    state: tauri::State<'_, LinkVaultState>,
+    job_id: String,
+) -> Result<BootstrapState, String> {
+    let connection = state.connection()?;
+    let job = get_job(&connection, &job_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Download job was not found.".to_string())?;
+    if job.status != "completed" {
+        return Err("Only completed downloads can delete their course files.".to_string());
+    }
+
+    let artifacts =
+        list_artifacts_for_job(&connection, &job.id).map_err(|error| error.to_string())?;
+    delete_completed_download_files(&job, &artifacts)?;
+    remove_completed_download_job(&connection, &job.id).map_err(|error| error.to_string())?;
+
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(
@@ -675,6 +756,78 @@ fn download_folder_for_job(job: &JobRecord, artifacts: &[crate::cache::ArtifactR
     output_dir
 }
 
+fn delete_completed_download_files(
+    job: &JobRecord,
+    artifacts: &[crate::cache::ArtifactRecord],
+) -> Result<Option<PathBuf>, String> {
+    if job.status != "completed" {
+        return Err("Only completed downloads can delete their course files.".to_string());
+    }
+
+    let output_dir = PathBuf::from(job.output_dir.trim());
+    if output_dir.as_os_str().is_empty() {
+        return Err("The completed download does not have a saved output folder.".to_string());
+    }
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut course_folders = HashSet::new();
+    for artifact in artifacts {
+        let artifact_path = PathBuf::from(artifact.path.trim());
+        let relative = artifact_path.strip_prefix(&output_dir).map_err(|_| {
+            "LinkVault refused to delete files outside the saved download folder.".to_string()
+        })?;
+        let mut components = relative.components();
+        let first = match components.next() {
+            Some(Component::Normal(value)) => value,
+            _ => {
+                return Err(
+                    "LinkVault could not identify a safe course folder to delete.".to_string(),
+                )
+            }
+        };
+        if components.any(|component| !matches!(component, Component::Normal(_))) {
+            return Err(
+                "LinkVault refused to delete a course folder containing an unsafe path."
+                    .to_string(),
+            );
+        }
+        course_folders.insert(output_dir.join(first));
+    }
+
+    if course_folders.len() != 1 {
+        return Err(
+            "LinkVault could not identify one safe course folder for this completed download."
+                .to_string(),
+        );
+    }
+    let course_folder = course_folders.into_iter().next().expect("one folder");
+    if course_folder == output_dir {
+        return Err("LinkVault will never delete the selected download root.".to_string());
+    }
+    if !course_folder.exists() {
+        return Ok(Some(course_folder));
+    }
+    if !course_folder.is_dir() {
+        return Err("The saved course path is not a folder; no files were deleted.".to_string());
+    }
+
+    let canonical_output = fs::canonicalize(&output_dir)
+        .map_err(|error| format!("Could not verify the saved download root: {error}"))?;
+    let canonical_course = fs::canonicalize(&course_folder)
+        .map_err(|error| format!("Could not verify the completed course folder: {error}"))?;
+    if canonical_course == canonical_output || !canonical_course.starts_with(&canonical_output) {
+        return Err(
+            "LinkVault refused to delete files outside the saved download root.".to_string(),
+        );
+    }
+
+    fs::remove_dir_all(&course_folder)
+        .map_err(|error| format!("Could not delete the completed course folder: {error}"))?;
+    Ok(Some(course_folder))
+}
+
 fn course_folder_from_artifact_path(output_dir: &Path, artifact_path: &Path) -> Option<PathBuf> {
     let relative = artifact_path.strip_prefix(output_dir).ok()?;
     let first = relative
@@ -867,6 +1020,7 @@ fn queue_download_jobs(
                 download_quizzes: request.download_quizzes,
                 quiz_hints_json: course_quiz_hints_json(course),
                 output_dir: request.output_dir.clone(),
+                paused: false,
                 scheduled_at,
                 created_at,
                 updated_at: created_at,
@@ -1120,6 +1274,7 @@ fn load_bootstrap_state(
             thumbnail_url,
             selected_quality: job.selected_quality,
             output_dir: job.output_dir,
+            paused: job.paused,
             scheduled_at: job.scheduled_at,
             created_at: job.created_at,
             updated_at: job.updated_at,
@@ -1788,6 +1943,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: temp.path().to_string_lossy().to_string(),
+            paused: false,
             scheduled_at: None,
             created_at: 100,
             updated_at: 200,
@@ -1808,6 +1964,121 @@ mod tests {
         }];
 
         assert_eq!(download_folder_for_job(&job, &artifacts), course_dir);
+    }
+
+    #[test]
+    fn delete_completed_download_files_removes_only_the_course_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let course_dir = temp.path().join("Sample Course");
+        let chapter_dir = course_dir.join("01 - Intro");
+        let sibling_dir = temp.path().join("Keep Me");
+        std::fs::create_dir_all(&chapter_dir).unwrap();
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        let artifact_path = chapter_dir.join("01 - Welcome.mp4");
+        std::fs::write(&artifact_path, b"video").unwrap();
+        std::fs::write(sibling_dir.join("notes.txt"), b"keep").unwrap();
+        let job = JobRecord {
+            id: "job-1".to_string(),
+            course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+            status: "completed".to_string(),
+            selected_quality: "720".to_string(),
+            download_videos: true,
+            download_exercises: true,
+            download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
+            output_dir: temp.path().to_string_lossy().to_string(),
+            paused: false,
+            scheduled_at: None,
+            created_at: 100,
+            updated_at: 200,
+        };
+        let artifacts = vec![crate::cache::ArtifactRecord {
+            id: "artifact-1".to_string(),
+            job_id: "job-1".to_string(),
+            artifact_type: "video".to_string(),
+            path: artifact_path.to_string_lossy().to_string(),
+            status: "completed".to_string(),
+            size_bytes: Some(5),
+            created_at: 100,
+            updated_at: 200,
+        }];
+
+        let deleted = delete_completed_download_files(&job, &artifacts).unwrap();
+
+        assert_eq!(deleted, Some(course_dir.clone()));
+        assert!(!course_dir.exists());
+        assert!(temp.path().is_dir());
+        assert!(sibling_dir.join("notes.txt").is_file());
+    }
+
+    #[test]
+    fn delete_completed_download_files_rejects_artifacts_outside_the_output_root() {
+        let output = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("do-not-delete.mp4");
+        std::fs::write(&outside_file, b"video").unwrap();
+        let job = JobRecord {
+            id: "job-1".to_string(),
+            course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+            status: "completed".to_string(),
+            selected_quality: "720".to_string(),
+            download_videos: true,
+            download_exercises: true,
+            download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
+            output_dir: output.path().to_string_lossy().to_string(),
+            paused: false,
+            scheduled_at: None,
+            created_at: 100,
+            updated_at: 200,
+        };
+        let artifacts = vec![crate::cache::ArtifactRecord {
+            id: "artifact-1".to_string(),
+            job_id: "job-1".to_string(),
+            artifact_type: "video".to_string(),
+            path: outside_file.to_string_lossy().to_string(),
+            status: "completed".to_string(),
+            size_bytes: Some(5),
+            created_at: 100,
+            updated_at: 200,
+        }];
+
+        let error = delete_completed_download_files(&job, &artifacts).unwrap_err();
+
+        assert!(error.contains("outside the saved download folder"));
+        assert!(outside_file.is_file());
+        assert!(output.path().is_dir());
+    }
+
+    #[test]
+    fn delete_completed_download_files_allows_record_cleanup_when_no_artifacts_exist() {
+        let output = tempfile::tempdir().unwrap();
+        let job = JobRecord {
+            id: "job-1".to_string(),
+            course_slug: "sample-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+            status: "completed".to_string(),
+            selected_quality: "720".to_string(),
+            download_videos: false,
+            download_exercises: false,
+            download_subtitles: false,
+            download_quizzes: false,
+            quiz_hints_json: "[]".to_string(),
+            output_dir: output.path().to_string_lossy().to_string(),
+            paused: false,
+            scheduled_at: None,
+            created_at: 100,
+            updated_at: 200,
+        };
+
+        let deleted = delete_completed_download_files(&job, &[]).unwrap();
+
+        assert_eq!(deleted, None);
+        assert!(output.path().is_dir());
     }
 
     #[test]
@@ -1847,12 +2118,15 @@ mod tests {
         );
 
         state.request_download_cancellation();
+        state.set_download_paused(true);
         assert!(state.is_download_cancellation_requested());
         assert!(state.download_cancellation().is_cancelled());
+        assert!(state.download_cancellation().is_paused());
 
         let cancellation = state.reset_download_cancellation();
         assert!(!state.is_download_cancellation_requested());
         assert!(!cancellation.is_cancelled());
+        assert!(!cancellation.is_paused());
     }
 
     struct NoopCourseClient;

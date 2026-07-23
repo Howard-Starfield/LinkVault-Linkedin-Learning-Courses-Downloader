@@ -23,6 +23,7 @@
   --color-primary-foreground: #21140f;
   --color-ring: #f08a5d;
   --color-success: #62c880;
+  --color-warning: #e0b251;
   --color-danger: #ff6b72;
   --color-danger-hover: #ff7d83;
   --color-sidebar: #171717;
@@ -56,6 +57,7 @@
   --accent: #f08a5d;
   --accent-hover: #ff9a70;
   --success: #62c880;
+  --warning: #e0b251;
   --danger: #ff6b72;
   color-scheme: dark;
   font-family: var(--font-sans);
@@ -696,6 +698,7 @@ textarea {
 
 .table-progress-cell {
   justify-content: flex-end;
+  position: relative;
 }
 
 .table-progress-cell span {
@@ -713,18 +716,42 @@ textarea {
   text-align: right;
 }
 
-.scheduled-download-now {
-  height: 26px;
-  width: 26px;
-  color: var(--accent);
+.queue-row-actions {
+  position: absolute;
+  inset-inline-end: 0;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding-inline-start: 24px;
+  background: linear-gradient(90deg, transparent, var(--panel-bg) 22%);
   opacity: 0;
-  transform: translateX(4px);
-  transition: opacity 140ms ease, transform 140ms ease, background-color 140ms ease;
+  pointer-events: none;
+  transform: translateX(5px);
+  transition: opacity 140ms ease, transform 140ms ease;
 }
 
-.queue-table-row:hover .scheduled-download-now,
-.scheduled-download-now:focus-visible {
+.queue-row-actions .lv-icon-button {
+  height: 26px;
+  width: 26px;
+}
+
+.scheduled-download-now {
+  color: var(--accent);
+}
+
+.queue-pause-button {
+  color: var(--warning);
+}
+
+.queue-remove-button {
+  color: var(--danger);
+}
+
+.queue-table-row:hover .queue-row-actions,
+.queue-table-row:focus-within .queue-row-actions,
+.queue-row-actions:has(.lv-icon-button:focus-visible) {
   opacity: 1;
+  pointer-events: auto;
   transform: translateX(0);
 }
 
@@ -732,6 +759,12 @@ textarea {
   border: 1px solid rgb(240 138 93 / 0.18);
   background: rgb(240 138 93 / 0.09);
   color: var(--accent);
+}
+
+.paused-status-pill {
+  border: 1px solid rgb(224 178 81 / 0.22);
+  background: rgb(224 178 81 / 0.1);
+  color: var(--warning);
 }
 
 .table-progress-cell [role="progressbar"] {
@@ -985,13 +1018,46 @@ textarea {
   align-items: center;
   gap: 8px;
   border-bottom: 1px solid var(--border-soft);
+  padding: 0 4px;
   color: var(--text-muted);
   font-size: 11px;
+  transition: background-color 140ms ease;
+}
+
+.status-task-row:hover,
+.status-task-row:focus-within {
+  background: rgb(255 255 255 / 0.025);
 }
 
 .status-task-row .font-medium {
   color: var(--text-main);
   font-size: 12px;
+}
+
+.status-task-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.status-task-clear-action {
+  color: var(--danger);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(3px);
+  transition: color 140ms ease, opacity 140ms ease, transform 140ms ease;
+}
+
+.status-task-row:hover .status-task-clear-action,
+.status-task-row:focus-within .status-task-clear-action,
+.status-task-clear-action:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
+}
+
+.status-task-clear-action:hover {
+  color: #ff9b9b;
 }
 
 .status-task-empty {
@@ -1519,8 +1585,15 @@ textarea {
     display: none;
   }
 
-  .scheduled-download-now {
+  .queue-row-actions {
     opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+
+  .status-task-clear-action {
+    opacity: 1;
+    pointer-events: auto;
     transform: none;
   }
 }

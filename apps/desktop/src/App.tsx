@@ -10,6 +10,7 @@ import {
   Folder,
   History,
   PanelLeft,
+  Pause,
   Play,
   Plus,
   RotateCcw,
@@ -64,6 +65,7 @@ type QueuedDownloadJob = {
   thumbnail_url?: string | null;
   selected_quality?: string;
   output_dir?: string;
+  paused?: boolean;
   scheduled_at?: number | null;
   created_at?: number;
   updated_at?: number;
@@ -191,7 +193,7 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.1.6";
+const APP_VERSION = "0.1.7";
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
@@ -236,6 +238,8 @@ export default function App() {
   const [isQueueingDownload, setIsQueueingDownload] = useState(false);
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
   const [isCancellingDownload, setIsCancellingDownload] = useState(false);
+  const [pauseUpdatingTaskId, setPauseUpdatingTaskId] = useState<string | null>(null);
+  const [isPausingAll, setIsPausingAll] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
@@ -252,6 +256,7 @@ export default function App() {
   const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
   const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
   const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>(null);
+  const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<"downloads" | "coursera" | "history">("downloads");
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
@@ -441,7 +446,7 @@ export default function App() {
 
   function markNextQueuedJobActiveForLiveStats() {
     setQueuedJobs((jobs) => {
-      const queuedIndex = jobs.findIndex((job) => job.status === "queued");
+      const queuedIndex = jobs.findIndex((job) => job.status === "queued" && !job.paused);
       if (queuedIndex < 0) return jobs;
       return jobs.map((job, index) => (
         index === queuedIndex
@@ -495,14 +500,21 @@ export default function App() {
   const liveQueueJobs = queuedJobs.filter((job) => shouldShowInLiveQueue(job.status));
   const completedJobs = completedCourseJobs(queuedJobs);
   const displayedQueueJobs = liveQueueJobs;
+  const pausableQueueJobs = liveQueueJobs.filter((job) => job.status === "active" || job.status === "queued");
+  const activeDownloadJob = pausableQueueJobs.find((job) => job.status === "active") ?? null;
+  const allPausableJobsPaused = pausableQueueJobs.length > 0 && pausableQueueJobs.every((job) => job.paused);
+  const activeCount = queuedJobs.filter((job) => job.status === "active" && !job.paused).length;
+  const immediateQueuedCount = queuedJobs.filter((job) => job.status === "queued" && !job.paused && !job.scheduled_at).length;
   const scheduledCount = queuedJobs.filter(isScheduledJob).length;
+  const pausedCount = pausableQueueJobs.filter((job) => job.paused).length;
   const persistedActivityEvents = coalesceActivityEvents(persistedEvents);
 
   const queueSummary = queuedJobs.length > 0
     ? ([
-        queueCounts.active ? `${queueCounts.active} active` : null,
-        (queueCounts.queued ?? 0) - scheduledCount > 0 ? `${(queueCounts.queued ?? 0) - scheduledCount} queued` : null,
+        activeCount ? `${activeCount} active` : null,
+        immediateQueuedCount ? `${immediateQueuedCount} queued` : null,
         scheduledCount ? `${scheduledCount} scheduled` : null,
+        pausedCount ? `${pausedCount} paused` : null,
         queueCounts.failed ? `${queueCounts.failed} failed` : null,
         queueCounts.cancelled ? `${queueCounts.cancelled} cancelled` : null
       ].filter(Boolean).join(" - ") || "0 active")
@@ -539,6 +551,69 @@ export default function App() {
       });
     } catch (error) {
       toast.error("Clear failed queue failed", { description: String(error) });
+    }
+  }
+
+  async function clearStatusTask(job: QueuedDownloadJob) {
+    if (clearingTaskId) return;
+    const title = courseDisplayName(job);
+    let confirmationMessage: string;
+
+    if (job.status === "active") {
+      confirmationMessage = `Cancel ${title}?\n\nThe active download will stop at the next safe boundary. Other queued and scheduled courses will remain in the queue.`;
+    } else if (job.status === "completed") {
+      confirmationMessage = `Delete ${title}?\n\nThis permanently deletes the completed course folder and removes its task record. This cannot be undone.`;
+    } else {
+      confirmationMessage = `Remove ${title} from LinkVault?\n\nOnly the failed task record will be removed. Any partial files will stay on disk.`;
+    }
+
+    if (!window.confirm(confirmationMessage)) return;
+    setClearingTaskId(job.id);
+
+    try {
+      if (job.status === "active") {
+        cancellationRequestedRef.current = true;
+        setIsCancellingDownload(true);
+        const response = await requestActiveDownloadCancellation(job.id);
+        if (response.cancellation_requested) {
+          toast.info("Cancellation requested", {
+            description: `${title} will stop at the next safe cancellation boundary.`
+          });
+        }
+        await refreshBootstrapState();
+        return;
+      }
+
+      const state = job.status === "completed"
+        ? await deleteCompletedDownload(job.id)
+        : await removeDownloadQueueItem(job.id);
+      setQueuedJobs(state.persisted_jobs);
+      setPersistedEvents(state.recent_events ?? []);
+      setDownloadHistory(state.download_history ?? []);
+      setHasSavedToken(state.has_saved_token);
+      setProcessingSummary(null);
+
+      if (job.status === "completed") {
+        toast.success("Completed course deleted", {
+          description: `${title}'s course folder and task record were removed.`
+        });
+      } else {
+        toast.info("Failed task removed", {
+          description: "The task record was removed. Partial files were left on disk."
+        });
+      }
+    } catch (error) {
+      const action = job.status === "active"
+        ? "Cancellation failed"
+        : job.status === "completed"
+          ? "Course deletion failed"
+          : "Task removal failed";
+      toast.error(action, { description: String(error) });
+    } finally {
+      if (job.status === "active") {
+        setIsCancellingDownload(false);
+      }
+      setClearingTaskId(null);
     }
   }
 
@@ -938,11 +1013,11 @@ export default function App() {
   }
 
   async function cancelDownload() {
-    if (!isProcessingDownload) return;
+    if (!activeDownloadJob) return;
     cancellationRequestedRef.current = true;
     setIsCancellingDownload(true);
     try {
-      const response = await invoke<CancelDownloadResponse>("cancel_active_download");
+      const response = await requestActiveDownloadCancellation();
       if (response.cancellation_requested) {
         toast.info("Cancellation requested", {
           description: "The active job will stop at the next safe cancellation boundary."
@@ -953,6 +1028,54 @@ export default function App() {
       toast.error("Cancellation failed", { description: String(error) });
     } finally {
       setIsCancellingDownload(false);
+    }
+  }
+
+  async function toggleDownloadPause(job: QueuedDownloadJob) {
+    if (job.status !== "active" && job.status !== "queued") return;
+    const nextPaused = !job.paused;
+    setPauseUpdatingTaskId(job.id);
+    try {
+      const state = await setDownloadJobPause(job.id, nextPaused);
+      setQueuedJobs(state.persisted_jobs);
+      setPersistedEvents(state.recent_events ?? []);
+      toast.info(nextPaused ? "Download paused" : "Download resumed", {
+        description: nextPaused
+          ? `${courseDisplayName(job)} will pause at the next safe boundary.`
+          : `${courseDisplayName(job)} is available to continue.`
+      });
+      if (!nextPaused && job.status === "queued" && (isTauriRuntime() || hasSavedToken)) {
+        cancellationRequestedRef.current = false;
+        ensureDownloadProcessing(hasSavedToken);
+      }
+    } catch (error) {
+      toast.error(nextPaused ? "Pause failed" : "Resume failed", { description: String(error) });
+    } finally {
+      setPauseUpdatingTaskId(null);
+    }
+  }
+
+  async function toggleAllDownloadsPause() {
+    if (pausableQueueJobs.length === 0) return;
+    const nextPaused = !allPausableJobsPaused;
+    setIsPausingAll(true);
+    try {
+      const state = await setAllDownloadsPaused(nextPaused);
+      setQueuedJobs(state.persisted_jobs);
+      setPersistedEvents(state.recent_events ?? []);
+      toast.info(nextPaused ? "All downloads paused" : "All downloads resumed", {
+        description: nextPaused
+          ? "Active work will pause at the next safe boundary. Queued and scheduled courses will wait."
+          : "Queued downloads are available to continue."
+      });
+      if (!nextPaused && (isTauriRuntime() || hasSavedToken)) {
+        cancellationRequestedRef.current = false;
+        ensureDownloadProcessing(hasSavedToken);
+      }
+    } catch (error) {
+      toast.error(nextPaused ? "Pause all failed" : "Resume all failed", { description: String(error) });
+    } finally {
+      setIsPausingAll(false);
     }
   }
 
@@ -978,7 +1101,7 @@ export default function App() {
       setQueuedJobs((jobs) =>
         jobs.map((candidate) =>
           candidate.id === job.id
-            ? { ...candidate, status: "queued", artifact_counts: emptyArtifactCounts() }
+            ? { ...candidate, status: "queued", paused: false, artifact_counts: emptyArtifactCounts() }
             : candidate
         )
       );
@@ -1084,7 +1207,7 @@ export default function App() {
         </nav>
 
         <div className="flex items-center justify-between py-4 pl-6 pr-0 text-xs text-sidebar-muted">
-          <span>v1.2.0</span>
+          <span>v{APP_VERSION}</span>
           <div className="flex items-center gap-2">
             <SunMedium aria-hidden="true" className="h-4 w-4" />
             <Popover
@@ -1240,9 +1363,31 @@ export default function App() {
                       <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
                       Schedule
                     </Button>
-                    <Button type="button" variant="outline" onClick={cancelDownload} disabled={!isProcessingDownload || isCancellingDownload}>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => activeDownloadJob && void toggleDownloadPause(activeDownloadJob)}
+                      disabled={!activeDownloadJob || pauseUpdatingTaskId !== null || isPausingAll}
+                    >
+                      {activeDownloadJob?.paused
+                        ? <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                        : <Pause aria-hidden="true" className="h-3.5 w-3.5" />}
+                      {activeDownloadJob?.paused ? "Resume" : "Pause"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void toggleAllDownloadsPause()}
+                      disabled={pausableQueueJobs.length === 0 || pauseUpdatingTaskId !== null || isPausingAll}
+                    >
+                      {allPausableJobsPaused
+                        ? <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                        : <Pause aria-hidden="true" className="h-3.5 w-3.5" />}
+                      {isPausingAll ? "Updating" : allPausableJobsPaused ? "Resume all" : "Pause all"}
+                    </Button>
+                    <Button type="button" variant="outline" onClick={cancelDownload} disabled={!activeDownloadJob || isCancellingDownload}>
                       <X aria-hidden="true" className="h-3.5 w-3.5" />
-                      {isCancellingDownload ? "Cancelling" : "Cancel"}
+                      {isCancellingDownload ? "Cancelling" : "Cancel active"}
                     </Button>
                   </div>
                 </div>
@@ -1266,7 +1411,17 @@ export default function App() {
                   ) : null}
                 </div>
               </div>
-              <DownloadQueueTable jobs={displayedQueueJobs} parsedCourses={parsedCourses} hasPersistedJobs={queuedJobs.length > 0} onRetry={retryDownloadJob} onRemove={removeQueueItem} onDownloadNow={downloadScheduledNow} />
+              <DownloadQueueTable
+                jobs={displayedQueueJobs}
+                parsedCourses={parsedCourses}
+                hasPersistedJobs={queuedJobs.length > 0}
+                onRetry={retryDownloadJob}
+                onRemove={removeQueueItem}
+                onDownloadNow={downloadScheduledNow}
+                onPause={toggleDownloadPause}
+                pauseUpdatingTaskId={pauseUpdatingTaskId}
+                bulkPauseUpdating={isPausingAll}
+              />
             </Panel>
           </div>
 
@@ -1287,6 +1442,8 @@ export default function App() {
                   filter={activityFilter}
                   onOpenFolder={openCompletedFolder}
                   onRetry={retryDownloadJob}
+                  onClear={clearStatusTask}
+                  clearingTaskId={clearingTaskId}
                 />
               </div>
             ) : (
@@ -1534,12 +1691,12 @@ function shouldShowInLiveQueue(status: string) {
 }
 
 function isScheduledJob(job: QueuedDownloadJob) {
-  return job.status === "queued" && typeof job.scheduled_at === "number";
+  return job.status === "queued" && !job.paused && typeof job.scheduled_at === "number";
 }
 
 function hasReadyQueuedJobs(jobs: QueuedDownloadJob[]) {
   const now = Math.floor(Date.now() / 1000);
-  return jobs.some((job) => job.status === "queued" && (!job.scheduled_at || job.scheduled_at <= now));
+  return jobs.some((job) => job.status === "queued" && !job.paused && (!job.scheduled_at || job.scheduled_at <= now));
 }
 
 function formatScheduledDate(timestamp: number) {
@@ -1702,8 +1859,8 @@ function ActivitySummaryChip({
 function ActivityLog({ events }: { events: ActivityRow[] }) {
   return (
     <ol className="activity-list">
-      {events.length > 0 ? events.map(([time, label, tone]) => (
-        <ActivityEventRow key={`${time}-${label}`} time={time} label={label} dotClassName={activityDotClass(tone)} />
+      {events.length > 0 ? events.map(([time, label, tone], index) => (
+        <ActivityEventRow key={`${time}-${label}-${index}`} time={time} label={label} dotClassName={activityDotClass(tone)} />
       )) : (
         <li className="activity-empty-row">No persisted activity yet.</li>
       )}
@@ -1717,7 +1874,10 @@ function DownloadQueueTable({
   hasPersistedJobs,
   onRetry,
   onRemove,
-  onDownloadNow
+  onDownloadNow,
+  onPause,
+  pauseUpdatingTaskId,
+  bulkPauseUpdating
 }: {
   jobs: QueuedDownloadJob[];
   parsedCourses: ParsedCourse[];
@@ -1725,6 +1885,9 @@ function DownloadQueueTable({
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
   onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
   onDownloadNow: (job: QueuedDownloadJob) => void | Promise<void>;
+  onPause: (job: QueuedDownloadJob) => void | Promise<void>;
+  pauseUpdatingTaskId: string | null;
+  bulkPauseUpdating: boolean;
 }) {
   return (
     <DataTable className="queue-table">
@@ -1734,7 +1897,18 @@ function DownloadQueueTable({
         <span>Progress</span>
       </DataTableHeader>
       {jobs.length > 0 ? (
-        jobs.map((job) => <QueueJobRow key={job.id} job={job} onRetry={onRetry} onRemove={onRemove} onDownloadNow={onDownloadNow} />)
+        jobs.map((job) => (
+          <QueueJobRow
+            key={job.id}
+            job={job}
+            onRetry={onRetry}
+            onRemove={onRemove}
+            onDownloadNow={onDownloadNow}
+            onPause={onPause}
+            pauseUpdatingTaskId={pauseUpdatingTaskId}
+            bulkPauseUpdating={bulkPauseUpdating}
+          />
+        ))
       ) : parsedCourses.length > 0 ? (
         parsedCourses.map((course, index) => <ValidatedQueueRow key={`${course.slug}-${index}`} course={course} />)
       ) : (
@@ -1751,12 +1925,18 @@ function QueueJobRow({
   job,
   onRetry,
   onRemove,
-  onDownloadNow
+  onDownloadNow,
+  onPause,
+  pauseUpdatingTaskId,
+  bulkPauseUpdating
 }: {
   job: QueuedDownloadJob;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
   onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
   onDownloadNow: (job: QueuedDownloadJob) => void | Promise<void>;
+  onPause: (job: QueuedDownloadJob) => void | Promise<void>;
+  pauseUpdatingTaskId: string | null;
+  bulkPauseUpdating: boolean;
 }) {
   const counts = artifactCounts(job);
   const progress = courseOverallProgress(job, counts);
@@ -1779,30 +1959,48 @@ function QueueJobRow({
       </div>
       <div className="table-progress-cell">
         {scheduled ? <span className="scheduled-time-compact">{formatScheduledTime(job.scheduled_at ?? 0)}</span> : <><Progress value={progress} /><span>{progress}%</span></>}
-        {scheduled ? (
-          <Tooltip label="Download now">
-            <IconButton
-              type="button"
-              aria-label={`Download ${title} now`}
-              onClick={() => onDownloadNow(job)}
-              className="scheduled-download-now"
-            >
-              <Play aria-hidden="true" className="h-3.5 w-3.5" />
-            </IconButton>
-          </Tooltip>
-        ) : null}
-        {canRemove ? (
-          <Tooltip label="Remove from queue">
-            <IconButton
-              type="button"
-              aria-label={`Remove ${title} from queue`}
-              onClick={() => onRemove(job)}
-              className="queue-remove-button"
-            >
-              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
-            </IconButton>
-          </Tooltip>
-        ) : null}
+        <div className="queue-row-actions">
+          {scheduled && !job.paused ? (
+            <Tooltip label="Download now">
+              <IconButton
+                type="button"
+                aria-label={`Download ${title} now`}
+                onClick={() => onDownloadNow(job)}
+                className="scheduled-download-now"
+              >
+                <Play aria-hidden="true" className="h-3.5 w-3.5" />
+              </IconButton>
+            </Tooltip>
+          ) : null}
+          {(job.status === "active" || job.status === "queued") ? (
+            <Tooltip label={job.paused ? "Resume download" : "Pause download"}>
+              <IconButton
+                type="button"
+                aria-label={`${job.paused ? "Resume" : "Pause"} ${title}`}
+                onClick={() => onPause(job)}
+                className="queue-pause-button"
+                loading={pauseUpdatingTaskId === job.id}
+                disabled={pauseUpdatingTaskId !== null || bulkPauseUpdating}
+              >
+                {job.paused
+                  ? <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                  : <Pause aria-hidden="true" className="h-3.5 w-3.5" />}
+              </IconButton>
+            </Tooltip>
+          ) : null}
+          {canRemove ? (
+            <Tooltip label="Remove from queue">
+              <IconButton
+                type="button"
+                aria-label={`Remove ${title} from queue`}
+                onClick={() => onRemove(job)}
+                className="queue-remove-button"
+              >
+                <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+              </IconButton>
+            </Tooltip>
+          ) : null}
+        </div>
       </div>
     </DataTableRow>
   );
@@ -1812,12 +2010,16 @@ function FilteredTaskList({
   jobs,
   filter,
   onOpenFolder,
-  onRetry
+  onRetry,
+  onClear,
+  clearingTaskId
 }: {
   jobs: QueuedDownloadJob[];
   filter: ActivityFilter;
   onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void>;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+  onClear: (job: QueuedDownloadJob) => void | Promise<void>;
+  clearingTaskId: string | null;
 }) {
   if (jobs.length === 0) {
     return <div className="status-task-empty">No {filter} downloads.</div>;
@@ -1829,20 +2031,41 @@ function FilteredTaskList({
         const counts = artifactCounts(job);
         const title = courseDisplayName(job);
         const progress = courseOverallProgress(job, counts);
+        const clearLabel = filter === "active"
+          ? "Cancel download"
+          : filter === "completed"
+            ? "Delete downloaded files"
+            : "Remove failed task";
         return (
           <div className="status-task-row" key={job.id}>
             <span className={`status-dot ${activityDotClass(eventTone(job.status))}`} />
             <div className="min-w-0">
               <div className="truncate font-medium" title={title}>{title}</div>
               <div className="truncate text-soft">
-                {filter === "active" ? `${progress}% · ${filesSummaryText(counts, job.status)}` : `${jobStatusLabel(job.status)} · ${formatEventTime(job.updated_at ?? 0)}`}
+                {filter === "active" ? `${job.paused ? "Paused" : `${progress}%`} · ${filesSummaryText(counts, job.status)}` : `${jobStatusLabel(job.status, job.paused)} · ${formatEventTime(job.updated_at ?? 0)}`}
               </div>
             </div>
-            {filter === "completed" ? (
-              <Button size="xs" variant="ghost" onClick={() => onOpenFolder(job)}>Open</Button>
-            ) : filter === "failed" && job.status === "failed" ? (
-              <Button size="xs" variant="ghost" onClick={() => onRetry(job)}>Retry</Button>
-            ) : null}
+            <div className="status-task-actions">
+              {filter === "completed" ? (
+                <Button size="xs" variant="ghost" onClick={() => onOpenFolder(job)}>Open</Button>
+              ) : filter === "failed" && job.status === "failed" ? (
+                <Button size="xs" variant="ghost" onClick={() => onRetry(job)}>Retry</Button>
+              ) : null}
+              <Tooltip label={clearLabel}>
+                <IconButton
+                  type="button"
+                  aria-label={`${clearLabel}: ${title}`}
+                  className="status-task-clear-action"
+                  loading={clearingTaskId === job.id}
+                  disabled={clearingTaskId !== null}
+                  onClick={() => void onClear(job)}
+                >
+                  {filter === "active"
+                    ? <X aria-hidden="true" className="h-3.5 w-3.5" />
+                    : <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />}
+                </IconButton>
+              </Tooltip>
+            </div>
           </div>
         );
       })}
@@ -1868,6 +2091,14 @@ function ValidatedQueueRow({ course }: { course: ParsedCourse }) {
 }
 
 function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; title: string; onRetry: (job: QueuedDownloadJob) => void | Promise<void> }) {
+  if (job.paused) {
+    return (
+      <StatusBadge className="paused-status-pill" dotClassName="bg-warning">
+        <Pause aria-hidden="true" className="h-3 w-3" />
+        <span>Paused</span>
+      </StatusBadge>
+    );
+  }
   if (isScheduledJob(job)) {
     return (
       <StatusBadge className="scheduled-status-pill" dotClassName="bg-primary">
@@ -1878,7 +2109,7 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
   }
   return (
     <StatusBadge className={jobStatusBadgeClass(job.status)} dotClassName={activityDotClass(eventTone(job.status))}>
-      <span>{jobStatusLabel(job.status)}</span>
+      <span>{jobStatusLabel(job.status, job.paused)}</span>
       {job.status === "failed" ? (
         <button
           type="button"
@@ -2102,7 +2333,8 @@ function jobStatusBadgeClass(status: string) {
   return "bg-primary/15 text-primary";
 }
 
-function jobStatusLabel(status: string) {
+function jobStatusLabel(status: string, paused = false) {
+  if (paused) return "Paused";
   if (status === "active") return "Downloading";
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
@@ -2199,6 +2431,89 @@ async function startDownloadJobs(request: StartDownloadRequest) {
   return startDownloadJobsForPreview(request);
 }
 
+async function requestActiveDownloadCancellation(jobId?: string) {
+  if (isTauriRuntime()) {
+    return invoke<CancelDownloadResponse>("cancel_active_download");
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const currentJobs = readPreviewJobs();
+  const activeJob = currentJobs.find((job) =>
+    job.status === "active" && (!jobId || job.id === jobId)
+  );
+  if (!activeJob) {
+    throw new Error("Active download was not found.");
+  }
+  const jobs = currentJobs.map((job) =>
+    job.id === activeJob.id
+      ? { ...job, status: "cancelled", paused: false, updated_at: timestamp }
+      : job
+  );
+  const events = [{
+    id: Date.now(),
+    job_id: activeJob.id,
+    event_type: "job.cancelled",
+    message: "Download cancelled by user.",
+    created_at: timestamp
+  }, ...readPreviewEvents()];
+  writePreviewState(jobs, events);
+  return { cancellation_requested: true } satisfies CancelDownloadResponse;
+}
+
+async function setDownloadJobPause(jobId: string, paused: boolean) {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("set_download_job_pause", { jobId, paused });
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const currentJobs = readPreviewJobs();
+  const target = currentJobs.find((job) => job.id === jobId);
+  if (!target || (target.status !== "active" && target.status !== "queued")) {
+    throw new Error("Pausable download was not found.");
+  }
+  const jobs = currentJobs.map((job) =>
+    job.id === jobId ? { ...job, paused, updated_at: timestamp } : job
+  );
+  const events = [{
+    id: Date.now(),
+    job_id: jobId,
+    event_type: paused ? "job.paused" : "job.resumed",
+    message: paused ? "Download paused by user." : "Download resumed by user.",
+    created_at: timestamp
+  }, ...readPreviewEvents()];
+  writePreviewState(jobs, events);
+  return previewBootstrapState(jobs, events);
+}
+
+async function setAllDownloadsPaused(paused: boolean) {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("set_all_downloads_paused", { paused });
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const currentJobs = readPreviewJobs();
+  const changedJobs = currentJobs.filter((job) =>
+    (job.status === "active" || job.status === "queued") && Boolean(job.paused) !== paused
+  );
+  const jobs = currentJobs.map((job) =>
+    job.status === "active" || job.status === "queued"
+      ? { ...job, paused, updated_at: timestamp }
+      : job
+  );
+  const events = [
+    ...changedJobs.map((job, index) => ({
+      id: Date.now() * 1000 + index,
+      job_id: job.id,
+      event_type: paused ? "job.paused" : "job.resumed",
+      message: paused ? "Download paused by user." : "Download resumed by user.",
+      created_at: timestamp
+    })),
+    ...readPreviewEvents()
+  ];
+  writePreviewState(jobs, events);
+  return previewBootstrapState(jobs, events);
+}
+
 async function retryFailedDownloadJob(jobId: string) {
   if (isTauriRuntime()) {
     return invoke<BootstrapState>("retry_failed_download_job", { jobId });
@@ -2279,6 +2594,22 @@ async function removeDownloadQueueItem(jobId: string) {
     download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
+}
+
+async function deleteCompletedDownload(jobId: string) {
+  if (isTauriRuntime()) {
+    return invoke<BootstrapState>("delete_completed_download", { jobId });
+  }
+
+  const currentJobs = readPreviewJobs();
+  const target = currentJobs.find((job) => job.id === jobId);
+  if (!target || target.status !== "completed") {
+    throw new Error("Completed download was not found.");
+  }
+  const jobs = currentJobs.filter((job) => job.id !== jobId);
+  const events = readPreviewEvents().filter((event) => event.job_id !== jobId);
+  writePreviewState(jobs, events);
+  return previewBootstrapState(jobs, events);
 }
 
 async function checkForAppUpdate() {
@@ -2462,6 +2793,7 @@ function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownlo
     thumbnail_url: previewThumbnailForSlug(course.slug),
     selected_quality: request.selectedQuality,
     output_dir: request.outputDir,
+    paused: false,
     scheduled_at: scheduledTimes[index],
     updated_at: timestamp,
     artifact_counts: emptyArtifactCounts()
@@ -2534,7 +2866,7 @@ async function processNextQueuedDownloadForPreview(): Promise<ProcessQueuedDownl
   const jobs = readPreviewJobs();
   const scenario = getPreviewScenario();
   const readyAt = Math.floor(Date.now() / 1000);
-  const queuedIndex = jobs.findIndex((job) => job.status === "queued" && (!job.scheduled_at || job.scheduled_at <= readyAt));
+  const queuedIndex = jobs.findIndex((job) => job.status === "queued" && !job.paused && (!job.scheduled_at || job.scheduled_at <= readyAt));
   if (queuedIndex < 0) {
     return {
       processed: false,

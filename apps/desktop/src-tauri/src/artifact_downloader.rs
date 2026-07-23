@@ -41,6 +41,16 @@ pub trait ArtifactHttpClient {
 
 pub trait CancellationFlag {
     fn is_cancelled(&self) -> bool;
+
+    fn is_paused(&self) -> bool {
+        false
+    }
+
+    fn wait_if_paused(&self) {
+        while self.is_paused() && !self.is_cancelled() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 }
 
 pub struct NeverCancelled;
@@ -105,6 +115,7 @@ pub fn download_artifacts_for_active_job(
     let existing_artifacts = list_artifacts_for_job(connection, &job.id)?;
 
     for (index, download) in downloads.iter().enumerate() {
+        cancellation.wait_if_paused();
         if cancellation.is_cancelled() {
             cancel_artifacts_from(connection, &job.id, &downloads[index..], None, timestamp)?;
             summary.cancelled += downloads.len() - index;
@@ -397,6 +408,7 @@ fn write_artifact(
             download_bytes_from_urls(client, &url_refs)?
         }
     };
+    cancellation.wait_if_paused();
     if cancellation.is_cancelled() {
         return Ok(ArtifactWriteOutcome::CancelledBeforeWrite);
     }
@@ -1723,6 +1735,7 @@ mod tests {
             download_quizzes: true,
             quiz_hints_json: "[]".to_string(),
             output_dir: output_dir.to_string_lossy().to_string(),
+            paused: false,
             scheduled_at: None,
             created_at: 100,
             updated_at: 100,
