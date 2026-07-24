@@ -1596,6 +1596,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn active_download_waits_for_resume_and_finishes_with_atomic_file() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let video_path = output.path().join("Sample Course").join("welcome.mp4");
+        let downloads = vec![planned_url(
+            "artifact-video",
+            "job-1",
+            "video",
+            &video_path,
+            "https://cdn/video.mp4",
+        )];
+        let pause = PauseForPolls::new(3);
+        let mut client = FakeArtifactClient::new(vec![("https://cdn/video.mp4", 200, b"video")]);
+
+        let summary = download_artifacts_for_active_job(
+            &connection,
+            &mut client,
+            &pause,
+            "job-1",
+            &downloads,
+            200,
+        )
+        .unwrap();
+
+        assert!(pause.polls.get() >= 3);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(
+            get_job(&connection, "job-1").unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(fs::read(&video_path).unwrap(), b"video");
+        assert!(!partial_path(&video_path).exists());
+    }
+
+    struct PauseForPolls {
+        remaining: Cell<usize>,
+        polls: Cell<usize>,
+    }
+
+    impl PauseForPolls {
+        fn new(polls: usize) -> Self {
+            Self {
+                remaining: Cell::new(polls),
+                polls: Cell::new(0),
+            }
+        }
+    }
+
+    impl CancellationFlag for PauseForPolls {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn is_paused(&self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            let remaining = self.remaining.get();
+            if remaining == 0 {
+                return false;
+            }
+            self.remaining.set(remaining - 1);
+            true
+        }
+    }
+
     #[derive(Clone)]
     struct SharedCancellation {
         cancelled: Rc<Cell<bool>>,

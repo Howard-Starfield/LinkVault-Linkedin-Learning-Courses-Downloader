@@ -127,6 +127,13 @@ export async function clearFailedCourseraJobs(): Promise<number> {
   return invoke<number>("clear_failed_coursera_jobs");
 }
 
+export async function removeFailedCourseraJob(jobId: string): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return previewRemoveFailed(jobId);
+  }
+  return invoke<boolean>("remove_failed_coursera_job", { jobId });
+}
+
 export async function listCourseraHistory(): Promise<CourseraHistoryEntry[]> {
   if (!isTauriRuntime()) {
     return readPreviewHistory();
@@ -352,9 +359,21 @@ function previewProcessNext(): ProcessCourseraResponse {
 }
 
 function previewClearFailed(): number {
-  const jobs = readPreviewJobs().filter(
+  const previousJobs = readPreviewJobs();
+  const jobs = previousJobs.filter(
     (job) => job.status.toLowerCase() !== "failed" && job.status.toLowerCase() !== "cancelled"
   );
   writePreviewJobs(jobs);
-  return jobs.length;
+  return previousJobs.length - jobs.length;
+}
+
+function previewRemoveFailed(jobId: string): boolean {
+  const previousJobs = readPreviewJobs();
+  const jobs = previousJobs.filter((job) => {
+    const removable = ["failed", "cancelled"].includes(job.status.toLowerCase());
+    return job.id !== jobId || !removable;
+  });
+  if (jobs.length === previousJobs.length) return false;
+  writePreviewJobs(jobs);
+  return true;
 }

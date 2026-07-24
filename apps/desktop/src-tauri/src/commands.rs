@@ -736,6 +736,7 @@ fn merge_process_response(
 
 fn sleep_between_queued_courses(delay_seconds: u32, cancellation: &impl CancellationFlag) {
     for _ in 0..delay_seconds {
+        cancellation.wait_if_paused();
         if cancellation.is_cancelled() {
             return;
         }

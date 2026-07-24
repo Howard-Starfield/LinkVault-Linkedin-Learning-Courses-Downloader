@@ -46,6 +46,7 @@ import {
   loadCourseraPreferences,
   openCourseraDownloadFolder,
   processQueuedCourseraBatch,
+  removeFailedCourseraJob,
   retryFailedCourseraJob,
   saveCourseraPreferences,
   saveCourseraToken,
@@ -149,6 +150,7 @@ export function CourseraView() {
   const [history, setHistory] = useState<CourseraHistoryEntry[]>([]);
   const [isStarting, setIsStarting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [clearingJobId, setClearingJobId] = useState<string | null>(null);
   const [isSavingPrefs, setIsSavingPrefs] = useState(false);
   const [, setProcessingSummary] = useState<ProcessCourseraResponse | null>(null);
   const [previewSyllabus, setPreviewSyllabus] = useState<SyllabusPreview | null>(null);
@@ -506,6 +508,28 @@ export function CourseraView() {
       await refreshAll();
     } catch (error) {
       toast.error("Clear failed", { description: String(error) });
+    }
+  }
+
+  async function clearFailedJob(job: CourseraJob) {
+    const status = job.status.toLowerCase();
+    if (status !== "failed" && status !== "cancelled") return;
+    const shouldClear = window.confirm(
+      `Clear the failed attempt for ${job.className}? This removes the task record and its activity log. Partial downloaded files will remain.`
+    );
+    if (!shouldClear) return;
+
+    setClearingJobId(job.id);
+    try {
+      await removeFailedCourseraJob(job.id);
+      setJobs((previous) => previous.filter((candidate) => candidate.id !== job.id));
+      setEvents((previous) => previous.filter((event) => event.jobId !== job.id));
+      toast.info("Failed attempt cleared", { description: job.className });
+    } catch (error) {
+      toast.error("Clear failed attempt", { description: String(error) });
+      await refreshAll();
+    } finally {
+      setClearingJobId(null);
     }
   }
 
@@ -881,6 +905,8 @@ export function CourseraView() {
             );
           }}
           onRetry={retryJob}
+          onClearFailed={clearFailedJob}
+          clearingJobId={clearingJobId}
         />
       </Panel>
     </div>
@@ -965,7 +991,7 @@ export function CourseraView() {
 
 function isLiveStatus(status: string): boolean {
   const lower = status.toLowerCase();
-  return lower !== "completed" && lower !== "cancelled";
+  return lower !== "completed";
 }
 
 function splitList(input: string): string[] {
@@ -1099,13 +1125,17 @@ function CourseraQueueTable({
   parsedClasses,
   selectedSlugs,
   onToggle,
-  onRetry
+  onRetry,
+  onClearFailed,
+  clearingJobId
 }: {
   jobs: CourseraJob[];
   parsedClasses: ParsedCourseraClass[];
   selectedSlugs: string[];
   onToggle: (slug: string) => void;
   onRetry: (job: CourseraJob) => void | Promise<void>;
+  onClearFailed: (job: CourseraJob) => void | Promise<void>;
+  clearingJobId: string | null;
 }) {
   return (
     <DataTable className="queue-table">
@@ -1115,7 +1145,15 @@ function CourseraQueueTable({
         <span>Progress</span>
       </DataTableHeader>
       {jobs.length > 0 ? (
-        jobs.map((job) => <CourseraQueueJobRow key={job.id} job={job} onRetry={onRetry} />)
+        jobs.map((job) => (
+          <CourseraQueueJobRow
+            key={job.id}
+            job={job}
+            onRetry={onRetry}
+            onClearFailed={onClearFailed}
+            clearing={clearingJobId === job.id}
+          />
+        ))
       ) : parsedClasses.length > 0 ? (
         parsedClasses.map((course) => {
           const checked = selectedSlugs.includes(course.slug);
@@ -1149,12 +1187,23 @@ function CourseraQueueTable({
   );
 }
 
-function CourseraQueueJobRow({ job, onRetry }: { job: CourseraJob; onRetry: (job: CourseraJob) => void | Promise<void> }) {
+function CourseraQueueJobRow({
+  job,
+  onRetry,
+  onClearFailed,
+  clearing
+}: {
+  job: CourseraJob;
+  onRetry: (job: CourseraJob) => void | Promise<void>;
+  onClearFailed: (job: CourseraJob) => void | Promise<void>;
+  clearing: boolean;
+}) {
   const counts = parseCourseraArtifactCounts(job.countsJson);
   const total = counts.total > 0 ? counts.total : derivedTotal(counts);
   const completed = counts.completed + counts.failed + counts.cancelled;
   const percent = total > 0 ? Math.max(0, Math.min(100, Math.round((completed / total) * 100))) : 0;
   const tone = job.status.toLowerCase();
+  const canClear = tone === "failed" || tone === "cancelled";
   return (
     <DataTableRow className="queue-table-row">
       <StatusBadge
@@ -1187,6 +1236,22 @@ function CourseraQueueJobRow({ job, onRetry }: { job: CourseraJob; onRetry: (job
       <div className="table-progress-cell">
         <Progress value={percent} />
         <span>{percent}%</span>
+        {canClear ? (
+          <div className="queue-row-actions">
+            <Tooltip label="Clear failed attempt">
+              <IconButton
+                type="button"
+                aria-label={`Clear failed attempt for ${job.className}`}
+                onClick={() => onClearFailed(job)}
+                className="queue-remove-button"
+                loading={clearing}
+                disabled={clearing}
+              >
+                <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+              </IconButton>
+            </Tooltip>
+          </div>
+        ) : null}
       </div>
     </DataTableRow>
   );
