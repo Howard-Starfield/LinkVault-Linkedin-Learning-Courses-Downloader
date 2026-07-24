@@ -575,32 +575,28 @@ pub fn retry_failed_coursera_job(
     job_id: String,
 ) -> Result<CourseraJob, String> {
     let connection = state.connection()?;
-    let mut jobs = job::list_recent_jobs(&connection, 500).map_err(|e| e.to_string())?;
-    let Some(mut job) = jobs.drain(..).find(|job| job.id == job_id) else {
-        return Err(format!("Coursera job not found: {}", job_id));
-    };
-    if job.status.to_lowercase() != "failed" && job.status.to_lowercase() != "cancelled" {
-        return Err("only failed or cancelled Coursera jobs can be retried".to_string());
-    }
     let now = chrono_now();
-    job.status = "Queued".to_string();
-    job.updated_at = now;
-    job::update_job_status(&connection, &job.id, "Queued", now).map_err(|e| e.to_string())?;
-    job::append_job_event(
-        &connection,
-        &job.id,
-        "retry_queued",
-        &serde_json::json!({ "message": "Retry queued" }).to_string(),
-        now,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(job)
+    job::retry_failed_job(&connection, &job_id, now)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Coursera job was not found or is no longer failed/cancelled".to_string())
 }
 
 #[tauri::command]
 pub fn clear_failed_coursera_jobs(state: State<'_, CourseraState>) -> Result<usize, String> {
     let connection = state.connection()?;
     job::clear_failed_jobs(&connection).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn remove_failed_coursera_job(
+    state: State<'_, CourseraState>,
+    job_id: String,
+) -> Result<bool, String> {
+    let connection = state.connection()?;
+    if !job::delete_failed_job(&connection, &job_id).map_err(|e| e.to_string())? {
+        return Err("Coursera job was not found or is no longer failed/cancelled".to_string());
+    }
+    Ok(true)
 }
 
 #[tauri::command]

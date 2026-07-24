@@ -66,6 +66,7 @@ pub fn run() {
             coursera::commands::cancel_active_coursera_download,
             coursera::commands::retry_failed_coursera_job,
             coursera::commands::clear_failed_coursera_jobs,
+            coursera::commands::remove_failed_coursera_job,
             coursera::commands::list_coursera_history,
             coursera::commands::open_coursera_download_folder,
             coursera::commands::fetch_coursera_syllabus_preview,

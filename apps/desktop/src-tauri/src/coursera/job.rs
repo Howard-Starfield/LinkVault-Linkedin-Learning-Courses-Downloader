@@ -5,7 +5,7 @@
 
 #![allow(dead_code)] // Phase 9 — wired by Phase 10
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::coursera::error::CourseraResult;
@@ -117,6 +117,28 @@ pub fn list_recent_jobs(conn: &Connection, limit: usize) -> CourseraResult<Vec<C
     Ok(rows)
 }
 
+pub fn get_job(conn: &Connection, id: &str) -> CourseraResult<Option<CourseraJob>> {
+    conn.query_row(
+        "SELECT id, class_name, status, options_json, output_dir, created_at, updated_at, counts_json \
+         FROM coursera_jobs WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(CourseraJob {
+                id: row.get(0)?,
+                class_name: row.get(1)?,
+                status: row.get(2)?,
+                options_json: row.get(3)?,
+                output_dir: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                counts_json: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn list_job_events(
     conn: &Connection,
     job_id: &str,
@@ -193,11 +215,70 @@ pub fn delete_job(conn: &Connection, id: &str) -> CourseraResult<()> {
     Ok(())
 }
 
+pub fn delete_failed_job(conn: &Connection, id: &str) -> CourseraResult<bool> {
+    let transaction = conn.unchecked_transaction()?;
+    let removed = transaction.execute(
+        "DELETE FROM coursera_jobs
+         WHERE id = ?1 AND lower(status) IN ('failed', 'cancelled')",
+        params![id],
+    )?;
+    if removed == 0 {
+        transaction.rollback()?;
+        return Ok(false);
+    }
+    transaction.execute(
+        "DELETE FROM coursera_job_events WHERE job_id = ?1",
+        params![id],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+pub fn retry_failed_job(
+    conn: &Connection,
+    id: &str,
+    updated_at: i64,
+) -> CourseraResult<Option<CourseraJob>> {
+    let transaction = conn.unchecked_transaction()?;
+    let updated = transaction.execute(
+        "UPDATE coursera_jobs
+         SET status = 'Queued', updated_at = ?2
+         WHERE id = ?1 AND lower(status) IN ('failed', 'cancelled')",
+        params![id, updated_at],
+    )?;
+    if updated == 0 {
+        transaction.rollback()?;
+        return Ok(None);
+    }
+    transaction.execute(
+        "INSERT INTO coursera_job_events (job_id, event_type, payload_json, created_at)
+         VALUES (?1, 'retry_queued', ?2, ?3)",
+        params![
+            id,
+            serde_json::json!({ "message": "Retry queued" }).to_string(),
+            updated_at
+        ],
+    )?;
+    let job = get_job(&transaction, id)?;
+    transaction.commit()?;
+    Ok(job)
+}
+
 pub fn clear_failed_jobs(conn: &Connection) -> CourseraResult<usize> {
-    let count = conn.execute(
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "DELETE FROM coursera_job_events
+         WHERE job_id IN (
+             SELECT id FROM coursera_jobs
+             WHERE lower(status) IN ('failed', 'cancelled')
+        )",
+        [],
+    )?;
+    let count = transaction.execute(
         "DELETE FROM coursera_jobs WHERE lower(status) IN ('failed', 'cancelled')",
         [],
     )?;
+    transaction.commit()?;
     Ok(count)
 }
 
@@ -327,9 +408,55 @@ mod tests {
         insert_job(&conn, &fixture_job("j1", "Failed")).unwrap();
         insert_job(&conn, &fixture_job("j2", "Cancelled")).unwrap();
         insert_job(&conn, &fixture_job("j3", "Queued")).unwrap();
+        append_job_event(&conn, "j1", "failed", "{}", 100).unwrap();
+        append_job_event(&conn, "j2", "cancelled", "{}", 100).unwrap();
+        append_job_event(&conn, "j3", "queued", "{}", 100).unwrap();
         let n = clear_failed_jobs(&conn).unwrap();
         assert_eq!(n, 2);
         assert_eq!(list_recent_jobs(&conn, 10).unwrap().len(), 1);
+        let events = list_recent_events(&conn, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].job_id, "j3");
+    }
+
+    #[test]
+    fn get_job_finds_exact_job() {
+        let conn = fresh_schema();
+        insert_job(&conn, &fixture_job("j1", "Failed")).unwrap();
+        assert_eq!(get_job(&conn, "j1").unwrap().unwrap().status, "Failed");
+        assert!(get_job(&conn, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_failed_job_rejects_non_terminal_status_and_removes_events_atomically() {
+        let conn = fresh_schema();
+        insert_job(&conn, &fixture_job("failed", "Failed")).unwrap();
+        insert_job(&conn, &fixture_job("queued", "Queued")).unwrap();
+        append_job_event(&conn, "failed", "failure", "{}", 100).unwrap();
+        append_job_event(&conn, "queued", "queued", "{}", 100).unwrap();
+
+        assert!(delete_failed_job(&conn, "failed").unwrap());
+        assert!(!delete_failed_job(&conn, "queued").unwrap());
+        assert!(get_job(&conn, "failed").unwrap().is_none());
+        assert!(get_job(&conn, "queued").unwrap().is_some());
+        assert!(list_job_events(&conn, "failed", 10).unwrap().is_empty());
+        assert_eq!(list_job_events(&conn, "queued", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_failed_job_updates_only_failed_or_cancelled_jobs() {
+        let conn = fresh_schema();
+        insert_job(&conn, &fixture_job("failed", "Failed")).unwrap();
+        insert_job(&conn, &fixture_job("queued", "Queued")).unwrap();
+
+        let retried = retry_failed_job(&conn, "failed", 200).unwrap().unwrap();
+        assert_eq!(retried.status, "Queued");
+        assert_eq!(retried.updated_at, 200);
+        assert_eq!(
+            list_job_events(&conn, "failed", 10).unwrap()[0].event_type,
+            "retry_queued"
+        );
+        assert!(retry_failed_job(&conn, "queued", 200).unwrap().is_none());
     }
 
     #[test]

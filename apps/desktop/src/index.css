@@ -220,6 +220,10 @@ textarea {
   transition: grid-template-columns 180ms ease;
 }
 
+.lv-shell[data-sidebar-dragging="true"] {
+  transition: none;
+}
+
 .lv-shell[data-sidebar-state="collapsed"] {
   grid-template-columns: 0 minmax(0, 1fr);
 }

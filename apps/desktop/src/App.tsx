@@ -191,13 +191,29 @@ const SIDEBAR_MAX_WIDTH = 320;
 const SIDEBAR_DEFAULT_WIDTH = 220;
 const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
+const DOWNLOAD_DELAY_STORAGE_KEY = "linkvault.downloadDelaySeconds";
+const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.1.7";
+const APP_VERSION = "0.1.8";
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
   return Math.min(Math.max(width, SIDEBAR_MIN_WIDTH), SIDEBAR_MAX_WIDTH);
+}
+
+function normalizeDelaySeconds(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.min(DOWNLOAD_DELAY_MAX_SECONDS, Math.max(0, Math.round(parsed)));
+}
+
+function readStoredDownloadDelaySeconds() {
+  if (typeof window === "undefined") return null;
+  const stored = window.localStorage.getItem(DOWNLOAD_DELAY_STORAGE_KEY);
+  if (stored === null || stored.trim() === "") return null;
+  const parsed = Number(stored);
+  return Number.isFinite(parsed) ? normalizeDelaySeconds(parsed) : null;
 }
 
 function calculateAutomaticScheduleWaitRange(windowHours: number, courseCount: number): AutomaticScheduleWaitRange {
@@ -221,13 +237,14 @@ function calculateAutomaticScheduleWaitRange(windowHours: number, courseCount: n
 }
 
 export default function App() {
+  const initialStoredDelaySeconds = useRef(readStoredDownloadDelaySeconds());
   const [courseUrls, setCourseUrls] = useState("");
   const [folder, setFolder] = useState("");
   const [token, setToken] = useState("");
   const [resolution, setResolution] = useState("720");
   const [browserSource, setBrowserSource] = useState("Chrome");
   const [browserSources, setBrowserSources] = useState(["Chrome", "Edge", "Firefox"]);
-  const [delaySeconds, setDelaySeconds] = useState(0);
+  const [delaySeconds, setDelaySeconds] = useState(initialStoredDelaySeconds.current ?? 0);
   const [downloadVideos, setDownloadVideos] = useState(true);
   const [downloadExercises, setDownloadExercises] = useState(true);
   const [downloadSubtitles, setDownloadSubtitles] = useState(true);
@@ -264,8 +281,13 @@ export default function App() {
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
   const cancellationRequestedRef = useRef(false);
   const queueSubmissionRef = useRef(false);
+  const startupUpdateCheckedRef = useRef(false);
+  const downloadPreferencesHydratedRef = useRef(false);
   const downloadProcessingPromiseRef = useRef<Promise<ProcessQueuedDownloadResponse> | null>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
   const sidebarDragStart = useRef({ x: 0, width: SIDEBAR_DEFAULT_WIDTH });
+  const sidebarDragWidth = useRef(SIDEBAR_DEFAULT_WIDTH);
+  const sidebarDragAnimationFrame = useRef<number | null>(null);
   const sidebarDragCleanup = useRef<(() => void) | null>(null);
   const wasSettingsOpen = useRef(false);
   const automaticScheduleWaitRange = useMemo(
@@ -289,7 +311,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    checkForUpdatesOnLaunch();
+    if (startupUpdateCheckedRef.current) return;
+    startupUpdateCheckedRef.current = true;
+    void checkForUpdatesOnLaunch();
   }, []);
 
   useEffect(() => {
@@ -321,6 +345,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    window.localStorage.setItem(DOWNLOAD_DELAY_STORAGE_KEY, String(normalizeDelaySeconds(delaySeconds)));
+  }, [delaySeconds]);
+
+  useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
   }, [sidebarWidth]);
 
@@ -340,42 +368,64 @@ export default function App() {
   function startSidebarResize(event: ReactMouseEvent<HTMLButtonElement>) {
     if (isSidebarCollapsed) return;
     sidebarDragStart.current = { x: event.clientX, width: sidebarWidth };
+    sidebarDragWidth.current = sidebarWidth;
     setIsDraggingSidebar(true);
     sidebarDragCleanup.current?.();
 
     function handleMouseMove(moveEvent: MouseEvent) {
       const nextWidth = sidebarDragStart.current.width + moveEvent.clientX - sidebarDragStart.current.x;
-      setSidebarWidth(clampSidebarWidth(nextWidth));
+      sidebarDragWidth.current = clampSidebarWidth(nextWidth);
+      if (sidebarDragAnimationFrame.current !== null) return;
+      sidebarDragAnimationFrame.current = window.requestAnimationFrame(() => {
+        sidebarDragAnimationFrame.current = null;
+        shellRef.current?.style.setProperty("--sidebar-width", `${sidebarDragWidth.current}px`);
+      });
     }
 
-    function stopDragging() {
-      setIsDraggingSidebar(false);
+    function stopDragging(commit: boolean) {
+      if (sidebarDragAnimationFrame.current !== null) {
+        window.cancelAnimationFrame(sidebarDragAnimationFrame.current);
+        sidebarDragAnimationFrame.current = null;
+      }
+      shellRef.current?.style.setProperty("--sidebar-width", `${sidebarDragWidth.current}px`);
+      if (commit) {
+        setSidebarWidth(sidebarDragWidth.current);
+        setIsDraggingSidebar(false);
+      }
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", stopDragging);
+      window.removeEventListener("mouseup", finishDragging);
       sidebarDragCleanup.current = null;
+    }
+
+    function finishDragging() {
+      stopDragging(true);
     }
 
     document.body.style.cursor = "ew-resize";
     document.body.style.userSelect = "none";
     window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", stopDragging);
-    sidebarDragCleanup.current = stopDragging;
+    window.addEventListener("mouseup", finishDragging);
+    sidebarDragCleanup.current = () => stopDragging(false);
     event.preventDefault();
   }
 
   useEffect(() => {
     return () => {
       sidebarDragCleanup.current?.();
+      if (sidebarDragAnimationFrame.current !== null) {
+        window.cancelAnimationFrame(sidebarDragAnimationFrame.current);
+      }
     };
   }, []);
 
   async function refreshBootstrapState(): Promise<BootstrapState | null> {
     if (!isTauriRuntime()) {
       const previewPreferences = readPreviewPreferences();
-      if (previewPreferences) {
-        applyDownloadPreferences(previewPreferences);
+      if (previewPreferences && !downloadPreferencesHydratedRef.current) {
+        applyDownloadPreferences(previewPreferences, true);
+        downloadPreferencesHydratedRef.current = true;
       }
       const previewState = getBrowserPreviewState();
       if (previewState) {
@@ -401,22 +451,24 @@ export default function App() {
 
     try {
       const state = await invoke<BootstrapState>("bootstrap_state");
-      setBrowserSources(state.browser_sources.length > 0 ? state.browser_sources : browserSources);
+      const nextBrowserSources = state.browser_sources.length > 0 ? state.browser_sources : browserSources;
+      setBrowserSources((previous) => serializedStateEqual(previous, nextBrowserSources) ? previous : nextBrowserSources);
       const preferences = state.saved_download_preferences;
-      if (preferences) {
-        applyDownloadPreferences(preferences);
-      } else if (state.default_resolution) {
-        setResolution(String(state.default_resolution).replace("P", ""));
+      if (!downloadPreferencesHydratedRef.current) {
+        if (preferences) {
+          applyDownloadPreferences(preferences, true);
+        } else if (state.default_resolution) {
+          setResolution(String(state.default_resolution).replace("P", ""));
+        }
+        downloadPreferencesHydratedRef.current = true;
       }
 
-      if (state.persisted_jobs.length > 0) {
-        setQueuedJobs(state.persisted_jobs);
-      } else {
-        setQueuedJobs([]);
-      }
+      setQueuedJobs((previous) => serializedStateEqual(previous, state.persisted_jobs) ? previous : state.persisted_jobs);
       setHasSavedToken(state.has_saved_token);
-      setPersistedEvents(state.recent_events ?? []);
-      setDownloadHistory(state.download_history ?? []);
+      const nextEvents = state.recent_events ?? [];
+      const nextHistory = state.download_history ?? [];
+      setPersistedEvents((previous) => serializedStateEqual(previous, nextEvents) ? previous : nextEvents);
+      setDownloadHistory((previous) => serializedStateEqual(previous, nextHistory) ? previous : nextHistory);
       setDownloadHistoryFilePath(state.download_history_file_path ?? "");
       return state;
     } catch {
@@ -460,7 +512,7 @@ export default function App() {
     return {
       outputDir: folder,
       selectedQuality: resolution,
-      delaySeconds,
+      delaySeconds: normalizeDelaySeconds(delaySeconds),
       browserSource,
       downloadVideos,
       downloadExercises,
@@ -469,10 +521,12 @@ export default function App() {
     };
   }
 
-  function applyDownloadPreferences(preferences: SavedDownloadPreferences) {
+  function applyDownloadPreferences(preferences: SavedDownloadPreferences, preserveStoredDelay = false) {
     setFolder(preferences.outputDir);
     setResolution(preferences.selectedQuality);
-    setDelaySeconds(preferences.delaySeconds);
+    if (!preserveStoredDelay || initialStoredDelaySeconds.current === null) {
+      setDelaySeconds(normalizeDelaySeconds(preferences.delaySeconds));
+    }
     setBrowserSource(preferences.browserSource);
     setDownloadVideos(preferences.downloadVideos);
     setDownloadExercises(preferences.downloadExercises);
@@ -552,6 +606,10 @@ export default function App() {
     } catch (error) {
       toast.error("Clear failed queue failed", { description: String(error) });
     }
+  }
+
+  function updateDelaySeconds(value: string) {
+    setDelaySeconds(normalizeDelaySeconds(value));
   }
 
   async function clearStatusTask(job: QueuedDownloadJob) {
@@ -774,7 +832,7 @@ export default function App() {
         courseUrls,
         outputDir,
         selectedQuality: resolution,
-        delaySeconds,
+        delaySeconds: normalizeDelaySeconds(delaySeconds),
         browserSource,
         downloadVideos,
         downloadExercises,
@@ -826,7 +884,7 @@ export default function App() {
     setIsProcessingDownload(true);
     setProcessingSummary(null);
     let processingFailed = false;
-    const processPromise = processQueuedDownloadBatchWithLiveRefresh(delaySeconds, useSavedToken);
+    const processPromise = processQueuedDownloadBatchWithLiveRefresh(normalizeDelaySeconds(delaySeconds), useSavedToken);
     downloadProcessingPromiseRef.current = processPromise;
 
     void processPromise
@@ -872,7 +930,7 @@ export default function App() {
     });
 
     while (!settled) {
-      await sleep(150);
+      await sleep(400);
       if (!settled) {
         await refreshBootstrapState();
       }
@@ -983,7 +1041,12 @@ export default function App() {
       setPendingUpdate(update);
       if (update) {
         toast.info("Update available", {
-          description: `LinkVault ${update.version} can be installed from Settings.`
+          description: `LinkVault ${update.version} is ready to install.`,
+          duration: 15000,
+          action: {
+            label: "Install now",
+            onClick: () => void installUpdate(update)
+          }
         });
       }
     } catch {
@@ -991,8 +1054,8 @@ export default function App() {
     }
   }
 
-  async function installUpdate() {
-    if (!pendingUpdate) {
+  async function installUpdate(updateToInstall: UpdateMetadata | null = pendingUpdate) {
+    if (!updateToInstall) {
       toast.warning("No update selected", {
         description: "Check for updates before installing."
       });
@@ -1173,6 +1236,7 @@ export default function App() {
   return (
     <>
     <div
+      ref={shellRef}
       className="lv-shell"
       data-sidebar-dragging={isDraggingSidebar || undefined}
       data-sidebar-state={isSidebarCollapsed ? "collapsed" : "expanded"}
@@ -1340,7 +1404,9 @@ export default function App() {
                       value={delaySeconds}
                       type="number"
                       min={0}
-                      onChange={(event) => setDelaySeconds(Number(event.target.value))}
+                      max={DOWNLOAD_DELAY_MAX_SECONDS}
+                      step={1}
+                      onChange={(event) => updateDelaySeconds(event.target.value)}
                       aria-label="Delay seconds"
                     />
                   </Field>
@@ -1587,8 +1653,16 @@ export default function App() {
                 <option value="360">360 (Low)</option>
               </Select>
             </Field>
-            <Field label="Delay seconds">
-              <Input value={delaySeconds} type="number" min={0} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Settings delay seconds" />
+            <Field label="Delay between courses (seconds)">
+              <Input
+                value={delaySeconds}
+                type="number"
+                min={0}
+                max={DOWNLOAD_DELAY_MAX_SECONDS}
+                step={1}
+                onChange={(event) => updateDelaySeconds(event.target.value)}
+                aria-label="Settings delay seconds"
+              />
             </Field>
           </div>
           <Field label="Browser source">
@@ -1645,7 +1719,7 @@ export default function App() {
               <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
               Check for updates
             </Button>
-            <Button type="button" variant="primary" onClick={installUpdate} disabled={!pendingUpdate} loading={isInstallingUpdate} loadingLabel="Installing">
+            <Button type="button" variant="primary" onClick={() => void installUpdate()} disabled={!pendingUpdate} loading={isInstallingUpdate} loadingLabel="Installing">
               <Play aria-hidden="true" className="h-3.5 w-3.5" />
               Install update
             </Button>
@@ -1944,6 +2018,9 @@ function QueueJobRow({
   const queueLabel = queueCourseLabel(job, counts);
   const canRemove = job.status !== "active";
   const scheduled = isScheduledJob(job);
+  const removeLabel = job.status === "failed" || job.status === "cancelled"
+    ? "Clear failed attempt"
+    : "Remove from queue";
 
   return (
     <DataTableRow className="queue-table-row">
@@ -1989,10 +2066,10 @@ function QueueJobRow({
             </Tooltip>
           ) : null}
           {canRemove ? (
-            <Tooltip label="Remove from queue">
+            <Tooltip label={removeLabel}>
               <IconButton
                 type="button"
-                aria-label={`Remove ${title} from queue`}
+                aria-label={`${removeLabel}: ${title}`}
                 onClick={() => onRemove(job)}
                 className="queue-remove-button"
               >
@@ -2351,6 +2428,11 @@ function showProcessedDownloadToast(response: ProcessQueuedDownloadResponse) {
 
 function sleep(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function serializedStateEqual(left: unknown, right: unknown) {
+  if (left === right) return true;
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 async function sleepUntilNextQueueItem(milliseconds: number, shouldStop?: () => boolean) {

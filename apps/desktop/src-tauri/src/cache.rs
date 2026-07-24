@@ -512,21 +512,47 @@ pub fn reconcile_active_jobs_after_restart(
     let mut reconciled = 0;
 
     for job in active_jobs {
-        transition_job_status(
-            connection,
-            &job.id,
-            "failed",
-            restarted_at,
-            Some("Job was active when LinkVault restarted and was marked failed for recovery."),
-        )?;
-        connection.execute(
-            r#"
-            UPDATE artifacts
-            SET status = 'failed', updated_at = ?2
-            WHERE job_id = ?1 AND status IN ('pending', 'active')
-            "#,
-            params![&job.id, restarted_at],
-        )?;
+        if job.paused {
+            connection.execute(
+                "UPDATE jobs SET status = 'queued', updated_at = ?2 WHERE id = ?1",
+                params![&job.id, restarted_at],
+            )?;
+            connection.execute(
+                r#"
+                UPDATE artifacts
+                SET status = 'pending', updated_at = ?2
+                WHERE job_id = ?1 AND status = 'active'
+                "#,
+                params![&job.id, restarted_at],
+            )?;
+            append_job_event(
+                connection,
+                &NewJobEvent {
+                    job_id: job.id.clone(),
+                    event_type: "job.pause.recovered".to_string(),
+                    message: "Paused download was safely restored to the queue after restart."
+                        .to_string(),
+                    payload_json: None,
+                    created_at: restarted_at,
+                },
+            )?;
+        } else {
+            transition_job_status(
+                connection,
+                &job.id,
+                "failed",
+                restarted_at,
+                Some("Job was active when LinkVault restarted and was marked failed for recovery."),
+            )?;
+            connection.execute(
+                r#"
+                UPDATE artifacts
+                SET status = 'failed', updated_at = ?2
+                WHERE job_id = ?1 AND status IN ('pending', 'active')
+                "#,
+                params![&job.id, restarted_at],
+            )?;
+        }
         reconciled += 1;
     }
 
@@ -1531,6 +1557,78 @@ mod tests {
         assert!(list_jobs_by_status(&connection, "active")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn restart_reconciliation_preserves_paused_active_job_for_safe_resume() {
+        let connection = initialized_connection();
+        let mut paused_job = sample_job("paused-job", "active", 100);
+        paused_job.paused = true;
+        insert_job(&connection, &paused_job).unwrap();
+        upsert_artifact(
+            &connection,
+            &ArtifactRecord {
+                id: "artifact-active".to_string(),
+                job_id: "paused-job".to_string(),
+                artifact_type: "video".to_string(),
+                path: "C:/downloads/sample/partial.mp4".to_string(),
+                status: "active".to_string(),
+                size_bytes: None,
+                created_at: 105,
+                updated_at: 105,
+            },
+        )
+        .unwrap();
+        upsert_artifact(
+            &connection,
+            &ArtifactRecord {
+                id: "artifact-complete".to_string(),
+                job_id: "paused-job".to_string(),
+                artifact_type: "subtitle".to_string(),
+                path: "C:/downloads/sample/complete.srt".to_string(),
+                status: "completed".to_string(),
+                size_bytes: Some(32),
+                created_at: 105,
+                updated_at: 105,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconcile_active_jobs_after_restart(&connection, 200).unwrap(),
+            1
+        );
+
+        let recovered = get_job(&connection, "paused-job").unwrap().unwrap();
+        let artifacts = list_artifacts_for_job(&connection, "paused-job").unwrap();
+        let events = list_job_events(&connection, "paused-job").unwrap();
+        assert_eq!(recovered.status, "queued");
+        assert!(recovered.paused);
+        assert_eq!(
+            artifacts
+                .iter()
+                .find(|artifact| artifact.id == "artifact-active")
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            artifacts
+                .iter()
+                .find(|artifact| artifact.id == "artifact-complete")
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert_eq!(events[0].event_type, "job.pause.recovered");
+        assert!(list_ready_queued_jobs(&connection, 200).unwrap().is_empty());
+
+        let resumed = set_download_job_paused(&connection, "paused-job", false, 210).unwrap();
+        assert!(!resumed.paused);
+        assert_eq!(
+            list_ready_queued_jobs(&connection, 210).unwrap()[0].id,
+            "paused-job"
+        );
     }
 
     #[test]
