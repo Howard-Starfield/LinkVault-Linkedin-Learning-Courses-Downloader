@@ -1,0 +1,23 @@
+import assert from "node:assert/strict";
+import { chromium } from "playwright";
+
+const url = process.env.LINKVAULT_PREVIEW_URL;
+assert.ok(url, "Set LINKVAULT_PREVIEW_URL to a running local LinkVault preview.");
+const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome", headless: true });
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+await page.goto(url);
+await page.getByRole("button", { name: "World Journal" }).click();
+const left = await page.locator(".newspaper-editions").boundingBox();
+const right = await page.locator(".newspaper-options").boundingBox();
+assert.ok(left && right, "Newspaper setup columns are not visible.");
+assert.ok(Math.abs(left.y - right.y) <= 1, "Setup column tops are not aligned.");
+assert.ok(Math.abs((left.y + left.height) - (right.y + right.height)) <= 1, "Setup column bottoms are not aligned.");
+assert.equal(await page.getByRole("button", { name: "Download now" }).count(), 1);
+await page.getByLabel("Schedule download").check();
+assert.equal(await page.getByRole("button", { name: "Schedule downloads" }).count(), 1);
+await page.setViewportSize({ width: 900, height: 900 });
+const narrowLeft = await page.locator(".newspaper-editions").boundingBox();
+const narrowRight = await page.locator(".newspaper-options").boundingBox();
+assert.ok(narrowLeft && narrowRight && narrowRight.y > narrowLeft.y, "Setup columns do not stack below 980px.");
+await browser.close();
+console.log("Visual geometry verification passed.");

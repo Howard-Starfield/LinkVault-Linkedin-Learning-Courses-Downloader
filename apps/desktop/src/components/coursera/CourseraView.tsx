@@ -109,7 +109,7 @@ function clampPositiveInt(value: number, min: number, fallback: number): number 
   return Math.max(min, Math.floor(value));
 }
 
-export function CourseraView() {
+export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "history" }) {
   // --- form state ---------------------------------------------------------
   const [classInput, setClassInput] = useState("");
   const [parsedClasses, setParsedClasses] = useState<ParsedCourseraClass[]>([]);
@@ -616,6 +616,10 @@ export function CourseraView() {
     }
   }
 
+  if (mode === "history") {
+    return <CourseraHistoryPage entries={history} onOpenFolder={openJobFolder} />;
+  }
+
   return (
     <>
     <div className="lv-workspace coursera-workspace">
@@ -929,14 +933,6 @@ export function CourseraView() {
         </div>
         <CourseraCompletedTable jobs={completedJobs} onOpenFolder={openJobFolder} />
       </div>
-      {history.length > 0 ? (
-        <div className="activity-section">
-          <div className="activity-section-header">
-            <h4>History</h4>
-          </div>
-          <CourseraHistoryTable entries={history} onOpenFolder={openJobFolder} />
-        </div>
-      ) : null}
     </Panel>
 
       <Dialog
@@ -1321,6 +1317,32 @@ function CourseraHistoryTable({
         </DataTableRow>
       ))}
     </DataTable>
+  );
+}
+
+function CourseraHistoryPage({
+  entries,
+  onOpenFolder
+}: {
+  entries: CourseraHistoryEntry[];
+  onOpenFolder: (job: CourseraJob) => void | Promise<void>;
+}) {
+  return (
+    <Panel className="history-page-panel">
+      <div className="history-page-header">
+        <div>
+          <h3>Coursera download history</h3>
+          <p>{entries.length} completed course{entries.length === 1 ? "" : "s"}</p>
+        </div>
+      </div>
+      {entries.length > 0 ? (
+        <CourseraHistoryTable entries={entries} onOpenFolder={onOpenFolder} />
+      ) : (
+        <DataTable className="history-table">
+          <EmptyRow title="No downloaded Coursera courses" description="Completed Coursera downloads will appear here." />
+        </DataTable>
+      )}
+    </Panel>
   );
 }
 
