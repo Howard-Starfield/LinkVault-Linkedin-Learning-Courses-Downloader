@@ -176,6 +176,7 @@ export function SectionHeader({
 
 export function SidebarItem({
   icon,
+  trailing,
   children,
   active = false,
   disabled = false,
@@ -183,6 +184,7 @@ export function SidebarItem({
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   icon?: ReactNode;
+  trailing?: ReactNode;
   active?: boolean;
   disabled?: boolean;
 }) {
@@ -194,7 +196,8 @@ export function SidebarItem({
       {...props}
     >
       {icon}
-      <span>{children}</span>
+      <span className="lv-nav-label">{children}</span>
+      {trailing ? <span className="lv-nav-trailing">{trailing}</span> : null}
     </button>
   );
 }

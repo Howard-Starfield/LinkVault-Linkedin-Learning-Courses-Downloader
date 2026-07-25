@@ -96,6 +96,7 @@ pub fn open_or_initialize(path: &Path) -> Result<Connection> {
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.execute_batch(SCHEMA)?;
+    crate::newspaper::storage::initialize(connection)?;
     migrate_jobs_download_quizzes(connection)?;
     migrate_jobs_source_url(connection)?;
     migrate_jobs_quiz_hints(connection)?;

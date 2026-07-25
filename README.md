@@ -2,7 +2,7 @@
 
 ![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)
 
-LinkVault helps you save LinkedIn Learning courses you already have access to into a local folder, so your learning materials are easier to organize, revisit, and study offline.
+LinkVault helps you save LinkedIn Learning and Coursera courses you can access, plus World Journal newspaper editions, into organized local archives.
 
 ## What You Can Do
 
@@ -12,6 +12,11 @@ LinkVault helps you save LinkedIn Learning courses you already have access to in
 - Retry failed downloads without rebuilding the whole list.
 - Save your cookie once, then reuse it for future launches.
 - Keep data local to your machine.
+- Download daily, weekly, and discovered special World Journal editions.
+- Schedule newspaper batches with a configurable delay between editions.
+- Optimize newspaper pages as high-clarity WebP while safely retaining originals when needed.
+- Browse shallow front-page previews and read downloaded editions offline.
+- Register an existing Newspaper Extractor archive without moving its files.
 
 ## How To Use
 
@@ -21,6 +26,8 @@ LinkVault helps you save LinkedIn Learning courses you already have access to in
 4. Choose the download folder and quality.
 5. Paste your LinkedIn `li_at` cookie once, or use a supported browser session.
 6. Click **Start Download**.
+
+For newspapers, open **World Journal → Download editions**, select editions and dates, then choose **Download now** or **Schedule downloads**. Completed and partial editions appear under **Newspaper library**.
 
 Your downloads are saved into the folder you picked. Your saved session is protected with Windows encryption and stored locally.
 
@@ -72,12 +79,12 @@ Production outputs:
 
 ```text
 apps\desktop\src-tauri\target\release\linkvault.exe
-apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.1.7_x64-setup.exe
+apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.2.0_x64-setup.exe
 ```
 
 ## Publish An Update
 
-The release workflow runs when you push a version tag like `v0.1.7`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
+The release workflow runs when you push a version tag like `v0.2.0`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
 
 1. Bump the version in `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, and `apps/desktop/src-tauri/tauri.conf.json`.
 2. Run:
@@ -91,9 +98,9 @@ npm run cargo:test
 4. Create and push the tag:
 
 ```powershell
-git tag v0.1.7
+git tag v0.2.0
 git push origin main
-git push origin v0.1.7
+git push origin v0.2.0
 ```
 
 Users on older signed builds can use the in-app update button after the GitHub release finishes.

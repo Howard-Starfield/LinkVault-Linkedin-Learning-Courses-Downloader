@@ -5,10 +5,14 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
   CalendarClock,
+  ChevronDown,
   CircleHelp,
   Clock3,
+  Download,
   Folder,
   History,
+  Moon,
+  Newspaper,
   PanelLeft,
   Pause,
   Play,
@@ -19,7 +23,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { IconBrandLinkedin, IconCertificate, IconMovie, IconTool } from "@tabler/icons-react";
+import { IconBrandLinkedin, IconCertificate, IconMovie } from "@tabler/icons-react";
 import liAtCookieGuide from "./assets/guide.png";
 import linkvaultLogo from "./assets/linkvault-wordmark.svg";
 import {
@@ -47,6 +51,7 @@ import {
   guardedToast
 } from "./components/primitives";
 import { CourseraView } from "./components/coursera/CourseraView";
+import { NewspaperView } from "./components/newspaper/NewspaperView";
 
 type ParsedCourse = {
   original: string;
@@ -194,8 +199,18 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
 const DOWNLOAD_DELAY_STORAGE_KEY = "linkvault.downloadDelaySeconds";
 const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
+const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.1.8";
+const APP_VERSION = "0.2.0";
+type AppTheme = "light" | "dark";
+type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
+
+function readInitialTheme(): AppTheme {
+  if (typeof window === "undefined") return "dark";
+  const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (stored === "light" || stored === "dark") return stored;
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
 const SAVED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
 function clampSidebarWidth(width: number) {
@@ -274,7 +289,11 @@ export default function App() {
   const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
   const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>(null);
   const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
-  const [activeView, setActiveView] = useState<"downloads" | "coursera" | "history">("downloads");
+  const [activeView, setActiveView] = useState<AppView>("downloads");
+  const [isLinkedInExpanded, setIsLinkedInExpanded] = useState(true);
+  const [isCourseraExpanded, setIsCourseraExpanded] = useState(true);
+  const [isNewspaperExpanded, setIsNewspaperExpanded] = useState(true);
+  const [theme, setTheme] = useState<AppTheme>(readInitialTheme);
   const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -355,6 +374,12 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(isSidebarCollapsed));
   }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   useEffect(() => {
     if (wasSettingsOpen.current && !isSettingsOpen) {
@@ -1258,22 +1283,112 @@ export default function App() {
         </div>
 
         <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
-          <SidebarItem active={activeView === "downloads"} icon={<IconBrandLinkedin aria-hidden="true" size={18} />} onClick={() => setActiveView("downloads")}>LinkedIn Courses</SidebarItem>
-          <SidebarItem active={activeView === "coursera"} icon={<IconCertificate aria-hidden="true" size={18} />} onClick={() => setActiveView("coursera")}>Coursera Courses</SidebarItem>
+          <div className="lv-nav-group">
+            <SidebarItem
+              active={activeView === "downloads"}
+              icon={<IconBrandLinkedin aria-hidden="true" size={18} />}
+              trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
+              aria-expanded={isLinkedInExpanded}
+              onClick={() => {
+                const isCurrentProvider = activeView === "downloads" || activeView === "linkedin-history";
+                setActiveView("downloads");
+                setIsLinkedInExpanded((expanded) => isCurrentProvider ? !expanded : true);
+              }}
+            >
+              LinkedIn Courses
+            </SidebarItem>
+            <div className="lv-nav-children" hidden={!isLinkedInExpanded}>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "linkedin-history"}
+                icon={<History aria-hidden="true" />}
+                aria-label="LinkedIn download history"
+                onClick={() => setActiveView("linkedin-history")}
+              >
+                Download history
+              </SidebarItem>
+            </div>
+          </div>
+          <div className="lv-nav-group">
+            <SidebarItem
+              active={activeView === "coursera"}
+              icon={<IconCertificate aria-hidden="true" size={18} />}
+              trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
+              aria-expanded={isCourseraExpanded}
+              onClick={() => {
+                const isCurrentProvider = activeView === "coursera" || activeView === "coursera-history";
+                setActiveView("coursera");
+                setIsCourseraExpanded((expanded) => isCurrentProvider ? !expanded : true);
+              }}
+            >
+              Coursera Courses
+            </SidebarItem>
+            <div className="lv-nav-children" hidden={!isCourseraExpanded}>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "coursera-history"}
+                icon={<History aria-hidden="true" />}
+                aria-label="Coursera download history"
+                onClick={() => setActiveView("coursera-history")}
+              >
+                Download history
+              </SidebarItem>
+            </div>
+          </div>
+          <div className="lv-nav-group">
+            <SidebarItem
+              active={activeView === "newspaper-download"}
+              icon={<Newspaper aria-hidden="true" size={18} />}
+              trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
+              aria-expanded={isNewspaperExpanded}
+              onClick={() => {
+                const isCurrentProvider = activeView === "newspaper-download" || activeView === "newspaper-library";
+                setActiveView("newspaper-download");
+                setIsNewspaperExpanded((expanded) => isCurrentProvider ? !expanded : true);
+              }}
+            >
+              World Journal
+            </SidebarItem>
+            <div className="lv-nav-children" hidden={!isNewspaperExpanded}>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "newspaper-download"}
+                icon={<Download aria-hidden="true" />}
+                onClick={() => setActiveView("newspaper-download")}
+              >
+                Download editions
+              </SidebarItem>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "newspaper-library"}
+                icon={<History aria-hidden="true" />}
+                onClick={() => setActiveView("newspaper-library")}
+              >
+                Newspaper library
+              </SidebarItem>
+            </div>
+          </div>
           <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
-          <SidebarItem icon={<IconTool aria-hidden="true" size={18} />}>Tools</SidebarItem>
-          <SidebarItem active={activeView === "history"} icon={<History aria-hidden="true" />} onClick={() => setActiveView("history")}>History</SidebarItem>
           <div className="mt-7 flex items-center justify-between border-t border-sidebar-border pt-6 text-xs text-sidebar-muted">
             <span>LinkedIn Scraper</span>
             <span className="rounded-full border border-sidebar-border px-2 py-0.5 text-[11px]">Coming Soon</span>
           </div>
-          <SidebarItem className="mt-5" icon={<Settings aria-hidden="true" />} aria-label="Open settings" onClick={() => setIsSettingsOpen(true)}>Settings</SidebarItem>
         </nav>
 
-        <div className="flex items-center justify-between py-4 pl-6 pr-0 text-xs text-sidebar-muted">
-          <span>v{APP_VERSION}</span>
+        <div className="lv-sidebar-footer">
+          <SidebarItem className="lv-sidebar-settings" icon={<Settings aria-hidden="true" />} aria-label="Open settings" onClick={() => setIsSettingsOpen(true)}>Settings</SidebarItem>
           <div className="flex items-center gap-2">
-            <SunMedium aria-hidden="true" className="h-4 w-4" />
+            <Tooltip label={`Switch to ${theme === "dark" ? "day" : "night"} mode`}>
+              <IconButton
+                aria-label={`Switch to ${theme === "dark" ? "day" : "night"} mode`}
+                aria-pressed={theme === "light"}
+                onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+              >
+                {theme === "dark"
+                  ? <SunMedium aria-hidden="true" className="h-4 w-4" />
+                  : <Moon aria-hidden="true" className="h-4 w-4" />}
+              </IconButton>
+            </Tooltip>
             <Popover
               label="LinkVault help"
               open={isHelpOpen}
@@ -1307,7 +1422,13 @@ export default function App() {
         <div className="lv-content">
           {activeView === "coursera" ? (
             <CourseraView />
-          ) : activeView === "history" ? (
+          ) : activeView === "coursera-history" ? (
+            <CourseraView mode="history" />
+          ) : activeView === "newspaper-download" ? (
+            <NewspaperView />
+          ) : activeView === "newspaper-library" ? (
+            <NewspaperView mode="library" />
+          ) : activeView === "linkedin-history" ? (
             <HistoryPage
               entries={downloadHistory}
               historyFilePath={downloadHistoryFilePath}
@@ -1702,7 +1823,7 @@ export default function App() {
           <div className="settings-section-title">Application</div>
           <div className="settings-row">
             <span>Theme</span>
-            <span>Jan dark</span>
+            <span>{theme === "dark" ? "Night" : "Day"}</span>
           </div>
           <div className="settings-row">
             <span>Version</span>
@@ -2261,7 +2382,7 @@ function HistoryPage({
     <Panel className="history-page-panel">
       <div className="history-page-header">
         <div>
-          <h3>Download History</h3>
+          <h3>LinkedIn download history</h3>
           <p>{entries.length} completed course{entries.length === 1 ? "" : "s"}</p>
         </div>
         {historyFilePath ? (

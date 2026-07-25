@@ -22,6 +22,7 @@ pub mod token_store;
 // `docs/learning/agent-harness-coursera/ISOLATION_RULES.md`, the
 // LinkedIn command surface in `commands::*` is unchanged.
 pub mod coursera;
+pub mod newspaper;
 
 use tauri::Manager;
 
@@ -70,6 +71,20 @@ pub fn run() {
             coursera::commands::list_coursera_history,
             coursera::commands::open_coursera_download_folder,
             coursera::commands::fetch_coursera_syllabus_preview,
+            newspaper::commands::bootstrap_newspaper_state,
+            newspaper::commands::list_newspaper_catalog,
+            newspaper::commands::refresh_newspaper_catalog,
+            newspaper::commands::create_newspaper_batch,
+            newspaper::commands::process_newspaper_queue,
+            newspaper::commands::pause_newspaper_batch,
+            newspaper::commands::cancel_newspaper_batch,
+            newspaper::commands::retry_newspaper_job,
+            newspaper::commands::list_newspaper_library,
+            newspaper::commands::get_newspaper_reader_manifest,
+            newspaper::commands::get_newspaper_preview,
+            newspaper::commands::get_newspaper_page_image,
+            newspaper::commands::open_newspaper_download_folder,
+            newspaper::commands::import_existing_newspaper_archive,
         ])
         .setup(|app| {
             let db_path = storage::resolve_db_path()?;
@@ -82,9 +97,14 @@ pub fn run() {
                 &connection,
                 commands::now_unix_timestamp(),
             )?;
+            newspaper::storage::reconcile_after_restart(
+                &connection,
+                commands::now_unix_timestamp(),
+            )?;
             drop(connection);
             app.manage(commands::LinkVaultState::new(db_path.clone()));
-            app.manage(coursera::commands::CourseraState::new(db_path));
+            app.manage(coursera::commands::CourseraState::new(db_path.clone()));
+            app.manage(newspaper::commands::NewspaperState::new(db_path));
             app.manage(app_updates::PendingUpdate::default());
             Ok(())
         })

@@ -1,6 +1,6 @@
 [package]
 name = "linkvault"
-version = "0.1.8"
+version = "0.2.0"
 description = "LinkVault desktop app"
 authors = ["LinkVault"]
 license-file = "../../../LICENSE"
@@ -24,19 +24,23 @@ tauri-build = { version = "2", features = [] }
 aes-gcm = "0.10"
 base64 = "0.22"
 bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+image = { version = "0.24.9", default-features = false, features = ["jpeg", "png", "webp"] }
 mime = "0.3"
 regex = "1"
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "time"] }
 url = "2"
+webp = "0.3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-updater = "2"
