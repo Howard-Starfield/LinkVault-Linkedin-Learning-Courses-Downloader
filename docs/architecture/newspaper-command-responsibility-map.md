@@ -156,3 +156,77 @@ separate design decision.
 Verification after this slice: 60 newspaper tests passed, `cargo check` and
 `cargo fmt -- --check` passed, the TypeScript/Vite production build passed, and
 the 8/50/500 newspaper performance contracts passed.
+
+### Refined second-slice dependency order
+
+The archive audit found that `repair_library_files` legitimately shares
+`optimize_completed_pages` with the optimization queue and also needs stable job
+row mapping. Moving archive first would therefore either create a dependency from
+a service back into `commands.rs` or duplicate the optimization workflow.
+
+The safe order for the second slice is:
+
+1. Extract `naming.rs` for shared IDs, edition keys, and safe path segments.
+2. Extract `job_repository.rs` as the single owner of job row mapping and
+   list/find queries.
+3. Extract `optimization_service.rs` as the owner of the optimization queue and
+   whole-job page optimization.
+4. Extract `archive_service.rs`, depending only on the job repository,
+   optimization service, naming, storage, optimizer, models, and SQLite.
+5. Keep the `process_newspaper_optimization_queue`,
+   `import_existing_newspaper_archive`, and `repair_newspaper_library` Tauri
+   adapters in `commands.rs`.
+
+This refinement does not change the public command contract or the remaining
+schedule, Library, job-control, and download-queue order.
+
+### Completed in the second modularization slice
+
+- `naming.rs` now owns the existing ID, edition-key, and safe path-segment rules
+  without changing their formats.
+- `job_repository.rs` now owns job list/find queries and the shared SQLite row
+  mapper used by Library and queue reads.
+- `optimization_service.rs` now owns optimization-queue discovery and whole-job
+  page optimization.
+- `archive_service.rs` now owns archive import, legacy file repair, optimized
+  source cleanup, archive identity, and archive page numbering.
+- `commands.rs` retains the optimization, import, and repair Tauri adapters,
+  shared state extraction, invalidation, and thumbnail prewarming.
+- All 24 public command paths remain registered through
+  `newspaper::commands::*`.
+- `commands.rs` decreased from 3,481 lines before modularization to 2,579 lines,
+  a reduction of 902 lines while preserving behavior behind the facade.
+
+Focused job repository, optimization, archive identity, repair, and cleanup
+tests passed after their respective extractions. Final gates also passed: all 60
+newspaper tests, `cargo check`, `cargo fmt -- --check`, the TypeScript/Vite
+production build, and the 8/50/500 newspaper performance contracts.
+
+## Remaining extraction plan
+
+The audited target wiring, all 24 command destinations, dependency rules,
+phased extraction order, behavior invariants, and stop conditions are recorded
+in
+[`newspaper-command-target-wiring-plan.md`](newspaper-command-target-wiring-plan.md).
+
+### Completed in the final modularization slices
+
+- `state.rs` owns shared database-path, cancellation, queue lock, revision, and
+  page-dimension backfill state.
+- `library_events.rs` owns Library invalidation and thumbnail prewarming.
+- `catalog_service.rs`, `batch_service.rs`, and `schedule_service.rs` own their
+  domain validation, SQL, and lifecycle behavior.
+- `overview_service.rs` and `library_service.rs` own bootstrap, activity, and
+  paginated Library read models.
+- `job_service.rs` owns job controls, while `queue_service.rs` owns download
+  orchestration, retry timing, and terminal transitions.
+- Newspaper characterization tests moved from the facade into `tests.rs`.
+- `commands.rs` now contains only the 24 Tauri adapters, state/lock extraction,
+  async translation, invalidation coordination, and the setup backfill adapter.
+- The facade is 303 lines, contains no newspaper table SQL, and retains all 24
+  registered command paths.
+
+Final automated gates passed: all 60 newspaper tests, all 354 runnable Rust
+tests with 2 credential-dependent tests ignored, `cargo check`, Rust formatting,
+the TypeScript/Vite production build, release-manifest and UI contracts, and
+the 8/50/500 newspaper performance contracts.
