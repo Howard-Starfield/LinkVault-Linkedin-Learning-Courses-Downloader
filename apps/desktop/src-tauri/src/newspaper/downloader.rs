@@ -28,6 +28,8 @@ pub enum PageDownloadError {
     InvalidImage(#[from] image::ImageError),
     #[error("filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("newspaper edition has not been released yet")]
+    NotReleased,
 }
 
 pub async fn download_validated_page(
@@ -37,7 +39,11 @@ pub async fn download_validated_page(
     destination: &Path,
     cancelled: &AtomicBool,
 ) -> Result<DownloadedPage, PageDownloadError> {
-    let bytes = client.fetch_page(page_url, referer, cancelled).await?;
+    let response = client.fetch_page(page_url, referer, cancelled).await?;
+    if is_unreleased_placeholder(&response.content_type, &response.bytes) {
+        return Err(PageDownloadError::NotReleased);
+    }
+    let bytes = response.bytes;
     let image = image::load_from_memory(&bytes)?;
     let (width, height) = image.dimensions();
     let checksum_sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -65,6 +71,16 @@ pub async fn download_validated_page(
         width,
         height,
     })
+}
+
+fn is_unreleased_placeholder(content_type: &str, bytes: &[u8]) -> bool {
+    let text = std::str::from_utf8(bytes)
+        .ok()
+        .map(str::trim)
+        .unwrap_or_default();
+    text.eq_ignore_ascii_case("future date")
+        || (content_type.to_ascii_lowercase().starts_with("text/html")
+            && text.to_ascii_lowercase().contains("future date"))
 }
 
 pub async fn validate_existing_page(path: &Path) -> Result<DownloadedPage, PageDownloadError> {
@@ -159,6 +175,35 @@ mod tests {
         ));
         assert!(!destination.exists());
         assert!(!sibling_part_path(&destination).exists());
+    }
+
+    #[tokio::test]
+    async fn future_date_placeholder_is_not_written() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"Future date"),
+            )
+            .mount(&server)
+            .await;
+        let client = NewspaperClient::for_test(Url::parse(&server.uri()).unwrap());
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("A01.jpg");
+
+        assert!(matches!(
+            download_validated_page(
+                &client,
+                Url::parse(&server.uri()).unwrap(),
+                &server.uri(),
+                &destination,
+                &AtomicBool::new(false),
+            )
+            .await,
+            Err(PageDownloadError::NotReleased)
+        ));
+        assert!(!destination.exists());
     }
 
     #[tokio::test]

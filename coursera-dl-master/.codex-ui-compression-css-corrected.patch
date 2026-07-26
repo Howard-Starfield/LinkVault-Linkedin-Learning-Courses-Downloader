@@ -1,0 +1,85 @@
+diff --git a/apps/desktop/src/index.css b/apps/desktop/src/index.css
+--- a/apps/desktop/src/index.css
++++ b/apps/desktop/src/index.css
+@@ -1946,0 +1947,79 @@
++
++.newspaper-compression-control {
++  display: grid;
++  gap: 7px;
++  border-top: 1px solid var(--border-soft);
++  border-bottom: 1px solid var(--border-soft);
++  padding: 9px 0 10px;
++  transition: opacity 140ms ease;
++}
++
++.newspaper-compression-control.is-disabled {
++  opacity: 0.54;
++}
++
++.newspaper-compression-head {
++  display: flex;
++  min-height: 24px;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++}
++
++.newspaper-compression-head output {
++  color: var(--text-main);
++  font-size: 11px;
++  font-variant-numeric: tabular-nums;
++  font-weight: 700;
++  letter-spacing: 0.01em;
++}
++
++.newspaper-compression-gauge {
++  display: grid;
++  grid-template-columns: auto minmax(120px, 1fr) auto;
++  align-items: center;
++  gap: 9px;
++  color: var(--text-soft);
++  font-size: 9px;
++  font-weight: 650;
++  letter-spacing: 0.04em;
++  text-transform: uppercase;
++}
++
++.newspaper-compression-gauge input[type="range"] {
++  width: 100%;
++  height: 16px;
++  margin: 0;
++  accent-color: var(--accent);
++  cursor: ew-resize;
++}
++
++.newspaper-compression-gauge input[type="range"]::-webkit-slider-runnable-track {
++  height: 3px;
++  border-radius: 999px;
++  background: linear-gradient(90deg, var(--border-strong), var(--accent));
++}
++
++.newspaper-compression-gauge input[type="range"]::-webkit-slider-thumb {
++  width: 15px;
++  height: 15px;
++  border: 2px solid var(--surface-1);
++  border-radius: 50%;
++  margin-top: -6px;
++  background: var(--accent);
++  box-shadow: 0 0 0 1px var(--border-strong), 0 2px 7px color-mix(in srgb, var(--accent) 28%, transparent);
++  -webkit-appearance: none;
++}
++
++.newspaper-compression-gauge input[type="range"]:focus-visible {
++  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
++  outline-offset: 3px;
++}
++
++.newspaper-compression-gauge input[type="range"]:disabled {
++  cursor: not-allowed;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .newspaper-compression-control {
++    transition: none;
++  }
++}

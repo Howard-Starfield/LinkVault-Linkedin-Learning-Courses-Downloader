@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::path::Path;
 use thiserror::Error;
 use url::Url;
 
@@ -122,6 +123,25 @@ pub fn resolve_page_url_with_origin(pagefile: &str, origin: &Url) -> Result<Url,
     Ok(url)
 }
 
+pub fn page_file_extension(url: &Url) -> &'static str {
+    let candidate = url
+        .query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("pageurl"))
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| url.path().to_string());
+    match Path::new(&candidate)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpeg") => "jpeg",
+        Some("png") => "png",
+        Some("webp") => "webp",
+        _ => "jpg",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +188,18 @@ mod tests {
         assert!(resolve_page_url("/pages/a01.jpg").is_ok());
         assert!(resolve_page_url("https://evil.example/a01.jpg").is_err());
         assert!(resolve_page_url("http://ep.worldjournal.com/a01.jpg").is_err());
+    }
+
+    #[test]
+    fn page_extension_comes_from_pageurl_query_not_php_endpoint() {
+        let url =
+            Url::parse("https://ep.worldjournal.com/pagebrowse.php?pageurl=LA_20260724_A01.jpg")
+                .unwrap();
+        assert_eq!(page_file_extension(&url), "jpg");
+        assert_eq!(
+            page_file_extension(&Url::parse("https://ep.worldjournal.com/pages/A01.png").unwrap()),
+            "png"
+        );
     }
 
     #[test]

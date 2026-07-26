@@ -106,10 +106,6 @@ pub fn expand_dates(
         .collect())
 }
 
-pub const fn default_optimization_quality() -> u8 {
-    86
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateNewspaperBatchRequest {
@@ -122,8 +118,6 @@ pub struct CreateNewspaperBatchRequest {
     pub delay_seconds: u32,
     pub optimize_images: bool,
     pub optimization_profile: String,
-    #[serde(default = "default_optimization_quality")]
-    pub optimization_quality: u8,
     pub keep_original_jpg: bool,
 }
 
@@ -136,7 +130,6 @@ pub struct NewspaperBatch {
     pub delay_seconds: u32,
     pub optimize_images: bool,
     pub optimization_profile: String,
-    pub optimization_quality: u8,
     pub keep_original_jpg: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -157,12 +150,7 @@ pub struct NewspaperJob {
     pub retry_at: Option<i64>,
     pub retry_count: u32,
     pub warning: Option<String>,
-    pub queue_position: i64,
-    pub paused: bool,
-    pub dismissed: bool,
-    pub created_at: i64,
     pub updated_at: i64,
-    pub completed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,7 +163,6 @@ pub struct NewspaperSchedule {
     pub delay_seconds: u32,
     pub optimize_images: bool,
     pub optimization_profile: String,
-    pub optimization_quality: u8,
     pub keep_original_jpg: bool,
     pub last_run_date: Option<String>,
     pub last_error: Option<String>,
@@ -192,81 +179,21 @@ pub struct CreateNewspaperScheduleRequest {
     pub delay_seconds: u32,
     pub optimize_images: bool,
     pub optimization_profile: String,
-    #[serde(default = "default_optimization_quality")]
-    pub optimization_quality: u8,
     pub keep_original_jpg: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct NewspaperPage {
     pub id: String,
     pub job_id: String,
-    pub canonical_index: u32,
     pub page_number: String,
     pub section_name: Option<String>,
     pub source_url: String,
     pub display_path: Option<String>,
     pub status: String,
-    pub media_url: Option<String>,
-    pub media_version: i64,
-    pub pixel_width: Option<u32>,
-    pub pixel_height: Option<u32>,
     pub final_bytes: Option<u64>,
     pub checksum: Option<String>,
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewspaperReadingProgress {
-    pub job_id: String,
-    pub last_page_id: String,
-    pub last_page_index: u32,
-    pub furthest_page_index: u32,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewspaperLibraryItem {
-    pub job_id: String,
-    pub edition_code: String,
-    pub edition_name: String,
-    pub publication_date: String,
-    pub status: String,
-    pub output_dir: String,
-    pub page_count: u32,
-    pub completed_count: u32,
-    pub warning: Option<String>,
-    pub updated_at: i64,
-    pub thumbnail_ready: bool,
-    pub thumbnail_url: Option<String>,
-    pub thumbnail_version: Option<String>,
-    pub last_page_id: Option<String>,
-    pub last_page_index: Option<u32>,
-    pub furthest_page_index: Option<u32>,
-    pub reading_updated_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewspaperLibraryPage {
-    pub items: Vec<NewspaperLibraryItem>,
-    pub total: u32,
-    pub offset: u32,
-    pub limit: u32,
-    pub revision: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewspaperActivitySnapshot {
-    pub jobs: Vec<NewspaperJob>,
-    pub batches: Vec<NewspaperBatch>,
-    pub schedules: Vec<NewspaperSchedule>,
-    pub has_live_activity: bool,
-    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,7 +203,6 @@ pub struct NewspaperBootstrap {
     pub batches: Vec<NewspaperBatch>,
     pub jobs: Vec<NewspaperJob>,
     pub schedules: Vec<NewspaperSchedule>,
-    pub reading_progress: Vec<NewspaperReadingProgress>,
     pub settings: serde_json::Value,
 }
 
@@ -293,7 +219,6 @@ pub struct CreateNewspaperBatchResponse {
 pub struct RepairNewspaperLibraryResult {
     pub renamed_files: u32,
     pub optimized_jobs: u32,
-    pub removed_source_files: u32,
     pub warnings: Vec<String>,
 }
 

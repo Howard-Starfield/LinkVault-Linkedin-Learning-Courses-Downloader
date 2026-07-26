@@ -10,6 +10,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
     "verify:ui": "node ./scripts/verify-ui.mjs",
+    "verify:newspaper-performance": "node --experimental-strip-types ./scripts/verify-newspaper-performance.mjs",
+    "verify:newspaper-performance-browser": "node ./scripts/verify-newspaper-performance-browser.mjs",
     "verify:visual": "node ./scripts/verify-visual.mjs",
     "verify:tauri-smoke": "node ./scripts/verify-tauri-smoke.mjs",
     "verify:release": "node ./scripts/verify-release.mjs",
@@ -18,6 +20,7 @@
   },
   "dependencies": {
     "@tabler/icons-react": "^3.24.0",
+    "@tanstack/react-virtual": "^3.14.8",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "2.7.1",
     "@tauri-apps/plugin-opener": "2.5.0",

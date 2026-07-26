@@ -28,6 +28,12 @@ pub enum FetchError {
     Manifest(#[from] ManifestError),
 }
 
+#[derive(Debug, Clone)]
+pub struct PageResponse {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+}
+
 #[derive(Clone)]
 pub struct NewspaperClient {
     client: Client,
@@ -112,9 +118,18 @@ impl NewspaperClient {
         page_url: Url,
         referer: &str,
         cancelled: &AtomicBool,
-    ) -> Result<Vec<u8>, FetchError> {
+    ) -> Result<PageResponse, FetchError> {
         let response = self.get_with_retry(page_url, referer, cancelled).await?;
-        Ok(response.bytes().await?.to_vec())
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Ok(PageResponse {
+            bytes: response.bytes().await?.to_vec(),
+            content_type,
+        })
     }
 
     async fn get_with_retry(

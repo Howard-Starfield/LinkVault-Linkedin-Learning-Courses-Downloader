@@ -1,0 +1,272 @@
+diff --git a/apps/desktop/src-tauri/src/newspaper/storage.rs b/apps/desktop/src-tauri/src/newspaper/storage.rs
+--- a/apps/desktop/src-tauri/src/newspaper/storage.rs
++++ b/apps/desktop/src-tauri/src/newspaper/storage.rs
+@@ -237,16 +237,35 @@
+-pub fn reconcile_after_restart(connection: &Connection, updated_at: i64) -> Result<usize> {
+-    let jobs = connection.execute(
+-        "UPDATE newspaper_jobs SET status = 'queued', updated_at = ?1 WHERE status IN ('active', 'optimizing')",
+-        params![updated_at],
+-    )?;
+-    connection.execute(
+-        "UPDATE newspaper_pages SET status = 'pending', updated_at = ?1 WHERE status IN ('downloading', 'optimizing')",
+-        params![updated_at],
+-    )?;
+-    connection.execute(
+-        "UPDATE newspaper_batches SET status = 'queued', updated_at = ?1 WHERE status = 'active'",
+-        params![updated_at],
+-    )?;
+-    Ok(jobs)
+-}
++pub fn reconcile_after_restart(connection: &Connection, updated_at: i64) -> Result<usize> {
++    let jobs = connection.execute(
++        "UPDATE newspaper_jobs SET status = 'queued', updated_at = ?1 WHERE status IN ('active', 'optimizing')",
++        params![updated_at],
++    )?;
++    connection.execute(
++        "UPDATE newspaper_pages SET status = 'pending', updated_at = ?1 WHERE status IN ('downloading', 'optimizing')",
++        params![updated_at],
++    )?;
++    connection.execute(
++        "UPDATE newspaper_batches SET status = 'queued', updated_at = ?1 WHERE status = 'active'",
++        params![updated_at],
++    )?;
++    let candidates = connection
++        .prepare(
++            "SELECT id FROM newspaper_jobs
++             WHERE page_count > 0 AND status IN ('queued', 'completed', 'partial')",
++        )?
++        .query_map([], |row| row.get::<_, String>(0))?
++        .collect::<Result<Vec<_>>>()?;
++    let mut recovered = 0;
++    for job_id in candidates {
++        let completion = finalize_job(connection, &job_id, updated_at)?;
++        if completion.status == "queued" {
++            recovered += 1;
++        }
++    }
++    Ok(jobs + recovered)
++}
+@@ -271,55 +290,152 @@
+-pub fn finalize_job(
+-    connection: &Connection,
+-    job_id: &str,
+-    updated_at: i64,
+-) -> std::result::Result<JobCompletion, FinalizeError> {
+-    let job = connection
+-        .query_row(
+-            "SELECT output_dir, page_count FROM newspaper_jobs WHERE id = ?1",
+-            params![job_id],
+-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+-        )
+-        .optional()?
+-        .ok_or_else(|| FinalizeError::JobNotFound(job_id.to_string()))?;
+-    let (completed_count, failed_count): (i64, i64) = connection.query_row(
+-        "SELECT
+-            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
+-            SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END)
+-         FROM newspaper_pages WHERE job_id = ?1",
+-        params![job_id],
+-        |row| Ok((row.get(0)?, row.get(1)?)),
+-    )?;
+-    let page_count = job.1;
+-    let status = if page_count > 0 && completed_count == page_count && failed_count == 0 {
+-        "completed"
+-    } else if completed_count > 0 {
+-        "partial"
+-    } else {
+-        "failed"
+-    };
+-    let marker = Path::new(&job.0).join(".complete");
+-
+-    if status == "completed" {
+-        std::fs::create_dir_all(&job.0)?;
+-        let part = Path::new(&job.0).join(".complete.part");
+-        std::fs::write(&part, b"validated")?;
+-        std::fs::rename(part, &marker)?;
+-    } else if marker.exists() {
+-        std::fs::remove_file(&marker)?;
+-    }
+-
+-    connection.execute(
+-        "UPDATE newspaper_jobs
+-         SET status = ?2, completed_count = ?3, failed_count = ?4,
+-             updated_at = ?5, completed_at = CASE WHEN ?2 IN ('completed', 'partial') THEN ?5 ELSE NULL END
+-         WHERE id = ?1",
+-        params![job_id, status, completed_count, failed_count, updated_at],
+-    )?;
+-
+-    Ok(JobCompletion {
+-        status: status.to_string(),
+-        page_count,
+-        completed_count,
+-        failed_count,
+-    })
+-}
++pub fn finalize_job(
++    connection: &Connection,
++    job_id: &str,
++    updated_at: i64,
++) -> std::result::Result<JobCompletion, FinalizeError> {
++    let job = connection
++        .query_row(
++            "SELECT j.output_dir, j.page_count, j.batch_id, b.optimize_images
++             FROM newspaper_jobs j
++             JOIN newspaper_batches b ON b.id = j.batch_id
++             WHERE j.id = ?1",
++            params![job_id],
++            |row| {
++                Ok((
++                    row.get::<_, String>(0)?,
++                    row.get::<_, i64>(1)?,
++                    row.get::<_, String>(2)?,
++                    row.get::<_, bool>(3)?,
++                ))
++            },
++        )
++        .optional()?
++        .ok_or_else(|| FinalizeError::JobNotFound(job_id.to_string()))?;
++    let page_records = connection
++        .prepare(
++            "SELECT id, status, original_path, optimized_path, original_bytes, final_bytes
++             FROM newspaper_pages WHERE job_id = ?1",
++        )?
++        .query_map(params![job_id], |row| {
++            Ok((
++                row.get::<_, String>(0)?,
++                row.get::<_, String>(1)?,
++                row.get::<_, Option<String>>(2)?,
++                row.get::<_, Option<String>>(3)?,
++                row.get::<_, Option<i64>>(4)?,
++                row.get::<_, Option<i64>>(5)?,
++            ))
++        })?
++        .collect::<Result<Vec<_>>>()?;
++
++    let mut missing_files = 0_i64;
++    for (page_id, status, original_path, optimized_path, original_bytes, final_bytes) in
++        page_records
++    {
++        if status != "completed"
++            || recorded_page_is_valid(
++                original_path.as_deref(),
++                optimized_path.as_deref(),
++                original_bytes,
++                final_bytes,
++            )
++        {
++            continue;
++        }
++        connection.execute(
++            "UPDATE newspaper_pages
++             SET status = 'pending', optimized_path = NULL,
++                 error = 'Downloaded file is missing or incomplete; queued for recovery.',
++                 updated_at = ?2
++             WHERE id = ?1",
++            params![page_id, updated_at],
++        )?;
++        missing_files += 1;
++    }
++
++    let (completed_count, failed_count, pending_count, optimization_pending): (i64, i64, i64, i64) =
++        connection.query_row(
++            "SELECT
++                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
++                COALESCE(SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END), 0),
++                COALESCE(SUM(CASE WHEN status IN ('pending', 'downloading', 'downloaded', 'optimizing') THEN 1 ELSE 0 END), 0),
++                COALESCE(SUM(CASE WHEN status = 'completed' AND optimized_path IS NULL THEN 1 ELSE 0 END), 0)
++             FROM newspaper_pages WHERE job_id = ?1",
++            params![job_id],
++            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
++        )?;
++    let page_count = job.1;
++    let status = if missing_files > 0 || pending_count > 0 {
++        "queued"
++    } else if page_count > 0 && completed_count == page_count && failed_count == 0 {
++        if job.3 && optimization_pending > 0 {
++            "optimizing"
++        } else {
++            "completed"
++        }
++    } else if completed_count > 0 {
++        "partial"
++    } else {
++        "failed"
++    };
++    let marker = Path::new(&job.0).join(".complete");
++    let marker_part = Path::new(&job.0).join(".complete.part");
++
++    if status == "completed" {
++        std::fs::create_dir_all(&job.0)?;
++        std::fs::write(
++            &marker_part,
++            format!("validated-pages={page_count}").as_bytes(),
++        )?;
++        std::fs::rename(&marker_part, &marker)?;
++    } else {
++        if marker.exists() {
++            std::fs::remove_file(&marker)?;
++        }
++        if marker_part.exists() {
++            std::fs::remove_file(&marker_part)?;
++        }
++    }
++
++    connection.execute(
++        "UPDATE newspaper_jobs
++         SET status = ?2, completed_count = ?3, failed_count = ?4,
++             updated_at = ?5, completed_at = CASE WHEN ?2 IN ('completed', 'partial') THEN ?5 ELSE NULL END
++         WHERE id = ?1",
++        params![job_id, status, completed_count, failed_count, updated_at],
++    )?;
++
++    if status == "queued" {
++        connection.execute(
++            "UPDATE newspaper_batches
++             SET status = 'queued', completed_at = NULL, updated_at = ?2
++             WHERE id = ?1 AND status NOT IN ('paused', 'cancelled')",
++            params![job.2, updated_at],
++        )?;
++    } else if status == "optimizing" {
++        connection.execute(
++            "UPDATE newspaper_batches
++             SET status = 'active', completed_at = NULL, updated_at = ?2
++             WHERE id = ?1 AND status NOT IN ('paused', 'cancelled')",
++            params![job.2, updated_at],
++        )?;
++    }
++
++    Ok(JobCompletion {
++        status: status.to_string(),
++        page_count,
++        completed_count,
++        failed_count,
++    })
++}
++
++fn recorded_page_is_valid(
++    original_path: Option<&str>,
++    optimized_path: Option<&str>,
++    original_bytes: Option<i64>,
++    final_bytes: Option<i64>,
++) -> bool {
++    let (path, expected_bytes) = match optimized_path.filter(|value| !value.is_empty()) {
++        Some(path) => (Some(path), final_bytes.or(original_bytes)),
++        None => (
++            original_path.filter(|value| !value.is_empty()),
++            original_bytes.or(final_bytes),
++        ),
++    };
++    let Some(path) = path else {
++        return false;
++    };
++    let Ok(metadata) = std::fs::metadata(path) else {
++        return false;
++    };
++    if !metadata.is_file() || metadata.len() == 0 {
++        return false;
++    }
++    expected_bytes
++        .filter(|value| *value > 0)
++        .map(|value| metadata.len() == value as u64)
++        .unwrap_or(true)
++}

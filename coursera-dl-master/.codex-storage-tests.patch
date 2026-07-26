@@ -1,0 +1,110 @@
+diff --git a/apps/desktop/src-tauri/src/newspaper/storage.rs b/apps/desktop/src-tauri/src/newspaper/storage.rs
+--- a/apps/desktop/src-tauri/src/newspaper/storage.rs
++++ b/apps/desktop/src-tauri/src/newspaper/storage.rs
+@@ -615,17 +615,27 @@
+         ).unwrap();
+         for (index, status) in statuses.iter().enumerate() {
++            let page_number = format!("A{:02}", index + 1);
++            let original_path = output_dir.join(format!("{page_number}.jpg"));
++            let payload = format!("validated-page-{index}").into_bytes();
++            if *status == "completed" {
++                std::fs::write(&original_path, &payload).unwrap();
++            }
+             connection
+                 .execute(
+                     "INSERT INTO newspaper_pages
+-                (id, job_id, page_number, source_url, status, created_at, updated_at)
+-                VALUES (?1, 'finalize-job', ?2, ?3, ?4, 1, 1)",
++                (id, job_id, page_number, source_url, original_path, status,
++                 original_bytes, final_bytes, created_at, updated_at)
++                VALUES (?1, 'finalize-job', ?2, ?3, ?4, ?5, ?6, ?6, 1, 1)",
+                     params![
+                         format!("finalize-page-{index}"),
+-                        format!("A{:02}", index + 1),
++                        page_number,
+                         format!("https://ep.worldjournal.com/{index}.jpg"),
++                        original_path.to_string_lossy(),
+                         status,
++                        payload.len() as i64,
+                     ],
+                 )
+                 .unwrap();
+@@ -657,6 +667,70 @@
+         assert!(!directory.path().join(".complete.part").exists());
+     }
+ 
++    #[test]
++    fn completed_database_rows_without_files_are_requeued_and_never_marked_complete() {
++        let connection = initialized();
++        let directory = tempdir().unwrap();
++        insert_job_with_pages(&connection, directory.path(), &["completed"]);
++        std::fs::remove_file(directory.path().join("A01.jpg")).unwrap();
++        std::fs::write(directory.path().join(".complete"), b"stale").unwrap();
++
++        let result = finalize_job(&connection, "finalize-job", 10).unwrap();
++
++        assert_eq!(result.status, "queued");
++        assert_eq!(result.completed_count, 0);
++        assert!(!directory.path().join(".complete").exists());
++        let page_status: String = connection
++            .query_row(
++                "SELECT status FROM newspaper_pages WHERE job_id = 'finalize-job'",
++                [],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert_eq!(page_status, "pending");
++    }
++
++    #[test]
++    fn optimization_must_finish_before_complete_marker_is_written() {
++        let connection = initialized();
++        let directory = tempdir().unwrap();
++        insert_job_with_pages(&connection, directory.path(), &["completed"]);
++        connection
++            .execute(
++                "UPDATE newspaper_batches SET optimize_images = 1 WHERE id = 'finalize-batch'",
++                [],
++            )
++            .unwrap();
++
++        let downloaded = finalize_job(&connection, "finalize-job", 10).unwrap();
++        assert_eq!(downloaded.status, "optimizing");
++        assert!(!directory.path().join(".complete").exists());
++
++        connection
++            .execute(
++                "UPDATE newspaper_pages SET optimized_path = original_path
++                 WHERE job_id = 'finalize-job'",
++                [],
++            )
++            .unwrap();
++        let optimized = finalize_job(&connection, "finalize-job", 11).unwrap();
++        assert_eq!(optimized.status, "completed");
++        assert!(directory.path().join(".complete").exists());
++    }
++
++    #[test]
++    fn restart_reconciliation_removes_stale_marker_and_recovers_missing_files() {
++        let connection = initialized();
++        let directory = tempdir().unwrap();
++        insert_job_with_pages(&connection, directory.path(), &["completed"]);
++        std::fs::remove_file(directory.path().join("A01.jpg")).unwrap();
++        std::fs::write(directory.path().join(".complete"), b"stale").unwrap();
++        connection
++            .execute(
++                "UPDATE newspaper_jobs SET status = 'completed' WHERE id = 'finalize-job'",
++                [],
++            )
++            .unwrap();
++
++        assert_eq!(reconcile_after_restart(&connection, 20).unwrap(), 1);
++        assert!(!directory.path().join(".complete").exists());
++        let status: String = connection
++            .query_row("SELECT status FROM newspaper_jobs WHERE id = 'finalize-job'", [], |row| row.get(0))
++            .unwrap();
++        assert_eq!(status, "queued");
++    }
++
+     #[test]
+     fn retry_missing_pages_preserves_completed_pages() {
