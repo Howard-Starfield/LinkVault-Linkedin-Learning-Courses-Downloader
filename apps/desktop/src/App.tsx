@@ -336,6 +336,34 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
+
+    let disposed = false;
+    let processing = false;
+    async function processNewspaperSchedules() {
+      if (disposed || processing) return;
+      processing = true;
+      try {
+        await invoke("process_newspaper_queue");
+        if (!disposed) {
+          await invoke("process_newspaper_optimization_queue");
+        }
+      } catch {
+        // The newspaper screen surfaces persisted job and schedule errors.
+      } finally {
+        processing = false;
+      }
+    }
+
+    void processNewspaperSchedules();
+    const intervalId = window.setInterval(() => void processNewspaperSchedules(), 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!hasSavedToken) return;
     let disposed = false;
 
@@ -380,6 +408,34 @@ export default function App() {
     document.documentElement.style.colorScheme = theme;
     window.localStorage.setItem(THEME_STORAGE_KEY, theme);
   }, [theme]);
+
+  useEffect(() => {
+    let resizeFrame: number | null = null;
+    let resizeSettledTimer: number | null = null;
+    const root = document.documentElement;
+
+    function handleWindowResize() {
+      if (root.dataset.windowResizing !== "true" && resizeFrame === null) {
+        resizeFrame = window.requestAnimationFrame(() => {
+          resizeFrame = null;
+          root.dataset.windowResizing = "true";
+        });
+      }
+      if (resizeSettledTimer !== null) window.clearTimeout(resizeSettledTimer);
+      resizeSettledTimer = window.setTimeout(() => {
+        resizeSettledTimer = null;
+        delete root.dataset.windowResizing;
+      }, 140);
+    }
+
+    window.addEventListener("resize", handleWindowResize, { passive: true });
+    return () => {
+      window.removeEventListener("resize", handleWindowResize);
+      if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
+      if (resizeSettledTimer !== null) window.clearTimeout(resizeSettledTimer);
+      delete root.dataset.windowResizing;
+    };
+  }, []);
 
   useEffect(() => {
     if (wasSettingsOpen.current && !isSettingsOpen) {
@@ -1419,6 +1475,16 @@ export default function App() {
         />
       </aside>
       <main className="lv-main">
+        <button
+          type="button"
+          className="lv-sidebar-reopen"
+          aria-label="Show sidebar"
+          aria-hidden={!isSidebarCollapsed}
+          tabIndex={isSidebarCollapsed ? 0 : -1}
+          onClick={() => setIsSidebarCollapsed(false)}
+        >
+          <PanelLeft aria-hidden="true" className="h-4 w-4" />
+        </button>
         <div className="lv-content">
           {activeView === "coursera" ? (
             <CourseraView />
@@ -1439,16 +1505,6 @@ export default function App() {
           <div className="lv-workspace">
             <Panel className="command-panel">
               <div className="section-heading command-section-heading">
-                <button
-                  type="button"
-                  className="lv-sidebar-reopen"
-                  aria-label="Show sidebar"
-                  aria-hidden={!isSidebarCollapsed}
-                  tabIndex={isSidebarCollapsed ? 0 : -1}
-                  onClick={() => setIsSidebarCollapsed(false)}
-                >
-                  <PanelLeft aria-hidden="true" className="h-4 w-4" />
-                </button>
                 <div className="min-w-0">
                   <h3>Linkedin Course</h3>
                   <p>Paste LinkedIn Learning course URLs and choose what to download.</p>

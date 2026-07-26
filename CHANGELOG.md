@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Rebuilt Newspaper Downloads as a compact three-panel dispatch board that keeps the LinkVault sidebar, removes decorative step numbers and panel headings, orders Editions → Download settings → Schedule, groups regional/weekly/special editions, moves the save location into Download settings, reuses the compact LinkedIn action buttons, reserves a collision-free Progress area, and suppresses expensive transitions and repaints while the desktop window is actively resizing.
+- Added persisted newspaper queue ordering, row-level pause/resume, safe removal that leaves downloaded files on disk, timestamped download history, hover-revealed actions, and restart reconciliation for paused or dismissed work.
+- Fixed World Journal page filenames by deriving the image extension from the embedded page URL instead of the PHP delivery endpoint.
+- Added an in-app repair action that renames legacy PHP-suffixed images and applies the selected WebP optimization profile.
+- Fixed last-seven-days batches to use the computer's current local date and skip already-known editions instead of failing on duplicate jobs.
+- Changed the default inter-edition delay to 15 seconds and added page-level real-time progress.
+- Added unreleased-edition detection with automatic 30-minute retries.
+- Replaced one-time scheduling with a recurring daily local-time schedule that skips editions already present in the library.
+- Separated recurring schedule creation from immediate date-range downloads so Last 7 days always queues all seven dates.
+- Moved image optimization into a resumable post-download queue so WebP encoding no longer blocks the next edition.
+- Hardened `.complete` so it is written only after every recorded page exists at its validated size and any requested optimization has finished; stale database rows now requeue missing files automatically.
+- Replaced the two fixed WebP profiles with a compact adjustable compression-strength gauge spanning quality 55–92 while preserving the original page dimensions.
+- Rebuilt the newspaper reader as a full-window canvas with back navigation, direct 20% click zoom, a 50–300% zoom ruler, keyboard controls, and responsive header navigation.
+
 ## 0.2.0 — 2026-07-24
 
 - Added a World Journal provider with compact edition selection and a row-based newspaper library.

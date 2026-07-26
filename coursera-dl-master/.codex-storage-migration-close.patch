@@ -1,0 +1,5 @@
+diff --git a/apps/desktop/src-tauri/src/newspaper/storage.rs b/apps/desktop/src-tauri/src/newspaper/storage.rs
+--- a/apps/desktop/src-tauri/src/newspaper/storage.rs
++++ b/apps/desktop/src-tauri/src/newspaper/storage.rs
+@@ -203,0 +204 @@
++}

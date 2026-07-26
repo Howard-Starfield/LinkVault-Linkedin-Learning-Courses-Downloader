@@ -1,24 +1,24 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent as ReactDragEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   CalendarClock,
-  ChevronLeft,
-  ChevronRight,
+  CheckCircle2,
+  Clock3,
   Download,
   FolderOpen,
+  GripVertical,
+  History,
   LoaderCircle,
-  Maximize2,
   Pause,
   Play,
   RotateCcw,
   Search,
-  X,
-  ZoomIn,
-  ZoomOut
+  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch } from "../primitives";
+import { NewspaperLibrary } from "./NewspaperLibrary";
 
 type EditionKind = "daily" | "weekly" | "special";
 type NewspaperEdition = {
@@ -36,7 +36,18 @@ type NewspaperBatch = {
   status: string;
   destination: string;
   scheduled_at?: number | null;
-  delay_minutes: number;
+  delay_seconds: number;
+};
+type NewspaperSchedule = {
+  id: string;
+  enabled: boolean;
+  cron_time: string;
+  destination: string;
+  edition_codes: string[];
+  delay_seconds: number;
+  optimization_quality: number;
+  last_run_date?: string | null;
+  last_error?: string | null;
 };
 type NewspaperJob = {
   id: string;
@@ -49,24 +60,34 @@ type NewspaperJob = {
   page_count: number;
   completed_count: number;
   failed_count: number;
+  retry_at?: number | null;
+  retry_count: number;
   warning?: string | null;
+  queue_position: number;
+  paused: boolean;
+  dismissed: boolean;
+  created_at: number;
   updated_at: number;
-};
-type NewspaperPage = {
-  id: string;
-  page_number: string;
-  section_name?: string | null;
-  status: string;
-  display_path?: string | null;
+  completed_at?: number | null;
 };
 type Bootstrap = {
   catalog: NewspaperEdition[];
   batches: NewspaperBatch[];
   jobs: NewspaperJob[];
+  schedules: NewspaperSchedule[];
   settings: Record<string, unknown>;
 };
-
+type ActivitySnapshot = {
+  jobs: NewspaperJob[];
+  schedules: NewspaperSchedule[];
+  hasLiveActivity: boolean;
+};
+type CreateBatchResponse = {
+  jobs: NewspaperJob[];
+  skippedCount: number;
+};
 const PREF_KEY = "linkvault.newspaper.preferences";
+const WEBP_QUALITY_PRESETS: readonly number[] = [92, 86, 74, 55, 45, 35, 25];
 const FALLBACK_CATALOG: NewspaperEdition[] = [
   ["NY", "紐約", "New York", "daily"],
   ["LA", "洛杉磯", "Los Angeles", "daily"],
@@ -92,7 +113,11 @@ const FALLBACK_CATALOG: NewspaperEdition[] = [
 }));
 
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function isTauriRuntime() {
@@ -106,69 +131,99 @@ function editionKey(edition: NewspaperEdition) {
 export function NewspaperView({ mode = "download" }: { mode?: "download" | "library" }) {
   const initial = useRef(readPreferences());
   const [catalog, setCatalog] = useState<NewspaperEdition[]>(FALLBACK_CATALOG);
-  const [batches, setBatches] = useState<NewspaperBatch[]>([]);
   const [jobs, setJobs] = useState<NewspaperJob[]>([]);
+  const [schedules, setSchedules] = useState<NewspaperSchedule[]>([]);
   const [selected, setSelected] = useState<Set<string>>(() => new Set(initial.current.selected ?? ["NY"]));
   const [query, setQuery] = useState("");
   const [kind, setKind] = useState<"all" | EditionKind>("all");
-  const [libraryStatus, setLibraryStatus] = useState<"all" | "completed" | "partial">("all");
-  const [libraryLimit, setLibraryLimit] = useState(50);
-  const [dateMode, setDateMode] = useState<"single" | "last_7_days" | "custom">("single");
+  const [dateMode, setDateMode] = useState<"single" | "last7_days" | "custom">("single");
   const [startDate, setStartDate] = useState(today());
   const [endDate, setEndDate] = useState(today());
   const [destination, setDestination] = useState(initial.current.destination ?? "");
-  const [delayMinutes, setDelayMinutes] = useState(initial.current.delayMinutes ?? 5);
+  const [delaySeconds, setDelaySeconds] = useState(initial.current.delaySeconds ?? 15);
   const [optimize, setOptimize] = useState(initial.current.optimize ?? true);
-  const [profile, setProfile] = useState(initial.current.profile ?? "webp_high");
+  const [optimizationQuality, setOptimizationQuality] = useState(() =>
+    preferredQuality(
+      initial.current.optimizationQuality,
+      initial.current.compressionStrength,
+      initial.current.profile
+    )
+  );
   const [keepOriginal, setKeepOriginal] = useState(initial.current.keepOriginal ?? false);
-  const [schedule, setSchedule] = useState(initial.current.schedule ?? false);
-  const [scheduledLocal, setScheduledLocal] = useState(initial.current.scheduledLocal ?? "");
+  const [cronTime, setCronTime] = useState(initial.current.cronTime ?? "07:00");
+  const [scheduleTab, setScheduleTab] = useState<"schedule" | "history">("schedule");
+  const [draggedJobId, setDraggedJobId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [savingSchedule, setSavingSchedule] = useState(false);
   const [processing, setProcessing] = useState(false);
-  const [previews, setPreviews] = useState<Record<string, string>>({});
-  const [reader, setReader] = useState<{ job: NewspaperJob; pages: NewspaperPage[]; index: number; image: string; zoom: number } | null>(null);
 
+  const optimizationProfile = optimizationQuality >= 89 ? "webp_high" : "webp_balanced";
+  const compressionLabel = optimizationQuality >= 89
+    ? "Light"
+    : optimizationQuality >= 70
+      ? "Balanced"
+      : optimizationQuality >= 50
+        ? "Strong"
+        : optimizationQuality >= 35
+          ? "Compact"
+          : "Archive";
   async function refresh() {
     if (!isTauriRuntime()) return;
     try {
       const state = await invoke<Bootstrap>("bootstrap_newspaper_state");
       setCatalog(state.catalog.length ? state.catalog : FALLBACK_CATALOG);
-      setBatches(state.batches);
       setJobs(state.jobs);
+      setSchedules(state.schedules);
     } catch (error) {
       toast.error("Could not load newspaper state", { description: String(error) });
     }
   }
 
   useEffect(() => {
+    if (mode === "library") return;
+    let disposed = false;
+    let activityTimer: number | undefined;
+    const pollActivity = async () => {
+      if (disposed || !isTauriRuntime()) return;
+      let nextDelay = 15_000;
+      try {
+        const snapshot = await invoke<ActivitySnapshot>("get_newspaper_activity_snapshot");
+        if (disposed) return;
+        setJobs(snapshot.jobs);
+        setSchedules(snapshot.schedules);
+        nextDelay = snapshot.hasLiveActivity ? 1_000 : 15_000;
+      } catch {
+        nextDelay = 15_000;
+      }
+      if (!disposed) activityTimer = window.setTimeout(() => void pollActivity(), nextDelay);
+    };
     if (isTauriRuntime()) {
       void invoke<NewspaperEdition[]>("refresh_newspaper_catalog")
         .then((items) => items.length && setCatalog(items))
         .catch(() => undefined)
-        .finally(() => void refresh());
+        .finally(() => void refresh().finally(() => {
+          if (!disposed) activityTimer = window.setTimeout(() => void pollActivity(), 1_000);
+        }));
     } else {
       void refresh();
     }
-    if (!isTauriRuntime()) return;
-    const timer = window.setInterval(() => {
-      void refresh();
-      void invoke("process_newspaper_queue").catch(() => undefined);
-    }, 5_000);
-    return () => window.clearInterval(timer);
-  }, []);
+    return () => {
+      disposed = true;
+      if (activityTimer !== undefined) window.clearTimeout(activityTimer);
+    };
+  }, [mode]);
 
   useEffect(() => {
     window.localStorage.setItem(PREF_KEY, JSON.stringify({
       destination,
-      delayMinutes,
+      delaySeconds,
       optimize,
-      profile,
+      optimizationQuality,
       keepOriginal,
-      schedule,
-      scheduledLocal,
+      cronTime,
       selected: [...selected]
     }));
-  }, [delayMinutes, destination, keepOriginal, optimize, profile, schedule, scheduledLocal, selected]);
+  }, [cronTime, delaySeconds, destination, keepOriginal, optimizationQuality, optimize, selected]);
 
   const visibleEditions = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -177,81 +232,105 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
       && (!needle || `${edition.code} ${edition.nameZh} ${edition.nameEn}`.toLowerCase().includes(needle))
     );
   }, [catalog, kind, query]);
-  const activeJobs = jobs.filter((job) => !["completed", "partial", "failed", "unavailable", "cancelled"].includes(job.status));
-  const editionKinds = new Map(catalog.map((edition) => [edition.code, edition.kind]));
-  const libraryJobs = jobs
-    .filter((job) => ["completed", "partial"].includes(job.status))
-    .filter((job) => libraryStatus === "all" || job.status === libraryStatus)
-    .filter((job) => kind === "all" || editionKinds.get(job.edition_code) === kind)
-    .filter((job) => !query || `${job.edition_name} ${job.edition_code} ${job.publication_date}`.toLowerCase().includes(query.toLowerCase()))
-    .sort((a, b) => b.publication_date.localeCompare(a.publication_date));
-
-  useEffect(() => {
-    if (mode !== "library" || !isTauriRuntime()) return;
-    for (const job of libraryJobs.slice(0, 50)) {
-      if (previews[job.id]) continue;
-      void invoke<string>("get_newspaper_preview", { jobId: job.id })
-        .then((value) => setPreviews((current) => ({ ...current, [job.id]: value })))
-        .catch(() => undefined);
-    }
-  }, [libraryJobs, mode, previews]);
+  const progressJobs = [...jobs]
+    .filter((job) => !job.dismissed)
+    .sort((left, right) => {
+      const leftTerminal = isTerminalJob(left);
+      const rightTerminal = isTerminalJob(right);
+      if (leftTerminal !== rightTerminal) return leftTerminal ? 1 : -1;
+      if (!leftTerminal) return left.queue_position - right.queue_position;
+      return (right.completed_at ?? right.updated_at) - (left.completed_at ?? left.updated_at);
+    })
+    .slice(0, 20);
+  const historyJobs = [...jobs]
+    .filter((job) => isTerminalJob(job))
+    .sort((left, right) => (right.completed_at ?? right.updated_at) - (left.completed_at ?? left.updated_at));
 
   async function chooseFolder() {
     const picked = await open({ directory: true, multiple: false, title: "Choose newspaper folder" });
     if (typeof picked === "string") setDestination(picked);
   }
 
-  async function registerArchive() {
-    const picked = await open({ directory: true, multiple: false, title: "Register existing newspaper archive" });
-    if (typeof picked !== "string" || !isTauriRuntime()) return;
-    try {
-      const count = await invoke<number>("import_existing_newspaper_archive", { path: picked });
-      toast.success(`Registered ${count} newspaper editions`);
-      await refresh();
-    } catch (error) {
-      toast.error("Could not register newspaper archive", { description: String(error) });
-    }
-  }
-
-  async function submit() {
+  function validateSelection() {
     if (!destination.trim()) {
       toast.warning("Choose a download folder");
-      return;
+      return false;
     }
     if (selected.size === 0) {
       toast.warning("Select at least one edition");
-      return;
+      return false;
     }
     if (!isTauriRuntime()) {
       toast.info("Browser preview", { description: "Run the Tauri app to download newspapers." });
-      return;
+      return false;
     }
+    return true;
+  }
+
+  async function saveSchedule() {
+    if (!validateSelection()) return;
+    setSavingSchedule(true);
+    try {
+      await invoke("create_newspaper_schedule", {
+        request: {
+          editionCodes: [...selected],
+          cronTime,
+          destination,
+          delaySeconds,
+          optimizeImages: optimize,
+          optimizationProfile,
+          optimizationQuality,
+          keepOriginalJpg: keepOriginal
+        }
+      });
+      toast.success(`Daily schedule saved for ${cronTime}`, {
+        description: "This is separate from Download now and will use the computer's local date."
+      });
+      await refresh();
+    } catch (error) {
+      toast.error("Could not save newspaper schedule", { description: String(error) });
+    } finally {
+      setSavingSchedule(false);
+    }
+  }
+
+  async function submitDownload() {
+    if (!validateSelection()) return;
     setSubmitting(true);
     try {
-      const scheduledAt = schedule && scheduledLocal
-        ? Math.floor(new Date(scheduledLocal).getTime() / 1000)
-        : undefined;
-      await invoke("create_newspaper_batch", {
+      const response = await invoke<CreateBatchResponse>("create_newspaper_batch", {
         request: {
           editionCodes: [...selected],
           dateMode,
           startDate,
           endDate: dateMode === "custom" ? endDate : undefined,
           destination,
-          scheduledAt,
-          delayMinutes,
+          delaySeconds,
           optimizeImages: optimize,
-          optimizationProfile: profile,
+          optimizationProfile,
+          optimizationQuality,
           keepOriginalJpg: keepOriginal
         }
       });
-      toast.success(schedule ? "Downloads scheduled" : "Newspaper download queued");
-      await refresh();
-      if (!schedule) {
-        setProcessing(true);
-        await invoke("process_newspaper_queue");
-        await refresh();
+      if (response.jobs.length === 0 && response.skippedCount > 0) {
+        toast.info("Newspapers already exist", {
+          description: `${response.skippedCount} edition${response.skippedCount === 1 ? "" : "s"} skipped or resumed.`
+        });
+      } else {
+        const queued = response.jobs.length;
+        toast.success(`${queued} newspaper download${queued === 1 ? "" : "s"} queued`, {
+          description: response.skippedCount > 0
+            ? `${response.skippedCount} existing edition${response.skippedCount === 1 ? "" : "s"} skipped.`
+            : dateMode === "last7_days"
+              ? "Seven-day download confirmed. Image optimization will start after every date finishes."
+              : "Image optimization will start after downloading finishes."
+        });
       }
+      await refresh();
+      setProcessing(true);
+      await invoke("process_newspaper_queue");
+      void invoke("process_newspaper_optimization_queue").catch(() => undefined);
+      await refresh();
     } catch (error) {
       toast.error("Could not start newspaper download", { description: String(error) });
     } finally {
@@ -260,226 +339,414 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     }
   }
 
-  async function openReader(job: NewspaperJob) {
+  async function toggleSchedule(item: NewspaperSchedule) {
+    await invoke("toggle_newspaper_schedule", {
+      scheduleId: item.id,
+      enabled: !item.enabled
+    });
+    await refresh();
+  }
+
+  async function deleteSchedule(item: NewspaperSchedule) {
+    if (!window.confirm(`Remove the ${formatClockTime(item.cron_time)} daily schedule? Downloaded newspapers will not be affected.`)) return;
+    await invoke("delete_newspaper_schedule", { scheduleId: item.id });
+    toast.success("Daily newspaper schedule removed");
+    await refresh();
+  }
+
+  function continueQueue() {
+    if (!isTauriRuntime()) return;
+    setProcessing(true);
+    void invoke("process_newspaper_queue")
+      .then(() => invoke("process_newspaper_optimization_queue"))
+      .catch((error) => toast.error("Could not continue newspaper queue", { description: String(error) }))
+      .finally(() => {
+        setProcessing(false);
+        void refresh();
+      });
+  }
+
+  async function toggleJobPause(job: NewspaperJob) {
     if (!isTauriRuntime()) return;
     try {
-      const pages = await invoke<NewspaperPage[]>("get_newspaper_reader_manifest", { jobId: job.id });
-      const first = pages.findIndex((page) => page.status === "completed");
-      if (first < 0) throw new Error("No completed pages are available.");
-      const image = await invoke<string>("get_newspaper_page_image", { pageId: pages[first].id });
-      setReader({ job, pages, index: first, image, zoom: 1 });
+      await invoke("set_newspaper_job_pause", { jobId: job.id, paused: !job.paused });
+      toast.success(job.paused ? "Download resumed" : "Download paused", {
+        description: job.paused
+          ? "The saved queue position and completed pages will be reused."
+          : "Completed pages remain validated and the pause survives restart."
+      });
+      await refresh();
+      if (job.paused) continueQueue();
     } catch (error) {
-      toast.error("Could not open newspaper", { description: String(error) });
+      toast.error("Could not update download", { description: String(error) });
     }
   }
 
-  async function changeReaderPage(nextIndex: number) {
-    if (!reader) return;
-    const bounded = Math.max(0, Math.min(reader.pages.length - 1, nextIndex));
-    const page = reader.pages[bounded];
-    if (page.status !== "completed") return;
-    const image = await invoke<string>("get_newspaper_page_image", { pageId: page.id });
-    setReader({ ...reader, index: bounded, image });
+  async function startQueuedJob(job: NewspaperJob) {
+    if (!isTauriRuntime()) return;
+    try {
+      if (job.paused) {
+        await invoke("set_newspaper_job_pause", { jobId: job.id, paused: false });
+      }
+      const queuedIds = jobs
+        .filter((item) => !item.dismissed)
+        .filter((item) => item.status === "queued")
+        .sort((left, right) => left.queue_position - right.queue_position)
+        .map((item) => item.id);
+      await invoke("reorder_newspaper_jobs", {
+        jobIds: [job.id, ...queuedIds.filter((id) => id !== job.id)]
+      });
+      await refresh();
+      continueQueue();
+    } catch (error) {
+      toast.error("Could not start queued download", { description: String(error) });
+    }
   }
 
-  useEffect(() => {
-    if (!reader) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        void changeReaderPage(reader.index - 1);
-      } else if (event.key === "ArrowRight") {
-        event.preventDefault();
-        void changeReaderPage(reader.index + 1);
-      } else if (event.key === "Escape") {
-        setReader(null);
+  async function retryJob(job: NewspaperJob) {
+    if (!isTauriRuntime()) return;
+    try {
+      await invoke("retry_newspaper_job", { jobId: job.id });
+      toast.success("Missing newspaper pages queued again");
+      await refresh();
+      continueQueue();
+    } catch (error) {
+      toast.error("Could not retry newspaper", { description: String(error) });
+    }
+  }
+
+  async function removeJob(job: NewspaperJob) {
+    const prompt = isTerminalJob(job)
+      ? "Remove this item from Progress? Downloaded files will stay on disk and the entry will remain in History."
+      : "Cancel and remove this item from Progress? Completed page files will stay on disk and the cancellation will remain in History.";
+    if (!window.confirm(prompt) || !isTauriRuntime()) return;
+    try {
+      await invoke("remove_newspaper_job", { jobId: job.id });
+      toast.success("Removed from Progress", { description: "Downloaded files were left on disk." });
+      await refresh();
+      if (!isTerminalJob(job)) {
+        window.setTimeout(continueQueue, 250);
       }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [reader]);
+    } catch (error) {
+      toast.error("Could not remove queue item", { description: String(error) });
+    }
+  }
+
+  function handleQueueDragStart(event: ReactDragEvent<HTMLButtonElement>, job: NewspaperJob) {
+    if (job.status !== "queued") {
+      event.preventDefault();
+      return;
+    }
+    setDraggedJobId(job.id);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", job.id);
+  }
+
+  async function handleQueueDrop(event: ReactDragEvent<HTMLElement>, target: NewspaperJob) {
+    event.preventDefault();
+    const sourceId = draggedJobId ?? event.dataTransfer.getData("text/plain");
+    setDraggedJobId(null);
+    if (!sourceId || sourceId === target.id || target.status !== "queued") return;
+    const queuedIds = jobs
+      .filter((job) => !job.dismissed && job.status === "queued")
+      .sort((left, right) => left.queue_position - right.queue_position)
+      .map((job) => job.id);
+    const from = queuedIds.indexOf(sourceId);
+    const to = queuedIds.indexOf(target.id);
+    if (from < 0 || to < 0) return;
+    queuedIds.splice(from, 1);
+    queuedIds.splice(to, 0, sourceId);
+    try {
+      await invoke("reorder_newspaper_jobs", { jobIds: queuedIds });
+      await refresh();
+    } catch (error) {
+      toast.error("Could not reorder queue", { description: String(error) });
+    }
+  }
 
   if (mode === "library") {
-    return (
-      <section className="newspaper-library" aria-label="Newspaper library">
-        <div className="newspaper-library-toolbar">
-          <label className="newspaper-search">
-            <Search aria-hidden="true" />
-            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search editions or dates" aria-label="Search newspaper library" />
-          </label>
-          <Select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)} aria-label="Filter newspaper kind">
-            <option value="all">All publications</option>
-            <option value="daily">Daily</option>
-            <option value="weekly">Weekly</option>
-            <option value="special">Special</option>
-          </Select>
-          <Select value={libraryStatus} onChange={(event) => setLibraryStatus(event.target.value as typeof libraryStatus)} aria-label="Filter newspaper status">
-            <option value="all">All statuses</option>
-            <option value="completed">Completed</option>
-            <option value="partial">Partial</option>
-          </Select>
-          <Button variant="outline" onClick={() => void registerArchive()}><FolderOpen /> Register archive</Button>
-        </div>
-        <div className="newspaper-library-list">
-          {libraryJobs.length === 0 ? <div className="newspaper-empty">Downloaded editions will appear here.</div> : null}
-          {libraryJobs.slice(0, libraryLimit).map((job) => (
-            <article className="newspaper-library-row" key={job.id}>
-              <div className="newspaper-preview">
-                {previews[job.id] ? <img src={previews[job.id]} alt={`${job.edition_name} front page preview`} /> : <span>{job.edition_code}</span>}
-              </div>
-              <div className="newspaper-library-copy">
-                <strong>{job.edition_name}</strong>
-                <span>{job.edition_code} · {job.publication_date} · {job.completed_count}/{job.page_count} pages</span>
-                {job.warning ? <small>{job.warning}</small> : null}
-              </div>
-              <StatusBadge tone={job.status === "completed" ? "success" : "danger"}>{job.status}</StatusBadge>
-              <div className="newspaper-row-actions">
-                {job.status === "partial" ? (
-                  <Button size="xs" variant="ghost" onClick={() => void invoke("retry_newspaper_job", { jobId: job.id }).then(refresh)}>
-                    <RotateCcw /> Retry missing
-                  </Button>
-                ) : null}
-                <Button size="xs" variant="ghost" onClick={() => void invoke("open_newspaper_download_folder", { path: job.output_dir })}><FolderOpen /> Folder</Button>
-                <Button size="xs" onClick={() => void openReader(job)}>Read</Button>
-              </div>
-            </article>
-          ))}
-          {libraryJobs.length > libraryLimit ? (
-            <Button className="newspaper-library-more" variant="outline" onClick={() => setLibraryLimit((current) => current + 50)}>
-              Load 50 more
-            </Button>
-          ) : null}
-        </div>
-        {reader ? (
-          <div className="newspaper-reader-backdrop" role="presentation">
-            <section className="newspaper-reader" role="dialog" aria-modal="true" aria-label={`${reader.job.edition_name} reader`}>
-              <header>
-                <div><strong>{reader.job.edition_name}</strong><span>{reader.job.publication_date} · {reader.pages[reader.index]?.page_number}</span></div>
-                <div className="newspaper-reader-controls">
-                  <Button size="icon-sm" variant="ghost" aria-label="Previous page" onClick={() => void changeReaderPage(reader.index - 1)}><ChevronLeft /></Button>
-                  <Select
-                    value={String(reader.index)}
-                    onChange={(event) => void changeReaderPage(Number(event.target.value))}
-                    aria-label="Select newspaper page"
-                  >
-                    {reader.pages.map((page, index) => (
-                      <option key={page.id} value={index} disabled={page.status !== "completed"}>
-                        {page.page_number}
-                      </option>
-                    ))}
-                  </Select>
-                  <span>/ {reader.pages.length}</span>
-                  <Button size="icon-sm" variant="ghost" aria-label="Next page" onClick={() => void changeReaderPage(reader.index + 1)}><ChevronRight /></Button>
-                  <Button size="icon-sm" variant="ghost" aria-label="Zoom out" onClick={() => setReader({ ...reader, zoom: Math.max(.5, reader.zoom - .25) })}><ZoomOut /></Button>
-                  <Button size="icon-sm" variant="ghost" aria-label="Zoom in" onClick={() => setReader({ ...reader, zoom: Math.min(3, reader.zoom + .25) })}><ZoomIn /></Button>
-                  <Button size="icon-sm" variant="ghost" aria-label="Fit page width" onClick={() => setReader({ ...reader, zoom: 1 })}><Maximize2 /></Button>
-                  <Button size="icon-sm" variant="ghost" aria-label="Close reader" onClick={() => setReader(null)}><X /></Button>
-                </div>
-              </header>
-              <div className="newspaper-reader-canvas"><img src={reader.image} alt={`Page ${reader.pages[reader.index]?.page_number}`} style={{ width: `${reader.zoom * 100}%` }} /></div>
-            </section>
-          </div>
-        ) : null}
-      </section>
-    );
+    return <NewspaperLibrary />;
   }
 
   return (
     <section className="newspaper-download" aria-label="Download World Journal editions">
-      <div className="newspaper-target-row">
-        <label><span>Save to</span><Input value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="Choose a newspaper folder" /></label>
-        <Button variant="outline" onClick={() => void chooseFolder()}><FolderOpen /> Browse</Button>
-      </div>
-      <div className="newspaper-setup-grid">
-        <div className="newspaper-editions">
-          <div className="newspaper-edition-tools">
-            <label className="newspaper-search"><Search aria-hidden="true" /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search editions" aria-label="Search editions" /></label>
-            <Select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)} aria-label="Filter edition kind">
-              <option value="all">All</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="special">Special</option>
-            </Select>
-            <button type="button" onClick={() => setSelected(new Set(catalog.filter((item) => item.kind === "daily").map(editionKey)))}>All daily</button>
+      <div className="newspaper-dispatch-grid">
+        <section className="newspaper-dispatch-panel newspaper-editions" aria-label="Select newspaper editions">
+          <label className="newspaper-search">
+            <Search aria-hidden="true" />
+            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search editions…" aria-label="Search editions" />
+          </label>
+          <div className="newspaper-edition-tabs" role="tablist" aria-label="Edition groups">
+            {([["all", "All"], ["daily", "Regional"], ["weekly", "Weekly"], ["special", "Special"]] as const).map(([value, label]) => (
+              <button type="button" role="tab" aria-selected={kind === value} className={kind === value ? "active" : undefined} key={value} onClick={() => setKind(value)}>
+                {label} <span>({value === "all" ? catalog.length : catalog.filter((item) => item.kind === value).length})</span>
+              </button>
+            ))}
           </div>
           <div className="newspaper-edition-list">
             {visibleEditions.map((edition) => {
               const key = editionKey(edition);
               return (
-                <Checkbox key={key} label={`${edition.nameZh} · ${edition.code}`} checked={selected.has(key)} onChange={(event) => {
-                  const next = new Set(selected);
-                  if (event.target.checked) next.add(key); else next.delete(key);
-                  setSelected(next);
-                }} />
+                <div className="newspaper-edition-row" key={key}>
+                  <Checkbox label="" checked={selected.has(key)} aria-label={`Select ${edition.nameZh} ${edition.code}`} onChange={(event) => {
+                    const next = new Set(selected);
+                    if (event.target.checked) next.add(key); else next.delete(key);
+                    setSelected(next);
+                  }} />
+                  <span>{edition.nameZh}<small>{edition.nameEn}</small></span>
+                  <em>{edition.code}</em>
+                </div>
               );
             })}
+            {visibleEditions.length === 0 ? <div className="newspaper-empty">No editions match this filter.</div> : null}
           </div>
-        </div>
-        <div className="newspaper-options">
-          <div className="newspaper-option-line">
-            <span>Date</span>
-            <Select value={dateMode} onChange={(event) => setDateMode(event.target.value as typeof dateMode)}>
-              <option value="single">Single date</option><option value="last_7_days">Last 7 days</option><option value="custom">Custom range</option>
-            </Select>
+          <footer className="newspaper-edition-footer">
+            <span>Showing {visibleEditions.length} of {catalog.length} · {selected.size} selected</span>
+            <button type="button" onClick={() => {
+              const allVisibleSelected = visibleEditions.every((edition) => selected.has(editionKey(edition)));
+              const next = new Set(selected);
+              visibleEditions.forEach((edition) => {
+                const key = editionKey(edition);
+                if (allVisibleSelected) next.delete(key); else next.add(key);
+              });
+              setSelected(next);
+            }}>
+              {visibleEditions.length > 0 && visibleEditions.every((edition) => selected.has(editionKey(edition))) ? "Clear visible" : "Select visible"}
+            </button>
+          </footer>
+        </section>
+
+        <section className="newspaper-dispatch-panel newspaper-scheduler" aria-label="Daily newspaper schedule">
+          <div className="newspaper-schedule-tabs" role="tablist" aria-label="Schedule and download history">
+            <button type="button" role="tab" aria-selected={scheduleTab === "schedule"} className={scheduleTab === "schedule" ? "active" : undefined} onClick={() => setScheduleTab("schedule")}>Daily schedule</button>
+            <button type="button" role="tab" aria-selected={scheduleTab === "history"} className={scheduleTab === "history" ? "active" : undefined} onClick={() => setScheduleTab("history")}>History</button>
           </div>
-          <div className="newspaper-date-line">
-            <Input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} aria-label="Start publication date" />
-            {dateMode === "custom" ? <Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} aria-label="End publication date" /> : null}
-          </div>
-          <div className="newspaper-option-line">
-            <span>Delay between editions</span>
-            <Input className="newspaper-delay-input" type="number" min={0} max={1440} value={delayMinutes} onChange={(event) => setDelayMinutes(Number(event.target.value))} />
-            <span>minutes</span>
-          </div>
-          <div className="newspaper-option-line">
-            <Switch label="Optimize images" checked={optimize} onChange={(event) => setOptimize(event.target.checked)} />
-            <Select value={profile} onChange={(event) => setProfile(event.target.value)} disabled={!optimize} aria-label="Image optimization profile">
-              <option value="webp_high">High clarity · WebP 92</option>
-              <option value="webp_balanced">Balanced · WebP 86</option>
-            </Select>
-          </div>
-          <Checkbox label="Keep original JPG files" checked={keepOriginal} onChange={(event) => setKeepOriginal(event.target.checked)} disabled={!optimize} />
-        </div>
-      </div>
-      <div className="newspaper-action-row">
-        <Checkbox label="Schedule download" checked={schedule} onChange={(event) => setSchedule(event.target.checked)} />
-        {schedule ? <Input type="datetime-local" value={scheduledLocal} onChange={(event) => setScheduledLocal(event.target.value)} aria-label="Scheduled local date and time" /> : null}
-        <Button variant="primary" loading={submitting || processing} onClick={() => void submit()}>
-          {schedule ? <CalendarClock /> : <Download />}
-          {schedule ? "Schedule downloads" : "Download now"}
-        </Button>
-      </div>
-      <div className="newspaper-active-table">
-        <div className="newspaper-active-head"><span>Status</span><span>Edition</span><span>Date</span><span>Pages</span><span>Actions</span></div>
-        {activeJobs.length === 0 ? <div className="newspaper-empty">No active newspaper downloads.</div> : activeJobs.map((job) => {
-          const batch = batches.find((item) => item.id === job.batch_id);
-          return (
-            <div className="newspaper-active-row" key={job.id}>
-              <StatusBadge tone="primary">{job.status}</StatusBadge>
-              <strong>{job.edition_name}</strong><span>{job.publication_date}</span>
-              <span>{job.completed_count}/{job.page_count || "—"}</span>
-              <div>
-                <Button size="icon-sm" variant="ghost" aria-label={batch?.status === "paused" ? "Resume batch" : "Pause batch"} onClick={() => void invoke("pause_newspaper_batch", { batchId: job.batch_id, paused: batch?.status !== "paused" }).then(refresh)}>
-                  {batch?.status === "paused" ? <Play /> : <Pause />}
-                </Button>
-                <Button size="icon-sm" variant="ghost" aria-label="Cancel batch" onClick={() => void invoke("cancel_newspaper_batch", { batchId: job.batch_id }).then(refresh)}>
-                  <X />
+          {scheduleTab === "schedule" ? (
+            <>
+              <div className="newspaper-schedule-create">
+                <Select value="daily" aria-label="Schedule frequency" disabled><option value="daily">Daily</option></Select>
+                <Input type="time" value={cronTime} onChange={(event) => setCronTime(event.target.value)} aria-label="Daily newspaper schedule time" />
+              </div>
+              <div className="newspaper-schedule-label">Scheduled editions ({schedules.length})</div>
+              <div className="newspaper-schedule-cards">
+                {schedules.length === 0 ? (
+                  <div className="newspaper-empty newspaper-schedule-empty"><Clock3 aria-hidden="true" /><span>No daily schedules yet. Choose editions and a time below.</span></div>
+                ) : schedules.map((item) => (
+                  <article className="newspaper-schedule-card" key={item.id}>
+                    <time>{formatClockTime(item.cron_time)}</time>
+                    <div>
+                      <strong>{scheduleEditionSummary(item, catalog)}</strong>
+                      <span>{item.edition_codes.length} edition{item.edition_codes.length === 1 ? "" : "s"} · Local time</span>
+                      {item.last_run_date ? <small>Last run {item.last_run_date}</small> : null}
+                      {item.last_error ? <small className="is-error">{item.last_error}</small> : null}
+                    </div>
+                    <StatusBadge tone={item.enabled ? "success" : "neutral"}>{item.enabled ? "Enabled" : "Paused"}</StatusBadge>
+                    <div className="newspaper-schedule-actions">
+                      <button type="button" aria-label={item.enabled ? "Pause daily schedule" : "Resume daily schedule"} title={item.enabled ? "Pause schedule" : "Resume schedule"} onClick={() => void toggleSchedule(item)}>{item.enabled ? <Pause /> : <Play />}</button>
+                      <button type="button" className="danger" aria-label="Delete daily schedule" title="Delete schedule" onClick={() => void deleteSchedule(item)}><Trash2 /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <div className="command-actions newspaper-schedule-submit">
+                <Button variant="outline" loading={savingSchedule} onClick={() => void saveSchedule()}>
+                  <CalendarClock /> {schedules.length > 0 ? "Add another time" : "Add daily schedule"}
                 </Button>
               </div>
+            </>
+          ) : (
+            <div className="newspaper-history-list" aria-label="Newspaper download history">
+              {historyJobs.length === 0 ? (
+                <div className="newspaper-empty"><History aria-hidden="true" />Download history will appear here.</div>
+              ) : historyJobs.slice(0, 30).map((job) => (
+                <article className="newspaper-history-row" key={job.id}>
+                  <span className={`newspaper-history-icon is-${job.status}`}>{job.status === "completed" ? <CheckCircle2 /> : <Clock3 />}</span>
+                  <div><strong>{job.edition_name} · {job.edition_code}</strong><span>{job.publication_date}</span></div>
+                  <div><StatusBadge tone={job.status === "completed" ? "success" : job.status === "cancelled" ? "neutral" : "danger"}>{formatJobStatus(job)}</StatusBadge><time>{formatJobTime(job)}</time></div>
+                </article>
+              ))}
             </div>
-          );
-        })}
+          )}
+        </section>
+
+        <section className="newspaper-dispatch-panel newspaper-options" aria-label="Newspaper download settings">
+          <div className="newspaper-settings-stack">
+            <label className="newspaper-setting-field">
+              <span>Date range</span>
+              <Select value={dateMode} onChange={(event) => setDateMode(event.target.value as typeof dateMode)}>
+                <option value="single">Single date</option>
+                <option value="last7_days">Last 7 days</option>
+                <option value="custom">Custom range</option>
+              </Select>
+            </label>
+            <div className={`newspaper-date-controls${dateMode === "last7_days" ? " is-system-date" : ""}`}>
+              <Input type="date" value={dateMode === "last7_days" ? today() : startDate} onChange={(event) => setStartDate(event.target.value)} disabled={dateMode === "last7_days"} aria-label={dateMode === "last7_days" ? "System current date" : "Start publication date"} />
+              {dateMode === "custom" ? <Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} aria-label="End publication date" /> : null}
+              {dateMode === "last7_days" ? <small>Uses the system date automatically and includes today.</small> : null}
+            </div>
+            <label className="newspaper-delay-setting">
+              <span>Delay between editions</span>
+              <Input type="number" min={0} max={3600} value={delaySeconds} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Delay between editions in seconds" />
+              <em>seconds</em>
+            </label>
+            <label className="newspaper-destination-setting">
+              <span>Save location</span>
+              <div>
+                <Input id="newspaper-destination" value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="Choose a newspaper folder" />
+                <Button variant="outline" onClick={() => void chooseFolder()}><FolderOpen /> Browse</Button>
+              </div>
+            </label>
+            <div className={`newspaper-optimization-setting${optimize ? "" : " is-disabled"}`}>
+              <span>Image optimization</span>
+              <div>
+                <Switch label="Optimize images" checked={optimize} onChange={(event) => setOptimize(event.target.checked)} />
+                <Select value={String(optimizationQuality)} onChange={(event) => setOptimizationQuality(Number(event.target.value))} disabled={!optimize} aria-label="Image compression strength">
+                  <option value="92">High clarity · WebP 92</option>
+                  <option value="86">Crisp · WebP 86</option>
+                  <option value="74">Balanced · WebP 74</option>
+                  <option value="55">Small · WebP 55</option>
+                  <option value="45">Compact · WebP 45</option>
+                  <option value="35">Very small · WebP 35</option>
+                  <option value="25">Maximum savings · WebP 25</option>
+                </Select>
+                <Checkbox label="Keep source JPG" checked={keepOriginal} onChange={(event) => setKeepOriginal(event.target.checked)} disabled={!optimize} />
+              </div>
+              <small>{compressionLabel} · Quality 25 may soften fine print. JPG remains only if WebP is larger or fails.</small>
+            </div>
+          </div>
+          <div className="command-actions newspaper-download-actions">
+            <Button variant="primary" loading={submitting || processing} onClick={() => void submitDownload()}>
+              <Download /> Download now
+            </Button>
+          </div>
+        </section>
       </div>
+      <section className="newspaper-progress-panel" aria-label="Newspaper download progress">
+        <div className="newspaper-progress-table">
+          <div className="newspaper-progress-head"><span></span><span>Newspaper</span><span>Status</span><span>Progress</span><span>Actions</span></div>
+          {progressJobs.length === 0 ? <div className="newspaper-empty">Newspaper downloads will appear here.</div> : progressJobs.map((job) => {
+            const completed = job.completed_count + job.failed_count;
+            const progress = job.status === "completed" ? 100 : job.page_count > 0 ? Math.min(100, Math.round((completed / job.page_count) * 100)) : 0;
+            const awaitingRelease = Boolean(job.retry_at && job.retry_at * 1000 > Date.now());
+            return (
+              <article
+                className={`newspaper-progress-row${draggedJobId === job.id ? " is-dragging" : ""}`}
+                key={job.id}
+                onDragOver={(event) => {
+                  if (job.status === "queued") {
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                  }
+                }}
+                onDrop={(event) => void handleQueueDrop(event, job)}
+              >
+                <button
+                  type="button"
+                  className="newspaper-drag-handle"
+                  draggable={job.status === "queued"}
+                  disabled={job.status !== "queued"}
+                  aria-label={`Reorder ${job.edition_name}`}
+                  title={job.status === "queued" ? "Drag to reorder" : "Only queued items can be reordered"}
+                  onDragStart={(event) => handleQueueDragStart(event, job)}
+                  onDragEnd={() => setDraggedJobId(null)}
+                >
+                  <GripVertical />
+                </button>
+                <div className="newspaper-progress-edition"><strong>{job.edition_name} · {job.edition_code}</strong><span>{job.publication_date}</span></div>
+                <div className="newspaper-progress-status">
+                  <StatusBadge className={job.status === "completed" ? "is-completed" : undefined} tone={job.status === "completed" ? "success" : job.status === "failed" || job.status === "partial" ? "danger" : job.paused || awaitingRelease ? "neutral" : "primary"}>
+                    {awaitingRelease ? "Awaiting release" : formatJobStatus(job)}
+                  </StatusBadge>
+                  <span>{formatJobTime(job)}</span>
+                </div>
+                <div className="newspaper-job-progress">
+                  <span>{job.status === "queued" || job.paused ? "—" : `${progress}%`}</span>
+                  <div role="progressbar" aria-label={`${job.edition_name} download progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+                    <i style={{ width: `${progress}%` }} />
+                  </div>
+                  <small>{job.status === "optimizing" ? "Optimizing images" : job.page_count > 0 ? `${job.completed_count}/${job.page_count} pages` : job.paused ? "Paused safely" : "Waiting"}</small>
+                </div>
+                <div className="newspaper-progress-actions">
+                  {job.status === "active" || job.status === "optimizing" ? (
+                    <button type="button" aria-label={`Pause ${job.edition_name}`} title="Pause download" onClick={() => void toggleJobPause(job)}><Pause /></button>
+                  ) : null}
+                  {job.status === "queued" ? (
+                    <button type="button" aria-label={`${job.paused ? "Resume" : "Start"} ${job.edition_name}`} title={job.paused ? "Resume download" : "Start this download next"} onClick={() => void startQueuedJob(job)}><Play /></button>
+                  ) : null}
+                  {["partial", "failed", "unavailable"].includes(job.status) ? (
+                    <button type="button" aria-label={`Retry ${job.edition_name}`} title="Retry missing pages" onClick={() => void retryJob(job)}><RotateCcw /></button>
+                  ) : null}
+                  {["completed", "partial"].includes(job.status) ? (
+                    <button type="button" aria-label={`Open ${job.edition_name} folder`} title="Open download folder" onClick={() => void invoke("open_newspaper_download_folder", { path: job.output_dir })}><FolderOpen /></button>
+                  ) : null}
+                  <button type="button" className="danger" aria-label={`Remove ${job.edition_name} from progress`} title="Remove from Progress; files stay on disk" onClick={() => void removeJob(job)}><Trash2 /></button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
       {processing ? <div className="newspaper-processing"><LoaderCircle className="lv-button-spinner" /> Downloading and validating pages…</div> : null}
     </section>
   );
 }
 
+function isTerminalJob(job: NewspaperJob) {
+  return ["completed", "partial", "failed", "unavailable", "cancelled"].includes(job.status);
+}
+
+function formatJobStatus(job: NewspaperJob) {
+  if (job.paused) return "Paused";
+  const labels: Record<string, string> = {
+    active: "Downloading",
+    queued: "Queued",
+    optimizing: "Optimizing",
+    completed: "Completed",
+    partial: "Needs retry",
+    failed: "Failed",
+    unavailable: "Unavailable",
+    cancelled: "Cancelled"
+  };
+  return labels[job.status] ?? job.status;
+}
+
+function formatJobTime(job: NewspaperJob) {
+  const timestamp = job.completed_at ?? job.updated_at ?? job.created_at;
+  if (!timestamp) return "Time unavailable";
+  return new Date(timestamp * 1000).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+}
+
+function formatClockTime(value: string) {
+  const [hours, minutes] = value.split(":").map(Number);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return value;
+  const date = new Date();
+  date.setHours(hours, minutes, 0, 0);
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function scheduleEditionSummary(schedule: NewspaperSchedule, catalog: NewspaperEdition[]) {
+  const names = schedule.edition_codes.map((key) => {
+    const edition = catalog.find((item) => editionKey(item) === key || item.code === key.split("@")[0]);
+    return edition ? `${edition.nameZh} · ${edition.code}` : key;
+  });
+  if (names.length <= 2) return names.join(", ");
+  return `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
+}
+
 function readPreferences(): {
   destination?: string;
-  delayMinutes?: number;
+  delaySeconds?: number;
+  compressionStrength?: number;
+  optimizationQuality?: number;
   optimize?: boolean;
   profile?: string;
   keepOriginal?: boolean;
-  schedule?: boolean;
-  scheduledLocal?: string;
+  cronTime?: string;
   selected?: string[];
 } {
   try {
@@ -487,4 +754,15 @@ function readPreferences(): {
   } catch {
     return {};
   }
+}
+
+function preferredQuality(quality?: number, compressionStrength?: number, profile?: string) {
+  if (quality !== undefined && WEBP_QUALITY_PRESETS.includes(quality)) return quality;
+  if (compressionStrength === 0) return 92;
+  if (compressionStrength === 16) return 86;
+  if (compressionStrength === 50) return 74;
+  if (compressionStrength === 100) return 55;
+  if (profile === "webp_high") return 92;
+  if (profile === "webp_balanced") return 86;
+  return 74;
 }

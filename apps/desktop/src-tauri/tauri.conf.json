@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "LinkVault",
-        "width": 1536,
-        "height": 1024,
-        "minWidth": 390,
-        "minHeight": 640,
+        "width": 1720,
+        "height": 960,
+        "minWidth": 1280,
+        "minHeight": 720,
         "resizable": true
       }
     ],
