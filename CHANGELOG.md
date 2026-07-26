@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.1 — 2026-07-26
+
+- Modularized the newspaper backend behind its stable 24-command Tauri facade, moving state, catalog, batch, schedule, Library, job lifecycle, queue, archive, optimization, naming, and repository ownership into focused modules while preserving behavior and reducing `commands.rs` from 3,481 to 303 lines.
+- Updated PostCSS and NanoID to patched releases after the pre-release dependency audit identified a high-severity source-map path traversal advisory.
 - Rebuilt Newspaper Downloads as a compact three-panel dispatch board that keeps the LinkVault sidebar, removes decorative step numbers and panel headings, orders Editions → Download settings → Schedule, groups regional/weekly/special editions, moves the save location into Download settings, reuses the compact LinkedIn action buttons, reserves a collision-free Progress area, and suppresses expensive transitions and repaints while the desktop window is actively resizing.
 - Added persisted newspaper queue ordering, row-level pause/resume, safe removal that leaves downloaded files on disk, timestamped download history, hover-revealed actions, and restart reconciliation for paused or dismissed work.
 - Fixed World Journal page filenames by deriving the image extension from the embedded page URL instead of the PHP delivery endpoint.
