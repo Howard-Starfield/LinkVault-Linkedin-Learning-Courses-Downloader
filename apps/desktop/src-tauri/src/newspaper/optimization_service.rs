@@ -1,6 +1,6 @@
 //! Queue-level and whole-job newspaper image optimization workflows.
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -8,7 +8,9 @@ use rusqlite::{params, Connection};
 use super::{
     job_repository,
     models::NewspaperJob,
-    optimizer::{optimize_page, OptimizationOutcome},
+    naming,
+    optimization_tasks::{self, FailureDisposition},
+    optimizer::{optimize_page, OptimizationError, OptimizationOutcome},
     storage,
 };
 
@@ -65,7 +67,7 @@ pub(super) async fn process_queue(db_path: &Path) -> Result<Vec<NewspaperJob>, S
 }
 
 pub(super) fn optimize_job(db_path: &Path, job: &NewspaperJob) -> Result<(), String> {
-    let connection = Connection::open(db_path).map_err(|error| error.to_string())?;
+    let mut connection = Connection::open(db_path).map_err(|error| error.to_string())?;
     let settings: (bool, u8, bool) = connection
         .query_row(
             "SELECT optimize_images, optimization_quality, keep_original_jpg
@@ -77,74 +79,84 @@ pub(super) fn optimize_job(db_path: &Path, job: &NewspaperJob) -> Result<(), Str
     if !settings.0 {
         return Ok(());
     }
+    let started_at = Utc::now().timestamp();
+    optimization_tasks::ensure_for_job(&connection, &job.id, started_at)
+        .map_err(|error| error.to_string())?;
+    optimization_tasks::reconcile(&connection, started_at).map_err(|error| error.to_string())?;
     connection
         .execute(
             "UPDATE newspaper_jobs SET status = 'optimizing', updated_at = ?2 WHERE id = ?1",
             params![job.id, Utc::now().timestamp()],
         )
         .map_err(|error| error.to_string())?;
-    let pages = {
-        let mut statement = connection
-            .prepare(
-                "SELECT id, original_path FROM newspaper_pages
-                 WHERE job_id = ?1 AND status = 'completed'
-                   AND original_path IS NOT NULL AND optimized_path IS NULL",
-            )
-            .map_err(|error| error.to_string())?;
-        let result = statement
-            .query_map(params![job.id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        result
-    };
-    let mut replacements = Vec::new();
+    let lease_owner = naming::unique_id(&format!("optimizer-{}", std::process::id()));
     let mut warnings = Vec::new();
-    for (page_id, source) in pages {
-        match optimize_page(Path::new(&source), settings.1) {
+    loop {
+        let now = Utc::now().timestamp();
+        let Some(task) =
+            optimization_tasks::claim_next(&mut connection, &job.id, &lease_owner, now)
+                .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        let page_started = Instant::now();
+        match optimize_page(&task.source_path, settings.1) {
             Ok(OptimizationOutcome::Replaced { path, bytes }) => {
-                connection
-                    .execute(
-                        "UPDATE newspaper_pages SET optimized_path = ?2, final_bytes = ?3,
-                         media_version = media_version + 1, updated_at = ?4 WHERE id = ?1",
-                        params![
-                            page_id,
-                            path.to_string_lossy(),
-                            bytes,
-                            Utc::now().timestamp()
-                        ],
-                    )
-                    .map_err(|error| error.to_string())?;
-                replacements.push(source);
+                let now = Utc::now().timestamp();
+                optimization_tasks::complete_replaced(
+                    &mut connection,
+                    &task,
+                    &path,
+                    bytes,
+                    elapsed_ms(page_started),
+                    now,
+                )
+                .map_err(|error| error.to_string())?;
+                if let Some(warning) = optimization_tasks::cleanup_completed_source(
+                    &connection,
+                    &task,
+                    &path,
+                    settings.2,
+                    now,
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    warnings.push(warning);
+                }
             }
             Ok(OptimizationOutcome::KeptOriginal { bytes }) => {
-                connection
-                    .execute(
-                        "UPDATE newspaper_pages
-                         SET optimized_path = original_path, final_bytes = ?2, updated_at = ?3
-                         WHERE id = ?1",
-                        params![page_id, bytes, Utc::now().timestamp()],
-                    )
-                    .map_err(|error| error.to_string())?;
+                optimization_tasks::complete_kept_original(
+                    &mut connection,
+                    &task,
+                    bytes,
+                    elapsed_ms(page_started),
+                    Utc::now().timestamp(),
+                )
+                .map_err(|error| error.to_string())?;
             }
             Err(error) => {
-                connection
-                    .execute(
-                        "UPDATE newspaper_pages SET optimized_path = original_path, updated_at = ?2
-                         WHERE id = ?1",
-                        params![page_id, Utc::now().timestamp()],
+                let (error_kind, retryable) = classify_error(&error);
+                let message = error.to_string();
+                let disposition = optimization_tasks::complete_failure(
+                    &mut connection,
+                    &task,
+                    &message,
+                    error_kind,
+                    retryable,
+                    elapsed_ms(page_started),
+                    Utc::now().timestamp(),
+                )
+                .map_err(|sql_error| sql_error.to_string())?;
+                let suffix = if disposition == FailureDisposition::RetryScheduled {
+                    format!(
+                        " Retrying attempt {} of {}.",
+                        task.attempts,
+                        optimization_tasks::MAX_ATTEMPTS
                     )
-                    .map_err(|sql_error| sql_error.to_string())?;
-                warnings.push(error.to_string());
-            }
-        }
-    }
-    if !settings.2 {
-        for source in replacements {
-            if let Err(error) = std::fs::remove_file(&source) {
-                warnings.push(format!("Could not remove original {}: {error}", source));
+                } else {
+                    String::new()
+                };
+                warnings.push(format!("{}: {message}{suffix}", task.source_path.display()));
             }
         }
     }
@@ -167,4 +179,18 @@ pub(super) fn optimize_job(db_path: &Path, job: &NewspaperJob) -> Result<(), Str
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn classify_error(error: &OptimizationError) -> (&'static str, bool) {
+    match error {
+        OptimizationError::Io(_) => ("io", true),
+        OptimizationError::Encoder => ("encoder", true),
+        OptimizationError::Image(_) => ("invalid_image", false),
+        OptimizationError::DimensionMismatch => ("dimension_mismatch", false),
+        OptimizationError::UnsupportedQuality(_) => ("unsupported_quality", false),
+    }
 }

@@ -89,7 +89,10 @@ for (const required of [
   "rangeExtractor",
   'data-mounted-page-images',
   'data-testid="newspaper-reader-page-image"',
-  'loading={virtualItem.index === activeIndex ? "eager" : "lazy"}',
+  'data-click-zoomed={zoom > 1 ? "true" : undefined}',
+  "xRatio: (event.clientX - rect.left)",
+  "element.style.scrollBehavior = \"auto\"",
+  'loading="eager"',
   'decoding="async"',
   "saveReadingProgress"
 ]) {
@@ -99,6 +102,8 @@ for (const required of [
 assert.equal((app.match(/className="lv-sidebar-reopen"/g) ?? []).length, 1, "The shared main surface must own one sidebar reopen control.");
 assert.ok(app.indexOf('className="lv-sidebar-reopen"') < app.indexOf('className="lv-content"'), "The sidebar reopen control must not be scoped to one provider view.");
 assert.ok(!library.includes(">Read</Button>"), "Opening a newspaper must be owned by the whole library row.");
+assert.ok(library.includes("item.readPageCount"), "Library progress must use unique viewed-page coverage.");
+assert.ok(!library.includes("item.furthestPageIndex + 1"), "Library progress must not treat the furthest reached page as read coverage.");
 assert.ok(!newspaperApi.includes("get_newspaper_preview"), "Thumbnail transport must not use the legacy base64 IPC command.");
 assert.ok(!newspaperApi.includes("get_newspaper_page_image"), "Reader transport must not use the legacy base64 IPC command.");
 assert.ok(css.includes(".newspaper-dispatch-grid"), "Newspaper view needs the three-panel dispatch grid.");

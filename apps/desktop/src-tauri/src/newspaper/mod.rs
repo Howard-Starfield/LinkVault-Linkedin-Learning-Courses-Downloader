@@ -14,6 +14,7 @@ pub mod media_protocol;
 pub mod models;
 mod naming;
 mod optimization_service;
+mod optimization_tasks;
 pub mod optimizer;
 mod overview_service;
 mod page_metadata;

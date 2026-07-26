@@ -88,6 +88,31 @@ CREATE TABLE IF NOT EXISTS newspaper_pages (
     UNIQUE (job_id, page_number)
 );
 
+CREATE TABLE IF NOT EXISTS newspaper_optimization_tasks (
+    page_id TEXT PRIMARY KEY NOT NULL,
+    job_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'kept_original', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    retry_at INTEGER,
+    started_at INTEGER,
+    completed_at INTEGER,
+    source_path TEXT NOT NULL,
+    source_size INTEGER,
+    source_modified_at INTEGER,
+    source_checksum TEXT,
+    output_path TEXT,
+    source_bytes INTEGER,
+    output_bytes INTEGER,
+    elapsed_ms INTEGER,
+    last_error TEXT,
+    error_kind TEXT,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (page_id) REFERENCES newspaper_pages(id) ON DELETE CASCADE,
+    FOREIGN KEY (job_id) REFERENCES newspaper_jobs(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS newspaper_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT,
@@ -133,6 +158,16 @@ CREATE TABLE IF NOT EXISTS newspaper_reading_progress (
     FOREIGN KEY (last_page_id) REFERENCES newspaper_pages(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS newspaper_read_pages (
+    job_id TEXT NOT NULL,
+    page_id TEXT NOT NULL,
+    page_index INTEGER NOT NULL CHECK (page_index >= 0),
+    viewed_at INTEGER NOT NULL,
+    PRIMARY KEY (job_id, page_id),
+    FOREIGN KEY (job_id) REFERENCES newspaper_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY (page_id) REFERENCES newspaper_pages(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS newspaper_thumbnail_cache (
     job_id TEXT PRIMARY KEY NOT NULL,
     source_page_id TEXT NOT NULL,
@@ -156,6 +191,8 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_jobs_library
     ON newspaper_jobs(publication_date DESC, status);
 CREATE INDEX IF NOT EXISTS idx_newspaper_pages_job_status
     ON newspaper_pages(job_id, status);
+CREATE INDEX IF NOT EXISTS idx_newspaper_optimization_tasks_queue
+    ON newspaper_optimization_tasks(job_id, status, retry_at, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_newspaper_schedules_enabled_time
     ON newspaper_schedules(enabled, cron_time);
 CREATE INDEX IF NOT EXISTS idx_newspaper_reading_progress_updated
@@ -166,6 +203,14 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_thumbnail_source
 
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(SCHEMA)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO newspaper_read_pages (job_id, page_id, page_index, viewed_at)
+         SELECT p.job_id, p.last_page_id, p.last_page_index, p.updated_at
+         FROM newspaper_reading_progress p
+         JOIN newspaper_pages page ON page.id = p.last_page_id
+         WHERE page.job_id = p.job_id AND page.status = 'completed'",
+        [],
+    )?;
     migrate_add_column(
         connection,
         "newspaper_batches",
@@ -238,7 +283,9 @@ pub fn initialize(connection: &Connection) -> Result<()> {
          ON newspaper_jobs(dismissed, paused, status, queue_position)",
         [],
     )?;
-    seed_built_in_catalog(connection, 0)
+    seed_built_in_catalog(connection, 0)?;
+    super::optimization_tasks::ensure_all(connection, 0)?;
+    Ok(())
 }
 
 fn migrate_add_column(
@@ -448,6 +495,7 @@ pub fn reconcile_after_restart(
         "UPDATE newspaper_batches SET status = 'queued', updated_at = ?1 WHERE status = 'active'",
         params![updated_at],
     )?;
+    super::optimization_tasks::reconcile(connection, updated_at)?;
     let candidates = connection
         .prepare(
             "SELECT id FROM newspaper_jobs
@@ -708,7 +756,9 @@ mod tests {
                 "newspaper_editions",
                 "newspaper_events",
                 "newspaper_jobs",
+                "newspaper_optimization_tasks",
                 "newspaper_pages",
+                "newspaper_read_pages",
                 "newspaper_reading_progress",
                 "newspaper_schedules",
                 "newspaper_settings",

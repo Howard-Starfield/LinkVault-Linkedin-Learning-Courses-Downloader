@@ -23,8 +23,17 @@ import {
 } from "./newspaper-api";
 import { threePageRange } from "./newspaper-virtualization";
 
-const PAGE_GAP = 24;
-const READER_PADDING = 30;
+const PAGE_GAP = 2;
+const CLICK_ZOOM = 1.6;
+
+type ZoomAnchor = {
+  pageIndex: number;
+  image: HTMLImageElement;
+  clientX: number;
+  clientY: number;
+  xRatio: number;
+  yRatio: number;
+};
 
 export function NewspaperReader({
   item,
@@ -38,6 +47,7 @@ export function NewspaperReader({
   const latestProgressRef = useRef<NewspaperReadingProgress | undefined>(undefined);
   const pendingPageRef = useRef<NewspaperReaderPage | null>(null);
   const initialScrollDoneRef = useRef(false);
+  const zoomingRef = useRef(false);
   const [pages, setPages] = useState<NewspaperReaderPage[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const activeIndexRef = useRef(0);
@@ -84,7 +94,7 @@ export function NewspaperReader({
     return () => observer.disconnect();
   }, []);
 
-  const pageWidth = Math.max(280, (containerWidth - READER_PADDING * 2) * zoom);
+  const pageWidth = Math.max(280, containerWidth * zoom);
   const estimatePageSize = useCallback((index: number) => {
     const page = pages[index];
     const width = page?.pixelWidth ?? 2500;
@@ -104,6 +114,7 @@ export function NewspaperReader({
     gap: PAGE_GAP,
     rangeExtractor,
     onChange: (instance) => {
+      if (zoomingRef.current) return;
       const measurements = instance.measurementsCache;
       if (measurements.length === 0) return;
       const center = (instance.scrollOffset ?? 0) + (instance.scrollRect?.height ?? 0) / 2;
@@ -197,21 +208,35 @@ export function NewspaperReader({
     };
   }, [flushProgress, onClose, pages.length, virtualizer]);
 
-  const changeZoom = (nextZoom: number) => {
+  const changeZoom = (nextZoom: number, anchor?: ZoomAnchor) => {
     const bounded = Math.max(.5, Math.min(3, nextZoom));
     const element = scrollRef.current;
-    const measurement = virtualizer.measurementsCache[activeIndexRef.current];
-    const relative = element && measurement
-      ? Math.max(0, (element.scrollTop - measurement.start) / Math.max(1, measurement.size))
-      : 0;
+    const targetIndex = anchor?.pageIndex ?? activeIndexRef.current;
+    const previousScrollBehavior = element?.style.scrollBehavior ?? "";
+    if (element) element.style.scrollBehavior = "auto";
+    activeIndexRef.current = targetIndex;
+    setActiveIndex(targetIndex);
+    zoomingRef.current = true;
     setZoom(bounded);
-    requestAnimationFrame(() => requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
       virtualizer.measure();
-      const nextMeasurement = virtualizer.measurementsCache[activeIndexRef.current];
-      if (element && nextMeasurement) {
-        element.scrollTop = nextMeasurement.start + relative * nextMeasurement.size;
-      }
-    }));
+      requestAnimationFrame(() => {
+        if (element && anchor?.image.isConnected) {
+          const nextRect = anchor.image.getBoundingClientRect();
+          element.scrollLeft += nextRect.left + nextRect.width * anchor.xRatio - anchor.clientX;
+          element.scrollTop += nextRect.top + nextRect.height * anchor.yRatio - anchor.clientY;
+        } else {
+          if (element) element.scrollLeft = Math.max(0, (element.scrollWidth - element.clientWidth) / 2);
+          virtualizer.scrollToIndex(targetIndex, { align: "center", behavior: "auto" });
+        }
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            zoomingRef.current = false;
+            if (element) element.style.scrollBehavior = previousScrollBehavior;
+          });
+        });
+      });
+    });
   };
 
   const activePage = pages[activeIndex];
@@ -244,7 +269,7 @@ export function NewspaperReader({
         </div>
         <div className="newspaper-reader-pagination" aria-label="Newspaper page navigation">
           <Button
-            size="icon-sm"
+            size="xs"
             variant="ghost"
             aria-label="Previous page"
             disabled={activeIndex <= 0}
@@ -253,6 +278,7 @@ export function NewspaperReader({
             <ChevronLeft />
           </Button>
           <Select
+            className="newspaper-reader-page-select"
             value={String(activeIndex)}
             onChange={(event) => virtualizer.scrollToIndex(Number(event.target.value), { align: "start" })}
             aria-label="Select newspaper page"
@@ -263,7 +289,7 @@ export function NewspaperReader({
           </Select>
           <span aria-live="polite">{pages.length ? activeIndex + 1 : 0} / {pages.length}</span>
           <Button
-            size="icon-sm"
+            size="xs"
             variant="ghost"
             aria-label="Next page"
             disabled={activeIndex >= pages.length - 1}
@@ -273,7 +299,7 @@ export function NewspaperReader({
           </Button>
         </div>
         <div className="newspaper-reader-controls">
-          <Button size="icon-sm" variant="ghost" aria-label="Zoom out 20 percent" onClick={() => changeZoom(zoom - .2)}>
+          <Button size="xs" variant="ghost" aria-label="Zoom out 20 percent" onClick={() => changeZoom(zoom - .2)}>
             <ZoomOut />
           </Button>
           <label className="newspaper-reader-zoom">
@@ -288,7 +314,7 @@ export function NewspaperReader({
             />
             <output>{Math.round(zoom * 100)}%</output>
           </label>
-          <Button size="icon-sm" variant="ghost" aria-label="Zoom in 20 percent" onClick={() => changeZoom(zoom + .2)}>
+          <Button size="xs" variant="ghost" aria-label="Zoom in 20 percent" onClick={() => changeZoom(zoom + .2)}>
             <ZoomIn />
           </Button>
           <Button size="xs" variant="ghost" aria-label="Fit page width" onClick={() => changeZoom(1)}>
@@ -302,7 +328,7 @@ export function NewspaperReader({
           className="newspaper-reader-virtual"
           style={{
             height: `${virtualizer.getTotalSize()}px`,
-            minWidth: `${pageWidth + READER_PADDING * 2}px`
+            minWidth: `${pageWidth}px`
           }}
         >
           {virtualItems.map((virtualItem) => {
@@ -326,11 +352,23 @@ export function NewspaperReader({
                     src={page.mediaUrl}
                     alt={`Page ${page.pageNumber}`}
                     draggable={false}
-                    loading={virtualItem.index === activeIndex ? "eager" : "lazy"}
+                    loading="eager"
                     decoding="async"
                     width={page.pixelWidth ?? 2500}
                     height={page.pixelHeight ?? 4384}
                     data-testid="newspaper-reader-page-image"
+                    data-click-zoomed={zoom > 1 ? "true" : undefined}
+                    onClick={(event) => {
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      changeZoom(zoom > 1 ? 1 : CLICK_ZOOM, {
+                        pageIndex: virtualItem.index,
+                        image: event.currentTarget,
+                        clientX: event.clientX,
+                        clientY: event.clientY,
+                        xRatio: (event.clientX - rect.left) / Math.max(1, rect.width),
+                        yRatio: (event.clientY - rect.top) / Math.max(1, rect.height)
+                      });
+                    }}
                     onError={() => setFailedImages((current) => new Set(current).add(page.id))}
                   />
                 ) : (

@@ -66,7 +66,21 @@ pub(super) fn save_progress(
     updated_at: i64,
 ) -> Result<NewspaperReadingProgress, String> {
     let page_index = canonical_page_index(connection, job_id, page_id)?;
-    let changed = connection
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let viewed = transaction
+        .execute(
+            "INSERT OR IGNORE INTO newspaper_read_pages (job_id, page_id, page_index, viewed_at)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (
+                 SELECT 1 FROM newspaper_pages
+                 WHERE id = ?2 AND job_id = ?1 AND status = 'completed'
+             )",
+            params![job_id, page_id, page_index, updated_at],
+        )
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
         .execute(
             "INSERT INTO newspaper_reading_progress (
                 job_id, last_page_id, last_page_index, furthest_page_index, updated_at
@@ -87,14 +101,16 @@ pub(super) fn save_progress(
             params![job_id, page_id, page_index, updated_at],
         )
         .map_err(|error| error.to_string())?;
-    if changed == 0 {
+    if changed == 0 && viewed == 0 {
         return Err(
             "Reading progress can only be saved for a completed page in this newspaper."
                 .to_string(),
         );
     }
-    progress_for_job(connection, job_id)?
-        .ok_or_else(|| "Reading progress was not saved.".to_string())
+    let progress = progress_for_job(&transaction, job_id)?
+        .ok_or_else(|| "Reading progress was not saved.".to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(progress)
 }
 
 pub(super) fn list_progress(
@@ -102,9 +118,11 @@ pub(super) fn list_progress(
 ) -> Result<Vec<NewspaperReadingProgress>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT job_id, last_page_id, last_page_index, furthest_page_index, updated_at
-             FROM newspaper_reading_progress
-             ORDER BY updated_at DESC",
+            "SELECT p.job_id, p.last_page_id, p.last_page_index, p.furthest_page_index,
+                    (SELECT COUNT(*) FROM newspaper_read_pages viewed WHERE viewed.job_id = p.job_id),
+                    p.updated_at
+             FROM newspaper_reading_progress p
+             ORDER BY p.updated_at DESC",
         )
         .map_err(|error| error.to_string())?;
     let result = statement
@@ -141,8 +159,10 @@ fn progress_for_job(
 ) -> Result<Option<NewspaperReadingProgress>, String> {
     connection
         .query_row(
-            "SELECT job_id, last_page_id, last_page_index, furthest_page_index, updated_at
-             FROM newspaper_reading_progress WHERE job_id = ?1",
+            "SELECT p.job_id, p.last_page_id, p.last_page_index, p.furthest_page_index,
+                    (SELECT COUNT(*) FROM newspaper_read_pages viewed WHERE viewed.job_id = p.job_id),
+                    p.updated_at
+             FROM newspaper_reading_progress p WHERE p.job_id = ?1",
             params![job_id],
             row_to_progress,
         )
@@ -156,6 +176,7 @@ fn row_to_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<NewspaperReading
         last_page_id: row.get(1)?,
         last_page_index: row.get(2)?,
         furthest_page_index: row.get(3)?,
-        updated_at: row.get(4)?,
+        read_page_count: row.get(4)?,
+        updated_at: row.get(5)?,
     })
 }

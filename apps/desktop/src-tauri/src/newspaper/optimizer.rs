@@ -45,6 +45,15 @@ pub fn optimize_page(source: &Path, quality: u8) -> Result<OptimizationOutcome, 
     let config = encoder_config(quality)?;
     let source_bytes = std::fs::read(source)?;
     let image = image::load_from_memory(&source_bytes)?;
+    if source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("webp"))
+    {
+        return Ok(OptimizationOutcome::KeptOriginal {
+            bytes: source_bytes.len() as u64,
+        });
+    }
     let dimensions = image.dimensions();
     let encoded = if image.color().has_alpha() {
         let rgba = image.to_rgba8();
@@ -146,5 +155,29 @@ mod tests {
         assert_eq!(config.quality, 45.0);
         assert_eq!(config.method, 2);
         assert_eq!(config.thread_level, 1);
+    }
+
+    #[test]
+    fn existing_webp_is_kept_without_replacing_or_deleting_it() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("A01.webp");
+        let image = ImageBuffer::from_fn(480, 640, |x, y| {
+            let value = ((x.wrapping_mul(31) + y.wrapping_mul(17)) % 255) as u8;
+            Rgb([value, value.wrapping_add(40), value.wrapping_add(80)])
+        });
+        image
+            .save_with_format(&source, image::ImageFormat::WebP)
+            .unwrap();
+        let original = std::fs::read(&source).unwrap();
+
+        let outcome = optimize_page(&source, 25).unwrap();
+
+        assert_eq!(
+            outcome,
+            OptimizationOutcome::KeptOriginal {
+                bytes: original.len() as u64
+            }
+        );
+        assert_eq!(std::fs::read(source).unwrap(), original);
     }
 }

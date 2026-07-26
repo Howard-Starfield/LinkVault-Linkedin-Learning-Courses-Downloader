@@ -9,7 +9,7 @@ use super::{
     models::*,
     optimization_service,
     optimizer::{optimize_page, OptimizationOutcome},
-    page_metadata, queue_service, reader_service, schedule_service,
+    page_metadata, queue_service, reader_service, schedule_service, storage,
 };
 
 fn request(destination: &Path, date: &str) -> CreateNewspaperBatchRequest {
@@ -334,16 +334,36 @@ fn reading_progress_resumes_last_page_without_regressing_furthest_page() {
         reader_service::save_progress(&connection, &job.id, "reading-page-2", 10).unwrap();
     assert_eq!(forward.last_page_index, 2);
     assert_eq!(forward.furthest_page_index, 2);
+    assert_eq!(forward.read_page_count, 1);
 
     let backward =
         reader_service::save_progress(&connection, &job.id, "reading-page-0", 11).unwrap();
     assert_eq!(backward.last_page_id, "reading-page-0");
     assert_eq!(backward.last_page_index, 0);
     assert_eq!(backward.furthest_page_index, 2);
+    assert_eq!(backward.read_page_count, 2);
+    let repeated =
+        reader_service::save_progress(&connection, &job.id, "reading-page-0", 12).unwrap();
+    assert_eq!(repeated.read_page_count, 2);
+    let completed_coverage =
+        reader_service::save_progress(&connection, &job.id, "reading-page-1", 13).unwrap();
+    assert_eq!(completed_coverage.furthest_page_index, 2);
+    assert_eq!(completed_coverage.read_page_count, 3);
     assert_eq!(
         reader_service::list_progress(&connection).unwrap(),
-        vec![backward]
+        vec![completed_coverage]
     );
+
+    connection
+        .execute(
+            "DELETE FROM newspaper_read_pages WHERE job_id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+    storage::initialize(&connection).unwrap();
+    let migrated = reader_service::list_progress(&connection).unwrap();
+    assert_eq!(migrated[0].read_page_count, 1);
+    assert_eq!(migrated[0].last_page_id, "reading-page-1");
 }
 
 #[test]

@@ -20,6 +20,7 @@ export type NewspaperLibraryItem = {
   lastPageId?: string | null;
   lastPageIndex?: number | null;
   furthestPageIndex?: number | null;
+  readPageCount: number;
   readingUpdatedAt?: number | null;
 };
 
@@ -51,6 +52,7 @@ export type NewspaperReadingProgress = {
   lastPageId: string;
   lastPageIndex: number;
   furthestPageIndex: number;
+  readPageCount: number;
   updatedAt: number;
 };
 
