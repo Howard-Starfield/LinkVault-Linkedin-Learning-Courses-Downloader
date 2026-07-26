@@ -224,6 +224,7 @@ pub struct NewspaperReadingProgress {
     pub last_page_id: String,
     pub last_page_index: u32,
     pub furthest_page_index: u32,
+    pub read_page_count: u32,
     pub updated_at: i64,
 }
 
@@ -246,6 +247,7 @@ pub struct NewspaperLibraryItem {
     pub last_page_id: Option<String>,
     pub last_page_index: Option<u32>,
     pub furthest_page_index: Option<u32>,
+    pub read_page_count: u32,
     pub reading_updated_at: Option<i64>,
 }
 

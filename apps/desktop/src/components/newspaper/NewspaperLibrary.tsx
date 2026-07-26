@@ -190,6 +190,7 @@ export function NewspaperLibrary() {
                     lastPageId: progress.lastPageId,
                     lastPageIndex: progress.lastPageIndex,
                     furthestPageIndex: progress.furthestPageIndex,
+                    readPageCount: progress.readPageCount,
                     readingUpdatedAt: progress.updatedAt
                   }
                 : candidate
@@ -273,11 +274,10 @@ export function NewspaperLibrary() {
                 />
               );
             }
-            const progressPercent = item.furthestPageIndex !== null && item.furthestPageIndex !== undefined
-              ? Math.min(100, Math.round(((item.furthestPageIndex + 1) / Math.max(1, item.pageCount)) * 100))
-              : 0;
+            const readPageCount = Math.min(item.pageCount, item.readPageCount);
+            const progressPercent = Math.min(100, Math.round((readPageCount / Math.max(1, item.pageCount)) * 100));
             const progressLabel = item.lastPageIndex !== null && item.lastPageIndex !== undefined
-              ? `${progressPercent}% read · resumes at page ${item.lastPageIndex + 1}`
+              ? `${readPageCount} of ${item.pageCount} pages viewed · resumes at page ${item.lastPageIndex + 1}`
               : "Not started";
             return (
               <article

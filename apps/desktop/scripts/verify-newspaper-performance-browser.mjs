@@ -17,6 +17,7 @@ try {
       const callbacks = new Map();
       let callbackId = 1;
       let lastSavedPageId = null;
+      const viewedPageIds = new Set();
       const svgUrl = (width, height, label) =>
         `data:image/svg+xml,${encodeURIComponent(
           `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="#f4f0e6"/><text x="24" y="48" fill="#25221d" font-size="24">${label}</text></svg>`
@@ -38,6 +39,7 @@ try {
         lastPageId: index === 0 ? "fixture-page-9" : null,
         lastPageIndex: index === 0 ? 9 : null,
         furthestPageIndex: index === 0 ? 12 : null,
+        readPageCount: index === 0 ? 1 : 0,
         readingUpdatedAt: index === 0 ? 1_753_500_000 : null
       }));
       const pages = Array.from({ length: 38 }, (_, index) => ({
@@ -126,11 +128,13 @@ try {
             case "save_newspaper_reading_progress": {
               const index = pages.findIndex((readerPage) => readerPage.id === args.pageId);
               lastSavedPageId = args.pageId;
+              viewedPageIds.add(args.pageId);
               return {
                 jobId: args.jobId,
                 lastPageId: args.pageId,
                 lastPageIndex: index,
                 furthestPageIndex: Math.max(12, index),
+                readPageCount: viewedPageIds.size,
                 updatedAt: Date.now()
               };
             }
@@ -169,8 +173,124 @@ try {
     );
     assert.ok(libraryCalls <= 2, `${editionCount}-edition initial view made ${libraryCalls} Library page calls`);
 
-    await page.locator(".newspaper-library-open").first().click();
+    await page.locator(".newspaper-library-open").nth(1).click();
     await page.locator('[data-testid="newspaper-reader-page-image"]').first().waitFor();
+    await page.waitForFunction(() => {
+      const canvasRect = document.querySelector('[data-testid="newspaper-reader-scroll"]')?.getBoundingClientRect();
+      return canvasRect && [...document.querySelectorAll('[data-testid="newspaper-reader-page-image"]')]
+        .some((image) => {
+          const rect = image.getBoundingClientRect();
+          return rect.bottom > canvasRect.top && rect.top < canvasRect.bottom;
+        });
+    });
+    const renderedReader = await page.evaluate(() => {
+      const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
+      const canvasRect = canvas?.getBoundingClientRect();
+      if (!canvas || !canvasRect) return null;
+      const images = [...document.querySelectorAll('[data-testid="newspaper-reader-page-image"]')];
+      const visibleImage = images
+        .find((image) => {
+          const rect = image.getBoundingClientRect();
+          return rect.bottom > canvasRect.top && rect.top < canvasRect.bottom;
+        });
+      return {
+        selectedIndex: visibleImage?.closest(".newspaper-reader-page")?.getAttribute("data-index") ?? null,
+        activeIndex: document.querySelector('[aria-label="Select newspaper page"]')?.value ?? null,
+        scrollTop: canvas.scrollTop,
+        canvas: { top: canvasRect.top, bottom: canvasRect.bottom },
+        images: images.map((image) => {
+          const rect = image.getBoundingClientRect();
+          return { top: rect.top, bottom: rect.bottom };
+        })
+      };
+    });
+    assert.ok(renderedReader?.selectedIndex, `Reader has no page image intersecting the viewport: ${JSON.stringify(renderedReader)}`);
+    const selectedIndex = renderedReader.selectedIndex;
+    const readerImage = page.locator(
+      `.newspaper-reader-page[data-index="${selectedIndex}"] [data-testid="newspaper-reader-page-image"]`
+    );
+    await readerImage.waitFor();
+    const readerCanvas = page.locator('[data-testid="newspaper-reader-scroll"]');
+    const [imageBox, canvasBox, headerBox] = await Promise.all([
+      readerImage.boundingBox(),
+      readerCanvas.boundingBox(),
+      page.locator(".newspaper-reader-header").boundingBox()
+    ]);
+    assert.ok(imageBox && canvasBox, "Reader image or canvas has no rendered bounds");
+    assert.ok(
+      canvasBox.width - imageBox.width <= 24,
+      `Fit width left ${Math.round(canvasBox.width - imageBox.width)}px of horizontal dead space`
+    );
+    assert.ok(headerBox && headerBox.height <= 34, `Reader toolbar is ${headerBox?.height ?? 0}px tall`);
+    const mountedLoadingModes = await page.locator('[data-testid="newspaper-reader-page-image"]').evaluateAll(
+      (images) => images.map((image) => image.getAttribute("loading"))
+    );
+    assert.ok(
+      mountedLoadingModes.every((loading) => loading === "eager"),
+      `Reader left a bounded adjacent page lazy: ${mountedLoadingModes.join(", ")}`
+    );
+    const mountedPageRects = await page.locator(".newspaper-reader-page").evaluateAll(
+      (articles) => articles
+        .map((article) => article.getBoundingClientRect())
+        .sort((left, right) => left.top - right.top)
+        .map((rect) => ({ top: rect.top, bottom: rect.bottom }))
+    );
+    if (mountedPageRects.length > 1) {
+      assert.ok(
+        mountedPageRects[1].top - mountedPageRects[0].bottom <= 3,
+        `Reader left a ${Math.round(mountedPageRects[1].top - mountedPageRects[0].bottom)}px dark page gap`
+      );
+    }
+    const zoomClick = {
+      x: imageBox.width * 0.72,
+      y: Math.min(240, imageBox.height * 0.2)
+    };
+    const clickClient = {
+      x: imageBox.x + zoomClick.x,
+      y: imageBox.y + zoomClick.y
+    };
+    const clickRatio = {
+      x: zoomClick.x / imageBox.width,
+      y: zoomClick.y / imageBox.height
+    };
+    await readerImage.click({ position: zoomClick });
+    await page.locator('[data-testid="newspaper-reader-page-image"][data-click-zoomed="true"]').first().waitFor();
+    assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "160%");
+    await page.evaluate(() => new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    ));
+    const zoomedImageBox = await readerImage.boundingBox();
+    assert.ok(zoomedImageBox, "Zoomed reader image has no rendered bounds");
+    assert.ok(
+      Math.abs(zoomedImageBox.x + zoomedImageBox.width * clickRatio.x - clickClient.x) <= 3
+        && Math.abs(zoomedImageBox.y + zoomedImageBox.height * clickRatio.y - clickClient.y) <= 3,
+      "Click zoom did not keep the selected newspaper location under the pointer"
+    );
+    const imageTransitionProperties = await readerImage.evaluate(
+      (image) => getComputedStyle(image).transitionProperty
+    );
+    assert.ok(
+      !imageTransitionProperties.split(",").map((property) => property.trim()).includes("width"),
+      "Reader still animates image width during click zoom"
+    );
+    await readerImage.click({
+      position: {
+        x: clickClient.x - zoomedImageBox.x,
+        y: clickClient.y - zoomedImageBox.y
+      }
+    });
+    await page.locator('[data-testid="newspaper-reader-page-image"]:not([data-click-zoomed])').first().waitFor();
+    assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "100%");
+    const restoredImageBox = await readerImage.boundingBox();
+    assert.ok(
+      restoredImageBox
+        && restoredImageBox.y + restoredImageBox.height > canvasBox.y
+        && restoredImageBox.y < canvasBox.y + canvasBox.height,
+      "Click zoom returned to a blank reader viewport"
+    );
+    if (editionCount === 8 && process.env.LINKVAULT_READER_SCREENSHOT) {
+      await page.screenshot({ path: process.env.LINKVAULT_READER_SCREENSHOT });
+    }
     await page.evaluate(() => {
       window.__NEWSPAPER_PERF__.maxMountedImages = document.querySelectorAll(
         '[data-testid="newspaper-reader-page-image"]'
@@ -184,13 +304,13 @@ try {
       observer.observe(document.body, { childList: true, subtree: true });
       window.__NEWSPAPER_PERF__.observer = observer;
     });
-    const readerScroll = page.locator('[data-testid="newspaper-reader-scroll"]');
-    for (const ratio of [0.25, 0.5, 0.9, 0.35]) {
-      await readerScroll.evaluate((element, nextRatio) => {
+    for (const ratio of [0.25, 0.5, 0.9, 1]) {
+      await readerCanvas.evaluate((element, nextRatio) => {
         element.scrollTop = (element.scrollHeight - element.clientHeight) * nextRatio;
       }, ratio);
       await page.waitForTimeout(80);
     }
+    await page.waitForTimeout(450);
     const maxMountedImages = await page.evaluate(() => {
       window.__NEWSPAPER_PERF__.observer.disconnect();
       return window.__NEWSPAPER_PERF__.maxMountedImages;
@@ -198,6 +318,16 @@ try {
     assert.ok(maxMountedImages <= 3, `Reader mounted ${maxMountedImages} page images`);
     await page.getByRole("button", { name: "Back to library" }).click();
     await page.locator(".newspaper-library").waitFor();
+    const returnedProgress = page.locator(".newspaper-reading-progress").nth(1);
+    assert.ok(
+      Number(await returnedProgress.getAttribute("aria-valuenow")) < 100,
+      "Fast-scrolling to the final page incorrectly marked every page viewed"
+    );
+    assert.match(
+      await returnedProgress.getAttribute("title") ?? "",
+      /\d+ of 38 pages viewed/,
+      "Library progress does not explain unique viewed-page coverage"
+    );
     const savedPageId = await page.evaluate(() => window.__NEWSPAPER_PERF__.lastSavedPageId);
     assert.ok(savedPageId, "Reader did not persist its active page before closing");
 

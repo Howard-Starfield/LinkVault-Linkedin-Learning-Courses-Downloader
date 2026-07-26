@@ -2360,13 +2360,14 @@ textarea {
   position: relative;
   z-index: 2;
   display: grid;
-  min-height: 64px;
-  grid-template-columns: minmax(250px, 1fr) auto minmax(300px, 1fr);
+  height: 33px;
+  min-height: 33px;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(280px, 1fr);
   align-items: center;
-  gap: 18px;
+  gap: 12px;
   border-bottom: 1px solid var(--border-soft);
   background: color-mix(in srgb, var(--panel-bg) 94%, transparent);
-  padding: 8px 16px;
+  padding: 4px 10px;
   box-shadow: 0 1px 16px rgb(0 0 0 / 0.12);
   backdrop-filter: blur(16px);
 }
@@ -2379,15 +2380,16 @@ textarea {
 }
 
 .newspaper-reader-identity > div {
-  display: grid;
+  display: flex;
   min-width: 0;
-  gap: 2px;
+  align-items: baseline;
+  gap: 8px;
 }
 
 .newspaper-reader-identity strong {
   overflow: hidden;
   color: var(--text-main);
-  font-size: 13px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2395,7 +2397,8 @@ textarea {
 .newspaper-reader-identity span,
 .newspaper-reader-pagination > span {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 10px;
+  white-space: nowrap;
 }
 
 .newspaper-reader-back {
@@ -2414,7 +2417,15 @@ textarea {
 }
 
 .newspaper-reader-pagination .lv-select-shell {
-  width: 86px;
+  width: 78px;
+}
+
+.newspaper-reader-page-select {
+  height: 24px;
+  padding-top: 0;
+  padding-bottom: 0;
+  padding-left: 8px;
+  font-size: 11px;
 }
 
 .newspaper-reader-controls {
@@ -2423,10 +2434,10 @@ textarea {
 
 .newspaper-reader-zoom {
   display: grid;
-  width: 176px;
-  grid-template-columns: minmax(80px, 1fr) 44px;
+  width: 160px;
+  grid-template-columns: minmax(72px, 1fr) 40px;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .newspaper-reader-zoom input[type="range"] {
@@ -2449,7 +2460,7 @@ textarea {
   background:
     radial-gradient(circle at 50% 0%, rgb(255 255 255 / 0.055), transparent 34%),
     #25282a;
-  padding: 30px;
+  padding: 8px;
   text-align: center;
   scroll-behavior: smooth;
 }
@@ -2475,7 +2486,7 @@ textarea {
   background: #fff;
   box-shadow: 0 16px 48px rgb(0 0 0 / 0.38);
   cursor: zoom-in;
-  transition: width 180ms ease, box-shadow 180ms ease;
+  transition: box-shadow 120ms ease;
   user-select: none;
 }
 
@@ -2534,16 +2545,8 @@ textarea {
   }
 
   .newspaper-reader-header {
-    grid-template-columns: 1fr auto;
-  }
-
-  .newspaper-reader-pagination {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
-
-  .newspaper-reader-controls {
-    grid-column: 2;
+    grid-template-columns: minmax(132px, 1fr) auto minmax(210px, 1fr);
+    gap: 6px;
   }
 
   .newspaper-library-row {
@@ -2605,8 +2608,9 @@ textarea {
   }
 
   .newspaper-reader-header {
-    gap: 8px;
-    padding: 8px;
+    grid-template-columns: auto 1fr auto;
+    gap: 4px;
+    padding: 4px 6px;
   }
 
   .newspaper-reader-identity > div {
@@ -2614,7 +2618,7 @@ textarea {
   }
 
   .newspaper-reader-zoom {
-    width: 132px;
+    display: none;
   }
 }
 

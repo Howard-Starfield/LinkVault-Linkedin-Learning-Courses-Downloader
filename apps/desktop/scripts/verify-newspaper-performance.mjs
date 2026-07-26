@@ -61,6 +61,8 @@ const commandsSource = await readFile(
 
 assert.ok(readerSource.includes("rangeExtractor"), "Reader must supply its bounded range extractor");
 assert.ok(readerSource.includes("overscan: 0"), "Reader must not add hidden image overscan");
+assert.ok(readerSource.includes('loading="eager"'), "All bounded reader images must preload before they enter view");
+assert.ok(readerSource.includes("const PAGE_GAP = 2"), "Reader page seam must remain a hairline");
 assert.ok(librarySource.includes("PAGE_SIZE = 50"), "Library queries must remain paged");
 assert.ok(librarySource.includes("overscan: 4"), "Library row overscan contract changed unexpectedly");
 assert.ok(

@@ -104,7 +104,9 @@ pub(super) fn query_page(
             "SELECT
                 j.id, j.edition_code, e.name_zh, j.publication_date, j.status,
                 j.output_dir, j.page_count, j.completed_count, j.warning, j.updated_at,
-                p.last_page_id, p.last_page_index, p.furthest_page_index, p.updated_at,
+                p.last_page_id, p.last_page_index, p.furthest_page_index,
+                (SELECT COUNT(*) FROM newspaper_read_pages viewed WHERE viewed.job_id = j.id),
+                p.updated_at,
                 fp.id, fp.media_version,
                 t.cache_path, t.source_page_id, t.source_media_version,
                 t.cache_schema_version, t.byte_count
@@ -154,14 +156,15 @@ pub(super) fn query_page(
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<u32>>(11)?,
                 row.get::<_, Option<u32>>(12)?,
-                row.get::<_, Option<i64>>(13)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<i64>>(15)?,
-                row.get::<_, Option<String>>(16)?,
+                row.get::<_, u32>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<i64>>(16)?,
                 row.get::<_, Option<String>>(17)?,
-                row.get::<_, Option<i64>>(18)?,
+                row.get::<_, Option<String>>(18)?,
                 row.get::<_, Option<i64>>(19)?,
-                row.get::<_, Option<u64>>(20)?,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<u64>>(21)?,
             ))
         })
         .map_err(|_| "DATABASE_UNAVAILABLE".to_string())?
@@ -184,6 +187,7 @@ pub(super) fn query_page(
                 last_page_id,
                 last_page_index,
                 furthest_page_index,
+                read_page_count,
                 reading_updated_at,
                 first_page_id,
                 first_media_version,
@@ -230,6 +234,7 @@ pub(super) fn query_page(
                     last_page_id,
                     last_page_index,
                     furthest_page_index,
+                    read_page_count,
                     reading_updated_at,
                 }
             },
