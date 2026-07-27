@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.4 — 2026-07-27
+
+- Superseded 0.2.3 with a distinct version so installations that previously identified themselves as 0.2.3 can discover and install the audited architecture and persistence release through the updater.
+
 ## 0.2.3 — 2026-07-27
 
 - Established explicit `app`, `workflow`, and provider ownership boundaries so LinkedIn Learning, Coursera, Newspaper, and future providers can share one durable workflow architecture without duplicating schedulers or job engines.
