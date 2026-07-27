@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.3 — 2026-07-27
+
+- Established explicit `app`, `workflow`, and provider ownership boundaries so LinkedIn Learning, Coursera, Newspaper, and future providers can share one durable workflow architecture without duplicating schedulers or job engines.
+- Added versioned SQLite startup migrations with verified, non-overwriting pre-migration backups, a consistent WAL/runtime connection policy, and future-schema rejection.
+- Added a dedicated serialized database writer with graceful shutdown draining, panic containment, independent WAL readers, and bounded redacted diagnostics.
+- Added structural architecture and persistence gates that freeze legacy provider write growth while provider cutovers proceed incrementally.
+- Recorded Windows release contention and native migration evidence, including 800 concurrent writes with zero failures and preservation of pre-migration Newspaper data.
+
 ## 0.2.2 — 2026-07-26
 
 - Reworked the newspaper reader into a wider, seamless canvas with a slim one-row toolbar, immediate pointer-centered zoom, persistent default/click zoom preferences, and accurate unique-page reading progress.

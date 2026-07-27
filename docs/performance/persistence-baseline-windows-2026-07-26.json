@@ -1,0 +1,37 @@
+{
+  "capturedAt": "2026-07-26",
+  "scope": "Synthetic SQLite writer contention and WAL snapshot baseline; this is not native UI responsiveness evidence.",
+  "command": "npm.cmd run verify:persistence-baseline",
+  "profile": "release",
+  "environment": {
+    "os": "Microsoft Windows 11 Enterprise 10.0.26100",
+    "cpu": "AMD Ryzen 7 9700X 8-Core Processor",
+    "logicalProcessors": 16,
+    "memoryGiB": 63.6,
+    "rustc": "1.94.1",
+    "cargo": "1.94.1",
+    "node": "24.14.0"
+  },
+  "workload": {
+    "producerCount": 8,
+    "writesPerProducer": 100,
+    "acceptedWrites": 800
+  },
+  "result": {
+    "completedWrites": 800,
+    "failedWrites": 0,
+    "contentionElapsedMs": 336,
+    "writesPerSecond": 2380,
+    "maxQueueDepth": 7,
+    "snapshotRows": 800,
+    "snapshotReadElapsedMs": 1,
+    "retainedDiagnosticEvents": 512
+  },
+  "regressionThresholds": {
+    "contentionElapsedMsMaximum": 5000,
+    "snapshotReadElapsedMsMaximum": 250,
+    "failedWritesMaximum": 0
+  },
+  "diagnosticSample": "persistence-diagnostic-sample-windows-2026-07-26.json",
+  "nativeUiEvidence": "persistence-native-smoke-windows-2026-07-26.json"
+}

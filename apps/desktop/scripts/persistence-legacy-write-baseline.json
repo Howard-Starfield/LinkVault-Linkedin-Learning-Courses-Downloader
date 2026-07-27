@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
+  "directSqlPrimitiveCounts": {
+    "src-tauri/src/providers/coursera/commands.rs": 1,
+    "src-tauri/src/providers/coursera/job.rs": 15,
+    "src-tauri/src/providers/newspaper/archive_service.rs": 6,
+    "src-tauri/src/providers/newspaper/batch_service.rs": 11,
+    "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
+    "src-tauri/src/providers/newspaper/job_service.rs": 7,
+    "src-tauri/src/providers/newspaper/optimization_tasks.rs": 19,
+    "src-tauri/src/providers/newspaper/page_metadata.rs": 2,
+    "src-tauri/src/providers/newspaper/queue_service.rs": 17,
+    "src-tauri/src/providers/newspaper/reader_service.rs": 3,
+    "src-tauri/src/providers/newspaper/schedule_service.rs": 5,
+    "src-tauri/src/providers/newspaper/storage.rs": 23,
+    "src-tauri/src/providers/newspaper/thumbnails.rs": 1
+  },
+  "sharedWriteHelperCallCounts": {
+    "src-tauri/src/providers/coursera/commands.rs": {
+      "append_job_event": 2,
+      "clear_failed_jobs": 1,
+      "insert_job": 1,
+      "retry_failed_job": 1
+    },
+    "src-tauri/src/providers/coursera/job.rs": {
+      "append_job_event": 1,
+      "clear_failed_jobs": 1,
+      "insert_job": 1,
+      "retry_failed_job": 1
+    },
+    "src-tauri/src/providers/linkedin/artifact_downloader.rs": {
+      "append_job_event": 2,
+      "transition_job_status": 6,
+      "update_artifact_status": 7,
+      "upsert_artifact": 2
+    },
+    "src-tauri/src/providers/linkedin/download_orchestrator.rs": {
+      "append_job_event": 3,
+      "transition_job_status": 5,
+      "upsert_artifact": 1,
+      "upsert_course_cache_entry": 1
+    }
+  }
+}

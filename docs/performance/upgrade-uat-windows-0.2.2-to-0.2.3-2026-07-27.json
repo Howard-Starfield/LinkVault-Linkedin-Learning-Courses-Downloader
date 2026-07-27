@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-27T00:27:00-07:00",
+  "platform": "windows-x64",
+  "status": "passed",
+  "scope": "Installed in-place upgrade from LinkVault 0.2.2 to 0.2.3",
+  "candidate": {
+    "version": "0.2.3",
+    "installer": "LinkVault_0.2.3_x64-setup.exe",
+    "installerBytes": 4290338,
+    "installerSha256": "E34AE2F2A9733C5AE524895E605DC8283592B5DFF0719CC88E051E3C1221AFE5",
+    "authenticodeStatus": "NotSigned",
+    "distributionConstraint": "Local UAT only; production updater artifacts remain CI-signed."
+  },
+  "sourceInstallation": {
+    "version": "0.2.2",
+    "backup": "%LOCALAPPDATA%\\LinkVaultUpgradeBackups\\2026-07-27T00-20-28-from-0.2.2",
+    "files": 32,
+    "bytes": 19909065,
+    "restoreProbe": {
+      "databaseSha256Matched": true,
+      "integrityCheck": "ok",
+      "userVersion": 0
+    }
+  },
+  "installedResult": {
+    "installerExitCode": 0,
+    "version": "0.2.3",
+    "executableBytes": 13783552,
+    "executableSha256": "1444175BD136ED933F06E974CDFBAC39F3F9A4FFE1724D95ADB61F7534C99DF5",
+    "cleanShutdownCycles": 2,
+    "stableLaunches": 3,
+    "startupHydration": {
+      "convergedWithinSeconds": 5,
+      "savedLinkedInSessionVisible": true,
+      "completedLinkedInJobsVisible": 20
+    }
+  },
+  "persistence": {
+    "integrityCheck": "ok",
+    "userVersionBefore": 0,
+    "userVersionAfter": 1,
+    "preMigrationBackup": {
+      "file": "linkvault.sqlite3.pre-migration-v0-to-v1-1785136897951678000-0.bak",
+      "sha256": "B517480C84E30228C029B329EE6B763DCC9C1EDABD1826A987265F6DF8897AD9",
+      "integrityCheck": "ok",
+      "userVersion": 0
+    },
+    "preservedCounts": {
+      "artifacts": 4669,
+      "jobs": 95,
+      "newspaperEditions": 24,
+      "newspaperPages": 3576,
+      "newspaperReadPages": 3,
+      "newspaperReadingProgress": 3
+    },
+    "encryptedLinkedInToken": {
+      "preserved": true,
+      "sha256": "C7BA0E8213DF1C01B404EBA96C43D1BA9FA0CFB45CA53BDFCFE68C0E3E5F4405"
+    },
+    "downloadHistory": {
+      "preserved": true,
+      "sha256": "609C47FAB835CEEDBB402166050C3E9E20FA35569BAD5047003AED4400F1217F"
+    }
+  },
+  "nativeSurfaces": {
+    "linkedin": "passed; saved session, preferences, queue history, and completed jobs loaded",
+    "coursera": "passed; provider surface loaded and accurately reported that credentials were not configured",
+    "newspaper": "passed; existing edition library, thumbnails, progress, and folders rendered",
+    "settings": "passed; version v0.2.3 and encrypted-token availability rendered"
+  },
+  "networkActions": {
+    "downloadsStarted": false,
+    "updaterInvoked": false,
+    "reason": "Installed-upgrade UAT validated state restoration and provider surfaces without mutating remote provider state."
+  },
+  "rollback": {
+    "available": true,
+    "backupRestoreProbePassed": true,
+    "previousInstallerPreserved": true
+  }
+}

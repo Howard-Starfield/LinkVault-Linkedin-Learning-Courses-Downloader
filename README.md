@@ -67,6 +67,13 @@ The desktop app opens from Tauri. The Vite frontend runs at:
 http://127.0.0.1:1420
 ```
 
+## Architecture
+
+Backend ownership, the unified workflow decision, and the provider migration
+roadmap are documented in [`docs/architecture`](docs/architecture/README.md).
+Read that contract before adding a provider, queue, scheduler, background
+worker, or persisted job state.
+
 ## Build The App
 
 Use this when you want a production executable or Windows installer.

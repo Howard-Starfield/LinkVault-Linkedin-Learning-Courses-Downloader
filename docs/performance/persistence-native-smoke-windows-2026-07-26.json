@@ -1,0 +1,56 @@
+{
+  "capturedAt": "2026-07-26",
+  "status": "passed-release-executable-smoke",
+  "scope": "Exact release executable startup, v0-to-v1 migration, backup integrity, provider-surface navigation, graceful shutdown, and restart. This is not an installed-bundle or authenticated-download result.",
+  "build": {
+    "command": "npm.cmd --prefix apps/desktop run tauri -- build --no-bundle",
+    "profile": "release",
+    "executable": "apps/desktop/src-tauri/target/release/linkvault.exe",
+    "bytes": 13783552,
+    "sha256": "bf63d47bc8335e7e3070d2e353fe19d087eb93d7e16f5f40447db65a989fc060"
+  },
+  "database": {
+    "path": "apps/desktop/src-tauri/target/release/LinkVaultData/linkvault.sqlite3",
+    "fromVersion": 0,
+    "toVersion": 1,
+    "integrityCheck": "ok",
+    "legacyRowsChecked": 13,
+    "legacyRowsMissingOrChanged": 0,
+    "newTables": [
+      "newspaper_optimization_tasks",
+      "newspaper_read_pages",
+      "newspaper_reading_progress",
+      "newspaper_schedules",
+      "newspaper_thumbnail_cache"
+    ],
+    "backup": {
+      "path": "apps/desktop/src-tauri/target/release/LinkVaultData/linkvault.sqlite3.pre-migration-v0-to-v1-1785132735077716700-0.bak",
+      "bytes": 155648,
+      "sha256": "ddfef1846b00dcbb1b4f618a2c44334d0c2b110e4fcb3659dc9cf03acae964f3",
+      "integrityCheck": "ok",
+      "userVersion": 0
+    }
+  },
+  "nativeUat": {
+    "launchCycles": 2,
+    "cleanShutdownCycles": 2,
+    "releaseProcessRemainingAfterClose": false,
+    "surfacesRendered": [
+      "LinkedIn Courses",
+      "Coursera Courses",
+      "World Journal Download editions",
+      "Newspaper library"
+    ],
+    "credentialStateObserved": {
+      "linkedin": "Session required",
+      "coursera": "Sign-in required"
+    }
+  },
+  "notRun": [
+    "Installed NSIS/MSI bundle replacement and launch",
+    "Authenticated LinkedIn course download",
+    "Authenticated Coursera course download",
+    "Live Newspaper download submission"
+  ],
+  "notRunReason": "Installing over the user's existing LinkVault and using provider credentials or starting live downloads require external state or authority not supplied by this change."
+}

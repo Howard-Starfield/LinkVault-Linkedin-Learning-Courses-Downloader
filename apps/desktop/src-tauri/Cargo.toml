@@ -1,6 +1,6 @@
 [package]
 name = "linkvault"
-version = "0.2.2"
+version = "0.2.3"
 description = "LinkVault desktop app"
 authors = ["LinkVault"]
 license-file = "../../../LICENSE"
@@ -58,5 +58,5 @@ wiremock = "0.6"
 codegen-units = 1
 lto = "thin"
 opt-level = "z"
-panic = "abort"
+panic = "unwind"
 strip = true
