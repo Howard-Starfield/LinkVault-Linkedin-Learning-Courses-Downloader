@@ -79,12 +79,12 @@ Production outputs:
 
 ```text
 apps\desktop\src-tauri\target\release\linkvault.exe
-apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_0.2.0_x64-setup.exe
+apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_<version>_x64-setup.exe
 ```
 
 ## Publish An Update
 
-The release workflow runs when you push a version tag like `v0.2.0`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
+The release workflow runs when you push a version tag like `vX.Y.Z`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
 
 1. Bump the version in `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, and `apps/desktop/src-tauri/tauri.conf.json`.
 2. Run:
@@ -98,9 +98,9 @@ npm run cargo:test
 4. Create and push the tag:
 
 ```powershell
-git tag v0.2.0
+git tag vX.Y.Z
 git push origin main
-git push origin v0.2.0
+git push origin vX.Y.Z
 ```
 
 Users on older signed builds can use the in-app update button after the GitHub release finishes.
@@ -134,6 +134,6 @@ Only download content you are allowed to access and archive. LinkVault does not 
 
 ## License
 
-LinkVault's original code is proprietary and all rights are reserved. Third-party and vendored components retain their own licenses, including the LGPL license in `coursera-dl-master/LICENSE`. See the root `LICENSE` file for details.
+LinkVault's original code is proprietary and all rights are reserved. Third-party dependencies retain their own licenses. See `LICENSE` and `THIRD_PARTY_NOTICES.md` for details.
 
 Copyright (c) 2026 Howard Deng. All rights reserved.

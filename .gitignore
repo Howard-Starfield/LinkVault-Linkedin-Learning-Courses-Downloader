@@ -197,7 +197,9 @@ PublishScripts/
 # Local research clones / agent scratch data
 agent-harness/
 docs/learning/
+docs/superpowers/
 .jez/
+coursera-dl-master/
 
 # JavaScript / Tauri generated outputs
 apps/desktop/pnpm-lock.yaml

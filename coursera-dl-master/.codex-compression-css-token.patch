@@ -1,6 +1,0 @@
-diff --git a/apps/desktop/src/index.css b/apps/desktop/src/index.css
---- a/apps/desktop/src/index.css
-+++ b/apps/desktop/src/index.css
-@@ -2006 +2006 @@
--  border: 2px solid var(--surface-1);
-+  border: 2px solid var(--section-bg);

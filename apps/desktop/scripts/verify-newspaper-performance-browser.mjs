@@ -9,9 +9,13 @@ const browser = await chromium.launch({
   headless: true
 });
 
+const editionCounts = process.env.LINKVAULT_NEWSPAPER_PROFILE_COUNTS
+  ? process.env.LINKVAULT_NEWSPAPER_PROFILE_COUNTS.split(",").map(Number).filter(Number.isFinite)
+  : [8, 50, 500];
 const profiles = [];
 try {
-  for (const editionCount of [8, 50, 500]) {
+  for (const editionCount of editionCounts) {
+    console.log(`Profiling ${editionCount} newspaper editions...`);
     const page = await browser.newPage({ viewport: { width: 1720, height: 960 } });
     await page.addInitScript(({ count }) => {
       const callbacks = new Map();
@@ -159,6 +163,19 @@ try {
     await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Newspaper library" }).click();
     await page.locator(".newspaper-library-row:not(.newspaper-library-row-skeleton)").first().waitFor();
+    await page.getByRole("button", { name: "Open settings" }).click();
+    const defaultZoomControl = page.getByLabel("Default newspaper zoom");
+    const clickZoomControl = page.getByLabel("Newspaper left-click zoom");
+    const defaultToneControl = page.getByLabel("Default newspaper page tone");
+    assert.equal(await defaultZoomControl.inputValue(), "100");
+    assert.equal(await clickZoomControl.inputValue(), "120");
+    assert.equal(await defaultToneControl.inputValue(), "soft");
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    assert.equal(
+      await page.locator(".newspaper-library-toolbar").evaluate((toolbar) => toolbar.scrollWidth <= toolbar.clientWidth),
+      true,
+      "Library filters overflowed the toolbar"
+    );
     const readyMs = performance.now() - startedAt;
     const mountedRows = await page.locator(".newspaper-library-row").count();
     assert.ok(mountedRows <= 16, `${editionCount}-edition Library mounted ${mountedRows} rows`);
@@ -173,8 +190,43 @@ try {
     );
     assert.ok(libraryCalls <= 2, `${editionCount}-edition initial view made ${libraryCalls} Library page calls`);
 
-    await page.locator(".newspaper-library-open").nth(1).click();
+    const libraryCanvas = page.locator('[data-testid="newspaper-library-scroll"]');
+    let savedLibraryScrollTop = 0;
+    if (editionCount === 500) {
+      savedLibraryScrollTop = await libraryCanvas.evaluate((element) => {
+        element.scrollTop = Math.round((element.scrollHeight - element.clientHeight) * 0.72);
+        return element.scrollTop;
+      });
+      await page.waitForTimeout(120);
+      await page.locator(".newspaper-library-row:not(.newspaper-library-row-skeleton)").first().waitFor();
+      assert.ok(savedLibraryScrollTop > 10_000, "Large Library fixture did not reach a deep scroll position");
+      await page.getByRole("button", { name: "Open settings" }).click();
+      await defaultToneControl.selectOption("dim");
+      await defaultToneControl.selectOption("soft");
+      await page.getByRole("button", { name: "Save settings" }).click();
+      await page.getByRole("button", { name: "Close", exact: true }).click();
+      assert.ok(
+        Math.abs(await libraryCanvas.evaluate((element) => element.scrollTop) - savedLibraryScrollTop) <= 1,
+        "Changing Reader preferences moved the deep Library scroll position"
+      );
+    }
+
+    const libraryOpenButton = page.locator(".newspaper-library-open").nth(1);
+    if (editionCount === 500) {
+      await libraryOpenButton.evaluate((button) => button.click());
+    } else {
+      await libraryOpenButton.click();
+    }
     await page.locator('[data-testid="newspaper-reader-page-image"]').first().waitFor();
+    assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "100%");
+    assert.equal(await page.getByLabel("Newspaper page tone").inputValue(), "soft");
+    await page.waitForFunction(() => {
+      const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
+      const image = document.querySelector('[data-testid="newspaper-reader-page-image"]');
+      if (!canvas || !image) return false;
+      const ratio = image.getBoundingClientRect().width / canvas.getBoundingClientRect().width;
+      return ratio >= .96 && ratio <= 1.02;
+    });
     await page.waitForFunction(() => {
       const canvasRect = document.querySelector('[data-testid="newspaper-reader-scroll"]')?.getBoundingClientRect();
       return canvasRect && [...document.querySelectorAll('[data-testid="newspaper-reader-page-image"]')]
@@ -218,10 +270,31 @@ try {
     ]);
     assert.ok(imageBox && canvasBox, "Reader image or canvas has no rendered bounds");
     assert.ok(
-      canvasBox.width - imageBox.width <= 24,
-      `Fit width left ${Math.round(canvasBox.width - imageBox.width)}px of horizontal dead space`
+      imageBox.width / canvasBox.width >= .96 && imageBox.width / canvasBox.width <= 1.02,
+      `Reader did not open near its 100% baseline: ${Math.round((imageBox.width / canvasBox.width) * 100)}%`
     );
     assert.ok(headerBox && headerBox.height <= 34, `Reader toolbar is ${headerBox?.height ?? 0}px tall`);
+    assert.equal(
+      await page.locator(".newspaper-reader-header").evaluate((header) => header.scrollWidth <= header.clientWidth),
+      true,
+      "Reader controls overflowed the compact toolbar"
+    );
+    assert.equal(
+      await readerImage.evaluate((image) => getComputedStyle(image).cursor),
+      "default",
+      "The baseline Reader cursor must remain the arrow"
+    );
+    const baselineToneStyle = await readerImage.evaluate((image) => {
+      const style = getComputedStyle(image);
+      return { opacity: style.opacity, filter: style.filter };
+    });
+    assert.equal(baselineToneStyle.opacity, "1", "Soft paper must not allocate per-image opacity layers");
+    assert.equal(baselineToneStyle.filter, "none", "Soft paper must not allocate an image filter layer");
+    assert.notEqual(
+      await page.locator(".newspaper-reader-tone-overlay").evaluate((overlay) => getComputedStyle(overlay).backgroundColor),
+      "rgba(0, 0, 0, 0)",
+      "Soft paper did not apply its single viewport tint"
+    );
     const mountedLoadingModes = await page.locator('[data-testid="newspaper-reader-page-image"]').evaluateAll(
       (images) => images.map((image) => image.getAttribute("loading"))
     );
@@ -253,9 +326,9 @@ try {
       x: zoomClick.x / imageBox.width,
       y: zoomClick.y / imageBox.height
     };
-    await readerImage.click({ position: zoomClick });
+    await page.mouse.click(clickClient.x, clickClient.y);
     await page.locator('[data-testid="newspaper-reader-page-image"][data-click-zoomed="true"]').first().waitFor();
-    assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "160%");
+    assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "120%");
     await page.evaluate(() => new Promise((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(resolve))
     ));
@@ -273,12 +346,50 @@ try {
       !imageTransitionProperties.split(",").map((property) => property.trim()).includes("width"),
       "Reader still animates image width during click zoom"
     );
-    await readerImage.click({
-      position: {
-        x: clickClient.x - zoomedImageBox.x,
-        y: clickClient.y - zoomedImageBox.y
-      }
-    });
+    assert.equal(
+      await readerImage.evaluate((image) => getComputedStyle(image).cursor),
+      "grab",
+      "Click-zoomed Reader page did not expose the open drag hand"
+    );
+    const beforePan = await readerCanvas.evaluate((element) => ({
+      left: element.scrollLeft,
+      top: element.scrollTop
+    }));
+    await page.mouse.move(clickClient.x, clickClient.y);
+    await page.mouse.down();
+    await page.mouse.move(clickClient.x - 84, clickClient.y - 62, { steps: 6 });
+    assert.equal(
+      await page.locator(".newspaper-reader").getAttribute("data-panning"),
+      "true",
+      "Reader did not enter its active drag state"
+    );
+    assert.equal(
+      await readerCanvas.evaluate((element) => getComputedStyle(element).cursor),
+      "grabbing",
+      "Active Reader drag did not expose the closed hand"
+    );
+    await page.mouse.up();
+    const afterPan = await readerCanvas.evaluate((element) => ({
+      left: element.scrollLeft,
+      top: element.scrollTop
+    }));
+    assert.ok(afterPan.left >= beforePan.left + 70, "Reader drag did not pan horizontally");
+    assert.ok(afterPan.top >= beforePan.top + 48, "Reader drag did not pan vertically");
+    assert.equal(
+      await page.locator(".newspaper-reader-zoom output").textContent(),
+      "120%",
+      "Reader drag incorrectly triggered the click zoom toggle"
+    );
+    const afterPanImageBox = await readerImage.boundingBox();
+    assert.ok(afterPanImageBox, "Dragged Reader image has no rendered bounds");
+    const zoomOutPosition = {
+      x: Math.max(8, Math.min(afterPanImageBox.width - 8, clickClient.x - afterPanImageBox.x)),
+      y: Math.max(8, Math.min(afterPanImageBox.height - 8, clickClient.y - afterPanImageBox.y))
+    };
+    await page.mouse.click(
+      afterPanImageBox.x + zoomOutPosition.x,
+      afterPanImageBox.y + zoomOutPosition.y
+    );
     await page.locator('[data-testid="newspaper-reader-page-image"]:not([data-click-zoomed])').first().waitFor();
     assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "100%");
     const restoredImageBox = await readerImage.boundingBox();
@@ -287,6 +398,108 @@ try {
         && restoredImageBox.y + restoredImageBox.height > canvasBox.y
         && restoredImageBox.y < canvasBox.y + canvasBox.height,
       "Click zoom returned to a blank reader viewport"
+    );
+
+    await page.waitForTimeout(120);
+    await page.getByLabel("Select newspaper page").selectOption("17");
+    await page.waitForFunction(() => {
+      const select = document.querySelector('[aria-label="Select newspaper page"]');
+      const selectedImage = document.querySelector(
+        '.newspaper-reader-page[data-index="17"] [data-testid="newspaper-reader-page-image"]'
+      );
+      return select?.value === "17" && selectedImage;
+    });
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const beforeToneChange = await page.evaluate(() => {
+      const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
+      const select = document.querySelector('[aria-label="Select newspaper page"]');
+      return {
+        scrollTop: canvas?.scrollTop ?? -1,
+        scrollHeight: canvas?.scrollHeight ?? -1,
+        activeIndex: select?.value ?? null
+      };
+    });
+    await page.getByLabel("Newspaper page tone").selectOption("dim");
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const afterToneChange = await page.evaluate(() => {
+      const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
+      const select = document.querySelector('[aria-label="Select newspaper page"]');
+      const images = [...document.querySelectorAll('[data-testid="newspaper-reader-page-image"]')];
+      return {
+        scrollTop: canvas?.scrollTop ?? -1,
+        activeIndex: select?.value ?? null,
+        mountedImages: images.length,
+        filters: images.map((image) => getComputedStyle(image).filter)
+      };
+    });
+    assert.ok(
+      Math.abs(afterToneChange.scrollTop - beforeToneChange.scrollTop) <= 1,
+      `Changing page tone moved the settled deep Reader position from ${beforeToneChange.scrollTop} to ${afterToneChange.scrollTop}`
+    );
+    assert.equal(afterToneChange.activeIndex, beforeToneChange.activeIndex, "Changing page tone changed the active page");
+    assert.ok(afterToneChange.mountedImages <= 3, "Changing page tone broke bounded Reader mounting");
+    assert.ok(afterToneChange.filters.every((filter) => filter === "none"), "Dim paper allocated an image filter layer");
+    assert.notEqual(
+      await page.locator(".newspaper-reader-tone-overlay").evaluate((overlay) => getComputedStyle(overlay).backgroundColor),
+      "rgba(0, 0, 0, 0)",
+      "Dim paper did not apply its single viewport tint"
+    );
+
+    const measureScrollFrames = async (tone) => {
+      await page.getByLabel("Newspaper page tone").selectOption(tone);
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      return readerCanvas.evaluate(async (element) => {
+        const start = element.scrollTop;
+        const gaps = [];
+        let previous = performance.now();
+        for (let index = 0; index < 24; index += 1) {
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+          const now = performance.now();
+          gaps.push(now - previous);
+          previous = now;
+          element.scrollTop = Math.min(element.scrollHeight - element.clientHeight, start + index * 18);
+        }
+        element.scrollTop = start;
+        gaps.sort((left, right) => left - right);
+        return gaps[Math.floor(gaps.length * .95)];
+      });
+    };
+    const originalToneP95Ms = await measureScrollFrames("original");
+    const softToneP95Ms = await measureScrollFrames("soft");
+    const invertedToneP95Ms = await measureScrollFrames("inverted");
+    assert.ok(
+      softToneP95Ms <= Math.max(50, originalToneP95Ms * 2.5),
+      `Soft paper regressed scroll frames from ${originalToneP95Ms.toFixed(1)}ms to ${softToneP95Ms.toFixed(1)}ms`
+    );
+    assert.ok(
+      invertedToneP95Ms <= Math.max(50, originalToneP95Ms * 2.5),
+      `Inverted paper regressed scroll frames from ${originalToneP95Ms.toFixed(1)}ms to ${invertedToneP95Ms.toFixed(1)}ms`
+    );
+    await page.getByLabel("Newspaper page tone").selectOption("soft");
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const postProfileViewport = await page.evaluate(() => {
+      const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
+      const canvasRect = canvas?.getBoundingClientRect();
+      const images = [...document.querySelectorAll('[data-testid="newspaper-reader-page-image"]')];
+      return {
+        activeIndex: document.querySelector('[aria-label="Select newspaper page"]')?.value ?? null,
+        scrollTop: canvas?.scrollTop ?? -1,
+        canvas: canvasRect ? { top: canvasRect.top, bottom: canvasRect.bottom } : null,
+        images: images.map((image) => {
+          const rect = image.getBoundingClientRect();
+          return {
+            index: image.closest(".newspaper-reader-page")?.getAttribute("data-index") ?? null,
+            top: rect.top,
+            bottom: rect.bottom
+          };
+        })
+      };
+    });
+    assert.ok(
+      postProfileViewport.canvas && postProfileViewport.images.some((image) =>
+        image.bottom > postProfileViewport.canvas.top && image.top < postProfileViewport.canvas.bottom
+      ),
+      `Reader lost the visible page after tone profiling: ${JSON.stringify(postProfileViewport)}`
     );
     if (editionCount === 8 && process.env.LINKVAULT_READER_SCREENSHOT) {
       await page.screenshot({ path: process.env.LINKVAULT_READER_SCREENSHOT });
@@ -318,6 +531,15 @@ try {
     assert.ok(maxMountedImages <= 3, `Reader mounted ${maxMountedImages} page images`);
     await page.getByRole("button", { name: "Back to library" }).click();
     await page.locator(".newspaper-library").waitFor();
+    if (editionCount === 500) {
+      await page.waitForFunction(
+        (expected) => {
+          const element = document.querySelector('[data-testid="newspaper-library-scroll"]');
+          return element && Math.abs(element.scrollTop - expected) <= 2;
+        },
+        savedLibraryScrollTop
+      );
+    }
     const returnedProgress = page.locator(".newspaper-reading-progress").nth(1);
     assert.ok(
       Number(await returnedProgress.getAttribute("aria-valuenow")) < 100,
@@ -331,13 +553,35 @@ try {
     const savedPageId = await page.evaluate(() => window.__NEWSPAPER_PERF__.lastSavedPageId);
     assert.ok(savedPageId, "Reader did not persist its active page before closing");
 
+    if (editionCount === 8) {
+      await page.getByRole("button", { name: "Open settings" }).click();
+      await defaultZoomControl.selectOption("140");
+      await defaultToneControl.selectOption("dim");
+      await page.getByRole("button", { name: "Save settings" }).click();
+      await page.getByRole("button", { name: "Close", exact: true }).click();
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.getByRole("button", { name: "Newspaper library" }).click();
+      await page.locator(".newspaper-library-row:not(.newspaper-library-row-skeleton)").first().waitFor();
+      await page.getByRole("button", { name: "Open settings" }).click();
+      assert.equal(await page.getByLabel("Default newspaper zoom").inputValue(), "140");
+      assert.equal(await page.getByLabel("Default newspaper page tone").inputValue(), "dim");
+      await page.getByRole("button", { name: "Close", exact: true }).click();
+      await page.locator(".newspaper-library-open").first().click();
+      await page.locator('[data-testid="newspaper-reader-page-image"]').first().waitFor();
+      assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "140%");
+      assert.equal(await page.getByLabel("Newspaper page tone").inputValue(), "dim");
+    }
+
     profiles.push({
       editionCount,
       readyMs: Math.round(readyMs),
       mountedRows,
       mountedThumbnails,
       libraryCalls,
-      maxMountedImages
+      maxMountedImages,
+      originalToneP95Ms: Number(originalToneP95Ms.toFixed(1)),
+      softToneP95Ms: Number(softToneP95Ms.toFixed(1)),
+      invertedToneP95Ms: Number(invertedToneP95Ms.toFixed(1))
     });
     await page.close();
   }

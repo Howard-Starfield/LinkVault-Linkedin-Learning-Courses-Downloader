@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS newspaper_optimization_tasks (
     elapsed_ms INTEGER,
     last_error TEXT,
     error_kind TEXT,
+    recovered INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (page_id) REFERENCES newspaper_pages(id) ON DELETE CASCADE,
     FOREIGN KEY (job_id) REFERENCES newspaper_jobs(id) ON DELETE CASCADE
@@ -266,6 +267,12 @@ pub fn initialize(connection: &Connection) -> Result<()> {
         "newspaper_pages",
         "media_version",
         "ALTER TABLE newspaper_pages ADD COLUMN media_version INTEGER NOT NULL DEFAULT 1 CHECK (media_version > 0)",
+    )?;
+    migrate_add_column(
+        connection,
+        "newspaper_optimization_tasks",
+        "recovered",
+        "ALTER TABLE newspaper_optimization_tasks ADD COLUMN recovered INTEGER NOT NULL DEFAULT 0",
     )?;
     connection.execute(
         "UPDATE newspaper_jobs
@@ -765,6 +772,51 @@ mod tests {
                 "newspaper_thumbnail_cache",
             ]
         );
+    }
+
+    #[test]
+    fn initialization_adds_recovery_marker_to_phase_one_task_ledgers() {
+        let connection = initialized();
+        connection
+            .execute("DROP TABLE newspaper_optimization_tasks", [])
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE newspaper_optimization_tasks (
+                    page_id TEXT PRIMARY KEY NOT NULL,
+                    job_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_expires_at INTEGER,
+                    retry_at INTEGER,
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    source_path TEXT NOT NULL,
+                    source_size INTEGER,
+                    source_modified_at INTEGER,
+                    source_checksum TEXT,
+                    output_path TEXT,
+                    source_bytes INTEGER,
+                    output_bytes INTEGER,
+                    elapsed_ms INTEGER,
+                    last_error TEXT,
+                    error_kind TEXT,
+                    updated_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+
+        initialize(&connection).unwrap();
+
+        let columns = connection
+            .prepare("PRAGMA table_info(newspaper_optimization_tasks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.contains(&"recovered".to_string()));
     }
 
     #[test]

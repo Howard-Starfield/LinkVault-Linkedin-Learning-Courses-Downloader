@@ -10,6 +10,7 @@ import {
   Clock3,
   Download,
   Folder,
+  FolderOpen,
   History,
   Moon,
   Newspaper,
@@ -52,6 +53,27 @@ import {
 } from "./components/primitives";
 import { CourseraView } from "./components/coursera/CourseraView";
 import { NewspaperView } from "./components/newspaper/NewspaperView";
+import {
+  NEWSPAPER_PAGE_TONES,
+  NEWSPAPER_READER_ZOOM_MAX,
+  NEWSPAPER_READER_ZOOM_MIN,
+  NEWSPAPER_READER_ZOOM_STEP,
+  clampNewspaperReaderZoom,
+  readNewspaperReaderPreferences,
+  writeNewspaperReaderPreferences,
+  type NewspaperPageTone
+} from "./components/newspaper/newspaper-reader-preferences";
+
+const NEWSPAPER_READER_ZOOM_OPTIONS = Array.from(
+  { length: Math.round((NEWSPAPER_READER_ZOOM_MAX - NEWSPAPER_READER_ZOOM_MIN) / NEWSPAPER_READER_ZOOM_STEP) + 1 },
+  (_, index) => NEWSPAPER_READER_ZOOM_MIN + index * NEWSPAPER_READER_ZOOM_STEP
+);
+const NEWSPAPER_PAGE_TONE_LABELS: Record<NewspaperPageTone, string> = {
+  original: "Original",
+  soft: "Soft paper",
+  dim: "Dim paper",
+  inverted: "Inverted"
+};
 
 type ParsedCourse = {
   original: string;
@@ -201,7 +223,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.1";
+const APP_VERSION = "0.2.2";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
 
@@ -253,6 +275,7 @@ function calculateAutomaticScheduleWaitRange(windowHours: number, courseCount: n
 
 export default function App() {
   const initialStoredDelaySeconds = useRef(readStoredDownloadDelaySeconds());
+  const initialNewspaperReaderPreferences = useRef(readNewspaperReaderPreferences());
   const [courseUrls, setCourseUrls] = useState("");
   const [folder, setFolder] = useState("");
   const [token, setToken] = useState("");
@@ -273,9 +296,14 @@ export default function App() {
   const [pauseUpdatingTaskId, setPauseUpdatingTaskId] = useState<string | null>(null);
   const [isPausingAll, setIsPausingAll] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isRegisteringNewspaperArchive, setIsRegisteringNewspaperArchive] = useState(false);
+  const [isRepairingNewspaperLibrary, setIsRepairingNewspaperLibrary] = useState(false);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [newspaperDefaultZoom, setNewspaperDefaultZoom] = useState(initialNewspaperReaderPreferences.current.defaultZoom);
+  const [newspaperClickZoom, setNewspaperClickZoom] = useState(initialNewspaperReaderPreferences.current.clickZoom);
+  const [newspaperPageTone, setNewspaperPageTone] = useState<NewspaperPageTone>(initialNewspaperReaderPreferences.current.pageTone);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isScheduleOpen, setIsScheduleOpen] = useState(false);
   const [scheduleStep, setScheduleStep] = useState<"configure" | "confirm">("configure");
@@ -346,7 +374,7 @@ export default function App() {
       try {
         await invoke("process_newspaper_queue");
         if (!disposed) {
-          await invoke("process_newspaper_optimization_queue");
+          await invoke("process_newspaper_optimization_queue", { options: null });
         }
       } catch {
         // The newspaper screen surfaces persisted job and schedule errors.
@@ -444,6 +472,14 @@ export default function App() {
       });
     }
     wasSettingsOpen.current = isSettingsOpen;
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
+    if (!isSettingsOpen) return;
+    const preferences = readNewspaperReaderPreferences();
+    setNewspaperDefaultZoom(preferences.defaultZoom);
+    setNewspaperClickZoom(preferences.clickZoom);
+    setNewspaperPageTone(preferences.pageTone);
   }, [isSettingsOpen]);
 
   function startSidebarResize(event: ReactMouseEvent<HTMLButtonElement>) {
@@ -1070,7 +1106,14 @@ export default function App() {
 
   async function saveSettings() {
     if (!folder.trim()) {
-      toast.warning("Download folder required", { description: "Choose a default folder before saving settings." });
+      writeNewspaperReaderPreferences({
+        defaultZoom: newspaperDefaultZoom,
+        clickZoom: newspaperClickZoom,
+        pageTone: newspaperPageTone
+      });
+      toast.success("Newspaper settings saved", {
+        description: "Choose a download folder before saving downloader defaults."
+      });
       return;
     }
 
@@ -1079,6 +1122,11 @@ export default function App() {
     try {
       const preferences = await saveDownloadPreferences(currentDownloadPreferences());
       applyDownloadPreferences(preferences);
+      writeNewspaperReaderPreferences({
+        defaultZoom: newspaperDefaultZoom,
+        clickZoom: newspaperClickZoom,
+        pageTone: newspaperPageTone
+      });
       toast.success("Settings saved", {
         description: "Download defaults will be restored the next time LinkVault opens."
       });
@@ -1090,6 +1138,45 @@ export default function App() {
         await new Promise((resolve) => setTimeout(resolve, remaining));
       }
       setIsSavingSettings(false);
+    }
+  }
+
+  async function registerNewspaperArchive() {
+    if (!isTauriRuntime()) return;
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Register existing newspaper archive"
+    });
+    if (typeof picked !== "string") return;
+    setIsRegisteringNewspaperArchive(true);
+    try {
+      const imported = await invoke<number>("import_existing_newspaper_archive", { path: picked });
+      toast.success(`Registered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
+    } catch (error) {
+      toast.error("Could not register newspaper archive", { description: String(error) });
+    } finally {
+      setIsRegisteringNewspaperArchive(false);
+    }
+  }
+
+  async function repairNewspaperLibrary() {
+    if (!isTauriRuntime()) return;
+    setIsRepairingNewspaperLibrary(true);
+    try {
+      const result = await invoke<{
+        renamedFiles: number;
+        optimizedJobs: number;
+        removedSourceFiles: number;
+        warnings: string[];
+      }>("repair_newspaper_library");
+      toast.success("Newspaper library repair finished.", {
+        description: `${result.optimizedJobs} optimized, ${result.renamedFiles} renamed, ${result.removedSourceFiles} redundant source JPGs removed.${result.warnings.length ? ` ${result.warnings.length} warning(s).` : ""}`
+      });
+    } catch (error) {
+      toast.error("Could not repair newspaper library", { description: String(error) });
+    } finally {
+      setIsRepairingNewspaperLibrary(false);
     }
   }
 
@@ -1873,6 +1960,79 @@ export default function App() {
             <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
             Clear saved token
           </Button>
+        </section>
+
+        <section className="settings-section">
+          <div className="settings-section-title">Newspaper</div>
+          <div className="settings-newspaper-grid">
+            <Field label="Default zoom level">
+              <Select
+                value={String(Math.round(newspaperDefaultZoom * 100))}
+                onChange={(event) => {
+                  const nextDefault = Number(event.target.value) / 100;
+                  setNewspaperDefaultZoom(nextDefault);
+                  if (newspaperClickZoom <= nextDefault) {
+                    setNewspaperClickZoom(clampNewspaperReaderZoom(nextDefault + .2));
+                  }
+                }}
+                aria-label="Default newspaper zoom"
+              >
+                {NEWSPAPER_READER_ZOOM_OPTIONS.map((value) => (
+                  <option key={value} value={Math.round(value * 100)}>{Math.round(value * 100)}%</option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Left-click zoom level">
+              <Select
+                value={String(Math.round(newspaperClickZoom * 100))}
+                onChange={(event) => setNewspaperClickZoom(Number(event.target.value) / 100)}
+                aria-label="Newspaper left-click zoom"
+              >
+                {NEWSPAPER_READER_ZOOM_OPTIONS.map((value) => (
+                  <option
+                    key={value}
+                    value={Math.round(value * 100)}
+                    disabled={value <= newspaperDefaultZoom && value < NEWSPAPER_READER_ZOOM_MAX}
+                  >
+                    {Math.round(value * 100)}%
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Default page tone">
+              <Select
+                value={newspaperPageTone}
+                onChange={(event) => setNewspaperPageTone(event.target.value as NewspaperPageTone)}
+                aria-label="Default newspaper page tone"
+              >
+                {NEWSPAPER_PAGE_TONES.map((tone) => (
+                  <option key={tone} value={tone}>{NEWSPAPER_PAGE_TONE_LABELS[tone]}</option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <div className="settings-button-row">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void registerNewspaperArchive()}
+              loading={isRegisteringNewspaperArchive}
+              loadingLabel="Registering"
+            >
+              <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
+              Register archive
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void repairNewspaperLibrary()}
+              loading={isRepairingNewspaperLibrary}
+              loadingLabel="Repairing"
+            >
+              <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
+              Repair existing
+            </Button>
+          </div>
         </section>
 
         <section className="settings-section">

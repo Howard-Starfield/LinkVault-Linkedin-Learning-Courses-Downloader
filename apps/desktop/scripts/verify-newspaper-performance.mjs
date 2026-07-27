@@ -6,6 +6,21 @@ import {
   threePageRange,
   visibleVirtualIndexes
 } from "../src/components/newspaper/newspaper-virtualization.ts";
+import {
+  DEFAULT_NEWSPAPER_READER_ZOOM,
+  clampNewspaperReaderZoom,
+  readNewspaperReaderPreferences
+} from "../src/components/newspaper/newspaper-reader-preferences.ts";
+
+assert.equal(DEFAULT_NEWSPAPER_READER_ZOOM, 1, "Fresh readers must open at 100 percent");
+assert.equal(clampNewspaperReaderZoom(Number.NaN), 1, "Invalid zoom preferences must use the safe default");
+assert.equal(clampNewspaperReaderZoom(.1), .5, "Reader zoom must retain its lower bound");
+assert.equal(clampNewspaperReaderZoom(4), 3, "Reader zoom must retain its upper bound");
+assert.deepEqual(
+  readNewspaperReaderPreferences(),
+  { defaultZoom: 1, clickZoom: 1.2, pageTone: "soft" },
+  "Non-browser verification must receive safe reader defaults"
+);
 
 for (const pageCount of [8, 50, 500]) {
   for (let activeIndex = 0; activeIndex < pageCount; activeIndex += 1) {
@@ -60,11 +75,21 @@ const commandsSource = await readFile(
 );
 
 assert.ok(readerSource.includes("rangeExtractor"), "Reader must supply its bounded range extractor");
+assert.ok(
+  readerSource.includes("(range.startIndex + range.endIndex) / 2"),
+  "Reader range extraction must follow fast visible-range jumps"
+);
 assert.ok(readerSource.includes("overscan: 0"), "Reader must not add hidden image overscan");
 assert.ok(readerSource.includes('loading="eager"'), "All bounded reader images must preload before they enter view");
 assert.ok(readerSource.includes("const PAGE_GAP = 2"), "Reader page seam must remain a hairline");
+assert.ok(readerSource.includes("panGestureRef"), "Reader panning must stay on the stable virtual scroll container");
+assert.ok(readerSource.includes("data-page-tone"), "Virtual Reader pages must inherit one root-level tone");
 assert.ok(librarySource.includes("PAGE_SIZE = 50"), "Library queries must remain paged");
 assert.ok(librarySource.includes("overscan: 4"), "Library row overscan contract changed unexpectedly");
+assert.ok(
+  librarySource.includes("prefetchOffset < total && !items[prefetchOffset]"),
+  "Sparse deep Library scrolling must not reload an already populated page"
+);
 assert.ok(
   librarySource.includes("visibleIndexes.has(virtualItem.index)"),
   "Library thumbnail generation must stay limited to visible rows"

@@ -3,7 +3,6 @@ import { FolderOpen, RotateCcw, Search } from "lucide-react";
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { Button, Input, Select, StatusBadge } from "../primitives";
 import {
@@ -15,17 +14,23 @@ import {
   type NewspaperLibraryStatus
 } from "./newspaper-api";
 import { NewspaperReader } from "./NewspaperReader";
+import {
+  NEWSPAPER_READER_PREFERENCES_EVENT,
+  readNewspaperReaderPreferences,
+  writeNewspaperReaderPreferences,
+  type NewspaperReaderPreferences
+} from "./newspaper-reader-preferences";
 import { visibleVirtualIndexes } from "./newspaper-virtualization";
 
 const PAGE_SIZE = 50;
 const ROW_HEIGHT = 112;
-
 export function NewspaperLibrary() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const requestGenerationRef = useRef(0);
   const loadingOffsetsRef = useRef<Set<number>>(new Set());
   const thumbnailRequestsRef = useRef<Set<string>>(new Set());
   const savedScrollTopRef = useRef(0);
+  const [readerPreferences, setReaderPreferences] = useState(readNewspaperReaderPreferences);
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [kind, setKind] = useState<NewspaperEditionKind>("all");
@@ -39,6 +44,15 @@ export function NewspaperLibrary() {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 200);
     return () => window.clearTimeout(timer);
   }, [query]);
+
+  useEffect(() => {
+    const handlePreferences = (event: Event) => {
+      const detail = (event as CustomEvent<NewspaperReaderPreferences>).detail;
+      setReaderPreferences(detail ?? readNewspaperReaderPreferences());
+    };
+    window.addEventListener(NEWSPAPER_READER_PREFERENCES_EVENT, handlePreferences);
+    return () => window.removeEventListener(NEWSPAPER_READER_PREFERENCES_EVENT, handlePreferences);
+  }, []);
 
   const loadPage = async (offset: number, generation: number, reset = false) => {
     if (!isTauriRuntime() || loadingOffsetsRef.current.has(offset)) return;
@@ -125,8 +139,9 @@ export function NewspaperLibrary() {
         .map((virtualItem) => Math.floor(virtualItem.index / PAGE_SIZE) * PAGE_SIZE)
     );
     const last = virtualItems[virtualItems.length - 1].index;
-    if (last + 10 >= items.filter(Boolean).length && last < total - 1) {
-      offsets.add(Math.floor((last + 10) / PAGE_SIZE) * PAGE_SIZE);
+    const prefetchOffset = Math.floor((last + 10) / PAGE_SIZE) * PAGE_SIZE;
+    if (prefetchOffset < total && !items[prefetchOffset]) {
+      offsets.add(prefetchOffset);
     }
     offsets.forEach((offset) => void loadPage(offset, generation));
   }, [items, total, virtualItems]);
@@ -181,6 +196,14 @@ export function NewspaperLibrary() {
     return (
       <NewspaperReader
         item={openedItem}
+        defaultZoom={readerPreferences.defaultZoom}
+        clickZoom={readerPreferences.clickZoom}
+        pageTone={readerPreferences.pageTone}
+        onPageToneChange={(pageTone) => {
+          const next = { ...readerPreferences, pageTone };
+          setReaderPreferences(next);
+          writeNewspaperReaderPreferences(next);
+        }}
         onClose={(progress) => {
           if (progress) {
             setItems((current) => current.map((candidate) => (
@@ -205,39 +228,6 @@ export function NewspaperLibrary() {
     );
   }
 
-  const registerArchive = async () => {
-    const picked = await open({ directory: true, multiple: false, title: "Register existing newspaper archive" });
-    if (typeof picked !== "string" || !isTauriRuntime()) return;
-    try {
-      const imported = await invoke<number>("import_existing_newspaper_archive", { path: picked });
-      toast.success(`Registered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
-      const generation = requestGenerationRef.current + 1;
-      requestGenerationRef.current = generation;
-      await loadPage(0, generation, true);
-    } catch (error) {
-      toast.error("Could not register newspaper archive", { description: String(error) });
-    }
-  };
-
-  const repairLibrary = async () => {
-    try {
-      const result = await invoke<{
-        renamedFiles: number;
-        optimizedJobs: number;
-        removedSourceFiles: number;
-        warnings: string[];
-      }>("repair_newspaper_library");
-      const generation = requestGenerationRef.current + 1;
-      requestGenerationRef.current = generation;
-      await loadPage(0, generation, true);
-      toast.success("Newspaper library repair finished.", {
-        description: `${result.optimizedJobs} optimized, ${result.renamedFiles} renamed, ${result.removedSourceFiles} redundant source JPGs removed.${result.warnings.length ? ` ${result.warnings.length} warning(s).` : ""}`
-      });
-    } catch (error) {
-      toast.error("Could not repair newspaper library", { description: String(error) });
-    }
-  };
-
   return (
     <section className="newspaper-library" aria-label="Newspaper library">
       <div className="newspaper-library-toolbar">
@@ -257,8 +247,6 @@ export function NewspaperLibrary() {
           <option value="partial">Partial</option>
           <option value="optimizing">Optimizing</option>
         </Select>
-        <Button variant="outline" onClick={() => void registerArchive()}><FolderOpen /> Register archive</Button>
-        <Button variant="outline" onClick={() => void repairLibrary()}><RotateCcw /> Repair existing</Button>
       </div>
       <div ref={scrollRef} className="newspaper-library-list" data-testid="newspaper-library-scroll">
         {total === 0 ? <div className="newspaper-empty">Downloaded editions will appear here.</div> : null}
