@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.5 — 2026-07-27
+
+- Fixed Last 7 days runs that appeared to stall on an unavailable current edition by restoring legacy dismissed editions that are already downloaded and requeueing editions whose completed files are missing.
+- Changed the Progress trash action into a confirmed permanent deletion that removes the exact inactive edition folder, generated thumbnail, progress history, and duplicate identity so the edition can be downloaded again.
+- Added deletion safety guards for active downloads and paths outside the configured newspaper destination, with real SQLite and temporary-filesystem regression coverage.
+
 ## 0.2.4 — 2026-07-27
 
 - Superseded 0.2.3 with a distinct version so installations that previously identified themselves as 0.2.3 can discover and install the audited architecture and persistence release through the updater.

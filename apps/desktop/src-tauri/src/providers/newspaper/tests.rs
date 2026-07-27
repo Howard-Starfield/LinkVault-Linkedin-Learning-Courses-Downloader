@@ -182,7 +182,7 @@ fn duplicate_batch_request_skips_existing_job_instead_of_failing() {
 }
 
 #[test]
-fn queue_controls_are_persisted_and_removal_keeps_a_history_event() {
+fn queue_controls_are_persisted_and_removal_deletes_downloaded_files_and_identity() {
     let directory = tempdir().unwrap();
     let db_path = directory.path().join("test.db");
     let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
@@ -227,26 +227,61 @@ fn queue_controls_are_persisted_and_removal_keeps_a_history_event() {
         .unwrap();
     assert!(paused);
 
-    let (_, previous_status) =
-        job_service::dismiss_with_connection(&mut connection, &second.id, 102).unwrap();
-    assert_eq!(previous_status, "queued");
-    let dismissed: (String, bool) = connection
-        .query_row(
-            "SELECT status, dismissed FROM newspaper_jobs WHERE id = ?1",
+    std::fs::create_dir_all(&second.output_dir).unwrap();
+    std::fs::write(Path::new(&second.output_dir).join(".complete"), b"").unwrap();
+    let page_path = Path::new(&second.output_dir).join("A01.webp");
+    std::fs::write(&page_path, b"downloaded page").unwrap();
+    let thumbnail_path = directory
+        .path()
+        .join("newspaper-thumbnails")
+        .join("v1")
+        .join("second.webp");
+    std::fs::create_dir_all(thumbnail_path.parent().unwrap()).unwrap();
+    std::fs::write(&thumbnail_path, b"thumbnail").unwrap();
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'completed' WHERE id = ?1",
             params![second.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(dismissed, ("cancelled".to_string(), true));
-    let event_message: String = connection
+    connection
+        .execute(
+            "INSERT INTO newspaper_pages
+             (id, job_id, page_number, source_url, optimized_path, status,
+              media_version, created_at, updated_at)
+             VALUES ('second-page', ?1, 'A01', 'test://page', ?2, 'completed', 1, 1, 1)",
+            params![second.id, page_path.to_string_lossy()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_thumbnail_cache
+             (job_id, source_page_id, source_media_version, cache_schema_version,
+              cache_path, mime_type, pixel_width, pixel_height, byte_count, updated_at)
+             VALUES (?1, 'second-page', 1, 1, ?2, 'image/webp', 420, 176, 9, 1)",
+            params![second.id, thumbnail_path.to_string_lossy()],
+        )
+        .unwrap();
+
+    let (_, previous_status) =
+        job_service::delete_with_connection(&mut connection, &second.id).unwrap();
+    assert_eq!(previous_status, "completed");
+    assert!(
+        !Path::new(&second.output_dir).exists(),
+        "trash must remove the exact downloaded edition directory"
+    );
+    assert!(
+        !thumbnail_path.exists(),
+        "trash must remove the edition's generated thumbnail cache"
+    );
+    let remaining: i64 = connection
         .query_row(
-            "SELECT message FROM newspaper_events
-             WHERE job_id = ?1 AND event_type = 'queue.dismissed'",
+            "SELECT COUNT(*) FROM newspaper_jobs WHERE id = ?1",
             params![second.id],
             |row| row.get(0),
         )
         .unwrap();
-    assert!(event_message.contains("left on disk"));
+    assert_eq!(remaining, 0, "trash must release the duplicate identity");
 }
 
 #[test]
@@ -272,6 +307,102 @@ fn last_seven_days_batch_creates_all_seven_daily_jobs() {
     assert_eq!(dates.first(), Some(&expected_start));
     assert_eq!(dates.last(), Some(&expected_end));
     assert_eq!(response.skipped_count, 0);
+}
+
+#[test]
+fn a_new_batch_restores_a_legacy_dismissed_completed_edition() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    std::fs::create_dir_all(&job.output_dir).unwrap();
+    std::fs::write(Path::new(&job.output_dir).join(".complete"), b"").unwrap();
+    connection
+        .execute(
+            "UPDATE newspaper_jobs
+             SET status = 'completed', dismissed = 1
+             WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+
+    let response =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap();
+
+    assert!(response.jobs.is_empty());
+    assert_eq!(response.skipped_count, 1);
+    let restored: (String, bool) = connection
+        .query_row(
+            "SELECT status, dismissed FROM newspaper_jobs WHERE id = ?1",
+            params![job.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(restored, ("completed".to_string(), false));
+}
+
+#[test]
+fn removal_refuses_an_active_download() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'active' WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+
+    let result = job_service::delete_with_connection(&mut connection, &job.id);
+
+    assert!(result.is_err());
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_jobs WHERE id = ?1",
+            params![job.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 1);
+}
+
+#[test]
+fn removal_refuses_a_directory_outside_the_batch_destination() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    let outside = directory.path().join("must-not-delete");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET output_dir = ?2 WHERE id = ?1",
+            params![job.id, outside.to_string_lossy()],
+        )
+        .unwrap();
+
+    let result = job_service::delete_with_connection(&mut connection, &job.id);
+
+    assert!(result.is_err());
+    assert!(outside.join("keep.txt").exists());
 }
 
 #[test]

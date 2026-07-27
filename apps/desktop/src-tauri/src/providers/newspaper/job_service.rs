@@ -1,9 +1,12 @@
-//! Job control mutations for retry, pause, reorder, and dismissal.
+//! Job control mutations for retry, pause, reorder, and deletion.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{batch_service, storage};
 
@@ -90,59 +93,122 @@ pub(super) fn reorder_for_jobs(db_path: &Path, job_ids: &[String]) -> Result<(),
     reorder(&mut connection, job_ids, Utc::now().timestamp())
 }
 
-pub(super) fn dismiss_with_connection(
+pub(super) fn delete_with_connection(
     connection: &mut Connection,
     job_id: &str,
-    updated_at: i64,
 ) -> Result<(String, String), String> {
-    let (batch_id, status): (String, String) = connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let (batch_id, status, output_dir, destination): (String, String, String, String) = transaction
         .query_row(
-            "SELECT batch_id, status FROM newspaper_jobs WHERE id = ?1",
+            "SELECT j.batch_id, j.status, j.output_dir, b.destination
+             FROM newspaper_jobs j
+             JOIN newspaper_batches b ON b.id = j.batch_id
+             WHERE j.id = ?1",
             params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|_| "Newspaper queue item was not found.".to_string())?;
-    let transaction = connection
-        .transaction()
+    if matches!(status.as_str(), "active" | "optimizing") {
+        return Err("Pause the active newspaper download before deleting it.".to_string());
+    }
+    remove_output_directory(Path::new(&destination), Path::new(&output_dir))?;
+    remove_cached_thumbnail(&transaction, job_id)?;
+    transaction
+        .execute("DELETE FROM newspaper_jobs WHERE id = ?1", params![job_id])
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "UPDATE newspaper_jobs
-             SET dismissed = 1, paused = 0,
-                 status = CASE
-                     WHEN status IN ('queued', 'active', 'optimizing') THEN 'cancelled'
-                     ELSE status
-                 END,
-                 updated_at = ?2
-             WHERE id = ?1",
-            params![job_id, updated_at],
+            "UPDATE newspaper_batches SET updated_at = ?2 WHERE id = ?1",
+            params![batch_id, Utc::now().timestamp()],
         )
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "UPDATE newspaper_pages
-             SET status = 'cancelled', updated_at = ?2
-             WHERE job_id = ?1 AND status IN ('pending', 'downloading', 'optimizing')",
-            params![job_id, updated_at],
-        )
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "INSERT INTO newspaper_events
-             (batch_id, job_id, event_type, message, created_at)
-             VALUES (?1, ?2, 'queue.dismissed',
-                     'Removed from progress. Downloaded files were left on disk.', ?3)",
-            params![batch_id, job_id, updated_at],
+            "DELETE FROM newspaper_batches
+             WHERE id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM newspaper_jobs WHERE batch_id = newspaper_batches.id
+               )",
+            params![batch_id],
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok((batch_id, status))
 }
 
-pub(super) fn dismiss(db_path: &Path, job_id: &str) -> Result<String, String> {
+fn remove_cached_thumbnail(connection: &Connection, job_id: &str) -> Result<(), String> {
+    let cache_path = connection
+        .query_row(
+            "SELECT cache_path FROM newspaper_thumbnail_cache WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(cache_path) = cache_path.map(PathBuf::from) else {
+        return Ok(());
+    };
+    if !cache_path.exists() {
+        return Ok(());
+    }
+    let database_path: String = connection
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let cache_root = Path::new(&database_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("newspaper-thumbnails");
+    let resolved_cache_root = std::fs::canonicalize(&cache_root)
+        .map_err(|_| "The newspaper thumbnail cache could not be verified.".to_string())?;
+    let resolved_cache_path = std::fs::canonicalize(&cache_path)
+        .map_err(|_| "The newspaper thumbnail file could not be verified.".to_string())?;
+    if !resolved_cache_path.starts_with(&resolved_cache_root) {
+        return Ok(());
+    }
+    std::fs::remove_file(cache_path)
+        .map_err(|error| format!("Could not delete the newspaper thumbnail: {error}"))
+}
+
+fn remove_output_directory(destination: &Path, output_dir: &Path) -> Result<(), String> {
+    if !output_dir.exists() {
+        return Ok(());
+    }
+    if !output_dir.is_dir() {
+        return Err("The newspaper output path is not a directory.".to_string());
+    }
+    let resolved_destination = std::fs::canonicalize(destination)
+        .map_err(|_| "The newspaper destination could not be verified.".to_string())?;
+    let resolved_output = std::fs::canonicalize(output_dir)
+        .map_err(|_| "The newspaper output directory could not be verified.".to_string())?;
+    if resolved_output == resolved_destination
+        || !resolved_output.starts_with(&resolved_destination)
+    {
+        return Err(
+            "Refusing to delete a newspaper folder outside its configured destination.".to_string(),
+        );
+    }
+    std::fs::remove_dir_all(PathBuf::from(output_dir))
+        .map_err(|error| format!("Could not delete the downloaded newspaper files: {error}"))
+}
+
+pub(super) fn delete(db_path: &Path, job_id: &str) -> Result<String, String> {
     let mut connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    let now = Utc::now().timestamp();
-    let (batch_id, status) = dismiss_with_connection(&mut connection, job_id, now)?;
-    batch_service::finish_if_terminal(&connection, &batch_id)?;
+    let (batch_id, status) = delete_with_connection(&mut connection, job_id)?;
+    if connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM newspaper_batches WHERE id = ?1)",
+            params![batch_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    {
+        batch_service::finish_if_terminal(&connection, &batch_id)?;
+    }
     Ok(status)
 }

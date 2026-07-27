@@ -64,7 +64,10 @@ for (const required of [
   "reorder_newspaper_jobs",
   "remove_newspaper_job",
   "Drag to reorder",
-  "files stay on disk",
+  "Permanently delete this downloaded edition?",
+  "local files and progress history were removed",
+  "Pause this download before deleting it",
+  'disabled={["active", "optimizing"].includes(job.status)}',
   'role="progressbar"',
 ]) {
   assert.ok(view.includes(required), `Newspaper view is missing: ${required}`);

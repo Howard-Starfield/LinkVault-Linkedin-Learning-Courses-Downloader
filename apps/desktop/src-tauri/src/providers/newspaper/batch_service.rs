@@ -132,23 +132,31 @@ pub(super) fn create_with_connection(
                 .map_err(|error| error.to_string())?;
             if transaction.changes() == 0 {
                 skipped_count = skipped_count.saturating_add(1);
-                let existing: Option<(String, String, String)> = transaction
+                let existing: Option<(String, String, String, bool)> = transaction
                     .query_row(
-                        "SELECT id, batch_id, status FROM newspaper_jobs
+                        "SELECT id, batch_id, status, dismissed FROM newspaper_jobs
                          WHERE edition_code = ?1 AND publication_date = ?2 AND output_dir = ?3",
                         params![edition.code, date_string, output_dir.to_string_lossy()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()
                     .map_err(|error| error.to_string())?;
-                if let Some((existing_job_id, existing_batch_id, existing_status)) = existing {
+                if let Some((
+                    existing_job_id,
+                    existing_batch_id,
+                    existing_status,
+                    existing_dismissed,
+                )) = existing
+                {
                     let marker_missing = !output_dir.join(".complete").is_file();
-                    if marker_missing
+                    let should_requeue = marker_missing
                         && matches!(
                             existing_status.as_str(),
                             "completed" | "failed" | "unavailable" | "partial" | "cancelled"
-                        )
-                    {
+                        );
+                    let should_restore = existing_dismissed
+                        && matches!(existing_status.as_str(), "completed" | "partial");
+                    if should_requeue {
                         transaction
                             .execute(
                                 "UPDATE newspaper_pages
@@ -157,16 +165,26 @@ pub(super) fn create_with_connection(
                                 params![existing_job_id, now],
                             )
                             .map_err(|error| error.to_string())?;
+                    }
+                    if should_requeue || should_restore {
                         transaction
                             .execute(
                                 "UPDATE newspaper_jobs
-                                 SET status = 'queued', retry_at = NULL, failed_count = 0,
-                                     warning = NULL, paused = 0, dismissed = 0,
-                                     queue_position = ?3, completed_at = NULL, updated_at = ?2
+                                 SET status = CASE WHEN ?4 THEN 'queued' ELSE status END,
+                                     retry_at = CASE WHEN ?4 THEN NULL ELSE retry_at END,
+                                     failed_count = CASE WHEN ?4 THEN 0 ELSE failed_count END,
+                                     warning = CASE WHEN ?4 THEN NULL ELSE warning END,
+                                     paused = CASE WHEN ?4 THEN 0 ELSE paused END,
+                                     dismissed = 0,
+                                     queue_position = CASE WHEN ?4 THEN ?3 ELSE queue_position END,
+                                     completed_at = CASE WHEN ?4 THEN NULL ELSE completed_at END,
+                                     updated_at = ?2
                                  WHERE id = ?1",
-                                params![existing_job_id, now, next_queue_position],
+                                params![existing_job_id, now, next_queue_position, should_requeue],
                             )
                             .map_err(|error| error.to_string())?;
+                    }
+                    if should_requeue {
                         next_queue_position += 1;
                         transaction
                             .execute(
