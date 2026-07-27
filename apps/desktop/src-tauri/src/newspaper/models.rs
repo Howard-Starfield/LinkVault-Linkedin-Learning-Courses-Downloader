@@ -265,10 +265,63 @@ pub struct NewspaperLibraryPage {
 #[serde(rename_all = "camelCase")]
 pub struct NewspaperActivitySnapshot {
     pub jobs: Vec<NewspaperJob>,
+    pub progress: Vec<NewspaperJobProgress>,
     pub batches: Vec<NewspaperBatch>,
     pub schedules: Vec<NewspaperSchedule>,
     pub has_live_activity: bool,
+    pub optimization_runtime: OptimizationRuntimeStatus,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperJobProgress {
+    pub job_id: String,
+    pub current_stage: String,
+    pub download_total: u32,
+    pub download_completed: u32,
+    pub download_failed: u32,
+    pub optimization_total: u32,
+    pub optimization_completed: u32,
+    pub optimization_failed: u32,
+    pub optimization_pending: u32,
+    pub optimization_recovered: u32,
+    pub active_workers: u32,
+    pub pages_per_minute: Option<f64>,
+    pub eta_seconds: Option<u64>,
+    pub original_bytes: u64,
+    pub optimized_bytes: u64,
+    pub bytes_saved: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizationRunOptions {
+    pub mode: String,
+    pub worker_ceiling: u8,
+}
+
+impl Default for OptimizationRunOptions {
+    fn default() -> Self {
+        Self {
+            mode: "auto".to_string(),
+            worker_ceiling: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizationRuntimeStatus {
+    pub active: bool,
+    pub mode: String,
+    pub requested_workers: u8,
+    pub admitted_workers: u8,
+    pub active_workers: u8,
+    pub cpu_percent: Option<f32>,
+    pub available_memory_bytes: Option<u64>,
+    pub memory_safe: bool,
+    pub limited_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

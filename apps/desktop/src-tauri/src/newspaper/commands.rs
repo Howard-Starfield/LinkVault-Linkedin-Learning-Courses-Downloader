@@ -1,10 +1,14 @@
 //! Stable Tauri command facade for the newspaper subsystem.
 
-use std::{path::Path, sync::atomic::Ordering};
+use std::{
+    path::Path,
+    sync::{atomic::Ordering, Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use rusqlite::Connection;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 use super::{
     archive_service, batch_service, catalog_service, job_service, library_events, library_service,
@@ -12,7 +16,7 @@ use super::{
         CreateNewspaperBatchRequest, CreateNewspaperBatchResponse, CreateNewspaperScheduleRequest,
         NewspaperActivitySnapshot, NewspaperBootstrap, NewspaperEdition, NewspaperJob,
         NewspaperLibraryPage, NewspaperPage, NewspaperReadingProgress, NewspaperSchedule,
-        RepairNewspaperLibraryResult,
+        OptimizationRunOptions, OptimizationRuntimeStatus, RepairNewspaperLibraryResult,
     },
     optimization_service, overview_service, page_metadata, queue_service, reader_service,
     schedule_service,
@@ -107,11 +111,46 @@ pub async fn process_newspaper_queue(
 pub async fn process_newspaper_optimization_queue(
     app: tauri::AppHandle,
     state: State<'_, NewspaperState>,
+    options: Option<OptimizationRunOptions>,
 ) -> Result<Vec<NewspaperJob>, String> {
     if state.running.swap(true, Ordering::SeqCst) {
         return Ok(Vec::new());
     }
-    let result = optimization_service::process_queue(state.db_path()).await;
+    state.cancelled.store(false, Ordering::SeqCst);
+    let last_emit = Arc::new(Mutex::new(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now),
+    ));
+    let progress_app = app.clone();
+    let reporter = Arc::new(move |runtime: OptimizationRuntimeStatus| {
+        let newspaper_state = progress_app.state::<NewspaperState>();
+        newspaper_state.set_optimization_runtime(runtime.clone());
+        let mut emitted_at = last_emit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if emitted_at.elapsed() >= Duration::from_millis(200) || runtime.active_workers == 0 {
+            *emitted_at = Instant::now();
+            let revision = newspaper_state.invalidate_progress();
+            let _ = progress_app.emit(
+                "newspaper://optimization-progress",
+                serde_json::json!({ "revision": revision, "runtime": runtime }),
+            );
+        }
+    });
+    let result = optimization_service::process_queue_with_options(
+        state.db_path(),
+        options.unwrap_or_default(),
+        state.cancelled.clone(),
+        reporter,
+    )
+    .await;
+    state.set_optimization_runtime(OptimizationRuntimeStatus::default());
+    let progress_revision = state.invalidate_progress();
+    let _ = app.emit(
+        "newspaper://optimization-progress",
+        serde_json::json!({ "revision": progress_revision, "runtime": state.optimization_runtime() }),
+    );
     state.running.store(false, Ordering::SeqCst);
     if let Ok(jobs) = &result {
         library_events::emit(&app, &state, jobs);
@@ -157,7 +196,7 @@ pub fn set_newspaper_job_pause(
     paused: bool,
 ) -> Result<(), String> {
     let status = job_service::set_pause_for_job(state.db_path(), &job_id, paused)?;
-    if paused && status == "active" {
+    if paused && matches!(status.as_str(), "active" | "optimizing") {
         state.cancelled.store(true, Ordering::SeqCst);
     }
     Ok(())
@@ -217,10 +256,13 @@ pub async fn get_newspaper_activity_snapshot(
     state: State<'_, NewspaperState>,
 ) -> Result<NewspaperActivitySnapshot, String> {
     let db_path = state.db_path.clone();
-    let revision = state.library_revision();
-    tauri::async_runtime::spawn_blocking(move || overview_service::activity(&db_path, revision))
-        .await
-        .map_err(|error| error.to_string())?
+    let revision = state.progress_revision();
+    let runtime = state.optimization_runtime();
+    tauri::async_runtime::spawn_blocking(move || {
+        overview_service::activity(&db_path, revision, runtime)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

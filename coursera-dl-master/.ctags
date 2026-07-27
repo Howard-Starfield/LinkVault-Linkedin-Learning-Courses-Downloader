@@ -1,5 +1,0 @@
---exclude=.tox
---exclude=build
---exclude=*.patch
---exclude=*.html
---exclude=*.json

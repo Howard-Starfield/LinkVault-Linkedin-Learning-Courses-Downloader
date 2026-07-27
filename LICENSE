@@ -5,6 +5,5 @@ proprietary. No permission is granted to copy, modify, distribute, sublicense,
 or use those materials except with prior written permission from the copyright
 holder.
 
-Third-party and vendored components remain governed by their own license terms.
-In particular, the coursera-dl-master component is governed by the license in
-coursera-dl-master/LICENSE.
+Third-party dependencies remain governed by their own license terms. See
+THIRD_PARTY_NOTICES.md and the accompanying third-party license files.

@@ -5,9 +5,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use rusqlite::{
-    params, Connection, OptionalExtension, Result, Transaction, TransactionBehavior,
-};
+use rusqlite::{params, Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 
 pub(super) const MAX_ATTEMPTS: u32 = 3;
 const LEASE_SECONDS: i64 = 120;
@@ -91,15 +89,26 @@ pub(super) fn ensure_for_job(
         };
         let existing = connection
             .query_row(
-                "SELECT status, source_checksum
+                "SELECT status, source_checksum, source_size, source_modified_at
                  FROM newspaper_optimization_tasks WHERE page_id = ?1",
                 params![page_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
             )
             .optional()?;
 
-        if let Some((existing_status, existing_checksum)) = existing {
-            let source_changed = existing_checksum != checksum;
+        if let Some((existing_status, existing_checksum, existing_size, existing_modified_at)) =
+            existing
+        {
+            let source_changed = existing_checksum != checksum
+                || existing_size != source_size
+                || existing_modified_at != source_modified_at;
             let reset_failed = existing_status == "failed" && source_changed && optimized.is_none();
             let terminal_page = desired_status != "pending";
             connection.execute(
@@ -114,6 +123,7 @@ pub(super) fn ensure_for_job(
                      lease_owner = CASE WHEN ?3 = 1 OR ?5 = 1 THEN NULL ELSE lease_owner END,
                      lease_expires_at = CASE WHEN ?3 = 1 OR ?5 = 1 THEN NULL ELSE lease_expires_at END,
                      retry_at = CASE WHEN ?3 = 1 OR ?5 = 1 THEN NULL ELSE retry_at END,
+                     recovered = CASE WHEN ?5 = 1 THEN 0 ELSE recovered END,
                      completed_at = CASE WHEN ?3 = 1 THEN ?6 WHEN ?5 = 1 THEN NULL ELSE completed_at END,
                      source_path = ?7,
                      source_size = ?8,
@@ -176,6 +186,7 @@ pub(super) fn reconcile(connection: &Connection, updated_at: i64) -> Result<Reco
         "UPDATE newspaper_optimization_tasks
          SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL,
              started_at = NULL, retry_at = NULL,
+             recovered = 1,
              last_error = CASE
                  WHEN last_error IS NULL THEN 'Recovered after an interrupted optimization.'
                  ELSE last_error
@@ -250,6 +261,7 @@ pub(super) fn reconcile(connection: &Connection, updated_at: i64) -> Result<Reco
                     "UPDATE newspaper_optimization_tasks
                      SET status = ?2, output_path = ?3, lease_owner = NULL,
                          lease_expires_at = NULL, retry_at = NULL,
+                         recovered = 1,
                          completed_at = ?4, last_error = NULL, error_kind = NULL,
                          updated_at = ?4
                      WHERE page_id = ?1",
@@ -283,6 +295,10 @@ pub(super) fn reconcile(connection: &Connection, updated_at: i64) -> Result<Reco
                     0,
                     updated_at,
                     None,
+                )?;
+                connection.execute(
+                    "UPDATE newspaper_optimization_tasks SET recovered = 1 WHERE page_id = ?1",
+                    params![page_id],
                 )?;
                 stats.adopted_outputs += 1;
                 if cleanup_original(
@@ -511,6 +527,7 @@ pub(super) fn cleanup_completed_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps the file and lease checkpoint inputs explicit.
 fn commit_replaced_by_id(
     connection: &Connection,
     page_id: &str,
@@ -852,6 +869,56 @@ mod tests {
     }
 
     #[test]
+    fn restart_finishes_source_cleanup_after_database_commit() {
+        let mut fixture = fixture(false);
+        let task = claim_next(&mut fixture.connection, "job", "worker", 10)
+            .unwrap()
+            .unwrap();
+        let outcome = crate::newspaper::optimizer::optimize_page(&fixture.source, 25).unwrap();
+        let (path, bytes) = match outcome {
+            crate::newspaper::optimizer::OptimizationOutcome::Replaced { path, bytes } => {
+                (path, bytes)
+            }
+            crate::newspaper::optimizer::OptimizationOutcome::KeptOriginal { .. } => {
+                panic!("fixture should produce a smaller WebP")
+            }
+        };
+        complete_replaced(&mut fixture.connection, &task, &path, bytes, 5, 10).unwrap();
+        assert!(fixture.source.is_file());
+
+        let stats = reconcile(&fixture.connection, 11).unwrap();
+
+        assert!(!fixture.source.exists());
+        assert!(fixture.output.is_file());
+        assert_eq!(stats.removed_originals, 1);
+    }
+
+    #[test]
+    fn initialization_backfills_missing_tasks_for_existing_pages() {
+        let fixture = fixture(true);
+        fixture
+            .connection
+            .execute(
+                "DELETE FROM newspaper_optimization_tasks WHERE page_id = 'page'",
+                [],
+            )
+            .unwrap();
+
+        crate::newspaper::storage::initialize(&fixture.connection).unwrap();
+
+        let count: i64 = fixture
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_optimization_tasks
+                 WHERE page_id = 'page' AND status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn retryable_failure_waits_before_the_next_claim() {
         let mut fixture = fixture(true);
         let first = claim_next(&mut fixture.connection, "job", "worker", 10)
@@ -878,6 +945,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.attempts, 2);
+    }
+
+    #[test]
+    fn stale_worker_cannot_commit_after_another_worker_reclaims_the_task() {
+        let mut fixture = fixture(true);
+        let stale = claim_next(&mut fixture.connection, "job", "worker-one", 10)
+            .unwrap()
+            .unwrap();
+        fixture
+            .connection
+            .execute(
+                "UPDATE newspaper_optimization_tasks SET lease_expires_at = 11
+                 WHERE page_id = 'page'",
+                [],
+            )
+            .unwrap();
+        reconcile(&fixture.connection, 12).unwrap();
+        let current = claim_next(&mut fixture.connection, "job", "worker-two", 12)
+            .unwrap()
+            .unwrap();
+
+        assert!(complete_kept_original(&mut fixture.connection, &stale, 100, 1, 13).is_err());
+        let optimized_path: Option<String> = fixture
+            .connection
+            .query_row(
+                "SELECT optimized_path FROM newspaper_pages WHERE id = 'page'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(optimized_path.is_none());
+
+        complete_kept_original(&mut fixture.connection, &current, 100, 1, 13).unwrap();
     }
 
     #[test]

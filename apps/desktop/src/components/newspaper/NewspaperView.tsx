@@ -1,9 +1,11 @@
 import { type DragEvent as ReactDragEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   CalendarClock,
   CheckCircle2,
+  CircleHelp,
   Clock3,
   Download,
   FolderOpen,
@@ -17,7 +19,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Button, Checkbox, Input, Select, StatusBadge, Switch } from "../primitives";
+import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
 
 type EditionKind = "daily" | "weekly" | "special";
@@ -79,8 +81,40 @@ type Bootstrap = {
 };
 type ActivitySnapshot = {
   jobs: NewspaperJob[];
+  progress: NewspaperJobProgress[];
   schedules: NewspaperSchedule[];
   hasLiveActivity: boolean;
+  optimizationRuntime: OptimizationRuntime;
+  revision: number;
+};
+type NewspaperJobProgress = {
+  jobId: string;
+  currentStage: string;
+  downloadTotal: number;
+  downloadCompleted: number;
+  downloadFailed: number;
+  optimizationTotal: number;
+  optimizationCompleted: number;
+  optimizationFailed: number;
+  optimizationPending: number;
+  optimizationRecovered: number;
+  activeWorkers: number;
+  pagesPerMinute?: number | null;
+  etaSeconds?: number | null;
+  originalBytes: number;
+  optimizedBytes: number;
+  bytesSaved: number;
+};
+type OptimizationRuntime = {
+  active: boolean;
+  mode: string;
+  requestedWorkers: number;
+  admittedWorkers: number;
+  activeWorkers: number;
+  cpuPercent?: number | null;
+  availableMemoryBytes?: number | null;
+  memorySafe: boolean;
+  limitedReason?: string | null;
 };
 type CreateBatchResponse = {
   jobs: NewspaperJob[];
@@ -150,12 +184,23 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     )
   );
   const [keepOriginal, setKeepOriginal] = useState(initial.current.keepOriginal ?? false);
+  const [optimizationMode, setOptimizationMode] = useState<"auto" | "manual">(initial.current.optimizationMode ?? "auto");
+  const [workerCeiling, setWorkerCeiling] = useState(initial.current.workerCeiling ?? 16);
   const [cronTime, setCronTime] = useState(initial.current.cronTime ?? "07:00");
   const [scheduleTab, setScheduleTab] = useState<"schedule" | "history">("schedule");
   const [draggedJobId, setDraggedJobId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [savingSchedule, setSavingSchedule] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [jobProgress, setJobProgress] = useState<NewspaperJobProgress[]>([]);
+  const [optimizationRuntime, setOptimizationRuntime] = useState<OptimizationRuntime>({
+    active: false,
+    mode: "auto",
+    requestedWorkers: workerCeiling,
+    admittedWorkers: 0,
+    activeWorkers: 0,
+    memorySafe: true
+  });
 
   const optimizationProfile = optimizationQuality >= 89 ? "webp_high" : "webp_balanced";
   const compressionLabel = optimizationQuality >= 89
@@ -183,6 +228,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     if (mode === "library") return;
     let disposed = false;
     let activityTimer: number | undefined;
+    let unlistenProgress: (() => void) | undefined;
     const pollActivity = async () => {
       if (disposed || !isTauriRuntime()) return;
       let nextDelay = 15_000;
@@ -190,7 +236,9 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
         const snapshot = await invoke<ActivitySnapshot>("get_newspaper_activity_snapshot");
         if (disposed) return;
         setJobs(snapshot.jobs);
+        setJobProgress(snapshot.progress);
         setSchedules(snapshot.schedules);
+        setOptimizationRuntime(snapshot.optimizationRuntime);
         nextDelay = snapshot.hasLiveActivity ? 1_000 : 15_000;
       } catch {
         nextDelay = 15_000;
@@ -198,6 +246,14 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
       if (!disposed) activityTimer = window.setTimeout(() => void pollActivity(), nextDelay);
     };
     if (isTauriRuntime()) {
+      void listen("newspaper://optimization-progress", () => {
+        if (disposed) return;
+        if (activityTimer !== undefined) window.clearTimeout(activityTimer);
+        activityTimer = window.setTimeout(() => void pollActivity(), 100);
+      }).then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenProgress = unlisten;
+      });
       void invoke<NewspaperEdition[]>("refresh_newspaper_catalog")
         .then((items) => items.length && setCatalog(items))
         .catch(() => undefined)
@@ -209,6 +265,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     }
     return () => {
       disposed = true;
+      unlistenProgress?.();
       if (activityTimer !== undefined) window.clearTimeout(activityTimer);
     };
   }, [mode]);
@@ -219,11 +276,24 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
       delaySeconds,
       optimize,
       optimizationQuality,
+      optimizationMode,
+      workerCeiling,
       keepOriginal,
       cronTime,
       selected: [...selected]
     }));
-  }, [cronTime, delaySeconds, destination, keepOriginal, optimizationQuality, optimize, selected]);
+  }, [cronTime, delaySeconds, destination, keepOriginal, optimizationMode, optimizationQuality, optimize, selected, workerCeiling]);
+
+  const progressByJob = useMemo(
+    () => new Map(jobProgress.map((item) => [item.jobId, item])),
+    [jobProgress]
+  );
+  const aggregateProgress = useMemo(() => jobProgress.reduce((aggregate, item) => ({
+    downloaded: aggregate.downloaded + item.downloadCompleted,
+    downloadTotal: aggregate.downloadTotal + item.downloadTotal,
+    optimized: aggregate.optimized + item.optimizationCompleted,
+    optimizationTotal: aggregate.optimizationTotal + item.optimizationTotal
+  }), { downloaded: 0, downloadTotal: 0, optimized: 0, optimizationTotal: 0 }), [jobProgress]);
 
   const visibleEditions = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -329,7 +399,9 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
       await refresh();
       setProcessing(true);
       await invoke("process_newspaper_queue");
-      void invoke("process_newspaper_optimization_queue").catch(() => undefined);
+      void invoke("process_newspaper_optimization_queue", {
+        options: { mode: optimizationMode, workerCeiling }
+      }).catch(() => undefined);
       await refresh();
     } catch (error) {
       toast.error("Could not start newspaper download", { description: String(error) });
@@ -358,7 +430,9 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     if (!isTauriRuntime()) return;
     setProcessing(true);
     void invoke("process_newspaper_queue")
-      .then(() => invoke("process_newspaper_optimization_queue"))
+      .then(() => invoke("process_newspaper_optimization_queue", {
+        options: { mode: optimizationMode, workerCeiling }
+      }))
       .catch((error) => toast.error("Could not continue newspaper queue", { description: String(error) }))
       .finally(() => {
         setProcessing(false);
@@ -597,7 +671,14 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
               </div>
             </label>
             <div className={`newspaper-optimization-setting${optimize ? "" : " is-disabled"}`}>
-              <span>Image optimization</span>
+              <span className="newspaper-optimization-heading">
+                Image optimization
+                <Tooltip label={`${compressionLabel} · Quality 25 may soften fine print. JPG remains only if WebP is larger or fails.${optimizationRuntime.limitedReason ? ` ${optimizationRuntime.limitedReason}` : ""}`}>
+                  <button type="button" className="newspaper-setting-help" aria-label="About newspaper image optimization">
+                    <CircleHelp aria-hidden="true" />
+                  </button>
+                </Tooltip>
+              </span>
               <div>
                 <Switch label="Optimize images" checked={optimize} onChange={(event) => setOptimize(event.target.checked)} />
                 <Select value={String(optimizationQuality)} onChange={(event) => setOptimizationQuality(Number(event.target.value))} disabled={!optimize} aria-label="Image compression strength">
@@ -611,7 +692,16 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                 </Select>
                 <Checkbox label="Keep source JPG" checked={keepOriginal} onChange={(event) => setKeepOriginal(event.target.checked)} disabled={!optimize} />
               </div>
-              <small>{compressionLabel} · Quality 25 may soften fine print. JPG remains only if WebP is larger or fails.</small>
+              <div className="newspaper-worker-setting">
+                <span>Workers</span>
+                <Select value={optimizationMode} onChange={(event) => setOptimizationMode(event.target.value as "auto" | "manual")} disabled={!optimize} aria-label="Optimization worker mode">
+                  <option value="auto">Auto</option>
+                  <option value="manual">Manual ceiling</option>
+                </Select>
+                <Select value={String(workerCeiling)} onChange={(event) => setWorkerCeiling(Number(event.target.value))} disabled={!optimize || optimizationMode === "auto"} aria-label="Optimization worker ceiling">
+                  {[2, 4, 8, 12, 16, 20].map((workers) => <option value={workers} key={workers}>{workers}</option>)}
+                </Select>
+              </div>
             </div>
           </div>
           <div className="command-actions newspaper-download-actions">
@@ -625,8 +715,8 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
         <div className="newspaper-progress-table">
           <div className="newspaper-progress-head"><span></span><span>Newspaper</span><span>Status</span><span>Progress</span><span>Actions</span></div>
           {progressJobs.length === 0 ? <div className="newspaper-empty">Newspaper downloads will appear here.</div> : progressJobs.map((job) => {
-            const completed = job.completed_count + job.failed_count;
-            const progress = job.status === "completed" ? 100 : job.page_count > 0 ? Math.min(100, Math.round((completed / job.page_count) * 100)) : 0;
+            const details = progressByJob.get(job.id);
+            const progress = exactProgressPercent(job, details);
             const awaitingRelease = Boolean(job.retry_at && job.retry_at * 1000 > Date.now());
             return (
               <article
@@ -655,7 +745,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                 <div className="newspaper-progress-edition"><strong>{job.edition_name} · {job.edition_code}</strong><span>{job.publication_date}</span></div>
                 <div className="newspaper-progress-status">
                   <StatusBadge className={job.status === "completed" ? "is-completed" : undefined} tone={job.status === "completed" ? "success" : job.status === "failed" || job.status === "partial" ? "danger" : job.paused || awaitingRelease ? "neutral" : "primary"}>
-                    {awaitingRelease ? "Awaiting release" : formatJobStatus(job)}
+                    {awaitingRelease ? "Awaiting release" : formatJobStatus(job, details)}
                   </StatusBadge>
                   <span>{formatJobTime(job)}</span>
                 </div>
@@ -664,7 +754,13 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                   <div role="progressbar" aria-label={`${job.edition_name} download progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
                     <i style={{ width: `${progress}%` }} />
                   </div>
-                  <small>{job.status === "optimizing" ? "Optimizing images" : job.page_count > 0 ? `${job.completed_count}/${job.page_count} pages` : job.paused ? "Paused safely" : "Waiting"}</small>
+                  <small>{formatProgressDetail(job, details)}</small>
+                  {details?.optimizationTotal ? (
+                    <div className="newspaper-stage-counts">
+                      <span>Download {details.downloadCompleted}/{details.downloadTotal}</span>
+                      <span>Optimize {details.optimizationCompleted}/{details.optimizationTotal}</span>
+                    </div>
+                  ) : null}
                 </div>
                 <div className="newspaper-progress-actions">
                   {job.status === "active" || job.status === "optimizing" ? (
@@ -686,7 +782,16 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
           })}
         </div>
       </section>
-      {processing ? <div className="newspaper-processing"><LoaderCircle className="lv-button-spinner" /> Downloading and validating pages…</div> : null}
+      {processing || optimizationRuntime.active ? (
+        <div className="newspaper-processing">
+          <LoaderCircle className="lv-button-spinner" />
+          <span>
+            Downloaded {aggregateProgress.downloaded}/{aggregateProgress.downloadTotal}
+            {aggregateProgress.optimizationTotal > 0 ? ` · Optimized ${aggregateProgress.optimized}/${aggregateProgress.optimizationTotal}` : ""}
+            {optimizationRuntime.active ? ` · ${optimizationRuntime.activeWorkers}/${optimizationRuntime.admittedWorkers} workers${optimizationRuntime.cpuPercent != null ? ` · CPU ${Math.round(optimizationRuntime.cpuPercent)}%` : ""}` : ""}
+          </span>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -695,8 +800,10 @@ function isTerminalJob(job: NewspaperJob) {
   return ["completed", "partial", "failed", "unavailable", "cancelled"].includes(job.status);
 }
 
-function formatJobStatus(job: NewspaperJob) {
+function formatJobStatus(job: NewspaperJob, progress?: NewspaperJobProgress) {
   if (job.paused) return "Paused";
+  if (progress?.currentStage === "finalizing") return "Finalizing";
+  if (progress?.currentStage === "optimizing" && progress.optimizationRecovered > 0) return "Resuming";
   const labels: Record<string, string> = {
     active: "Downloading",
     queued: "Queued",
@@ -708,6 +815,48 @@ function formatJobStatus(job: NewspaperJob) {
     cancelled: "Cancelled"
   };
   return labels[job.status] ?? job.status;
+}
+
+function exactProgressPercent(job: NewspaperJob, progress?: NewspaperJobProgress) {
+  if (job.status === "completed" || progress?.currentStage === "complete") return 100;
+  if (!progress) {
+    const terminal = job.completed_count + job.failed_count;
+    return job.page_count > 0 ? Math.min(99, Math.round((terminal / job.page_count) * 100)) : 0;
+  }
+  const downloadTerminal = progress.downloadCompleted + progress.downloadFailed;
+  const optimizationTerminal = progress.optimizationCompleted + progress.optimizationFailed;
+  const downloadDone = progress.downloadTotal > 0 && downloadTerminal >= progress.downloadTotal;
+  const isOptimizationStage = progress.optimizationTotal > 0 && downloadDone;
+  const terminal = isOptimizationStage ? optimizationTerminal : downloadTerminal;
+  const total = isOptimizationStage ? progress.optimizationTotal : progress.downloadTotal;
+  return total > 0 ? Math.min(99, Math.round((terminal / total) * 100)) : 0;
+}
+
+function formatProgressDetail(job: NewspaperJob, progress?: NewspaperJobProgress) {
+  if (job.paused) return "Paused safely";
+  if (!progress) return job.page_count > 0 ? `${job.completed_count}/${job.page_count} downloaded` : "Waiting";
+  if (progress.currentStage === "queued") return "Waiting";
+  if (progress.currentStage === "downloading") {
+    return `${progress.downloadCompleted}/${progress.downloadTotal} downloaded${progress.downloadFailed ? ` · ${progress.downloadFailed} failed` : ""}`;
+  }
+  if (progress.currentStage === "optimizing" || progress.currentStage === "finalizing") {
+    const metrics = [
+      `${progress.optimizationCompleted}/${progress.optimizationTotal} optimized`,
+      progress.activeWorkers ? `${progress.activeWorkers} workers` : null,
+      progress.pagesPerMinute ? `${progress.pagesPerMinute.toFixed(1)} pages/min` : null,
+      progress.etaSeconds ? formatEta(progress.etaSeconds) : null,
+      progress.optimizationRecovered ? `${progress.optimizationRecovered} recovered` : null
+    ].filter(Boolean);
+    return metrics.join(" · ");
+  }
+  return progress.currentStage === "complete"
+    ? `${progress.downloadCompleted} downloaded · ${progress.optimizationCompleted || progress.downloadCompleted} ready`
+    : `${progress.downloadCompleted}/${progress.downloadTotal} downloaded`;
+}
+
+function formatEta(seconds: number) {
+  if (seconds < 60) return `about ${Math.max(1, Math.round(seconds))}s`;
+  return `about ${Math.ceil(seconds / 60)}m`;
 }
 
 function formatJobTime(job: NewspaperJob) {
@@ -746,6 +895,8 @@ function readPreferences(): {
   optimize?: boolean;
   profile?: string;
   keepOriginal?: boolean;
+  optimizationMode?: "auto" | "manual";
+  workerCeiling?: number;
   cronTime?: string;
   selected?: string[];
 } {

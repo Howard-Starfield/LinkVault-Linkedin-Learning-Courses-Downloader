@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.2 — 2026-07-26
+
+- Reworked the newspaper reader into a wider, seamless canvas with a slim one-row toolbar, immediate pointer-centered zoom, persistent default/click zoom preferences, and accurate unique-page reading progress.
+- Moved newspaper reader and archive maintenance controls into Settings, leaving the Library toolbar compact and revealing optimization guidance only on hover.
+- Added a durable page-level optimization ledger with crash recovery, lease reconciliation, safe original preservation, and exact download/optimization progress.
+- Added a CPU- and memory-aware conversion swarm with Auto mode, manual ceilings up to 20 workers, throttled runtime feedback, and 500-page stress coverage.
+- Expanded UI, browser, performance, recovery, and backend verification for newspaper reading and optimization.
+
 ## 0.2.1 — 2026-07-26
 
 - Modularized the newspaper backend behind its stable 24-command Tauri facade, moving state, catalog, batch, schedule, Library, job lifecycle, queue, archive, optimization, naming, and repository ownership into focused modules while preserving behavior and reducing `commands.rs` from 3,481 to 303 lines.

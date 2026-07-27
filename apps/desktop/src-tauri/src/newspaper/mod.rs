@@ -20,6 +20,7 @@ mod overview_service;
 mod page_metadata;
 mod queue_service;
 mod reader_service;
+mod resource_governor;
 mod schedule_service;
 mod state;
 pub mod storage;

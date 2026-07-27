@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 const bundleRoot = new URL("../src-tauri/target/release/bundle/", import.meta.url);
+const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const candidates = [];
 for (const folder of ["nsis", "msi"]) {
   try {
@@ -13,5 +14,9 @@ for (const folder of ["nsis", "msi"]) {
     // One Windows bundle format may be disabled.
   }
 }
-assert.ok(candidates.length > 0, "No Windows installer was found. Run npm run tauri build first.");
-console.log(`Installer verification passed: ${candidates.join(", ")}`);
+const expected = join("nsis", `LinkVault_${packageJson.version}_x64-setup.exe`);
+assert.ok(
+  candidates.includes(expected),
+  `Expected ${expected}, but found: ${candidates.join(", ") || "no Windows installers"}. Run npm run tauri build first.`
+);
+console.log(`Installer verification passed for ${expected}.`);
