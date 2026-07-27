@@ -1,5 +1,5 @@
 // Typed Tauri 2 invoke wrappers for the Coursera tab.
-// Mirrors `apps/desktop/src-tauri/src/coursera/commands.rs` 1:1.
+// Mirrors `apps/desktop/src-tauri/src/providers/coursera/commands.rs` 1:1.
 // All commands return `Result<T, String>` per Tauri 2 conventions; the
 // invoke wrappers surface the error string to the caller.
 

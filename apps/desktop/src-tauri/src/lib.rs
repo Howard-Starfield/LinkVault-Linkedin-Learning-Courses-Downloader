@@ -1,33 +1,22 @@
 #![deny(unused)]
 
-mod app_updates;
-pub mod artifact_downloader;
-pub mod auth;
-pub mod browser_cookies;
-pub mod cache;
-mod commands;
-pub mod course;
-pub mod download_orchestrator;
-pub mod exercise_archive;
-mod linkedin;
-pub mod live_clients;
-pub mod quality;
-pub mod quiz_hints;
-pub mod security;
-pub mod storage;
-pub mod token_store;
+mod app;
+mod providers;
+pub mod workflow;
 
-// Coursera tab: fully isolated sibling. The Tauri command surface is
-// registered below alongside the LinkedIn handlers. Per
-// `docs/learning/agent-harness-coursera/ISOLATION_RULES.md`, the
-// LinkedIn command surface in `commands::*` is unchanged.
-pub mod coursera;
-pub mod newspaper;
+use app::updates as app_updates;
+pub use app::{database as cache, security, storage};
+pub use providers::linkedin::{
+    artifact_downloader, auth, browser_cookies, course, download_orchestrator, exercise_archive,
+    live_clients, quality, quiz_hints, token_store,
+};
+use providers::linkedin::{commands, linkedin};
+pub use providers::{coursera, newspaper};
 
 use tauri::Manager;
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol(
             "newspaper-media",
             |context, request, responder| {
@@ -129,7 +118,9 @@ pub fn run() {
                 let legacy_app_data = app.path().app_data_dir()?;
                 storage::migrate_legacy_app_data(&legacy_app_data, data_dir)?;
             }
-            let connection = cache::open_or_initialize(&db_path)?;
+            let diagnostics = app::database_diagnostics::DatabaseDiagnostics::default();
+            let (connection, _initialization) =
+                cache::initialize_database_with_diagnostics(&db_path, &diagnostics)?;
             cache::reconcile_active_jobs_after_restart(
                 &connection,
                 commands::now_unix_timestamp(),
@@ -139,6 +130,10 @@ pub fn run() {
                 commands::now_unix_timestamp(),
             )?;
             drop(connection);
+            let writer =
+                app::database_writer::DatabaseWriter::start(db_path.clone(), diagnostics.clone())?;
+            app.manage(diagnostics);
+            app.manage(writer);
             app.manage(commands::LinkVaultState::new(db_path.clone()));
             app.manage(coursera::commands::CourseraState::new(db_path.clone()));
             app.manage(newspaper::thumbnails::ThumbnailCoordinator::new(
@@ -149,6 +144,17 @@ pub fn run() {
             app.manage(app_updates::PendingUpdate::default());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running LinkVault");
+        .build(tauri::generate_context!())
+        .expect("error while building LinkVault");
+
+    app.run(|handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            let _ = handle
+                .state::<app::database_writer::DatabaseWriter>()
+                .shutdown();
+        }
+    });
 }

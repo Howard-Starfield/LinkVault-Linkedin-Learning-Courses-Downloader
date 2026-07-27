@@ -8,12 +8,12 @@ If LinkedIn changes again, start with this map before editing code.
 
 | Symptom | First file to inspect | Current endpoint/source | Stable parser shape | Current regression tests |
 | --- | --- | --- | --- | --- |
-| Token accepted but API returns guest/trial/short responses | `apps/desktop/src-tauri/src/auth.rs` | `https://www.linkedin.com/learning` | `JSESSIONID`, no guest markers, `enterpriseProfile` or `enterpriseProfileHash` -> `x-li-identity` | `enterprise_profile`, `guest_learning_page` |
-| Video metadata exists but no MP4 downloads | `apps/desktop/src-tauri/src/course.rs` | `learning-api/detailedCourses?...fields=selectedVideo...` | `selectedVideo.url.progressiveUrl`, or metadata with `download_url: None` | `selected_video` |
-| SRT is cut short or final cue stretches to end | `apps/desktop/src-tauri/src/course.rs` | `learning-api/graphql?...queryId=videos.eb0cecfaa25dcd83d23769c32e492c1e` | any object with `lines[].caption` and `lines[].transcriptStartAt` | `transcript` |
-| Exercise zip fails or URL is empty/stale | `apps/desktop/src-tauri/src/course.rs` | `learning-api/graphql?...queryId=courses.7cd8dafe4728f0b6e7d53bf1990affce` | any object with `exerciseFiles[].name` and `exerciseFiles[].url` | `exercise` |
-| `Study.md` misses transcript text | `apps/desktop/src-tauri/src/download_orchestrator.rs` | local merge from `video.transcript_srt` | SRT captions -> transcript paragraphs | `study_guide` |
-| Browser cookie source says no candidates | `apps/desktop/src-tauri/src/browser_cookies.rs` | browser SQLite cookie DBs | Firefox readable; Chromium `v20` may be app-bound encrypted | `browser_cookies` |
+| Token accepted but API returns guest/trial/short responses | `apps/desktop/src-tauri/src/providers/linkedin/auth.rs` | `https://www.linkedin.com/learning` | `JSESSIONID`, no guest markers, `enterpriseProfile` or `enterpriseProfileHash` -> `x-li-identity` | `enterprise_profile`, `guest_learning_page` |
+| Video metadata exists but no MP4 downloads | `apps/desktop/src-tauri/src/providers/linkedin/course.rs` | `learning-api/detailedCourses?...fields=selectedVideo...` | `selectedVideo.url.progressiveUrl`, or metadata with `download_url: None` | `selected_video` |
+| SRT is cut short or final cue stretches to end | `apps/desktop/src-tauri/src/providers/linkedin/course.rs` | `learning-api/graphql?...queryId=videos.eb0cecfaa25dcd83d23769c32e492c1e` | any object with `lines[].caption` and `lines[].transcriptStartAt` | `transcript` |
+| Exercise zip fails or URL is empty/stale | `apps/desktop/src-tauri/src/providers/linkedin/course.rs` | `learning-api/graphql?...queryId=courses.7cd8dafe4728f0b6e7d53bf1990affce` | any object with `exerciseFiles[].name` and `exerciseFiles[].url` | `exercise` |
+| `Study.md` misses transcript text | `apps/desktop/src-tauri/src/providers/linkedin/download_orchestrator.rs` | local merge from `video.transcript_srt` | SRT captions -> transcript paragraphs | `study_guide` |
+| Browser cookie source says no candidates | `apps/desktop/src-tauri/src/providers/linkedin/browser_cookies.rs` | browser SQLite cookie DBs | Firefox readable; Chromium `v20` may be app-bound encrypted | `browser_cookies` |
 
 Keep these rules:
 
@@ -131,7 +131,7 @@ Validate Ambry links with a tiny range request. A good zip should usually return
 Planning happens in:
 
 ```text
-apps/desktop/src-tauri/src/download_orchestrator.rs
+apps/desktop/src-tauri/src/providers/linkedin/download_orchestrator.rs
 ```
 
 Important separation:
@@ -264,7 +264,7 @@ The selected-video fetcher no longer fails the whole course when LinkedIn return
 Changed file:
 
 ```text
-apps/desktop/src-tauri/src/course.rs
+apps/desktop/src-tauri/src/providers/linkedin/course.rs
 ```
 
 Behavior before:
@@ -283,7 +283,7 @@ Behavior after:
 This works because artifact planning already checks `video.download_url` before creating a video artifact:
 
 ```text
-apps/desktop/src-tauri/src/download_orchestrator.rs
+apps/desktop/src-tauri/src/providers/linkedin/download_orchestrator.rs
 ```
 
 ## Subtitle Fix Applied
@@ -291,7 +291,7 @@ apps/desktop/src-tauri/src/download_orchestrator.rs
 Changed file:
 
 ```text
-apps/desktop/src-tauri/src/course.rs
+apps/desktop/src-tauri/src/providers/linkedin/course.rs
 ```
 
 Behavior before:
@@ -379,8 +379,8 @@ Two adjacent issues were found while testing:
 Relevant files:
 
 ```text
-apps/desktop/src-tauri/src/auth.rs
-apps/desktop/src-tauri/src/browser_cookies.rs
+apps/desktop/src-tauri/src/providers/linkedin/auth.rs
+apps/desktop/src-tauri/src/providers/linkedin/browser_cookies.rs
 apps/desktop/src/App.tsx
 ```
 
@@ -497,7 +497,7 @@ When LinkedIn downloads break again, start here.
 
 12. Add a regression fixture before changing parser behavior.
 
-   Put the smallest representative selected-video JSON in `apps/desktop/src-tauri/src/course.rs` tests. Cover both:
+   Put the smallest representative selected-video JSON in `apps/desktop/src-tauri/src/providers/linkedin/course.rs` tests. Cover both:
 
    - media URL present,
    - valid metadata present but media URL absent.

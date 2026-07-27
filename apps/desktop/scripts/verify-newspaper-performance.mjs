@@ -70,7 +70,7 @@ const librarySource = await readFile(
   "utf8"
 );
 const commandsSource = await readFile(
-  new URL("../src-tauri/src/newspaper/commands.rs", import.meta.url),
+  new URL("../src-tauri/src/providers/newspaper/commands.rs", import.meta.url),
   "utf8"
 );
 

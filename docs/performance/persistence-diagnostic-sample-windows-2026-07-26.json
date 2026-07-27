@@ -1,0 +1,62 @@
+[
+  {
+    "sequence": 1,
+    "timestampMs": 1785132265244,
+    "kind": "migration",
+    "operation": "migrate_database",
+    "provider": "app",
+    "workflowId": null,
+    "elapsedMs": 189,
+    "queueDepth": 0,
+    "outcome": "ok",
+    "errorClass": null
+  },
+  {
+    "sequence": 2,
+    "timestampMs": 1785132265251,
+    "kind": "initialization",
+    "operation": "initialize_database",
+    "provider": "app",
+    "workflowId": null,
+    "elapsedMs": 197,
+    "queueDepth": 0,
+    "outcome": "ok",
+    "errorClass": null
+  },
+  {
+    "sequence": 3,
+    "timestampMs": 1785132265260,
+    "kind": "writer_request",
+    "operation": "diagnostic_success_probe",
+    "provider": "workflow",
+    "workflowId": null,
+    "elapsedMs": 1,
+    "queueDepth": 0,
+    "outcome": "ok",
+    "errorClass": null
+  },
+  {
+    "sequence": 4,
+    "timestampMs": 1785132265260,
+    "kind": "writer_request",
+    "operation": "diagnostic_error_probe",
+    "provider": "workflow",
+    "workflowId": null,
+    "elapsedMs": 0,
+    "queueDepth": 0,
+    "outcome": "error",
+    "errorClass": "sqlite"
+  },
+  {
+    "sequence": 5,
+    "timestampMs": 1785132265260,
+    "kind": "shutdown",
+    "operation": "database_writer_shutdown",
+    "provider": "app",
+    "workflowId": null,
+    "elapsedMs": 0,
+    "queueDepth": 0,
+    "outcome": "ok",
+    "errorClass": null
+  }
+]

@@ -1,6 +1,7 @@
 // TypeScript mirror of the Rust `coursera::*` serde structs.
 // All fields use camelCase to match the Rust `#[serde(rename_all = "camelCase")]`
-// boundary. Keep this file in sync with `apps/desktop/src-tauri/src/coursera/`.
+// boundary. Keep this file in sync with
+// `apps/desktop/src-tauri/src/providers/coursera/`.
 
 export type ParsedCourseraClass = {
   original: string;
