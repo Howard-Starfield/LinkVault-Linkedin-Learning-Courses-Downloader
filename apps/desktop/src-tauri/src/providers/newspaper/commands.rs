@@ -214,7 +214,7 @@ pub fn remove_newspaper_job(
     state: State<'_, NewspaperState>,
     job_id: String,
 ) -> Result<(), String> {
-    let status = job_service::dismiss(state.db_path(), &job_id)?;
+    let status = job_service::delete(state.db_path(), &job_id)?;
     if matches!(status.as_str(), "active" | "optimizing") {
         state.cancelled.store(true, Ordering::SeqCst);
     }

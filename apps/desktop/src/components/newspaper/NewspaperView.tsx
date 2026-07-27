@@ -490,19 +490,18 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
   }
 
   async function removeJob(job: NewspaperJob) {
-    const prompt = isTerminalJob(job)
-      ? "Remove this item from Progress? Downloaded files will stay on disk and the entry will remain in History."
-      : "Cancel and remove this item from Progress? Completed page files will stay on disk and the cancellation will remain in History.";
+    const prompt = ["completed", "partial"].includes(job.status)
+      ? "Permanently delete this downloaded edition? Its local newspaper files and progress history will be removed."
+      : "Permanently delete this queue item and its saved files? This cannot be undone.";
     if (!window.confirm(prompt) || !isTauriRuntime()) return;
     try {
       await invoke("remove_newspaper_job", { jobId: job.id });
-      toast.success("Removed from Progress", { description: "Downloaded files were left on disk." });
+      toast.success("Newspaper edition deleted", {
+        description: "Its local files and progress history were removed."
+      });
       await refresh();
-      if (!isTerminalJob(job)) {
-        window.setTimeout(continueQueue, 250);
-      }
     } catch (error) {
-      toast.error("Could not remove queue item", { description: String(error) });
+      toast.error("Could not delete newspaper edition", { description: String(error) });
     }
   }
 
@@ -775,7 +774,14 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                   {["completed", "partial"].includes(job.status) ? (
                     <button type="button" aria-label={`Open ${job.edition_name} folder`} title="Open download folder" onClick={() => void invoke("open_newspaper_download_folder", { path: job.output_dir })}><FolderOpen /></button>
                   ) : null}
-                  <button type="button" className="danger" aria-label={`Remove ${job.edition_name} from progress`} title="Remove from Progress; files stay on disk" onClick={() => void removeJob(job)}><Trash2 /></button>
+                  <button
+                    type="button"
+                    className="danger"
+                    aria-label={`Delete ${job.edition_name} and its local files`}
+                    title={["active", "optimizing"].includes(job.status) ? "Pause this download before deleting it" : "Delete edition and local files"}
+                    disabled={["active", "optimizing"].includes(job.status)}
+                    onClick={() => void removeJob(job)}
+                  ><Trash2 /></button>
                 </div>
               </article>
             );
