@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 import { IconBrandLinkedin, IconCertificate, IconMovie } from "@tabler/icons-react";
 import liAtCookieGuide from "./assets/guide.png";
-import linkvaultLogo from "./assets/linkvault-wordmark.png";
+import linkvaultLogo from "./assets/linkvault-wordmark.svg";
 import {
   ActivityEventRow,
   Button,
@@ -230,7 +230,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.9";
+const APP_VERSION = "0.2.10";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
 
