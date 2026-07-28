@@ -133,6 +133,27 @@ pub fn run() {
                 &connection,
                 commands::now_unix_timestamp(),
             )?;
+            // Self-heal the built-in newspaper catalog on every startup.
+            // Fresh databases and intact v0.2.7 installs hit the no-op path
+            // (one COUNT(*)); v0.2.7 installs whose users clicked Reset
+            // World Journal database get the 13 built-in editions
+            // restored here without any user action.
+            let reseeded = newspaper::storage::ensure_catalog_populated(
+                &connection,
+                commands::now_unix_timestamp(),
+            )?;
+            if reseeded {
+                diagnostics.record(app::database_diagnostics::DatabaseDiagnosticInput {
+                    kind: app::database_diagnostics::DatabaseDiagnosticKind::Initialization,
+                    operation: "ensure_newspaper_catalog_populated",
+                    provider: app::database_diagnostics::DatabaseProvider::Newspaper,
+                    workflow_id: None,
+                    elapsed: std::time::Duration::ZERO,
+                    queue_depth: 0,
+                    outcome: app::database_diagnostics::DatabaseDiagnosticOutcome::Ok,
+                    error_class: None,
+                });
+            }
             drop(connection);
             let writer =
                 app::database_writer::DatabaseWriter::start(db_path.clone(), diagnostics.clone())?;

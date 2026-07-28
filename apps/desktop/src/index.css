@@ -225,6 +225,53 @@ textarea {
   border-color: rgb(240 138 93 / 0.3) !important;
 }
 
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid rgb(240 138 93 / 0.3);
+  background: rgb(30 20 15 / 0.96);
+  font-size: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  flex-shrink: 0;
+}
+
+:root[data-theme="light"] .update-banner {
+  background: rgb(253 244 237 / 0.97);
+  border-bottom-color: rgb(200 120 60 / 0.2);
+}
+
+.update-banner-text {
+  color: var(--text-main);
+}
+
+.update-banner-text strong {
+  color: rgb(240 138 93);
+}
+
+.update-banner-text span {
+  color: var(--text-muted);
+}
+
+.update-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.update-banner-dismiss {
+  color: var(--text-muted) !important;
+}
+
+.update-banner-dismiss:hover {
+  color: var(--text-main) !important;
+}
+
 @keyframes lv-spin {
   to {
     transform: rotate(360deg);

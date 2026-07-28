@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 import { IconBrandLinkedin, IconCertificate, IconMovie } from "@tabler/icons-react";
 import liAtCookieGuide from "./assets/guide.png";
-import linkvaultLogo from "./assets/linkvault-wordmark.svg";
+import linkvaultLogo from "./assets/linkvault-wordmark.png";
 import {
   ActivityEventRow,
   Button,
@@ -223,7 +223,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.7";
+const APP_VERSION = "0.2.8";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
 
@@ -314,6 +314,7 @@ export default function App() {
   const [scheduleCourseCount, setScheduleCourseCount] = useState(0);
   const [isTokenGuideOpen, setIsTokenGuideOpen] = useState(false);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
+  const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
@@ -1189,6 +1190,7 @@ export default function App() {
       const update = await checkForAppUpdate();
       setPendingUpdate(update);
       if (update) {
+        setUpdateBannerDismissed(false);
         toast.success("Update available", {
           description: `LinkVault ${update.version} is ready to install.`
         });
@@ -1210,16 +1212,8 @@ export default function App() {
     try {
       const update = await checkForAppUpdate();
       setPendingUpdate(update);
-      if (update) {
-        toast.info("Update available", {
-          description: `LinkVault ${update.version} is ready to install.`,
-          duration: 15000,
-          action: {
-            label: "Install now",
-            onClick: () => void installUpdate(update)
-          }
-        });
-      }
+      // Reset dismissed state so the banner re-appears if a new update is available.
+      if (update) setUpdateBannerDismissed(false);
     } catch {
       // Startup checks should never block downloading courses.
     }
@@ -1571,19 +1565,35 @@ export default function App() {
         <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
           <div className="lv-nav-group">
             <SidebarItem
-              active={activeView === "downloads"}
               icon={<IconBrandLinkedin aria-hidden="true" size={18} />}
               trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
               aria-expanded={isLinkedInExpanded}
               onClick={() => {
                 const isCurrentProvider = activeView === "downloads" || activeView === "linkedin-history";
-                setActiveView("downloads");
-                setIsLinkedInExpanded((expanded) => isCurrentProvider ? !expanded : true);
+                if (isCurrentProvider) {
+                  setIsLinkedInExpanded((expanded) => {
+                    const nextExpanded = !expanded;
+                    if (nextExpanded) setActiveView("downloads");
+                    return nextExpanded;
+                  });
+                } else {
+                  setActiveView("downloads");
+                  setIsLinkedInExpanded(true);
+                }
               }}
             >
               LinkedIn Courses
             </SidebarItem>
             <div className="lv-nav-children" hidden={!isLinkedInExpanded}>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "downloads"}
+                icon={<Download aria-hidden="true" />}
+                aria-label="Download LinkedIn courses"
+                onClick={() => setActiveView("downloads")}
+              >
+                Download LinkedIn
+              </SidebarItem>
               <SidebarItem
                 className="lv-nav-child"
                 active={activeView === "linkedin-history"}
@@ -1597,19 +1607,35 @@ export default function App() {
           </div>
           <div className="lv-nav-group">
             <SidebarItem
-              active={activeView === "coursera"}
               icon={<IconCertificate aria-hidden="true" size={18} />}
               trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
               aria-expanded={isCourseraExpanded}
               onClick={() => {
                 const isCurrentProvider = activeView === "coursera" || activeView === "coursera-history";
-                setActiveView("coursera");
-                setIsCourseraExpanded((expanded) => isCurrentProvider ? !expanded : true);
+                if (isCurrentProvider) {
+                  setIsCourseraExpanded((expanded) => {
+                    const nextExpanded = !expanded;
+                    if (nextExpanded) setActiveView("coursera");
+                    return nextExpanded;
+                  });
+                } else {
+                  setActiveView("coursera");
+                  setIsCourseraExpanded(true);
+                }
               }}
             >
               Coursera Courses
             </SidebarItem>
             <div className="lv-nav-children" hidden={!isCourseraExpanded}>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "coursera"}
+                icon={<Download aria-hidden="true" />}
+                aria-label="Download Coursera courses"
+                onClick={() => setActiveView("coursera")}
+              >
+                Download Coursera
+              </SidebarItem>
               <SidebarItem
                 className="lv-nav-child"
                 active={activeView === "coursera-history"}
@@ -1623,14 +1649,21 @@ export default function App() {
           </div>
           <div className="lv-nav-group">
             <SidebarItem
-              active={activeView === "newspaper-download"}
               icon={<Newspaper aria-hidden="true" size={18} />}
               trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
               aria-expanded={isNewspaperExpanded}
               onClick={() => {
                 const isCurrentProvider = activeView === "newspaper-download" || activeView === "newspaper-library";
-                setActiveView("newspaper-download");
-                setIsNewspaperExpanded((expanded) => isCurrentProvider ? !expanded : true);
+                if (isCurrentProvider) {
+                  setIsNewspaperExpanded((expanded) => {
+                    const nextExpanded = !expanded;
+                    if (nextExpanded) setActiveView("newspaper-download");
+                    return nextExpanded;
+                  });
+                } else {
+                  setActiveView("newspaper-download");
+                  setIsNewspaperExpanded(true);
+                }
               }}
             >
               World Journal
@@ -1655,9 +1688,9 @@ export default function App() {
             </div>
           </div>
           <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
-          <div className="mt-7 flex items-center justify-between border-t border-sidebar-border pt-6 text-xs text-sidebar-muted">
+          <div className="mt-6 flex flex-col gap-1.5 border-t border-sidebar-border pt-4 text-xs text-sidebar-muted">
             <span>LinkedIn Scraper</span>
-            <span className="rounded-full border border-sidebar-border px-2 py-0.5 text-[11px]">Coming Soon</span>
+            <span className="self-start rounded-full border border-sidebar-border px-2 py-0.5 text-[10px] text-text-soft">Coming soon</span>
           </div>
         </nav>
 
@@ -1716,6 +1749,37 @@ export default function App() {
           <PanelLeft aria-hidden="true" className="h-4 w-4" />
         </button>
         <div className="lv-content">
+          {pendingUpdate && !updateBannerDismissed && (
+            <div className="update-banner" role="status" aria-live="polite">
+              <span className="update-banner-text">
+                <strong>Update available</strong>
+                <span> — LinkVault {pendingUpdate.version} is ready to install.</span>
+              </span>
+              <div className="update-banner-actions">
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="primary"
+                  onClick={() => void installUpdate()}
+                  loading={isInstallingUpdate}
+                  loadingLabel="Installing"
+                >
+                  Install now
+                </Button>
+                <Tooltip label="Dismiss">
+                  <IconButton
+                    type="button"
+                    size="xs"
+                    className="update-banner-dismiss"
+                    aria-label="Dismiss update banner"
+                    onClick={() => setUpdateBannerDismissed(true)}
+                  >
+                    <X aria-hidden="true" className="h-3 w-3" />
+                  </IconButton>
+                </Tooltip>
+              </div>
+            </div>
+          )}
           {activeView === "coursera" ? (
             <CourseraView />
           ) : activeView === "coursera-history" ? (
