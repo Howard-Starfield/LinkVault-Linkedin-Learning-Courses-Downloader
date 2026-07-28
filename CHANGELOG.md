@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.10 — 2026-07-28
+
+- Restored the LinkVault Course Downloader wordmark in the left sidebar. The v0.2.8 swap to a generic "All-in-One Downloader" graphic is reverted: the brand area now renders the cropped LinkVault SVG (viewBox `0 10 470 95`, 19% shorter than the v0.2.7 SVG) so the top section sits tighter against the panel. The wrong-brand `linkvault-wordmark.png` has been removed from the repository; `App.tsx` imports the SVG via `<img src>`, which honours the existing `.lv-brand-logo img { width: 100%; height: auto; }` rule. Users still on v0.2.8 or v0.2.9 will see the correct LinkVault wordmark after the in-app updater pulls this release.
+- Replaced the LI-AT cookie guide screenshot in the "Find your LinkedIn li_at cookie" dialog with the correct Chrome DevTools capture: Application tab open, Storage → Cookies → `www.linkedin.com` selected on the left, with the `li_at` cookie row visible in the cookie list. The previous image did not match the dialog's alt text and would have misled users about which cookie to copy.
+- Polished the left sidebar trigger button: the panel-collapse handle is now hidden by default and reveals itself on hover with a soft fade-in (160 ms), matching the rest of the rail's surface treatment. A `focus-within` rule keeps it visible for keyboard users.
+
 ## 0.2.9 — 2026-07-28
 
 - Newspaper image optimization now starts as soon as the first edition finishes downloading, instead of waiting for the entire batch. The per-edition trigger fires inside the download worker the moment a job reaches a `completed` or `partial` terminal status, so a "last 7 days" submission starts optimizing day 1 while days 2-7 are still downloading. The optimization queue and the download queue are now driven by independent `download_running` and `optimization_running` flags so they can overlap; the shared cooperative `cancelled` flag still stops both at safe boundaries.
