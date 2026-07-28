@@ -21,6 +21,7 @@ import {
 import { toast } from "sonner";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
+import { readNewspaperOptimizationPreferences } from "./newspaper-optimization-preferences";
 
 type EditionKind = "daily" | "weekly" | "special";
 type NewspaperEdition = {
@@ -393,15 +394,15 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
           description: response.skippedCount > 0
             ? `${response.skippedCount} existing edition${response.skippedCount === 1 ? "" : "s"} skipped.`
             : dateMode === "last7_days"
-              ? "Seven-day download confirmed. Image optimization will start after every date finishes."
-              : "Image optimization will start after downloading finishes."
+              ? "Seven-day download confirmed. Image optimization will start as soon as the first edition finishes downloading."
+              : "Image optimization will start as soon as this edition finishes downloading."
         });
       }
       await refresh();
       setProcessing(true);
       await invoke("process_newspaper_queue");
       void invoke("process_newspaper_optimization_queue", {
-        options: { mode: optimizationMode, workerCeiling }
+        options: buildOptimizationRunOptions()
       }).catch(() => undefined);
       await refresh();
     } catch (error) {
@@ -427,13 +428,22 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     await refresh();
   }
 
+  function buildOptimizationRunOptions() {
+    const preferences = readNewspaperOptimizationPreferences();
+    return {
+      mode: optimizationMode,
+      workerCeiling,
+      workerMemoryBudgetMb: preferences.workerMemoryBudgetMb,
+      memoryReserveBytes: preferences.memoryReserveMb * 1024 * 1024
+    };
+  }
+
   function continueQueue() {
     if (!isTauriRuntime()) return;
     setProcessing(true);
+    const options = buildOptimizationRunOptions();
     void invoke("process_newspaper_queue")
-      .then(() => invoke("process_newspaper_optimization_queue", {
-        options: { mode: optimizationMode, workerCeiling }
-      }))
+      .then(() => invoke("process_newspaper_optimization_queue", { options }))
       .catch((error) => toast.error("Could not continue newspaper queue", { description: String(error) }))
       .finally(() => {
         setProcessing(false);

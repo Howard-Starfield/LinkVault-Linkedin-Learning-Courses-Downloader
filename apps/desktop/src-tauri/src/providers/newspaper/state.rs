@@ -13,7 +13,8 @@ use super::models::OptimizationRuntimeStatus;
 pub struct NewspaperState {
     pub(super) db_path: PathBuf,
     pub(super) cancelled: Arc<AtomicBool>,
-    pub(super) running: AtomicBool,
+    pub(super) download_running: AtomicBool,
+    pub(super) optimization_running: Arc<AtomicBool>,
     library_revision: AtomicU64,
     progress_revision: AtomicU64,
     optimization_runtime: Mutex<OptimizationRuntimeStatus>,
@@ -25,7 +26,8 @@ impl NewspaperState {
         Self {
             db_path,
             cancelled: Arc::new(AtomicBool::new(false)),
-            running: AtomicBool::new(false),
+            download_running: AtomicBool::new(false),
+            optimization_running: Arc::new(AtomicBool::new(false)),
             library_revision: AtomicU64::new(1),
             progress_revision: AtomicU64::new(1),
             optimization_runtime: Mutex::new(OptimizationRuntimeStatus::default()),

@@ -299,6 +299,18 @@ pub struct NewspaperJobProgress {
 pub struct OptimizationRunOptions {
     pub mode: String,
     pub worker_ceiling: u8,
+    /// Memory budget per worker in megabytes. `None` falls back to the
+    /// governor's built-in default (160 MB), which fits typical 4K image
+    /// decode/encode peaks. 4K and other memory-hungry editions may want
+    /// 256-512 MB to avoid swap pressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_memory_budget_mb: Option<u32>,
+    /// Minimum bytes the system should keep free for the rest of the OS and
+    /// the LinkVault UI before the optimization workers are capped. `None`
+    /// falls back to the governor's built-in default (4 GB or 10% of total
+    /// RAM, whichever is larger).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_reserve_bytes: Option<u64>,
 }
 
 impl Default for OptimizationRunOptions {
@@ -306,6 +318,8 @@ impl Default for OptimizationRunOptions {
         Self {
             mode: "auto".to_string(),
             worker_ceiling: 16,
+            worker_memory_budget_mb: None,
+            memory_reserve_bytes: None,
         }
     }
 }
