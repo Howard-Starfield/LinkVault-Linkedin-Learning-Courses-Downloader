@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.9 — 2026-07-28
+
+- Newspaper image optimization now starts as soon as the first edition finishes downloading, instead of waiting for the entire batch. The per-edition trigger fires inside the download worker the moment a job reaches a `completed` or `partial` terminal status, so a "last 7 days" submission starts optimizing day 1 while days 2-7 are still downloading. The optimization queue and the download queue are now driven by independent `download_running` and `optimization_running` flags so they can overlap; the shared cooperative `cancelled` flag still stops both at safe boundaries.
+- The optimization governor's auto mode now targets a 50% CPU cap and re-evaluates the admitted worker pool every 3 seconds (down from every 1 second) to avoid oscillating around the cap. Manual mode still respects the user-configured worker ceiling and the new memory knobs as the upper bound.
+- Added two new governor knobs in the Newspaper section of the Settings dialog: **Memory per worker (MB)** (default 160, range 64-1024) and **Memory reserve (MB)** (default 4096, range 512-32768). 4K and other memory-hungry editions can raise the per-worker budget to avoid swap pressure; raising the reserve leaves more headroom for the rest of the OS, the LinkVault UI, and any active download. Both values are clamped server-side to safe bounds and persisted to `linkvault.newspaper.optimizationPreferences` in localStorage.
+- The "LinkedIn Scraper / Coming soon" placeholder in the left sidebar has been replaced with a live **Optimization** status panel that subscribes to the `newspaper://optimization-progress` event and renders the admitted worker count, the number of active workers, and the live system CPU percent. When nothing is optimizing, the panel shows an "Idle" pill instead. Regression coverage locks the eligible-status allowlist for the per-edition trigger and the new governor threshold constants.
+
 ## 0.2.8 — 2026-07-27
 
 - Rebuilt the left sidebar so the three expandable provider buttons (LinkedIn Courses, Coursera Courses, World Journal) no longer carry the active highlight, and added provider-specific Download LinkedIn and Download Coursera children as the first item under their groups, mirroring the World Journal's Download editions child. Clicking a parent now expands and snaps to its first child; collapsing leaves the current child active.

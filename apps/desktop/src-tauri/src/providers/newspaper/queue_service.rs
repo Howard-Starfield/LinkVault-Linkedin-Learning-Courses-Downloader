@@ -10,19 +10,28 @@ use std::{
 
 use chrono::{Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use tauri::Manager;
 
 use super::{
     batch_service,
     client::{FetchError, NewspaperClient},
+    commands::run_optimization_pass,
     downloader::{download_validated_page, validate_existing_page, PageDownloadError},
     job_repository, manifest,
-    models::NewspaperJob,
-    naming, storage,
+    models::{NewspaperJob, OptimizationRunOptions},
+    naming, state::NewspaperState, storage,
 };
+
+/// Jobs whose terminal download status carries at least one optimizable
+/// page. The optimization queue's own SQL filter is the source of truth;
+/// this list is the cheap pre-check used by the per-edition trigger so we
+/// don't spawn a no-op task for jobs that the queue would skip anyway.
+const OPTIMIZATION_ELIGIBLE_STATUSES: &[&str] = &["completed", "partial"];
 
 pub(super) async fn process_queue(
     db_path: &Path,
     cancelled: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
 ) -> Result<Vec<NewspaperJob>, String> {
     let client = NewspaperClient::new().map_err(|error| error.to_string())?;
     let mut processed = Vec::new();
@@ -55,7 +64,20 @@ pub(super) async fn process_queue(
                 .map_err(|error| error.to_string())?;
         }
         let outcome = process_job(db_path, &client, job.clone(), cancelled).await?;
+        let outcome_status = outcome.status.clone();
         processed.push(outcome);
+        if OPTIMIZATION_ELIGIBLE_STATUSES.contains(&outcome_status.as_str()) {
+            // The eligibility check is cheap and avoids spawning a task for
+            // jobs the optimization queue would skip anyway. The actual
+            // "is optimization already running" guard lives inside
+            // `run_optimization_pass` via the `optimization_running` flag,
+            // so a manual "Optimize now" overlapping with this trigger
+            // resolves to whichever caller arrived second becoming a no-op.
+            spawn_per_edition_optimization(
+                app.clone(),
+                outcome_status,
+            );
+        }
         let has_next_due_job = {
             let connection =
                 crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
@@ -70,6 +92,29 @@ pub(super) async fn process_queue(
         }
     }
     Ok(processed)
+}
+
+/// Fires the optimization queue as soon as a download job reaches a
+/// terminal status. Returns immediately if a previous optimization pass is
+/// still in flight (the `optimization_running` flag inside
+/// `run_optimization_pass` is the source of truth, so a manual "Optimize
+/// now" or a sibling per-edition trigger racing with this one resolves to a
+/// no-op rather than overlapping workers).
+fn spawn_per_edition_optimization(app: tauri::AppHandle, job_status: String) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<NewspaperState>();
+        let result = run_optimization_pass(
+            &app,
+            state.inner(),
+            OptimizationRunOptions::default(),
+        )
+        .await;
+        if let Err(error) = result {
+            eprintln!(
+                "per-edition optimization trigger failed after {job_status} job: {error}"
+            );
+        }
+    });
 }
 
 pub(super) async fn process_job(
@@ -526,4 +571,26 @@ pub(super) fn mark_retry_waiting_batches_scheduled(connection: &Connection) -> R
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OPTIMIZATION_ELIGIBLE_STATUSES;
+
+    #[test]
+    fn per_edition_trigger_fires_only_for_terminal_download_statuses() {
+        // The per-edition trigger fires for `completed` and `partial`
+        // jobs only. `queued`, `active`, `failed`, and `optimizing`
+        // statuses must not enqueue a redundant optimization pass.
+        for status in OPTIMIZATION_ELIGIBLE_STATUSES {
+            assert!(
+                matches!(*status, "completed" | "partial"),
+                "unexpected eligible status: {status}"
+            );
+        }
+        assert!(!OPTIMIZATION_ELIGIBLE_STATUSES.contains(&"queued"));
+        assert!(!OPTIMIZATION_ELIGIBLE_STATUSES.contains(&"active"));
+        assert!(!OPTIMIZATION_ELIGIBLE_STATUSES.contains(&"failed"));
+        assert!(!OPTIMIZATION_ELIGIBLE_STATUSES.contains(&"optimizing"));
+    }
 }

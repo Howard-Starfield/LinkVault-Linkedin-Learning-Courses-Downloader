@@ -369,6 +369,7 @@ mod tests {
             OptimizationRunOptions {
                 mode: "manual".to_string(),
                 worker_ceiling: 20,
+                ..OptimizationRunOptions::default()
             },
             Arc::new(AtomicBool::new(false)),
             Arc::new(move |runtime| {
@@ -410,6 +411,7 @@ mod tests {
             OptimizationRunOptions {
                 mode: "manual".to_string(),
                 worker_ceiling: 8,
+                ..OptimizationRunOptions::default()
             },
             cancelled,
             Arc::new(move |runtime| {

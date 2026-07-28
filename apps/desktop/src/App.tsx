@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
@@ -63,6 +64,12 @@ import {
   writeNewspaperReaderPreferences,
   type NewspaperPageTone
 } from "./components/newspaper/newspaper-reader-preferences";
+import {
+  NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS,
+  type NewspaperOptimizationPreferences,
+  readNewspaperOptimizationPreferences,
+  writeNewspaperOptimizationPreferences
+} from "./components/newspaper/newspaper-optimization-preferences";
 
 const NEWSPAPER_READER_ZOOM_OPTIONS = Array.from(
   { length: Math.round((NEWSPAPER_READER_ZOOM_MAX - NEWSPAPER_READER_ZOOM_MIN) / NEWSPAPER_READER_ZOOM_STEP) + 1 },
@@ -223,7 +230,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.8";
+const APP_VERSION = "0.2.9";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
 
@@ -307,6 +314,23 @@ export default function App() {
   const [newspaperDefaultZoom, setNewspaperDefaultZoom] = useState(initialNewspaperReaderPreferences.current.defaultZoom);
   const [newspaperClickZoom, setNewspaperClickZoom] = useState(initialNewspaperReaderPreferences.current.clickZoom);
   const [newspaperPageTone, setNewspaperPageTone] = useState<NewspaperPageTone>(initialNewspaperReaderPreferences.current.pageTone);
+  const [newspaperOptimizationPreferences, setNewspaperOptimizationPreferences] =
+    useState<NewspaperOptimizationPreferences>(() => readNewspaperOptimizationPreferences());
+  const [optimizationRuntime, setOptimizationRuntime] = useState<{
+    active: boolean;
+    admittedWorkers: number;
+    activeWorkers: number;
+    cpuPercent: number | null;
+    mode: string;
+    limitedReason: string | null;
+  }>({
+    active: false,
+    admittedWorkers: 0,
+    activeWorkers: 0,
+    cpuPercent: null,
+    mode: "auto",
+    limitedReason: null
+  });
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isScheduleOpen, setIsScheduleOpen] = useState(false);
   const [scheduleStep, setScheduleStep] = useState<"configure" | "confirm">("configure");
@@ -484,7 +508,49 @@ export default function App() {
     setNewspaperDefaultZoom(preferences.defaultZoom);
     setNewspaperClickZoom(preferences.clickZoom);
     setNewspaperPageTone(preferences.pageTone);
+    setNewspaperOptimizationPreferences(readNewspaperOptimizationPreferences());
   }, [isSettingsOpen]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{
+      revision: number;
+      runtime: {
+        active: boolean;
+        admittedWorkers: number;
+        activeWorkers: number;
+        cpuPercent: number | null;
+        mode: string;
+        limitedReason: string | null;
+      };
+    }>("newspaper://optimization-progress", (event) => {
+      if (disposed) return;
+      const runtime = event.payload?.runtime;
+      if (!runtime) return;
+      setOptimizationRuntime({
+        active: Boolean(runtime.active),
+        admittedWorkers: Number(runtime.admittedWorkers ?? 0),
+        activeWorkers: Number(runtime.activeWorkers ?? 0),
+        cpuPercent: typeof runtime.cpuPercent === "number" ? runtime.cpuPercent : null,
+        mode: String(runtime.mode ?? "auto"),
+        limitedReason: runtime.limitedReason ?? null
+      });
+    })
+      .then((dispose) => {
+        if (disposed) {
+          dispose();
+        } else {
+          unlisten = dispose;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   function startSidebarResize(event: ReactMouseEvent<HTMLButtonElement>) {
     if (isSidebarCollapsed) return;
@@ -1548,16 +1614,16 @@ export default function App() {
       style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
       <aside className="lv-sidebar" aria-label="Primary navigation">
+        <div className="lv-sidebar-trigger-wrap">
+          <Tooltip label="Toggle sidebar">
+            <IconButton className="lv-sidebar-trigger" aria-label="Toggle sidebar" aria-expanded={!isSidebarCollapsed} onClick={() => setIsSidebarCollapsed(true)}>
+              <PanelLeft aria-hidden="true" className="h-4 w-4" />
+            </IconButton>
+          </Tooltip>
+        </div>
         <div className="lv-sidebar-brand border-b border-sidebar-border">
-          <div className="lv-sidebar-trigger-wrap">
-            <Tooltip label="Toggle sidebar">
-              <IconButton className="lv-sidebar-trigger" aria-label="Toggle sidebar" aria-expanded={!isSidebarCollapsed} onClick={() => setIsSidebarCollapsed(true)}>
-                <PanelLeft aria-hidden="true" className="h-4 w-4" />
-              </IconButton>
-            </Tooltip>
-          </div>
           <div className="lv-brand-logo" aria-label="LinkVault Course Downloader">
-            <img src={linkvaultLogo} alt="" width={470} height={117} />
+            <img src={linkvaultLogo} alt="" />
           </div>
           <h1 className="sr-only">LinkVault</h1>
         </div>
@@ -1688,9 +1754,39 @@ export default function App() {
             </div>
           </div>
           <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
-          <div className="mt-6 flex flex-col gap-1.5 border-t border-sidebar-border pt-4 text-xs text-sidebar-muted">
-            <span>LinkedIn Scraper</span>
-            <span className="self-start rounded-full border border-sidebar-border px-2 py-0.5 text-[10px] text-text-soft">Coming soon</span>
+          <div
+            className="mt-6 flex flex-col gap-1.5 border-t border-sidebar-border pt-4 text-xs text-sidebar-muted"
+            aria-label="Newspaper optimization performance"
+          >
+            <span>Optimization</span>
+            {optimizationRuntime.active ? (
+              <>
+                <span
+                  className="font-mono text-[11px] text-foreground"
+                  aria-label="Admitted optimization workers"
+                >
+                  {optimizationRuntime.admittedWorkers} worker{optimizationRuntime.admittedWorkers === 1 ? "" : "s"}
+                  {" · "}
+                  {optimizationRuntime.activeWorkers} active
+                </span>
+                <span
+                  className="font-mono text-[11px] text-foreground"
+                  aria-label="System CPU usage"
+                >
+                  {optimizationRuntime.cpuPercent == null
+                    ? "CPU —"
+                    : `CPU ${optimizationRuntime.cpuPercent.toFixed(0)}%`}
+                  {optimizationRuntime.limitedReason ? ` · ${optimizationRuntime.limitedReason}` : ""}
+                </span>
+              </>
+            ) : (
+              <span
+                className="self-start rounded-full border border-sidebar-border px-2 py-0.5 text-[10px] text-text-soft"
+                aria-label="Optimization idle"
+              >
+                Idle
+              </span>
+            )}
           </div>
         </nav>
 
@@ -2240,6 +2336,52 @@ export default function App() {
               Repair existing
             </Button>
           </div>
+          <div className="settings-section-subtitle">Optimization governor</div>
+          <div className="settings-two-column">
+            <Field label="Memory per worker (MB)">
+              <Input
+                type="number"
+                min={NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS.workerMemoryBudgetMb.min}
+                max={NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS.workerMemoryBudgetMb.max}
+                step={NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS.workerMemoryBudgetMb.step}
+                value={newspaperOptimizationPreferences.workerMemoryBudgetMb}
+                onChange={(event) => {
+                  const next = Number(event.target.value);
+                  setNewspaperOptimizationPreferences((previous) => ({
+                    ...previous,
+                    workerMemoryBudgetMb: Number.isFinite(next) ? next : previous.workerMemoryBudgetMb
+                  }));
+                }}
+                onBlur={() => writeNewspaperOptimizationPreferences(newspaperOptimizationPreferences)}
+                aria-label="Newspaper optimization memory per worker"
+              />
+            </Field>
+            <Field label="Memory reserve (MB)">
+              <Input
+                type="number"
+                min={NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS.memoryReserveMb.min}
+                max={NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS.memoryReserveMb.max}
+                step={NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS.memoryReserveMb.step}
+                value={newspaperOptimizationPreferences.memoryReserveMb}
+                onChange={(event) => {
+                  const next = Number(event.target.value);
+                  setNewspaperOptimizationPreferences((previous) => ({
+                    ...previous,
+                    memoryReserveMb: Number.isFinite(next) ? next : previous.memoryReserveMb
+                  }));
+                }}
+                onBlur={() => writeNewspaperOptimizationPreferences(newspaperOptimizationPreferences)}
+                aria-label="Newspaper optimization memory reserve"
+              />
+            </Field>
+          </div>
+          <p className="settings-hint">
+            Auto mode caps the optimization at 50% CPU and adjusts the worker
+            pool every 3 seconds. 4K and other memory-hungry editions may
+            need a larger per-worker budget; the reserve must stay large
+            enough for the rest of the OS, the LinkVault UI, and the active
+            download.
+          </p>
         </section>
 
         <section className="settings-section">

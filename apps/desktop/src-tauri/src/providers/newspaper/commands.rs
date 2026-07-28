@@ -92,15 +92,22 @@ pub async fn process_newspaper_queue(
     app: tauri::AppHandle,
     state: State<'_, NewspaperState>,
 ) -> Result<Vec<NewspaperJob>, String> {
-    if state.running.swap(true, Ordering::SeqCst) {
+    if state.download_running.swap(true, Ordering::SeqCst) {
         return Ok(Vec::new());
     }
     state.cancelled.store(false, Ordering::SeqCst);
     let result = match schedule_service::materialize_due(state.db_path()) {
-        Ok(()) => queue_service::process_queue(state.db_path(), &state.cancelled).await,
+        Ok(()) => {
+            queue_service::process_queue(
+                state.db_path(),
+                &state.cancelled,
+                &app,
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
-    state.running.store(false, Ordering::SeqCst);
+    state.download_running.store(false, Ordering::SeqCst);
     if let Ok(jobs) = &result {
         library_events::emit(&app, &state, jobs);
     }
@@ -113,7 +120,24 @@ pub async fn process_newspaper_optimization_queue(
     state: State<'_, NewspaperState>,
     options: Option<OptimizationRunOptions>,
 ) -> Result<Vec<NewspaperJob>, String> {
-    if state.running.swap(true, Ordering::SeqCst) {
+    run_optimization_pass(&app, &state, options.unwrap_or_default()).await
+}
+
+/// Runs a single pass of the optimization queue. Used by both the
+/// `process_newspaper_optimization_queue` Tauri command and the per-edition
+/// trigger that fires inside the download worker the moment a job reaches a
+/// terminal download status. Returns the refreshed list of jobs.
+///
+/// The `optimization_running` flag is shared between these callers so a
+/// manual "Optimize now" and a per-edition auto-trigger never overlap, but
+/// the optimization is free to run while the download queue is still
+/// processing the next edition.
+pub(super) async fn run_optimization_pass(
+    app: &tauri::AppHandle,
+    state: &NewspaperState,
+    options: OptimizationRunOptions,
+) -> Result<Vec<NewspaperJob>, String> {
+    if state.optimization_running.swap(true, Ordering::SeqCst) {
         return Ok(Vec::new());
     }
     state.cancelled.store(false, Ordering::SeqCst);
@@ -140,7 +164,7 @@ pub async fn process_newspaper_optimization_queue(
     });
     let result = optimization_service::process_queue_with_options(
         state.db_path(),
-        options.unwrap_or_default(),
+        options,
         state.cancelled.clone(),
         reporter,
     )
@@ -151,9 +175,9 @@ pub async fn process_newspaper_optimization_queue(
         "newspaper://optimization-progress",
         serde_json::json!({ "revision": progress_revision, "runtime": state.optimization_runtime() }),
     );
-    state.running.store(false, Ordering::SeqCst);
+    state.optimization_running.store(false, Ordering::SeqCst);
     if let Ok(jobs) = &result {
-        library_events::emit(&app, &state, jobs);
+        library_events::emit(app, state, jobs);
     }
     result
 }
@@ -231,7 +255,8 @@ pub fn reset_newspaper_database(
     // commits and lets the next process_newspaper_queue invocation start from
     // a clean slate.
     state.cancelled.store(true, Ordering::SeqCst);
-    state.running.store(false, Ordering::SeqCst);
+    state.download_running.store(false, Ordering::SeqCst);
+    state.optimization_running.store(false, Ordering::SeqCst);
     state.dimension_backfill_running.store(false, Ordering::SeqCst);
     state.set_optimization_runtime(OptimizationRuntimeStatus::default());
 
