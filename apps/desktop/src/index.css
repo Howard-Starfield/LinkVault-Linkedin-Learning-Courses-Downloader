@@ -3187,12 +3187,6 @@ textarea {
   grid-column: 1 / -1;
 }
 
-.newspaper-date-controls small {
-  grid-column: 1 / -1;
-  color: var(--text-soft);
-  font-size: 9px;
-}
-
 .newspaper-date-controls.is-system-date {
   opacity: 0.58;
 }
@@ -3353,12 +3347,13 @@ textarea {
 .newspaper-job-progress {
   display: grid;
   min-width: 0;
-  grid-template-columns: 32px minmax(70px, 1fr) auto;
+  grid-template-columns: 32px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  column-gap: 8px;
+  row-gap: 4px;
 }
 
-.newspaper-job-progress > span {
+.newspaper-job-progress-percent {
   color: var(--text-main);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
@@ -3384,20 +3379,32 @@ textarea {
   background: var(--success);
 }
 
-.newspaper-job-progress small {
+.newspaper-stage-counts {
+  grid-column: 2 / -1;
+  display: flex;
+  gap: 14px;
+  padding: 3px 0;
+  border-top: 1px dashed var(--border-soft);
   color: var(--text-soft);
-  font-size: 9px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-.newspaper-stage-counts {
-  display: flex;
-  grid-column: 2 / -1;
-  gap: 10px;
-  color: var(--text-soft);
-  font-size: 8px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+.newspaper-stage-counts em {
+  font-style: normal;
+  color: var(--text-muted);
+  margin-right: 4px;
+  letter-spacing: 0.02em;
+}
+
+.newspaper-stage-counts.is-failed {
+  color: var(--danger);
+}
+
+.newspaper-stage-counts.is-failed em {
+  color: var(--danger);
+  opacity: 0.7;
 }
 
 .newspaper-progress-actions {

@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 3,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 1,
@@ -7,7 +7,7 @@
     "src-tauri/src/providers/newspaper/archive_service.rs": 6,
     "src-tauri/src/providers/newspaper/batch_service.rs": 11,
     "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
-    "src-tauri/src/providers/newspaper/job_service.rs": 7,
+    "src-tauri/src/providers/newspaper/job_service.rs": 9,
     "src-tauri/src/providers/newspaper/optimization_tasks.rs": 19,
     "src-tauri/src/providers/newspaper/page_metadata.rs": 2,
     "src-tauri/src/providers/newspaper/queue_service.rs": 17,
@@ -19,6 +19,7 @@
   "sharedWriteHelperCallCounts": {
     "src-tauri/src/providers/coursera/commands.rs": {
       "append_job_event": 2,
+      "clear_coursera_provider_data": 1,
       "clear_failed_jobs": 1,
       "insert_job": 1,
       "retry_failed_job": 1
@@ -40,6 +41,14 @@
       "transition_job_status": 5,
       "upsert_artifact": 1,
       "upsert_course_cache_entry": 1
+    },
+    "src-tauri/src/providers/newspaper/commands.rs": {
+      "clear_newspaper_provider_data": 1
     }
+  },
+  "versionNotes": {
+    "1": "Baseline established during v0.2.3 architecture foundation (commit f182e8f).",
+    "2": "Added two direct SQL write primitives in newspaper job_service.rs for the bulk pause/resume introduced with the Pause all / Resume all Download-now morph. Same shape as the existing per-job set_pause contract; will be migrated alongside the rest of the newspaper job_service.rs surface during the newspaper cutover phase.",
+    "3": "Added three new shared write helpers (clear_linkedin_provider_data, clear_coursera_provider_data, clear_newspaper_provider_data) and recorded one call site per provider. The provider reset path goes through app::cache helpers, keeping the provider's direct SQL surface flat; only the LinkedIn commands.rs file enters the sharedWriteHelperCallCounts map for the first time, because all of its write paths were previously either helpers or per-row UPDATEs that the gate does not track."
   }
 }

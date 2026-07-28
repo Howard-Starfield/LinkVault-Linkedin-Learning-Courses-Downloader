@@ -21,6 +21,7 @@ use super::{
     schedule_service,
     thumbnails::{EnsureThumbnailResult, ThumbnailCoordinator},
 };
+use crate::cache::{clear_newspaper_provider_data, NewspaperResetCounts};
 
 pub use super::state::NewspaperState;
 
@@ -199,6 +200,69 @@ pub fn set_newspaper_job_pause(
         state.cancelled.store(true, Ordering::SeqCst);
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_all_newspaper_jobs_paused(
+    state: State<'_, NewspaperState>,
+    paused: bool,
+) -> Result<Vec<String>, String> {
+    let mut connection = crate::cache::open_runtime(state.db_path()).map_err(|error| error.to_string())?;
+    let outcome = job_service::set_all_paused(&mut connection, paused, Utc::now().timestamp())?;
+    if outcome.triggered_cancel {
+        state.cancelled.store(true, Ordering::SeqCst);
+    } else if !paused {
+        // Resume must clear the cooperative cancellation flag so a follow-up
+        // process_newspaper_queue invocation is guaranteed to re-arm the
+        // worker, even if the in-flight worker has already unwound.
+        state.cancelled.store(false, Ordering::SeqCst);
+    }
+    Ok(outcome.updated)
+}
+
+#[tauri::command]
+pub fn reset_newspaper_database(
+    state: State<'_, NewspaperState>,
+    app: tauri::AppHandle,
+) -> Result<NewspaperResetCounts, String> {
+    // The UI is expected to call set_all_newspaper_jobs_paused(true) first
+    // so the worker unwinds at a safe boundary. Defensive re-arm of every
+    // in-memory flag here keeps a stale request from writing after the wipe
+    // commits and lets the next process_newspaper_queue invocation start from
+    // a clean slate.
+    state.cancelled.store(true, Ordering::SeqCst);
+    state.running.store(false, Ordering::SeqCst);
+    state.dimension_backfill_running.store(false, Ordering::SeqCst);
+    state.set_optimization_runtime(OptimizationRuntimeStatus::default());
+
+    let connection = crate::cache::open_runtime(state.db_path())
+        .map_err(|error| error.to_string())?;
+    let counts = clear_newspaper_provider_data(&connection)
+        .map_err(|error| error.to_string())?;
+
+    // Wipe the on-disk thumbnail cache (canonicalize + starts_with safety
+    // pattern, same as remove_cached_thumbnail). Failure here is not fatal —
+    // the DB is already wiped and stale thumbnails will be re-validated on
+    // next access — but we surface it to the caller for transparency.
+    let thumbnail_wipe_warning = job_service::clear_thumbnail_cache(state.db_path())
+        .err()
+        .map(|error| error.to_string());
+
+    // Reset the cooperative flags and bump the cache-busting revisions so
+    // the UI refreshes after the wipe.
+    state.cancelled.store(false, Ordering::SeqCst);
+    let library_revision = state.invalidate_library();
+    let progress_revision = state.invalidate_progress();
+    let _ = app.emit(
+        "newspaper://library-invalidated",
+        serde_json::json!({
+            "reason": "reset",
+            "libraryRevision": library_revision,
+            "progressRevision": progress_revision,
+            "thumbnailWarning": thumbnail_wipe_warning,
+        }),
+    );
+    Ok(counts)
 }
 
 #[tauri::command]

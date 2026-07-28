@@ -8,12 +8,12 @@ use crate::browser_cookies::{
     ChromiumCookieDecoder,
 };
 use crate::cache::{
-    append_job_event, clear_failed_jobs, clear_job_schedule, get_course_cache_entry, get_job,
-    get_setting, insert_job, list_artifacts_for_job, list_download_history, list_job_events,
-    list_jobs_by_status, list_ready_queued_jobs, list_recent_jobs, open_runtime,
-    remove_completed_download_job, remove_download_job, retry_failed_job,
-    set_all_download_jobs_paused, set_download_job_paused, upsert_setting_json,
-    DownloadHistoryEntry, JobRecord, NewJobEvent,
+    append_job_event, clear_failed_jobs, clear_job_schedule, clear_linkedin_provider_data,
+    get_course_cache_entry, get_job, get_setting, insert_job, list_artifacts_for_job,
+    list_download_history, list_job_events, list_jobs_by_status, list_ready_queued_jobs,
+    list_recent_jobs, open_runtime, remove_completed_download_job, remove_download_job,
+    retry_failed_job, set_all_download_jobs_paused, set_download_job_paused,
+    upsert_setting_json, DownloadHistoryEntry, JobRecord, NewJobEvent, ProviderResetCounts,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
@@ -341,6 +341,25 @@ pub fn set_all_downloads_paused(
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
+}
+
+#[tauri::command]
+pub fn reset_linkedin_database(
+    state: tauri::State<'_, LinkVaultState>,
+) -> Result<ProviderResetCounts, String> {
+    // The UI is expected to call set_all_downloads_paused(true) first so the
+    // worker unwinds at a safe boundary. We still defensively re-arm the
+    // flags here so a stale in-flight request can't keep writing after the
+    // wipe commits.
+    state.set_download_paused(true);
+    let connection = state.connection()?;
+    let counts = clear_linkedin_provider_data(&connection).map_err(|error| error.to_string())?;
+    // Regenerate the history markdown so the next read sees a valid empty
+    // document instead of rows that no longer exist in the database.
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    state.reset_download_cancellation();
+    Ok(counts)
 }
 
 #[tauri::command]

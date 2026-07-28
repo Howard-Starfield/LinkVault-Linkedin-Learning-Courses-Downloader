@@ -285,6 +285,170 @@ fn queue_controls_are_persisted_and_removal_deletes_downloaded_files_and_identit
 }
 
 #[test]
+fn set_all_paused_flips_active_queued_and_optimizing_only() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+
+    let mut created = Vec::new();
+    for (date, status) in [
+        ("2026-07-21", "active"),
+        ("2026-07-22", "queued"),
+        ("2026-07-23", "optimizing"),
+    ] {
+        let job = batch_service::create_with_connection(
+            &mut connection,
+            request(&destination, date),
+        )
+        .unwrap()
+        .jobs
+        .remove(0);
+        connection
+            .execute(
+                "UPDATE newspaper_jobs SET status = ?1, paused = 0 WHERE id = ?2",
+                params![status, job.id],
+            )
+            .unwrap();
+        created.push((job.id, status.to_string()));
+    }
+    let completed_job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-20"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'completed' WHERE id = ?1",
+            params![completed_job.id],
+        )
+        .unwrap();
+    let dismissed_active =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-19"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'active', dismissed = 1 WHERE id = ?1",
+            params![dismissed_active.id],
+        )
+        .unwrap();
+
+    let outcome_paused = job_service::set_all_paused(&mut connection, true, 200).unwrap();
+    let expected_ids: Vec<String> = created.iter().map(|(id, _)| id.clone()).collect();
+    let mut returned = outcome_paused.updated.clone();
+    returned.sort();
+    let mut wanted = expected_ids.clone();
+    wanted.sort();
+    assert_eq!(returned, wanted, "bulk pause should target the visible queue only");
+    assert!(
+        outcome_paused.triggered_cancel,
+        "pausing an active in-flight job must signal the cooperative cancellation flag"
+    );
+
+    for (id, original_status) in &created {
+        let (paused, status): (bool, String) = connection
+            .query_row(
+                "SELECT paused, status FROM newspaper_jobs WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(paused, "bulk pause should flip paused=1 for {id}");
+        let expected_status = match original_status.as_str() {
+            "active" => "queued",
+            // matches the existing per-job set_pause contract:
+            // active is rolled back so the next process_queue can pick something else;
+            // optimizing and queued keep their persisted status because the optimizer
+            // and the next queue pass already gate on `paused = 0`.
+            other => other,
+        };
+        assert_eq!(
+            status, expected_status,
+            "bulk pause must mirror the per-job set_pause status transition for {id}"
+        );
+    }
+    let completed_paused: bool = connection
+        .query_row(
+            "SELECT paused FROM newspaper_jobs WHERE id = ?1",
+            params![completed_job.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !completed_paused,
+        "completed jobs must remain unpaused and untouched by bulk pause"
+    );
+    let dismissed_state: (bool, i64) = connection
+        .query_row(
+            "SELECT paused, dismissed FROM newspaper_jobs WHERE id = ?1",
+            params![dismissed_active.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        dismissed_state,
+        (false, 1),
+        "dismissed jobs must be excluded from bulk pause"
+    );
+
+    let outcome_resumed = job_service::set_all_paused(&mut connection, false, 201).unwrap();
+    let mut resumed_returned = outcome_resumed.updated.clone();
+    resumed_returned.sort();
+    assert_eq!(
+        resumed_returned, wanted,
+        "bulk resume should target the same set of visible jobs"
+    );
+    assert!(
+        !outcome_resumed.triggered_cancel,
+        "resuming should never request cancellation"
+    );
+    for (id, original_status) in &created {
+        let (paused, status): (bool, String) = connection
+            .query_row(
+                "SELECT paused, status FROM newspaper_jobs WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!paused, "bulk resume should flip paused=0 for {id}");
+        let expected_status = match original_status.as_str() {
+            "active" => "queued",
+            // mirror the per-job set_pause contract: resume never changes
+            // the persisted status, it only flips the paused flag.
+            other => other,
+        };
+        assert_eq!(
+            status, expected_status,
+            "bulk resume must not alter the persisted status for {id}"
+        );
+    }
+}
+
+#[test]
+fn set_all_paused_is_a_noop_when_nothing_is_pausable() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'completed' WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+    let outcome = job_service::set_all_paused(&mut connection, true, 300).unwrap();
+    assert!(outcome.updated.is_empty());
+    assert!(!outcome.triggered_cancel);
+}
+
+#[test]
 fn last_seven_days_batch_creates_all_seven_daily_jobs() {
     let directory = tempdir().unwrap();
     let db_path = directory.path().join("test.db");
@@ -856,4 +1020,169 @@ async fn optimization_queue_runs_after_download_completion_and_is_resumable() {
         )
         .unwrap();
     assert!(Path::new(&display_path).exists());
+}
+
+#[test]
+fn clear_thumbnail_cache_wipes_only_the_newspaper_thumbnails_directory() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    drop(connection);
+
+    let cache_root = directory.path().join("newspaper-thumbnails").join("v1");
+    std::fs::create_dir_all(&cache_root).unwrap();
+    std::fs::write(cache_root.join("edition-a.webp"), b"a").unwrap();
+    std::fs::write(cache_root.join("edition-b.webp"), b"bb").unwrap();
+    // Sibling file outside the cache directory must survive the wipe.
+    let sibling = directory.path().join("keep-me.txt");
+    std::fs::write(&sibling, b"keep").unwrap();
+
+    job_service::clear_thumbnail_cache(&db_path).unwrap();
+
+    assert!(!cache_root.exists());
+    assert!(sibling.exists());
+    assert_eq!(std::fs::read(&sibling).unwrap(), b"keep");
+}
+
+#[test]
+fn clear_thumbnail_cache_is_a_noop_when_the_directory_does_not_exist() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    drop(connection);
+
+    // Never create the cache directory; the wipe must be a no-op rather than
+    // an error.
+    job_service::clear_thumbnail_cache(&db_path).unwrap();
+    assert!(!directory.path().join("newspaper-thumbnails").exists());
+}
+
+#[test]
+fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+
+    // Seed: one completed newspaper job, one thumbnail cache row, one
+    // reading-progress row, one schedule, and a sentinel LinkedIn job to
+    // confirm the wipe is strictly scoped.
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    std::fs::create_dir_all(&job.output_dir).unwrap();
+    std::fs::write(Path::new(&job.output_dir).join(".complete"), b"").unwrap();
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'completed' WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_pages
+             (id, job_id, page_number, source_url, optimized_path, status,
+              media_version, created_at, updated_at)
+             VALUES ('p-1', ?1, 'A01', 'test://x', 'C:/p.webp', 'completed', 1, 1, 1)",
+            params![job.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_thumbnail_cache
+             (job_id, source_page_id, source_media_version, cache_schema_version,
+              cache_path, mime_type, pixel_width, pixel_height, byte_count, updated_at)
+             VALUES (?1, 'p-1', 1, 1, 'C:/t.webp', 'image/webp', 1, 1, 1, 1)",
+            params![job.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_reading_progress
+             (job_id, last_page_id, last_page_index, furthest_page_index, updated_at)
+             VALUES (?1, 'p-1', 3, 5, 1)",
+            params![job.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_schedules
+             (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+              optimize_images, optimization_profile, optimization_quality,
+              keep_original_jpg, created_at, updated_at)
+             VALUES ('s-1', 1, '07:00', 'C:/papers', '[\"NY\"]', 15, 1, 'webp_high', 92, 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO jobs (id, course_slug, source_url, status, selected_quality,
+             download_videos, download_exercises, download_subtitles, download_quizzes,
+             quiz_hints_json, output_dir, paused, scheduled_at, created_at, updated_at)
+             VALUES ('linkedin-keep', 'sample', 'https://x', 'active', '720',
+             1, 1, 1, 1, '[]', 'C:/x', 0, NULL, 1, 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO settings (key, value_json, updated_at) VALUES ('download.folder', '\"C:/shared\"', 1)",
+            [],
+        )
+        .unwrap();
+
+    let counts = crate::cache::clear_newspaper_provider_data(&connection).unwrap();
+
+    assert_eq!(counts.jobs, 1);
+    assert_eq!(counts.batches, 1);
+    assert_eq!(counts.pages, 1);
+    assert_eq!(counts.thumbnail_cache, 1);
+    assert_eq!(counts.reading_progress, 1);
+    assert_eq!(counts.schedules, 1);
+    // editions are seeded by the migration with the regular catalog; the
+    // wipe must remove all of them, but the seeded count is not a stable
+    // assertion target. Settings/events/optimization_tasks/read_pages were
+    // never seeded by this test, so they should be 0.
+    assert_eq!(counts.settings, 0);
+    assert_eq!(counts.events, 0);
+    assert_eq!(counts.optimization_tasks, 0);
+    assert_eq!(counts.read_pages, 0);
+
+    // Every newspaper table is empty; the LinkedIn job and the shared
+    // settings row are untouched.
+    for table in [
+        "newspaper_jobs",
+        "newspaper_batches",
+        "newspaper_pages",
+        "newspaper_thumbnail_cache",
+        "newspaper_reading_progress",
+        "newspaper_schedules",
+        "newspaper_settings",
+        "newspaper_events",
+        "newspaper_optimization_tasks",
+        "newspaper_read_pages",
+        "newspaper_editions",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be empty after the wipe");
+    }
+    let linkedin_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(linkedin_count, 1, "LinkedIn jobs must survive a newspaper reset");
+    let settings_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM settings WHERE key = 'download.folder'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        settings_count, 1,
+        "the shared download.folder setting must survive a newspaper reset"
+    );
 }

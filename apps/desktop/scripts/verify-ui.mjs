@@ -24,7 +24,16 @@ for (const required of [
   "Repair existing",
   "windowResizing",
   'window.addEventListener("resize", handleWindowResize, { passive: true })',
-  "Switch to ${theme === \"dark\" ? \"day\" : \"night\"} mode"
+  "Switch to ${theme === \"dark\" ? \"day\" : \"night\"} mode",
+  "Data management",
+  "Reset LinkedIn database",
+  "Reset Coursera database",
+  "Reset World Journal database",
+  "reset_linkedin_database",
+  "reset_coursera_database",
+  "reset_newspaper_database",
+  "performProviderReset",
+  "pausingForReset"
 ]) {
   assert.ok(app.includes(required), `App shell is missing: ${required}`);
 }
@@ -56,11 +65,16 @@ for (const required of [
   "Optimization worker mode",
   "Manual ceiling",
   "newspaper://optimization-progress",
-  "formatProgressDetail",
   "Downloaded",
   "Optimized",
   "Newspaper",
   "set_newspaper_job_pause",
+  "set_all_newspaper_jobs_paused",
+  "toggleAllNewspaperJobsPause",
+  "isNewspaperQueueRunning",
+  "Pause all",
+  "Resume all",
+  "All newspaper downloads paused",
   "reorder_newspaper_jobs",
   "remove_newspaper_job",
   "Drag to reorder",
