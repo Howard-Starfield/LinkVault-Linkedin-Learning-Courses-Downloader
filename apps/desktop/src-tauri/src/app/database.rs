@@ -1045,7 +1045,6 @@ pub struct NewspaperResetCounts {
     pub schedules: usize,
     pub events: usize,
     pub settings: usize,
-    pub editions: usize,
 }
 
 /// Wipe the LinkedIn provider's data while keeping the schema, foreign-key
@@ -1096,6 +1095,15 @@ pub fn clear_coursera_provider_data(
 /// Runs in a single transaction. The on-disk thumbnail cache directory is
 /// the caller's responsibility — see `newspaper::job_service::delete` for the
 /// path-resolution pattern.
+///
+/// The reset deliberately leaves `newspaper_editions` untouched. The 13
+/// built-in editions (10 daily regions, 3 weeklies) and any specials the
+/// user has previously discovered are application-owned data that the
+/// Settings UI cannot edit, and `seed_built_in_catalog` only runs once at
+/// database initialization. Wiping the catalog here would orphan the
+/// regions until the next `refresh_newspaper_catalog` happened to rediscover
+/// them — and most days the world journal site only surfaces specials, so
+/// the regions would never come back on their own.
 pub fn clear_newspaper_provider_data(
     connection: &Connection,
 ) -> CacheResult<NewspaperResetCounts> {
@@ -1112,7 +1120,11 @@ pub fn clear_newspaper_provider_data(
     let settings = transaction.execute("DELETE FROM newspaper_settings", [])?;
     let jobs = transaction.execute("DELETE FROM newspaper_jobs", [])?;
     let batches = transaction.execute("DELETE FROM newspaper_batches", [])?;
-    let editions = transaction.execute("DELETE FROM newspaper_editions", [])?;
+    // Intentionally NOT deleting from newspaper_editions — see the doc
+    // comment above. The newspaper_editions table holds the built-in
+    // catalog plus any previously-discovered specials, all of which the
+    // app re-seeds / re-discovers automatically. Touching it here is what
+    // caused v0.2.7 to wipe the regions on reset.
     transaction.commit()?;
     Ok(NewspaperResetCounts {
         batches,
@@ -1125,7 +1137,6 @@ pub fn clear_newspaper_provider_data(
         schedules,
         events,
         settings,
-        editions,
     })
 }
 

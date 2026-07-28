@@ -436,6 +436,34 @@ fn rebuild_optimization_quality_constraint(connection: &Connection, table: &str)
     migration
 }
 
+/// Self-heal the built-in newspaper catalog.
+///
+/// Counts rows whose `publication_date` is empty (the built-in editions
+/// always have an empty `publication_date`; discovered specials always
+/// have a non-empty one) and re-seeds when zero are present.
+///
+/// This is the recovery path for users who already wiped their catalog
+/// via the v0.2.7 Reset World Journal database action. The bug was fixed
+/// in v0.2.8 (the reset no longer deletes from `newspaper_editions`),
+/// but existing v0.2.7 installations still need their catalog restored
+/// the next time the app starts. Running this on every startup is
+/// cheap (one `SELECT COUNT(*)` and a no-op when the catalog is present)
+/// and safe (the seed uses `ON CONFLICT DO UPDATE` and only conflicts on
+/// the built-in `(code, '')` rows, never on discovered specials).
+pub fn ensure_catalog_populated(connection: &Connection, updated_at: i64) -> Result<bool> {
+    let built_in_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE publication_date = ''",
+            [],
+            |row| row.get(0),
+        )?;
+    if built_in_count > 0 {
+        return Ok(false);
+    }
+    seed_built_in_catalog(connection, updated_at)?;
+    Ok(true)
+}
+
 pub fn seed_built_in_catalog(connection: &Connection, updated_at: i64) -> Result<()> {
     for edition in catalog::built_in_catalog() {
         connection.execute(

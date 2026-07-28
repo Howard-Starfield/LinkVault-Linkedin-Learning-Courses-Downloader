@@ -1058,6 +1058,124 @@ fn clear_thumbnail_cache_is_a_noop_when_the_directory_does_not_exist() {
 }
 
 #[test]
+fn ensure_catalog_populated_is_a_noop_when_the_built_in_catalog_is_intact() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+
+    // Fresh database already has the 13 built-in editions.
+    let pre_seed_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE publication_date = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pre_seed_count, 13);
+
+    let reseeded =
+        super::storage::ensure_catalog_populated(&mut connection, 1).unwrap();
+    assert!(
+        !reseeded,
+        "the self-heal must be a no-op when the built-in catalog is already present"
+    );
+
+    let post_seed_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE publication_date = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(post_seed_count, 13);
+}
+
+#[test]
+fn ensure_catalog_populated_restores_built_in_editions_after_a_wipe() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+
+    // Seed a discovered special first so we can confirm the self-heal
+    // does not clobber it.
+    connection
+        .execute(
+            "INSERT INTO newspaper_editions
+             (code, publication_date, name_zh, name_en, kind, schedule, source_url,
+              active, discovered, discovered_at, updated_at)
+             VALUES ('EA', '2026-07-25', '馬年春節專刊', 'Lunar New Year Special',
+                     'special', 'ad_hoc', 'https://ep.worldjournal.com/EA/2026-07-25', 1, 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+    // Simulate the v0.2.7 bug: the Reset World Journal database action
+    // wiped the entire newspaper_editions table, leaving the user with
+    // no built-in catalog and no previously-discovered specials.
+    connection
+        .execute("DELETE FROM newspaper_editions", [])
+        .unwrap();
+    let wiped_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        wiped_count, 0,
+        "the simulated v0.2.7 bug must leave the catalog empty"
+    );
+
+    // Run the v0.2.8 self-heal.
+    let reseeded =
+        super::storage::ensure_catalog_populated(&mut connection, 1).unwrap();
+    assert!(
+        reseeded,
+        "the self-heal must re-seed when the built-in catalog is missing"
+    );
+
+    // The 13 built-in editions are back.
+    let restored: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE publication_date = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        restored, 13,
+        "the 13 built-in editions must be restored by the self-heal"
+    );
+
+    // The previously-discovered special is also back because the wipe
+    // ran against an empty table — the self-heal re-seeds the built-in
+    // rows only, but in this test the special was added before the wipe,
+    // so it is gone. Re-assert the real-world contract: the self-heal
+    // restores the built-in catalog; discovered specials that were wiped
+    // are recovered by the next refresh_newspaper_catalog call.
+    let special_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE code = 'EA'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        special_count, 0,
+        "discovered specials wiped by the v0.2.7 reset are not auto-restored; the self-heal only covers the built-in catalog"
+    );
+
+    // And re-running the self-heal is now a no-op.
+    let second_pass =
+        super::storage::ensure_catalog_populated(&mut connection, 2).unwrap();
+    assert!(
+        !second_pass,
+        "the self-heal must be a no-op once the catalog is restored"
+    );
+}
+
+#[test]
 fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
     let directory = tempdir().unwrap();
     let db_path = directory.path().join("test.db");
@@ -1132,6 +1250,28 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
             [],
         )
         .unwrap();
+    // Add one discovered special so we can confirm the catalog as a whole
+    // (built-in + specials) is preserved across the reset. The built-in
+    // catalog alone is already covered by list_catalog_reads_seeded_regular_editions;
+    // here we want to lock in the regression that wiped regions on v0.2.7.
+    connection
+        .execute(
+            "INSERT INTO newspaper_editions
+             (code, publication_date, name_zh, name_en, kind, schedule, source_url,
+              active, discovered, discovered_at, updated_at)
+             VALUES ('EA', '2026-07-25', '馬年春節專刊', 'Lunar New Year Special',
+                     'special', 'ad_hoc', 'https://ep.worldjournal.com/EA/2026-07-25', 1, 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+    let pre_wipe_editions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        pre_wipe_editions >= 14,
+        "fresh database should hold the 13 built-in editions plus the discovered special (got {pre_wipe_editions})"
+    );
 
     let counts = crate::cache::clear_newspaper_provider_data(&connection).unwrap();
 
@@ -1141,17 +1281,16 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
     assert_eq!(counts.thumbnail_cache, 1);
     assert_eq!(counts.reading_progress, 1);
     assert_eq!(counts.schedules, 1);
-    // editions are seeded by the migration with the regular catalog; the
-    // wipe must remove all of them, but the seeded count is not a stable
-    // assertion target. Settings/events/optimization_tasks/read_pages were
-    // never seeded by this test, so they should be 0.
+    // Settings/events/optimization_tasks/read_pages were never seeded by
+    // this test, so they should be 0. The `editions` field no longer
+    // exists on the counts struct — the catalog is preserved on purpose.
     assert_eq!(counts.settings, 0);
     assert_eq!(counts.events, 0);
     assert_eq!(counts.optimization_tasks, 0);
     assert_eq!(counts.read_pages, 0);
 
-    // Every newspaper table is empty; the LinkedIn job and the shared
-    // settings row are untouched.
+    // Every wipeable newspaper table is empty; the LinkedIn job and the
+    // shared settings row are untouched.
     for table in [
         "newspaper_jobs",
         "newspaper_batches",
@@ -1163,13 +1302,45 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
         "newspaper_events",
         "newspaper_optimization_tasks",
         "newspaper_read_pages",
-        "newspaper_editions",
     ] {
         let count: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "{table} should be empty after the wipe");
     }
+
+    // Regression guard for v0.2.7: the catalog (built-in + previously
+    // discovered specials) must survive a newspaper reset unchanged.
+    let post_wipe_editions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        post_wipe_editions, pre_wipe_editions,
+        "newspaper_editions must survive a reset intact so the regional dailies never disappear"
+    );
+    let post_wipe_special: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE code = 'EA' AND publication_date = '2026-07-25'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        post_wipe_special, 1,
+        "previously-discovered specials must also survive a newspaper reset"
+    );
+    let post_wipe_ny: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_editions WHERE code = 'NY'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        post_wipe_ny, 1,
+        "the New York regional daily must survive a newspaper reset"
+    );
+
     let linkedin_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
