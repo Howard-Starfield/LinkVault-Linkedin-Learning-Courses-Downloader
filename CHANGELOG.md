@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.11 — 2026-07-28
+
+- **Rebrand: All-in-One Downloader.** The left-sidebar banner, the Windows taskbar icon, the system tray icon, and the Windows installer icon are now the "All-in-One Downloader" artwork. This re-introduces the v0.2.8 brand on purpose: the v0.2.10 "LinkVault Course Downloader" wordmark was a generic placeholder and is removed again. `App.tsx` imports the new sidebar asset via `<img src>`; `lib.rs` decodes the taskbar icon from `include_bytes!` so the binary has no runtime file dependency.
+- **New system tray icon** with a right-click menu. The app now stays reachable from the Windows notification area when the main window is closed. The tray carries a `Show` entry (un-hides, un-minimizes, and focuses the main window) and a `Quit` entry (exits the app). Left-click on the tray does **not** open the menu — the menu is right-click only, to avoid stealing focus from the user's current activity. The Tauri `tray-icon` feature is enabled in `Cargo.toml`.
+- **Restored the v0.1.3 red-highlighted F12 cookie guide.** Replaces the v0.2.10 Chrome DevTools capture in the "Find your LinkedIn li_at cookie" dialog. The v0.1.3 image highlights the F12 → Application tab → Cookies → `li_at` row flow with red callouts and big "Press F12 on Linkedin Learning" text, which is the version users actually found helpful. The v0.2.10 capture is the one that's now removed.
+- **Quantized the large icon and banner PNGs** to a 128-color palette with median-cut + Floyd-Steinberg dithering. The 1024×1024 master `icon.png` dropped 1.4% (the source already had a compact palette), and the 1264×424 `linkvault-wordmark.png` banner dropped 25.7% (576 KB down from 776 KB) with no visible banding. Both files now load faster and the binary bundle is ~200 KB lighter.
+- Bundled icon set in `apps/desktop/src-tauri/icons/` is now the full Tauri 2 set: `icon.png` (1024×1024, Linux/macOS bundle), `icon.ico` (Windows installer, multi-res 16/24/32/48/64/128/256), `icon-taskbar.png` (48×48, window icon), and the new `icon-tray.png` (48×48, system tray).
+
 ## 0.2.10 — 2026-07-28
 
 - Restored the LinkVault Course Downloader wordmark in the left sidebar. The v0.2.8 swap to a generic "All-in-One Downloader" graphic is reverted: the brand area now renders the cropped LinkVault SVG (viewBox `0 10 470 95`, 19% shorter than the v0.2.7 SVG) so the top section sits tighter against the panel. The wrong-brand `linkvault-wordmark.png` has been removed from the repository; `App.tsx` imports the SVG via `<img src>`, which honours the existing `.lv-brand-logo img { width: 100%; height: auto; }` rule. Users still on v0.2.8 or v0.2.9 will see the correct LinkVault wordmark after the in-app updater pulls this release.

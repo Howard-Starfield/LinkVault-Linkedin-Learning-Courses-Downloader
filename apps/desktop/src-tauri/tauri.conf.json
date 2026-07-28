@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LinkVault",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "identifier": "dev.linkvault.downloader",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -28,7 +28,12 @@
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
-    "icon": ["icons/icon.ico"],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon-taskbar.png",
+      "icons/icon-tray.png"
+    ],
     "publisher": "LinkVault",
     "shortDescription": "LinkVault offline learning archive",
     "longDescription": "LinkVault saves accessible courses and World Journal editions into organized local learning and newspaper archives.",
