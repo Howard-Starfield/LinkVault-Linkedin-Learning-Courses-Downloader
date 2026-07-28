@@ -14,6 +14,7 @@ use providers::linkedin::{commands, linkedin};
 pub use providers::{coursera, newspaper};
 
 use tauri::Manager;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 
 pub fn run() {
     let app = tauri::Builder::default()
@@ -167,6 +168,50 @@ pub fn run() {
             app.manage(newspaper::commands::NewspaperState::new(db_path));
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
+
+            // Taskbar + tray icon: the All-in-One Downloader icon, embedded
+            // at compile time so the binary has no runtime file dependency.
+            // Applied to every window so the taskbar shows the right icon,
+            // and to the system tray so the app stays reachable from the
+            // notification area. The tray carries a right-click menu with
+            // Show / Quit so the user can reopen or exit the app when the
+            // main window is closed.
+            let icon_bytes = include_bytes!("../icons/icon-taskbar.png");
+            if let Ok(decoded) = image::load_from_memory(icon_bytes) {
+                let rgba = decoded.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let taskbar_icon =
+                    tauri::image::Image::new_owned(rgba.into_raw(), w, h);
+
+                for (_, window) in app.webview_windows() {
+                    let _ = window.set_icon(taskbar_icon.clone());
+                }
+
+                let show_item = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+                let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let separator = PredefinedMenuItem::separator(app)?;
+                let tray_menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+
+                let _tray = tauri::tray::TrayIconBuilder::with_id("linkvault-main-tray")
+                    .icon(taskbar_icon)
+                    .icon_as_template(false)
+                    .tooltip("LinkVault")
+                    .menu(&tray_menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .build(app)?;
+            }
+
             Ok(())
         })
         .build(tauri::generate_context!())
