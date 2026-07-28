@@ -14,6 +14,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::cache::clear_coursera_provider_data;
+use crate::cache::CourseraResetCounts;
 use crate::coursera::auth;
 use crate::coursera::config::{
     parse_class_input, CourseraOptions, SavedCourseraPreferences, StartCourseraRequest,
@@ -567,6 +569,21 @@ fn update_job_status_and_counts(
 pub fn cancel_active_coursera_download(state: State<'_, CourseraState>) -> Result<bool, String> {
     state.cancellation.store(true, Ordering::Relaxed);
     Ok(true)
+}
+
+#[tauri::command]
+pub fn reset_coursera_database(
+    state: State<'_, CourseraState>,
+) -> Result<CourseraResetCounts, String> {
+    // The UI is expected to call cancel_active_coursera_download first so the
+    // in-flight worker unwinds at a safe boundary. Defensive re-arm of the
+    // cancellation flag here keeps a stale request from writing after the
+    // wipe commits.
+    state.cancellation.store(true, Ordering::Relaxed);
+    let connection = state.connection()?;
+    let counts = clear_coursera_provider_data(&connection).map_err(|e| e.to_string())?;
+    state.cancellation.store(false, Ordering::Relaxed);
+    Ok(counts)
 }
 
 #[tauri::command]

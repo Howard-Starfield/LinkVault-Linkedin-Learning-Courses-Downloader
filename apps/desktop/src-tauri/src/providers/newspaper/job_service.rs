@@ -57,6 +57,69 @@ pub(super) fn set_pause_for_job(
     set_pause(&connection, job_id, paused, Utc::now().timestamp())
 }
 
+/// Result of a bulk pause/resume mutation across the visible queue.
+///
+/// `triggered_cancel` is true when at least one job that was `active` or
+/// `optimizing` had its `paused` flag flipped to `true`. The caller flips the
+/// shared cooperative `cancelled` flag so the in-flight worker loop unwinds
+/// at the next safe boundary (between jobs, between pages, between HTTP
+/// requests, or after a failed page).
+pub struct BulkPauseOutcome {
+    pub updated: Vec<String>,
+    pub triggered_cancel: bool,
+}
+
+pub(super) fn set_all_paused(
+    connection: &mut Connection,
+    paused: bool,
+    updated_at: i64,
+) -> Result<BulkPauseOutcome, String> {
+    let mut targets: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT id, status FROM newspaper_jobs
+             WHERE status IN ('active', 'queued', 'optimizing')
+               AND paused != ?1
+               AND dismissed = 0",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map(params![paused], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    targets.sort_by(|left, right| left.0.cmp(&right.0));
+    let updated: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+    if updated.is_empty() {
+        return Ok(BulkPauseOutcome {
+            updated,
+            triggered_cancel: false,
+        });
+    }
+    let triggered_cancel = paused
+        && targets
+            .iter()
+            .any(|(_, status)| matches!(status.as_str(), "active" | "optimizing"));
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for job_id in &updated {
+        transaction
+            .execute(
+                "UPDATE newspaper_jobs
+                 SET paused = ?1,
+                     status = CASE WHEN ?1 = 1 AND status = 'active' THEN 'queued' ELSE status END,
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![paused, updated_at, job_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(BulkPauseOutcome {
+        updated,
+        triggered_cancel,
+    })
+}
+
 pub(super) fn reorder(
     connection: &mut Connection,
     job_ids: &[String],
@@ -211,4 +274,34 @@ pub(super) fn delete(db_path: &Path, job_id: &str) -> Result<String, String> {
         batch_service::finish_if_terminal(&connection, &batch_id)?;
     }
     Ok(status)
+}
+
+/// Wipe the entire newspaper thumbnail cache directory.
+///
+/// Mirrors the safety pattern of `remove_cached_thumbnail`: canonicalize the
+/// candidate path and verify it lives under the database's parent directory
+/// before recursing. The directory may not exist yet — that is treated as
+/// success. The caller is responsible for pausing active downloads first.
+pub fn clear_thumbnail_cache(db_path: &Path) -> Result<(), String> {
+    let cache_root = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("newspaper-thumbnails");
+    if !cache_root.exists() {
+        return Ok(());
+    }
+    let resolved_db_parent = std::fs::canonicalize(
+        db_path.parent().unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(|error| format!("The newspaper database folder could not be verified: {error}"))?;
+    let resolved_cache_root = std::fs::canonicalize(&cache_root)
+        .map_err(|error| format!("The newspaper thumbnail cache could not be verified: {error}"))?;
+    if !resolved_cache_root.starts_with(&resolved_db_parent) {
+        return Err(
+            "Refusing to delete a newspaper thumbnail cache outside the database folder."
+                .to_string(),
+        );
+    }
+    std::fs::remove_dir_all(&resolved_cache_root)
+        .map_err(|error| format!("Could not delete the newspaper thumbnail cache: {error}"))
 }

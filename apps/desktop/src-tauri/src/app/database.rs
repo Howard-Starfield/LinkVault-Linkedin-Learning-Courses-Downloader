@@ -10,7 +10,7 @@ use crate::app::database_diagnostics::{
     DatabaseDiagnostics, DatabaseErrorClass, DatabaseProvider,
 };
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -1013,6 +1013,120 @@ pub fn set_all_download_jobs_paused(
     }
 
     Ok(jobs.len())
+}
+
+/// Per-table row counts that a provider reset removed. Returned to the caller
+/// so the Settings UI can present a clear "X jobs, Y artifacts, Z events
+/// cleared" confirmation without having to re-query the database.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct ProviderResetCounts {
+    pub jobs: usize,
+    pub artifacts: usize,
+    pub job_events: usize,
+    pub course_cache: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct CourseraResetCounts {
+    pub jobs: usize,
+    pub events: usize,
+    pub settings: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct NewspaperResetCounts {
+    pub batches: usize,
+    pub jobs: usize,
+    pub pages: usize,
+    pub thumbnail_cache: usize,
+    pub optimization_tasks: usize,
+    pub reading_progress: usize,
+    pub read_pages: usize,
+    pub schedules: usize,
+    pub events: usize,
+    pub settings: usize,
+    pub editions: usize,
+}
+
+/// Wipe the LinkedIn provider's data while keeping the schema, foreign-key
+/// relationships, and shared `settings` rows intact. Runs in a single
+/// transaction so the UI never sees a half-wiped state.
+///
+/// The caller is responsible for pausing the queue first (via
+/// `set_all_download_jobs_paused`) and for resetting the in-memory
+/// `LinkVaultState` flags afterwards. This helper touches only the database.
+pub fn clear_linkedin_provider_data(
+    connection: &Connection,
+) -> CacheResult<ProviderResetCounts> {
+    let transaction = connection.unchecked_transaction()?;
+    // FKs use ON DELETE CASCADE on job_events.job_id → jobs.id, but
+    // artifacts.job_id → jobs.id does not. Delete the dependent rows first to
+    // keep the wipe robust regardless of foreign_keys pragma state.
+    let job_events = transaction.execute("DELETE FROM job_events", [])?;
+    let artifacts = transaction.execute("DELETE FROM artifacts", [])?;
+    let jobs = transaction.execute("DELETE FROM jobs", [])?;
+    let course_cache = transaction.execute("DELETE FROM course_cache", [])?;
+    transaction.commit()?;
+    Ok(ProviderResetCounts {
+        jobs,
+        artifacts,
+        job_events,
+        course_cache,
+    })
+}
+
+/// Wipe the Coursera provider's data while keeping the schema intact.
+/// Runs in a single transaction.
+pub fn clear_coursera_provider_data(
+    connection: &Connection,
+) -> CacheResult<CourseraResetCounts> {
+    let transaction = connection.unchecked_transaction()?;
+    let events = transaction.execute("DELETE FROM coursera_job_events", [])?;
+    let jobs = transaction.execute("DELETE FROM coursera_jobs", [])?;
+    let settings = transaction.execute("DELETE FROM coursera_settings", [])?;
+    transaction.commit()?;
+    Ok(CourseraResetCounts {
+        jobs,
+        events,
+        settings,
+    })
+}
+
+/// Wipe the World Journal provider's data while keeping the schema intact.
+/// Runs in a single transaction. The on-disk thumbnail cache directory is
+/// the caller's responsibility — see `newspaper::job_service::delete` for the
+/// path-resolution pattern.
+pub fn clear_newspaper_provider_data(
+    connection: &Connection,
+) -> CacheResult<NewspaperResetCounts> {
+    let transaction = connection.unchecked_transaction()?;
+    // Dependent rows first to keep the wipe robust regardless of
+    // foreign_keys pragma state.
+    let read_pages = transaction.execute("DELETE FROM newspaper_read_pages", [])?;
+    let reading_progress = transaction.execute("DELETE FROM newspaper_reading_progress", [])?;
+    let optimization_tasks = transaction.execute("DELETE FROM newspaper_optimization_tasks", [])?;
+    let thumbnail_cache = transaction.execute("DELETE FROM newspaper_thumbnail_cache", [])?;
+    let pages = transaction.execute("DELETE FROM newspaper_pages", [])?;
+    let events = transaction.execute("DELETE FROM newspaper_events", [])?;
+    let schedules = transaction.execute("DELETE FROM newspaper_schedules", [])?;
+    let settings = transaction.execute("DELETE FROM newspaper_settings", [])?;
+    let jobs = transaction.execute("DELETE FROM newspaper_jobs", [])?;
+    let batches = transaction.execute("DELETE FROM newspaper_batches", [])?;
+    let editions = transaction.execute("DELETE FROM newspaper_editions", [])?;
+    transaction.commit()?;
+    Ok(NewspaperResetCounts {
+        batches,
+        jobs,
+        pages,
+        thumbnail_cache,
+        optimization_tasks,
+        reading_progress,
+        read_pages,
+        schedules,
+        events,
+        settings,
+        editions,
+    })
 }
 
 pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobRecord>> {
@@ -2339,5 +2453,130 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
         }
+    }
+
+    fn table_row_count(connection: &Connection, table: &str) -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn settings_row(connection: &Connection, key: &str) -> Option<String> {
+        connection
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn clear_linkedin_provider_data_removes_only_linkedin_tables() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("job-1", "active", 100)).unwrap();
+        insert_job(&connection, &sample_job("job-2", "queued", 200)).unwrap();
+        connection
+            .execute(
+                "INSERT INTO artifacts (id, job_id, artifact_type, path, status, size_bytes, created_at, updated_at)
+                 VALUES ('artifact-1', 'job-1', 'video', 'C:/x.mp4', 'completed', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_events (job_id, event_type, message, payload_json, created_at)
+                 VALUES ('job-1', 'job.queued', 'queued', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO course_cache (course_slug, source_url, title, payload_json, fetched_at)
+                 VALUES ('sample', 'https://example.com', 'Sample', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('download.folder', '\"C:/x\"', 1)",
+                [],
+            )
+            .unwrap();
+        // Sentinel row in a different provider's table to confirm the wipe is
+        // strictly scoped to LinkedIn.
+        connection
+            .execute(
+                "INSERT INTO coursera_jobs (id, class_name, status, options_json, output_dir, created_at, updated_at, counts_json)
+                 VALUES ('keep-me', 'Keep', 'completed', '{}', 'C:/y', 1, 1, '{}')",
+                [],
+            )
+            .unwrap();
+
+        let counts = clear_linkedin_provider_data(&connection).unwrap();
+
+        assert_eq!(counts.jobs, 2);
+        assert_eq!(counts.artifacts, 1);
+        assert_eq!(counts.job_events, 1);
+        assert_eq!(counts.course_cache, 1);
+        assert_eq!(table_row_count(&connection, "jobs"), 0);
+        assert_eq!(table_row_count(&connection, "artifacts"), 0);
+        assert_eq!(table_row_count(&connection, "job_events"), 0);
+        assert_eq!(table_row_count(&connection, "course_cache"), 0);
+        // Schema is preserved (table still exists) and cross-provider data
+        // is untouched, including the shared `settings` row.
+        assert_eq!(table_row_count(&connection, "coursera_jobs"), 1);
+        assert_eq!(
+            settings_row(&connection, "download.folder").as_deref(),
+            Some("\"C:/x\"")
+        );
+    }
+
+    #[test]
+    fn clear_coursera_provider_data_removes_only_coursera_tables() {
+        let connection = initialized_connection();
+        connection
+            .execute(
+                "INSERT INTO coursera_jobs (id, class_name, status, options_json, output_dir, created_at, updated_at, counts_json)
+                 VALUES ('c-1', 'Class', 'queued', '{}', 'C:/y', 1, 1, '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coursera_job_events (job_id, event_type, payload_json, created_at)
+                 VALUES ('c-1', 'job.queued', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coursera_settings (key, value_json) VALUES ('prefs', '{\"x\":1}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('download.folder', '\"C:/z\"', 1)",
+                [],
+            )
+            .unwrap();
+        insert_job(&connection, &sample_job("keep-me", "active", 1)).unwrap();
+
+        let counts = clear_coursera_provider_data(&connection).unwrap();
+
+        assert_eq!(counts.jobs, 1);
+        assert_eq!(counts.events, 1);
+        assert_eq!(counts.settings, 1);
+        assert_eq!(table_row_count(&connection, "coursera_jobs"), 0);
+        assert_eq!(table_row_count(&connection, "coursera_job_events"), 0);
+        assert_eq!(table_row_count(&connection, "coursera_settings"), 0);
+        // Shared settings + LinkedIn job are untouched.
+        assert_eq!(
+            settings_row(&connection, "download.folder").as_deref(),
+            Some("\"C:/z\"")
+        );
+        assert_eq!(table_row_count(&connection, "jobs"), 1);
     }
 }

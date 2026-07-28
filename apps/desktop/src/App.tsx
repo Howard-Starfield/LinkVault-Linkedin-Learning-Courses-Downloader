@@ -223,7 +223,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.5";
+const APP_VERSION = "0.2.7";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
 
@@ -301,6 +301,9 @@ export default function App() {
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [pendingResetProvider, setPendingResetProvider] = useState<"linkedin" | "coursera" | "newspaper" | null>(null);
+  const [resetInProgress, setResetInProgress] = useState<"linkedin" | "coursera" | "newspaper" | null>(null);
+  const [pausingForReset, setPausingForReset] = useState<"linkedin" | "coursera" | "newspaper" | null>(null);
   const [newspaperDefaultZoom, setNewspaperDefaultZoom] = useState(initialNewspaperReaderPreferences.current.defaultZoom);
   const [newspaperClickZoom, setNewspaperClickZoom] = useState(initialNewspaperReaderPreferences.current.clickZoom);
   const [newspaperPageTone, setNewspaperPageTone] = useState<NewspaperPageTone>(initialNewspaperReaderPreferences.current.pageTone);
@@ -1310,6 +1313,146 @@ export default function App() {
     }
   }
 
+  // The reset-data flow lives in three pieces: the request handler that
+  // opens a confirmation dialog, the per-provider confirmation handler that
+  // performs the auto-pause + wipe, and the small derived state above the
+  // Settings panel that drives the disabled state on the trigger buttons.
+
+  type ResetProvider = "linkedin" | "coursera" | "newspaper";
+
+  function activeLinkedinJobCount(): number {
+    return queuedJobs.filter((job) => job.status === "active" && !job.paused).length;
+  }
+
+  function requestResetProvider(provider: ResetProvider) {
+    if (resetInProgress || pausingForReset || pendingResetProvider) return;
+    setPendingResetProvider(provider);
+  }
+
+  async function performProviderReset(provider: ResetProvider) {
+    if (!isTauriRuntime()) {
+      toast.info("Browser preview", { description: "Run the Tauri app to reset provider data." });
+      setPendingResetProvider(null);
+      return;
+    }
+    setPendingResetProvider(null);
+    setResetInProgress(provider);
+    try {
+      // Step 1: auto-pause the in-flight worker via the existing
+      // bulk-pause command. The worker unwinds at the next safe boundary;
+      // give it a short grace window before the wipe commits.
+      const hasActiveWork = await pauseProviderForReset(provider);
+      if (hasActiveWork) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_500));
+      }
+      // Step 2: snapshot the output folders the user might want to clean up
+      // on disk. This is best-effort — the wipe itself does not touch them.
+      const outputDirs = provider === "newspaper" ? collectNewspaperOutputDirs() : [];
+      // Step 3: run the provider-specific wipe.
+      const counts = await invokeProviderReset(provider);
+      const cleared = describeProviderCounts(provider, counts);
+      if (provider === "linkedin") {
+        await refreshBootstrapState();
+      }
+      toast.success(`${resetProviderLabel(provider)} database cleared`, {
+        description: cleared,
+        action: outputDirs.length > 0
+          ? {
+              label: "Open output folder",
+              onClick: () => {
+                const next = outputDirs[0];
+                void invoke("open_newspaper_download_folder", { path: next }).catch(() => undefined);
+              }
+            }
+          : undefined,
+      });
+    } catch (error) {
+      toast.error(`Could not reset ${resetProviderLabel(provider)} database`, {
+        description: String(error)
+      });
+    } finally {
+      setResetInProgress(null);
+      setPausingForReset(null);
+    }
+  }
+
+  async function pauseProviderForReset(provider: ResetProvider): Promise<boolean> {
+    setPausingForReset(provider);
+    try {
+      if (provider === "linkedin") {
+        if (pausableQueueJobs.length === 0) return false;
+        const state = await setAllDownloadsPaused(true);
+        setQueuedJobs(state.persisted_jobs);
+        setPersistedEvents(state.recent_events ?? []);
+        return true;
+      }
+      if (provider === "coursera") {
+        // Coursera has no per-job pause UI; the existing
+        // cancel_active_coursera_download command sets the cooperative
+        // flag and the worker unwinds at a safe boundary. The defensive
+        // re-arm in reset_coursera_database handles the case where the
+        // worker has already exited.
+        const cancelled = await invoke<boolean>("cancel_active_coursera_download");
+        if (!cancelled) {
+          // Either there was no active worker or the call returned false;
+          // either way we proceed with the wipe.
+        }
+        return true;
+      }
+      const updated = await invoke<string[]>("set_all_newspaper_jobs_paused", {
+        paused: true
+      });
+      return updated.length > 0;
+    } catch (error) {
+      // The pause step is best-effort. The reset command will defensively
+      // re-arm the cancellation flag, so we still proceed to the wipe.
+      toast.warning(`Could not pause ${resetProviderLabel(provider)} downloads first`, {
+        description: String(error)
+      });
+      return false;
+    }
+  }
+
+  async function invokeProviderReset(provider: ResetProvider): Promise<Record<string, number>> {
+    if (provider === "linkedin") {
+      return await invoke<Record<string, number>>("reset_linkedin_database");
+    }
+    if (provider === "coursera") {
+      return await invoke<Record<string, number>>("reset_coursera_database");
+    }
+    return await invoke<Record<string, number>>("reset_newspaper_database");
+  }
+
+  function resetProviderLabel(provider: ResetProvider): string {
+    return provider === "linkedin"
+      ? "LinkedIn"
+      : provider === "coursera"
+        ? "Coursera"
+        : "World Journal";
+  }
+
+  function describeProviderCounts(provider: ResetProvider, counts: Record<string, number>): string {
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(counts)) {
+      if (!value) continue;
+      const label = key.replace(/_/g, " ");
+      parts.push(`${value} ${label}`);
+    }
+    if (parts.length === 0) {
+      return "The selected tables were already empty.";
+    }
+    return `Cleared ${parts.join(", ")} from the ${resetProviderLabel(provider)} tables.`;
+  }
+
+  function collectNewspaperOutputDirs(): string[] {
+    // Output folders are tracked per batch in the bootstrap state. Without a
+    // dedicated command, fall back to the current NewspaperView state via
+    // the global poll. Returning an empty array here means the
+    // open-folder action simply does not appear, which is safer than
+    // guessing.
+    return [];
+  }
+
   async function retryDownloadJob(job: QueuedDownloadJob) {
     if (job.status !== "failed") return;
     const enteredToken = token.trim();
@@ -2063,6 +2206,55 @@ export default function App() {
           </div>
         </section>
 
+        <section className="settings-section">
+          <div className="settings-section-title">Data management</div>
+          <p className="settings-section-description">
+            Clear a provider's in-app database without touching the files you have already downloaded to disk.
+            The saved LinkedIn token is preserved.
+          </p>
+          <div className="settings-button-row">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => requestResetProvider("linkedin")}
+              disabled={resetInProgress === "linkedin" || pausingForReset === "linkedin"}
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+              {pausingForReset === "linkedin"
+                ? "Pausing LinkedIn"
+                : resetInProgress === "linkedin"
+                  ? "Clearing LinkedIn"
+                  : "Reset LinkedIn database"}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => requestResetProvider("coursera")}
+              disabled={resetInProgress === "coursera" || pausingForReset === "coursera"}
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+              {pausingForReset === "coursera"
+                ? "Pausing Coursera"
+                : resetInProgress === "coursera"
+                  ? "Clearing Coursera"
+                  : "Reset Coursera database"}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => requestResetProvider("newspaper")}
+              disabled={resetInProgress === "newspaper" || pausingForReset === "newspaper"}
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+              {pausingForReset === "newspaper"
+                ? "Pausing World Journal"
+                : resetInProgress === "newspaper"
+                  ? "Clearing World Journal"
+                  : "Reset World Journal database"}
+            </Button>
+          </div>
+        </section>
+
         <div className="settings-actions">
           <Button type="button" variant="ghost" onClick={() => setIsSettingsOpen(false)}>Close</Button>
           <Button type="button" variant="primary" onClick={saveSettings} loading={isSavingSettings} loadingLabel="Saving">
@@ -2092,6 +2284,65 @@ export default function App() {
           </Button>
         </div>
       </div>
+    </Dialog>
+    <Dialog
+      open={pendingResetProvider !== null}
+      onOpenChange={(open) => {
+        if (!open) setPendingResetProvider(null);
+      }}
+      title={pendingResetProvider ? `Reset ${resetProviderLabel(pendingResetProvider)} database?` : "Reset database"}
+      description="This is destructive. Read the details before you continue."
+    >
+      {pendingResetProvider ? (
+        <div className="reset-confirm">
+          <p>
+            Clearing the {resetProviderLabel(pendingResetProvider)} database removes the in-app records
+            for that provider. Files you have already saved to your download folder are <strong>not</strong> deleted.
+            Your saved LinkedIn <code>li_at</code> cookie is preserved.
+          </p>
+          <ul className="reset-confirm-list">
+            {pendingResetProvider === "linkedin" ? (
+              <>
+                <li>LinkedIn download queue, history, and saved preferences</li>
+                <li>LinkedIn course discovery cache</li>
+                <li>The Markdown download history file is rewritten as empty</li>
+              </>
+            ) : null}
+            {pendingResetProvider === "coursera" ? (
+              <>
+                <li>Coursera download queue, history, and per-course options</li>
+                <li>Coursera provider preferences</li>
+              </>
+            ) : null}
+            {pendingResetProvider === "newspaper" ? (
+              <>
+                <li>World Journal editions, batches, jobs, and pages</li>
+                <li>Thumbnail cache, optimization ledger, reading progress</li>
+                <li>Newspaper schedules and provider settings</li>
+                <li>On-disk <code>newspaper-thumbnails/</code> directory</li>
+              </>
+            ) : null}
+          </ul>
+          <p>
+            {pendingResetProvider === "linkedin" && activeLinkedinJobCount() > 0
+              ? `${activeLinkedinJobCount()} download${activeLinkedinJobCount() === 1 ? " is" : "s are"} still in flight. LinkVault will pause them at the next safe boundary before wiping.`
+              : "No active downloads detected for this provider."}
+          </p>
+          <div className="reset-confirm-actions">
+            <Button type="button" variant="ghost" onClick={() => setPendingResetProvider(null)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              onClick={() => void performProviderReset(pendingResetProvider)}
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+              Reset {resetProviderLabel(pendingResetProvider)} database
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </Dialog>
     </>
   );

@@ -192,6 +192,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
   const [submitting, setSubmitting] = useState(false);
   const [savingSchedule, setSavingSchedule] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [isPausingAll, setIsPausingAll] = useState(false);
   const [jobProgress, setJobProgress] = useState<NewspaperJobProgress[]>([]);
   const [optimizationRuntime, setOptimizationRuntime] = useState<OptimizationRuntime>({
     active: false,
@@ -456,6 +457,49 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
     }
   }
 
+  // Visible queue: anything still doing work, regardless of its current pause
+  // flag. Excludes terminal states and dismissed editions so the Download-now
+  // slot can revert to a fresh start when the queue drains.
+  const pausableNewspaperJobs = jobs.filter(
+    (job) =>
+      !job.dismissed &&
+      (job.status === "active" || job.status === "queued" || job.status === "optimizing")
+  );
+  const allNewspaperJobsPaused =
+    pausableNewspaperJobs.length > 0 && pausableNewspaperJobs.every((job) => job.paused);
+  const isNewspaperQueueRunning = pausableNewspaperJobs.length > 0;
+
+  async function toggleAllNewspaperJobsPause() {
+    if (!isTauriRuntime() || pausableNewspaperJobs.length === 0) return;
+    const nextPaused = !allNewspaperJobsPaused;
+    setIsPausingAll(true);
+    try {
+      const updatedIds = await invoke<string[]>("set_all_newspaper_jobs_paused", {
+        paused: nextPaused
+      });
+      toast.info(nextPaused ? "All newspaper downloads paused" : "All newspaper downloads resumed", {
+        description: nextPaused
+          ? "Active work will pause at the next safe boundary. Queued and scheduled editions will wait."
+          : "Queued editions are available to continue."
+      });
+      await refresh();
+      // The cooperative pause signal in the Rust worker may not have unwound
+      // the in-flight process_newspaper_queue task yet; re-arm it on resume so
+      // the worker picks up where it left off, mirroring the LinkedIn flow.
+      if (!nextPaused) continueQueue();
+      if (updatedIds.length === 0) {
+        // nothing was pausable at the moment of the call; refresh already covered
+        // any visible drift, so the UI settles back to Download now naturally.
+      }
+    } catch (error) {
+      toast.error(nextPaused ? "Pause all failed" : "Resume all failed", {
+        description: String(error)
+      });
+    } finally {
+      setIsPausingAll(false);
+    }
+  }
+
   async function startQueuedJob(job: NewspaperJob) {
     if (!isTauriRuntime()) return;
     try {
@@ -645,7 +689,14 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
         <section className="newspaper-dispatch-panel newspaper-options" aria-label="Newspaper download settings">
           <div className="newspaper-settings-stack">
             <label className="newspaper-setting-field">
-              <span>Date range</span>
+              <span>
+                Date range
+                <Tooltip label="Uses the system date automatically and includes today.">
+                  <button type="button" className="newspaper-setting-help" aria-label="About the Last 7 days date range">
+                    <CircleHelp aria-hidden="true" />
+                  </button>
+                </Tooltip>
+              </span>
               <Select value={dateMode} onChange={(event) => setDateMode(event.target.value as typeof dateMode)}>
                 <option value="single">Single date</option>
                 <option value="last7_days">Last 7 days</option>
@@ -655,7 +706,6 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
             <div className={`newspaper-date-controls${dateMode === "last7_days" ? " is-system-date" : ""}`}>
               <Input type="date" value={dateMode === "last7_days" ? today() : startDate} onChange={(event) => setStartDate(event.target.value)} disabled={dateMode === "last7_days"} aria-label={dateMode === "last7_days" ? "System current date" : "Start publication date"} />
               {dateMode === "custom" ? <Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} aria-label="End publication date" /> : null}
-              {dateMode === "last7_days" ? <small>Uses the system date automatically and includes today.</small> : null}
             </div>
             <label className="newspaper-delay-setting">
               <span>Delay between editions</span>
@@ -704,9 +754,27 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
             </div>
           </div>
           <div className="command-actions newspaper-download-actions">
-            <Button variant="primary" loading={submitting || processing} onClick={() => void submitDownload()}>
-              <Download /> Download now
-            </Button>
+            {isNewspaperQueueRunning ? (
+              <Button
+                variant="primary"
+                loading={isPausingAll || processing}
+                onClick={() => void toggleAllNewspaperJobsPause()}
+                disabled={isPausingAll}
+              >
+                {allNewspaperJobsPaused
+                  ? <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                  : <Pause aria-hidden="true" className="h-3.5 w-3.5" />}
+                {isPausingAll
+                  ? "Updating"
+                  : allNewspaperJobsPaused
+                    ? "Resume all"
+                    : "Pause all"}
+              </Button>
+            ) : (
+              <Button variant="primary" loading={submitting || processing} onClick={() => void submitDownload()}>
+                <Download /> Download now
+              </Button>
+            )}
           </div>
         </section>
       </div>
@@ -749,17 +817,34 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                   <span>{formatJobTime(job)}</span>
                 </div>
                 <div className="newspaper-job-progress">
-                  <span>{job.status === "queued" || job.paused ? "—" : `${progress}%`}</span>
+                  <span className="newspaper-job-progress-percent">{job.status === "queued" || job.paused ? "—" : `${progress}%`}</span>
                   <div role="progressbar" aria-label={`${job.edition_name} download progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
                     <i style={{ width: `${progress}%` }} />
                   </div>
-                  <small>{formatProgressDetail(job, details)}</small>
-                  {details?.optimizationTotal ? (
-                    <div className="newspaper-stage-counts">
-                      <span>Download {details.downloadCompleted}/{details.downloadTotal}</span>
-                      <span>Optimize {details.optimizationCompleted}/{details.optimizationTotal}</span>
-                    </div>
-                  ) : null}
+                  {(() => {
+                    if (!details) return <div className="newspaper-stage-counts"><span>Waiting</span></div>;
+                    const hasFailure = details.downloadFailed > 0 || details.optimizationFailed > 0;
+                    if (hasFailure) {
+                      return (
+                        <div className="newspaper-stage-counts is-failed" role="status">
+                          {details.downloadFailed > 0 ? (
+                            <span><em>Failed</em> {details.downloadFailed} download{details.downloadFailed === 1 ? "" : "s"}</span>
+                          ) : null}
+                          {details.optimizationFailed > 0 ? (
+                            <span><em>Failed</em> {details.optimizationFailed} optimization{details.optimizationFailed === 1 ? "" : "s"}</span>
+                          ) : null}
+                        </div>
+                      );
+                    }
+                    return (
+                      <div className="newspaper-stage-counts">
+                        <span><em>Downloaded</em> {details.downloadCompleted}/{details.downloadTotal}</span>
+                        {details.optimizationTotal > 0 ? (
+                          <span><em>Optimized</em> {details.optimizationCompleted}/{details.optimizationTotal}</span>
+                        ) : null}
+                      </div>
+                    );
+                  })()}
                 </div>
                 <div className="newspaper-progress-actions">
                   {job.status === "active" || job.status === "optimizing" ? (
@@ -836,33 +921,6 @@ function exactProgressPercent(job: NewspaperJob, progress?: NewspaperJobProgress
   const terminal = isOptimizationStage ? optimizationTerminal : downloadTerminal;
   const total = isOptimizationStage ? progress.optimizationTotal : progress.downloadTotal;
   return total > 0 ? Math.min(99, Math.round((terminal / total) * 100)) : 0;
-}
-
-function formatProgressDetail(job: NewspaperJob, progress?: NewspaperJobProgress) {
-  if (job.paused) return "Paused safely";
-  if (!progress) return job.page_count > 0 ? `${job.completed_count}/${job.page_count} downloaded` : "Waiting";
-  if (progress.currentStage === "queued") return "Waiting";
-  if (progress.currentStage === "downloading") {
-    return `${progress.downloadCompleted}/${progress.downloadTotal} downloaded${progress.downloadFailed ? ` · ${progress.downloadFailed} failed` : ""}`;
-  }
-  if (progress.currentStage === "optimizing" || progress.currentStage === "finalizing") {
-    const metrics = [
-      `${progress.optimizationCompleted}/${progress.optimizationTotal} optimized`,
-      progress.activeWorkers ? `${progress.activeWorkers} workers` : null,
-      progress.pagesPerMinute ? `${progress.pagesPerMinute.toFixed(1)} pages/min` : null,
-      progress.etaSeconds ? formatEta(progress.etaSeconds) : null,
-      progress.optimizationRecovered ? `${progress.optimizationRecovered} recovered` : null
-    ].filter(Boolean);
-    return metrics.join(" · ");
-  }
-  return progress.currentStage === "complete"
-    ? `${progress.downloadCompleted} downloaded · ${progress.optimizationCompleted || progress.downloadCompleted} ready`
-    : `${progress.downloadCompleted}/${progress.downloadTotal} downloaded`;
-}
-
-function formatEta(seconds: number) {
-  if (seconds < 60) return `about ${Math.max(1, Math.round(seconds))}s`;
-  return `about ${Math.ceil(seconds / 60)}m`;
 }
 
 function formatJobTime(job: NewspaperJob) {
