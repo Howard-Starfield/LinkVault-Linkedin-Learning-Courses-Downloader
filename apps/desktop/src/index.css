@@ -230,19 +230,24 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 14px;
-  border-bottom: 1px solid rgb(240 138 93 / 0.3);
+  padding: 12px 16px;
+  border: 1px solid rgb(240 138 93 / 0.3);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px -8px rgb(0 0 0 / 0.45), 0 2px 6px rgb(0 0 0 / 0.25);
   background: rgb(30 20 15 / 0.96);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   font-size: 12px;
-  position: sticky;
-  top: 0;
-  z-index: 40;
-  flex-shrink: 0;
+  position: fixed;
+  bottom: 1.25rem;
+  left: 1.25rem;
+  width: min(420px, calc(100vw - 2.5rem));
+  z-index: 60;
 }
 
 :root[data-theme="light"] .update-banner {
   background: rgb(253 244 237 / 0.97);
-  border-bottom-color: rgb(200 120 60 / 0.2);
+  border-color: rgb(200 120 60 / 0.2);
 }
 
 .update-banner-text {
@@ -3092,7 +3097,13 @@ textarea {
   gap: 4px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 120ms ease;
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.newspaper-schedule-card:hover .newspaper-schedule-status,
+.newspaper-schedule-card:focus-within .newspaper-schedule-status {
+  opacity: 0;
+  transform: translateY(-2px);
 }
 
 .newspaper-schedule-card:hover .newspaper-schedule-actions,
@@ -3101,12 +3112,34 @@ textarea {
 .newspaper-progress-row:focus-within .newspaper-progress-actions {
   opacity: 1;
   pointer-events: auto;
+  transform: translateY(0);
+}
+
+.newspaper-schedule-trailing {
+  position: relative;
+  display: grid;
+  align-items: center;
+  justify-items: end;
+  min-width: 60px;
+  min-height: 27px;
+}
+
+.newspaper-schedule-status,
+.newspaper-schedule-actions {
+  grid-area: 1 / 1;
+}
+
+.newspaper-schedule-status {
+  transition: opacity 140ms ease, transform 140ms ease;
+  transform: translateY(0);
 }
 
 .newspaper-schedule-actions {
-  position: absolute;
-  right: 8px;
-  bottom: 6px;
+  position: relative;
+  right: auto;
+  bottom: auto;
+  justify-content: flex-end;
+  transform: translateY(2px);
 }
 
 .newspaper-schedule-actions button,
@@ -3556,6 +3589,20 @@ textarea {
   .newspaper-progress-actions {
     opacity: 1;
     pointer-events: auto;
+    transform: none;
+  }
+  .newspaper-schedule-trailing {
+    grid-template-columns: auto auto;
+    column-gap: 6px;
+    min-width: 0;
+  }
+  .newspaper-schedule-status,
+  .newspaper-schedule-actions {
+    grid-area: auto;
+  }
+  .newspaper-schedule-status {
+    opacity: 1;
+    transform: none;
   }
 }
 
@@ -3579,6 +3626,7 @@ textarea {
 @media (prefers-reduced-motion: reduce) {
   .newspaper-edition-row,
   .newspaper-schedule-actions,
+  .newspaper-schedule-status,
   .newspaper-progress-actions,
   .newspaper-progress-row,
   .newspaper-job-progress [role="progressbar"] > i {
