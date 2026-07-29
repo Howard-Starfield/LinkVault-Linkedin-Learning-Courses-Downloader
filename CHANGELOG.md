@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.12 — 2026-07-29
+
+- **Newspaper schedule card hover polish.** The daily-schedule cards in the World Journal panel now replace the "Enabled / Paused" status badge with the pause / delete action buttons on hover, instead of stacking the badge and the buttons in two different positions. The crossfade is a 140ms ease; on touch devices the badge and the buttons sit side-by-side so the controls stay reachable without hover. Reduced-motion users get an instant swap.
+- **App icon regen via `generate-app-icons.py`.** Bundled a new script under `apps/desktop/scripts/` that produces the full Tauri 2 icon set (`icon.png`, `icon.ico`, `icon-taskbar.png`, `icon-tray.png`) from a single source PNG, deriving a real alpha channel from the near-white background so the installer / taskbar / tray icons show transparent corners on both light and dark backgrounds. The current v0.2.12 binary ships the regenerated set; downstream releases can rerun the script instead of hand-editing individual icon files.
+
 ## 0.2.11 — 2026-07-28
 
 - **Rebrand: All-in-One Downloader.** The left-sidebar banner, the Windows taskbar icon, the system tray icon, and the Windows installer icon are now the "All-in-One Downloader" artwork. This re-introduces the v0.2.8 brand on purpose: the v0.2.10 "LinkVault Course Downloader" wordmark was a generic placeholder and is removed again. `App.tsx` imports the new sidebar asset via `<img src>`; `lib.rs` decodes the taskbar icon from `include_bytes!` so the binary has no runtime file dependency.

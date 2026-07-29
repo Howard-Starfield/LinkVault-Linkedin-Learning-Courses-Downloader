@@ -667,10 +667,12 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                       {item.last_run_date ? <small>Last run {item.last_run_date}</small> : null}
                       {item.last_error ? <small className="is-error">{item.last_error}</small> : null}
                     </div>
-                    <StatusBadge tone={item.enabled ? "success" : "neutral"}>{item.enabled ? "Enabled" : "Paused"}</StatusBadge>
-                    <div className="newspaper-schedule-actions">
-                      <button type="button" aria-label={item.enabled ? "Pause daily schedule" : "Resume daily schedule"} title={item.enabled ? "Pause schedule" : "Resume schedule"} onClick={() => void toggleSchedule(item)}>{item.enabled ? <Pause /> : <Play />}</button>
-                      <button type="button" className="danger" aria-label="Delete daily schedule" title="Delete schedule" onClick={() => void deleteSchedule(item)}><Trash2 /></button>
+                    <div className="newspaper-schedule-trailing">
+                      <StatusBadge tone={item.enabled ? "success" : "neutral"} className="newspaper-schedule-status">{item.enabled ? "Enabled" : "Paused"}</StatusBadge>
+                      <div className="newspaper-schedule-actions">
+                        <button type="button" aria-label={item.enabled ? "Pause daily schedule" : "Resume daily schedule"} title={item.enabled ? "Pause schedule" : "Resume schedule"} onClick={() => void toggleSchedule(item)}>{item.enabled ? <Pause /> : <Play />}</button>
+                        <button type="button" className="danger" aria-label="Delete daily schedule" title="Delete schedule" onClick={() => void deleteSchedule(item)}><Trash2 /></button>
+                      </div>
                     </div>
                   </article>
                 ))}
