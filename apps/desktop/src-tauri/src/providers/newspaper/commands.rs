@@ -84,7 +84,10 @@ pub fn delete_newspaper_schedule(
     state: State<'_, NewspaperState>,
     schedule_id: String,
 ) -> Result<(), String> {
-    schedule_service::delete(state.db_path(), &schedule_id)
+    if schedule_service::delete(state.db_path(), &schedule_id)? {
+        state.cancelled.store(true, Ordering::SeqCst);
+    }
+    Ok(())
 }
 
 #[tauri::command]

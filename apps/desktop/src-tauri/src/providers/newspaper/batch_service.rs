@@ -26,6 +26,22 @@ pub(super) fn create_with_connection(
     connection: &mut Connection,
     request: CreateNewspaperBatchRequest,
 ) -> Result<CreateNewspaperBatchResponse, String> {
+    create_with_origin(connection, request, None)
+}
+
+pub(super) fn create_for_schedule_with_connection(
+    connection: &mut Connection,
+    request: CreateNewspaperBatchRequest,
+    schedule_id: &str,
+) -> Result<CreateNewspaperBatchResponse, String> {
+    create_with_origin(connection, request, Some(schedule_id))
+}
+
+fn create_with_origin(
+    connection: &mut Connection,
+    request: CreateNewspaperBatchRequest,
+    schedule_id: Option<&str>,
+) -> Result<CreateNewspaperBatchResponse, String> {
     validate_request(&request)?;
     let start = if request.date_mode == DateMode::Last7Days {
         Local::now().date_naive()
@@ -69,11 +85,12 @@ pub(super) fn create_with_connection(
     transaction
         .execute(
             "INSERT INTO newspaper_batches
-            (id, status, destination, scheduled_at, delay_minutes, delay_seconds, optimize_images,
+            (id, schedule_id, status, destination, scheduled_at, delay_minutes, delay_seconds, optimize_images,
              optimization_profile, optimization_quality, keep_original_jpg, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
                 batch_id,
+                schedule_id,
                 batch_status,
                 request.destination,
                 scheduled,

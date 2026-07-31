@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 1,
@@ -12,8 +12,8 @@
     "src-tauri/src/providers/newspaper/page_metadata.rs": 2,
     "src-tauri/src/providers/newspaper/queue_service.rs": 17,
     "src-tauri/src/providers/newspaper/reader_service.rs": 3,
-    "src-tauri/src/providers/newspaper/schedule_service.rs": 5,
-    "src-tauri/src/providers/newspaper/storage.rs": 23,
+    "src-tauri/src/providers/newspaper/schedule_service.rs": 4,
+    "src-tauri/src/providers/newspaper/storage.rs": 24,
     "src-tauri/src/providers/newspaper/thumbnails.rs": 1
   },
   "sharedWriteHelperCallCounts": {
@@ -44,11 +44,15 @@
     },
     "src-tauri/src/providers/newspaper/commands.rs": {
       "clear_newspaper_provider_data": 1
+    },
+    "src-tauri/src/providers/newspaper/schedule_service.rs": {
+      "delete_newspaper_schedule_and_cancel_owned_work": 1
     }
   },
   "versionNotes": {
     "1": "Baseline established during v0.2.3 architecture foundation (commit f182e8f).",
     "2": "Added two direct SQL write primitives in newspaper job_service.rs for the bulk pause/resume introduced with the Pause all / Resume all Download-now morph. Same shape as the existing per-job set_pause contract; will be migrated alongside the rest of the newspaper job_service.rs surface during the newspaper cutover phase.",
-    "3": "Added three new shared write helpers (clear_linkedin_provider_data, clear_coursera_provider_data, clear_newspaper_provider_data) and recorded one call site per provider. The provider reset path goes through app::cache helpers, keeping the provider's direct SQL surface flat; only the LinkedIn commands.rs file enters the sharedWriteHelperCallCounts map for the first time, because all of its write paths were previously either helpers or per-row UPDATEs that the gate does not track."
+    "3": "Added three new shared write helpers (clear_linkedin_provider_data, clear_coursera_provider_data, clear_newspaper_provider_data) and recorded one call site per provider. The provider reset path goes through app::cache helpers, keeping the provider's direct SQL surface flat; only the LinkedIn commands.rs file enters the sharedWriteHelperCallCounts map for the first time, because all of its write paths were previously either helpers or per-row UPDATEs that the gate does not track.",
+    "4": "Moved atomic schedule deletion and owned-work cancellation behind the shared app database boundary, reducing the schedule service direct SQL baseline by one and pinning the new helper call site. Added one reviewed storage migration write for the schedule ownership index."
   }
 }

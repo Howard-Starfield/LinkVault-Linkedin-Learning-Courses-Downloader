@@ -422,7 +422,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
   }
 
   async function deleteSchedule(item: NewspaperSchedule) {
-    if (!window.confirm(`Remove the ${formatClockTime(item.cron_time)} daily schedule? Downloaded newspapers will not be affected.`)) return;
+    if (!window.confirm(`Remove the ${formatClockTime(item.cron_time)} daily schedule? Pending automatic retries from this schedule will stop. Downloaded newspapers will not be affected.`)) return;
     await invoke("delete_newspaper_schedule", { scheduleId: item.id });
     toast.success("Daily newspaper schedule removed");
     await refresh();
