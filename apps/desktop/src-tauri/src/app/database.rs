@@ -9,7 +9,9 @@ use crate::app::database_diagnostics::{
     DatabaseDiagnosticInput, DatabaseDiagnosticKind, DatabaseDiagnosticOutcome,
     DatabaseDiagnostics, DatabaseErrorClass, DatabaseProvider,
 };
-use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Result};
+use rusqlite::{
+    backup::Backup, params, Connection, OptionalExtension, Result, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1138,6 +1140,53 @@ pub fn clear_newspaper_provider_data(
         events,
         settings,
     })
+}
+
+/// Remove a recurring newspaper schedule and atomically retire only the
+/// unfinished work that originated from it. Completed history remains intact.
+pub fn delete_newspaper_schedule_and_cancel_owned_work(
+    connection: &mut Connection,
+    schedule_id: &str,
+    now: i64,
+) -> CacheResult<bool> {
+    let transaction =
+        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let interrupted_active_work = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM newspaper_jobs j
+             JOIN newspaper_batches b ON b.id = j.batch_id
+             WHERE b.schedule_id = ?1
+               AND j.status IN ('active', 'optimizing')
+         )",
+        params![schedule_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "UPDATE newspaper_jobs
+         SET status = 'cancelled', retry_at = NULL,
+             warning = 'Daily schedule removed. Automatic retry stopped.',
+             updated_at = ?2
+         WHERE batch_id IN (
+             SELECT id FROM newspaper_batches WHERE schedule_id = ?1
+         )
+           AND status IN ('queued', 'active', 'optimizing')",
+        params![schedule_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE newspaper_batches
+         SET status = 'cancelled', scheduled_at = NULL,
+             completed_at = ?2, updated_at = ?2
+         WHERE schedule_id = ?1
+           AND status IN ('queued', 'scheduled', 'active', 'paused')",
+        params![schedule_id, now],
+    )?;
+    transaction.execute(
+        "DELETE FROM newspaper_schedules WHERE id = ?1",
+        params![schedule_id],
+    )?;
+    transaction.commit()?;
+    Ok(interrupted_active_work)
 }
 
 pub fn get_job(connection: &Connection, job_id: &str) -> CacheResult<Option<JobRecord>> {

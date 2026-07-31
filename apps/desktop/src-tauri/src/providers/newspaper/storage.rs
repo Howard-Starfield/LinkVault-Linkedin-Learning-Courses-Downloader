@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS newspaper_editions (
 
 CREATE TABLE IF NOT EXISTS newspaper_batches (
     id TEXT PRIMARY KEY NOT NULL,
+    schedule_id TEXT,
     status TEXT NOT NULL CHECK (status IN ('queued', 'scheduled', 'active', 'paused', 'completed', 'completed_with_warnings', 'failed', 'cancelled')),
     destination TEXT NOT NULL,
     scheduled_at INTEGER,
@@ -215,6 +216,12 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     migrate_add_column(
         connection,
         "newspaper_batches",
+        "schedule_id",
+        "ALTER TABLE newspaper_batches ADD COLUMN schedule_id TEXT",
+    )?;
+    migrate_add_column(
+        connection,
+        "newspaper_batches",
         "delay_seconds",
         "ALTER TABLE newspaper_batches ADD COLUMN delay_seconds INTEGER NOT NULL DEFAULT 15 CHECK (delay_seconds BETWEEN 0 AND 3600)",
     )?;
@@ -273,6 +280,11 @@ pub fn initialize(connection: &Connection) -> Result<()> {
         "newspaper_optimization_tasks",
         "recovered",
         "ALTER TABLE newspaper_optimization_tasks ADD COLUMN recovered INTEGER NOT NULL DEFAULT 0",
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_newspaper_batches_schedule
+         ON newspaper_batches(schedule_id)",
+        [],
     )?;
     connection.execute(
         "UPDATE newspaper_jobs
@@ -363,6 +375,7 @@ fn rebuild_optimization_quality_constraint(connection: &Connection, table: &str)
             ALTER TABLE newspaper_batches RENAME TO newspaper_batches_quality_legacy;
             CREATE TABLE newspaper_batches (
                 id TEXT PRIMARY KEY NOT NULL,
+                schedule_id TEXT,
                 status TEXT NOT NULL CHECK (status IN ('queued', 'scheduled', 'active', 'paused', 'completed', 'completed_with_warnings', 'failed', 'cancelled')),
                 destination TEXT NOT NULL,
                 scheduled_at INTEGER,
@@ -377,16 +390,18 @@ fn rebuild_optimization_quality_constraint(connection: &Connection, table: &str)
                 completed_at INTEGER
             );
             INSERT INTO newspaper_batches
-                (id, status, destination, scheduled_at, delay_minutes, delay_seconds,
+                (id, schedule_id, status, destination, scheduled_at, delay_minutes, delay_seconds,
                  optimize_images, optimization_profile, optimization_quality,
                  keep_original_jpg, created_at, updated_at, completed_at)
-            SELECT id, status, destination, scheduled_at, delay_minutes, delay_seconds,
+            SELECT id, schedule_id, status, destination, scheduled_at, delay_minutes, delay_seconds,
                    optimize_images, optimization_profile, optimization_quality,
                    keep_original_jpg, created_at, updated_at, completed_at
             FROM newspaper_batches_quality_legacy;
             DROP TABLE newspaper_batches_quality_legacy;
             CREATE INDEX IF NOT EXISTS idx_newspaper_batches_status_due
                 ON newspaper_batches(status, scheduled_at);
+            CREATE INDEX IF NOT EXISTS idx_newspaper_batches_schedule
+                ON newspaper_batches(schedule_id);
             COMMIT;
             "#,
         ),
@@ -918,6 +933,7 @@ mod tests {
             .unwrap();
         assert!(batch_columns.contains(&"delay_seconds".to_string()));
         assert!(batch_columns.contains(&"optimization_quality".to_string()));
+        assert!(batch_columns.contains(&"schedule_id".to_string()));
         assert!(job_columns.contains(&"retry_at".to_string()));
         assert!(job_columns.contains(&"retry_count".to_string()));
         assert!(job_columns.contains(&"queue_position".to_string()));

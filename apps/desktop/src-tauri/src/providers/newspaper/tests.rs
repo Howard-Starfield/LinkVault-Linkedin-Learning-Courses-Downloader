@@ -5,7 +5,7 @@ use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
 use super::{
-    archive_service, batch_service, catalog_service, job_service,
+    archive_service, batch_service, catalog_service, job_repository, job_service,
     models::*,
     optimization_service,
     optimizer::{optimize_page, OptimizationOutcome},
@@ -813,6 +813,62 @@ fn due_daily_schedule_materializes_only_once_per_local_date() {
         .unwrap();
     assert_eq!(job_count, 1);
     assert_eq!(last_run, Local::now().date_naive().to_string());
+}
+
+#[test]
+fn deleting_a_schedule_stops_retry_and_allows_immediate_manual_download() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let destination = directory.path().join("papers");
+    let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_schedules
+             (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+              optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
+             VALUES ('schedule-1', 1, '00:00', ?1, '[\"NY\"]', 15, 1,
+                     'webp_high', 0, 1, 1)",
+            params![destination.to_string_lossy()],
+        )
+        .unwrap();
+    drop(connection);
+
+    schedule_service::materialize_due(&db_path).unwrap();
+    let connection = Connection::open(&db_path).unwrap();
+    let mut job = job_repository::list(&connection, None).unwrap().remove(0);
+    let job_id = job.id.clone();
+    drop(connection);
+    queue_service::schedule_release_retry(&db_path, &mut job, "Not released.").unwrap();
+
+    schedule_service::delete(&db_path, "schedule-1").unwrap();
+
+    let connection = Connection::open(&db_path).unwrap();
+    let persisted: (String, Option<i64>) = connection
+        .query_row(
+            "SELECT status, retry_at FROM newspaper_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(persisted, ("cancelled".to_string(), None));
+    drop(connection);
+
+    let mut connection = Connection::open(&db_path).unwrap();
+    let response = batch_service::create_with_connection(
+        &mut connection,
+        request(&destination, &Local::now().date_naive().to_string()),
+    )
+    .unwrap();
+    assert!(response.jobs.is_empty());
+    assert_eq!(response.skipped_count, 1);
+    let resumed: (String, Option<i64>) = connection
+        .query_row(
+            "SELECT status, retry_at FROM newspaper_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(resumed, ("queued".to_string(), None));
 }
 
 #[test]

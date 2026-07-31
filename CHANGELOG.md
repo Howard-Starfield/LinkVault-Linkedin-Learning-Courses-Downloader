@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.13 ? 2026-07-31
+
+- **Fixed daily newspaper schedules retaining control of queued retries after deletion.** Schedule-created batches now persist their originating schedule identity. Removing a schedule atomically cancels only its queued, active, or optimizing work, clears pending release-retry deadlines, preserves completed newspaper history, and signals an in-flight worker to stop at its safe boundary.
+- **Restored immediate manual recovery without queue deletion.** A manual download for the same edition and date can now resume the cancelled schedule-owned job immediately instead of inheriting its future retry time. The delete confirmation explains that pending automatic retries will stop, and regression coverage locks the complete schedule-delete-to-manual-download flow.
+
 ## 0.2.12 — 2026-07-29
 
 - **Newspaper schedule card hover polish.** The daily-schedule cards in the World Journal panel now replace the "Enabled / Paused" status badge with the pause / delete action buttons on hover, instead of stacking the badge and the buttons in two different positions. The crossfade is a 140ms ease; on touch devices the badge and the buttons sit side-by-side so the controls stay reachable without hover. Reduced-motion users get an instant swap.

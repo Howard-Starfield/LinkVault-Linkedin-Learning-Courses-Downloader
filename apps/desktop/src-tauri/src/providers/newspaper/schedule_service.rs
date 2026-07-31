@@ -78,15 +78,14 @@ pub(super) fn toggle(db_path: &Path, schedule_id: &str, enabled: bool) -> Result
     Ok(())
 }
 
-pub(super) fn delete(db_path: &Path, schedule_id: &str) -> Result<(), String> {
-    let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    connection
-        .execute(
-            "DELETE FROM newspaper_schedules WHERE id = ?1",
-            params![schedule_id],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+pub(super) fn delete(db_path: &Path, schedule_id: &str) -> Result<bool, String> {
+    let mut connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
+    crate::cache::delete_newspaper_schedule_and_cancel_owned_work(
+        &mut connection,
+        schedule_id,
+        Utc::now().timestamp(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(super) fn list(connection: &Connection) -> Result<Vec<NewspaperSchedule>, String> {
@@ -182,7 +181,11 @@ pub(super) fn materialize_due(db_path: &Path) -> Result<(), String> {
         let result = {
             let mut connection =
                 crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-            batch_service::create_with_connection(&mut connection, request)
+            batch_service::create_for_schedule_with_connection(
+                &mut connection,
+                request,
+                &schedule.id,
+            )
         };
         let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
         match result {
