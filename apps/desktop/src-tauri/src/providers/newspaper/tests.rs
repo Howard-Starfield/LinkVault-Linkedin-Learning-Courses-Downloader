@@ -454,11 +454,11 @@ fn last_seven_days_batch_creates_all_seven_daily_jobs() {
     let db_path = directory.path().join("test.db");
     let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
     let destination = directory.path().join("papers");
-    let mut batch_request = request(&destination, "2000-01-01");
+    let today = Local::now().date_naive();
+    let mut batch_request = request(&destination, &today.to_string());
     batch_request.date_mode = DateMode::Last7Days;
 
     let response = batch_service::create_with_connection(&mut connection, batch_request).unwrap();
-    let today = Local::now().date_naive();
     let expected_start = (today - chrono::Duration::days(6)).to_string();
     let expected_end = today.to_string();
     let dates = response
@@ -813,6 +813,84 @@ fn due_daily_schedule_materializes_only_once_per_local_date() {
         .unwrap();
     assert_eq!(job_count, 1);
     assert_eq!(last_run, Local::now().date_naive().to_string());
+}
+
+#[test]
+fn due_last_seven_days_schedule_materializes_the_rolling_window() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO newspaper_schedules
+             (id, enabled, cron_time, destination, edition_codes_json, date_mode, delay_seconds,
+              optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
+             VALUES ('schedule-7-days', 1, '00:00', ?1, '[\"NY\"]', 'last7_days', 15, 1,
+                     'webp_high', 0, 1, 1)",
+            params![directory.path().join("papers").to_string_lossy()],
+        )
+        .unwrap();
+    drop(connection);
+
+    schedule_service::materialize_due(&db_path).unwrap();
+
+    let connection = Connection::open(&db_path).unwrap();
+    let window: (i64, String, String, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), MIN(j.publication_date), MAX(j.publication_date),
+                    COUNT(DISTINCT b.schedule_id)
+             FROM newspaper_jobs j
+             JOIN newspaper_batches b ON b.id = j.batch_id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let today = Local::now().date_naive();
+    assert_eq!(window.0, 7);
+    assert_eq!(window.1, (today - chrono::Duration::days(6)).to_string());
+    assert_eq!(window.2, today.to_string());
+    assert_eq!(window.3, 1);
+
+    let jobs = connection
+        .prepare("SELECT id, output_dir FROM newspaper_jobs")
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for (job_id, output_dir) in jobs {
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(Path::new(&output_dir).join(".complete"), b"").unwrap();
+        connection
+            .execute(
+                "UPDATE newspaper_jobs SET status = 'completed', completed_at = 2 WHERE id = ?1",
+                params![job_id],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE newspaper_schedules SET last_run_date = NULL WHERE id = 'schedule-7-days'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    schedule_service::materialize_due(&db_path).unwrap();
+
+    let connection = Connection::open(&db_path).unwrap();
+    let second_poll: (i64, i64, i64, String) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM newspaper_jobs),
+                (SELECT COUNT(*) FROM newspaper_jobs WHERE status = 'queued'),
+                (SELECT COUNT(*) FROM newspaper_batches),
+                (SELECT status FROM newspaper_batches ORDER BY created_at DESC, rowid DESC LIMIT 1)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(second_poll, (7, 0, 2, "completed".to_string()));
 }
 
 #[test]

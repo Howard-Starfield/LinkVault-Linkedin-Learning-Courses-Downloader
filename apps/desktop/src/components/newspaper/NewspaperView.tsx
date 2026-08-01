@@ -47,6 +47,7 @@ type NewspaperSchedule = {
   cron_time: string;
   destination: string;
   edition_codes: string[];
+  date_mode: "single" | "last7_days";
   delay_seconds: number;
   optimization_quality: number;
   last_run_date?: string | null;
@@ -340,6 +341,12 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
   }
 
   async function saveSchedule() {
+    if (dateMode === "custom") {
+      toast.warning("Custom ranges cannot repeat daily", {
+        description: "Choose Single date or Last 7 days before adding a schedule."
+      });
+      return;
+    }
     if (!validateSelection()) return;
     setSavingSchedule(true);
     try {
@@ -348,6 +355,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
           editionCodes: [...selected],
           cronTime,
           destination,
+          dateMode,
           delaySeconds,
           optimizeImages: optimize,
           optimizationProfile,
@@ -356,7 +364,9 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
         }
       });
       toast.success(`Daily schedule saved for ${cronTime}`, {
-        description: "This is separate from Download now and will use the computer's local date."
+        description: dateMode === "last7_days"
+          ? "The latest seven local calendar days will be checked on every run."
+          : "The current local calendar date will be checked on every run."
       });
       await refresh();
     } catch (error) {
@@ -374,7 +384,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
         request: {
           editionCodes: [...selected],
           dateMode,
-          startDate,
+          startDate: dateMode === "last7_days" ? today() : startDate,
           endDate: dateMode === "custom" ? endDate : undefined,
           destination,
           delaySeconds,
@@ -663,7 +673,7 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                     <time>{formatClockTime(item.cron_time)}</time>
                     <div>
                       <strong>{scheduleEditionSummary(item, catalog)}</strong>
-                      <span>{item.edition_codes.length} edition{item.edition_codes.length === 1 ? "" : "s"} · Local time</span>
+                      <span>{item.edition_codes.length} edition{item.edition_codes.length === 1 ? "" : "s"} · {scheduleDateModeLabel(item.date_mode)} · Local time</span>
                       {item.last_run_date ? <small>Last run {item.last_run_date}</small> : null}
                       {item.last_error ? <small className="is-error">{item.last_error}</small> : null}
                     </div>
@@ -676,11 +686,6 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
                     </div>
                   </article>
                 ))}
-              </div>
-              <div className="command-actions newspaper-schedule-submit">
-                <Button variant="outline" loading={savingSchedule} onClick={() => void saveSchedule()}>
-                  <CalendarClock /> {schedules.length > 0 ? "Add another time" : "Add daily schedule"}
-                </Button>
               </div>
             </>
           ) : (
@@ -766,6 +771,9 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
             </div>
           </div>
           <div className="command-actions newspaper-download-actions">
+            <Button variant="outline" loading={savingSchedule} onClick={() => void saveSchedule()}>
+              <CalendarClock /> Add schedule
+            </Button>
             {isNewspaperQueueRunning ? (
               <Button
                 variant="primary"
@@ -961,6 +969,10 @@ function scheduleEditionSummary(schedule: NewspaperSchedule, catalog: NewspaperE
   });
   if (names.length <= 2) return names.join(", ");
   return `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
+}
+
+function scheduleDateModeLabel(dateMode: NewspaperSchedule["date_mode"]) {
+  return dateMode === "last7_days" ? "Last 7 days" : "Single date";
 }
 
 function readPreferences(): {

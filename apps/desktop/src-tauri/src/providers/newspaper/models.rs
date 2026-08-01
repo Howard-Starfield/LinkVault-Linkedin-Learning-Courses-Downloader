@@ -69,6 +69,29 @@ pub enum DateMode {
     Custom,
 }
 
+impl DateMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Last7Days => "last7_days",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "single" => Some(Self::Single),
+            "last7_days" | "last_7_days" => Some(Self::Last7Days),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+pub const fn default_schedule_date_mode() -> DateMode {
+    DateMode::Single
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DateExpansionError {
     #[error("end date is required for a custom range")]
@@ -172,6 +195,7 @@ pub struct NewspaperSchedule {
     pub cron_time: String,
     pub destination: String,
     pub edition_codes: Vec<String>,
+    pub date_mode: DateMode,
     pub delay_seconds: u32,
     pub optimize_images: bool,
     pub optimization_profile: String,
@@ -189,6 +213,8 @@ pub struct CreateNewspaperScheduleRequest {
     pub cron_time: String,
     pub destination: String,
     pub edition_codes: Vec<String>,
+    #[serde(default = "default_schedule_date_mode")]
+    pub date_mode: DateMode,
     pub delay_seconds: u32,
     pub optimize_images: bool,
     pub optimization_profile: String,

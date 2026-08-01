@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.14 - 2026-07-31
+
+- **Added rolling Last 7 days support to daily newspaper schedules.** The saved schedule now preserves the user's date mode and deterministically expands one local-today anchor into the seven calendar dates from today minus six days through today on every poll. Custom date ranges remain manual-only because a fixed historical range is not meaningful for a recurring daily schedule.
+- **Kept repeat polls idempotent without hiding incomplete downloads.** A date whose database job is terminal and whose output directory contains the `.complete` marker is skipped on the next seven-day poll. A missing marker remains eligible for repair, and untracked local files are not mistaken for a completed database job. Regression coverage exercises both the rolling window and a second poll over completed database and filesystem state.
+- **Simplified the schedule action.** Add another time is now Add schedule and sits beside Download now, while saved schedule cards show whether they use Single date or Last 7 days.
+
 ## 0.2.13 ? 2026-07-31
 
 - **Fixed daily newspaper schedules retaining control of queued retries after deletion.** Schedule-created batches now persist their originating schedule identity. Removing a schedule atomically cancels only its queued, active, or optimizing work, clears pending release-retry deadlines, preserves completed newspaper history, and signals an in-flight worker to stop at its safe boundary.

@@ -65,11 +65,12 @@ assert.equal(Math.round(downloadButtonBox?.height ?? 0), Math.round(linkedInButt
 assert.equal(downloadButtonClass, linkedInButtonClass, "Download now must reuse the LinkedIn course button classes.");
 assert.deepEqual(downloadButtonStyle, linkedInButtonStyle, "Download now must reuse the LinkedIn course button visual style.");
 assert.ok((downloadButtonBox?.width ?? 999) < 200, "Download now must reuse the compact LinkedIn course button width.");
-const scheduleButton = page.getByRole("button", { name: /Add (daily schedule|another time)/ });
+const scheduleButton = page.getByRole("button", { name: "Add schedule", exact: true });
 const scheduleButtonBox = await scheduleButton.boundingBox();
-assert.equal(Math.round(scheduleButtonBox?.height ?? 0), Math.round(linkedInScheduleButtonBox?.height ?? 0), "Add daily schedule must reuse the LinkedIn schedule button height.");
-assert.equal(await scheduleButton.getAttribute("class"), linkedInScheduleButtonClass, "Add daily schedule must reuse the LinkedIn schedule button classes.");
-assert.ok((scheduleButtonBox?.width ?? 999) < 200, "Add daily schedule must remain compact.");
+assert.equal(Math.round(scheduleButtonBox?.height ?? 0), Math.round(linkedInScheduleButtonBox?.height ?? 0), "Add schedule must reuse the LinkedIn schedule button height.");
+assert.equal(await scheduleButton.getAttribute("class"), linkedInScheduleButtonClass, "Add schedule must reuse the LinkedIn schedule button classes.");
+assert.ok((scheduleButtonBox?.width ?? 999) < 200, "Add schedule must remain compact.");
+assert.ok(Math.abs((scheduleButtonBox?.y ?? 0) - (downloadButtonBox?.y ?? 999)) <= 1, "Add schedule and Download now must share one action row.");
 assert.equal(await page.locator(".newspaper-options").getByText("Save location", { exact: true }).count(), 1);
 await page.setViewportSize({ width: 1400, height: 720 });
 const compactPanels = await page.locator(".newspaper-dispatch-panel").evaluateAll((elements) =>
@@ -85,9 +86,9 @@ const compactDownloadAction = await downloadButton.boundingBox();
 assert.ok(compactProgress && compactProgress.y >= Math.max(...compactPanels.map((panel) => panel.bottom)) + 10, "Progress must remain below compact dispatch cards.");
 assert.ok(compactProgress.height >= 220, "Compact layout must reserve useful height for Progress.");
 assert.ok(compactEditionFooter && compactEditionFooter.y + compactEditionFooter.height <= compactPanels[0].bottom, "Edition footer must stay inside its card.");
-assert.ok(compactScheduleAction && compactScheduleAction.y + compactScheduleAction.height <= compactPanels[1].bottom, "Schedule action must stay inside its card.");
+assert.ok(compactScheduleAction && compactScheduleAction.y + compactScheduleAction.height <= compactPanels[2].bottom, "Schedule action must stay inside Download settings.");
 assert.ok(compactDownloadAction && compactDownloadAction.y + compactDownloadAction.height <= compactPanels[2].bottom, "Download action must stay inside its card.");
-await page.getByLabel("Date range").selectOption("last7_days");
+await page.locator(".newspaper-setting-field select").selectOption("last7_days");
 assert.equal(await page.getByLabel("System current date").isDisabled(), true, "Last 7 days must disable manual date editing.");
 await page.getByRole("tab", { name: "History" }).click();
 assert.equal(await page.locator(".newspaper-history-list").count(), 1, "History must remain inside the Schedule panel.");
@@ -112,7 +113,7 @@ for (const width of [1920, 1760, 1600, 1451, 1450, 1449, 1366, 1280, 1366, 1449,
   assert.ok(sweepSettings.x > sweepEditions.x && sweepSchedule.x > sweepSettings.x, `Card order must stay Editions, Settings, Schedule at ${width}px.`);
   assert.ok(Math.abs(sweepEditions.y - sweepSettings.y) <= 1 && Math.abs(sweepSettings.y - sweepSchedule.y) <= 1, `Cards must stay aligned at ${width}px.`);
   assert.ok(sweepProgress.y >= sweepEditions.y + sweepEditions.height + 10, `Progress must stay below cards at ${width}px.`);
-  assert.ok(sweepScheduleButton && sweepScheduleButton.y + sweepScheduleButton.height <= sweepSchedule.y + sweepSchedule.height, `Schedule action must stay contained at ${width}px.`);
+  assert.ok(sweepScheduleButton && sweepScheduleButton.y + sweepScheduleButton.height <= sweepSettings.y + sweepSettings.height, `Schedule action must stay inside Download settings at ${width}px.`);
   assert.ok(sweepDownloadButton && sweepDownloadButton.y + sweepDownloadButton.height <= sweepSettings.y + sweepSettings.height, `Download action must stay contained at ${width}px.`);
 }
 await page.waitForTimeout(180);
