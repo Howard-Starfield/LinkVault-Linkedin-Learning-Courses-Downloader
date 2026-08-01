@@ -34,6 +34,7 @@ pub(super) fn create(
         cron_time: request.cron_time,
         destination: request.destination,
         edition_codes: request.edition_codes,
+        date_mode: request.date_mode,
         delay_seconds: request.delay_seconds,
         optimize_images: request.optimize_images,
         optimization_profile: request.optimization_profile,
@@ -47,14 +48,15 @@ pub(super) fn create(
     connection
         .execute(
             "INSERT INTO newspaper_schedules
-             (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+             (id, enabled, cron_time, destination, edition_codes_json, date_mode, delay_seconds,
               optimize_images, optimization_profile, optimization_quality, keep_original_jpg, created_at, updated_at)
-             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
                 schedule.id,
                 schedule.cron_time,
                 schedule.destination,
                 serde_json::to_string(&schedule.edition_codes).map_err(|error| error.to_string())?,
+                schedule.date_mode.as_str(),
                 schedule.delay_seconds,
                 schedule.optimize_images,
                 schedule.optimization_profile,
@@ -92,29 +94,31 @@ pub(super) fn list(connection: &Connection) -> Result<Vec<NewspaperSchedule>, St
     let mut statement = connection
         .prepare(
             "SELECT id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
-                    optimize_images, optimization_profile, optimization_quality, keep_original_jpg,
-                    last_run_date, last_error, created_at, updated_at
+                    date_mode, optimize_images, optimization_profile, optimization_quality,
+                    keep_original_jpg, last_run_date, last_error, created_at, updated_at
              FROM newspaper_schedules ORDER BY created_at DESC",
         )
         .map_err(|error| error.to_string())?;
     let schedules = statement
         .query_map([], |row| {
             let edition_codes_json: String = row.get(4)?;
+            let date_mode: String = row.get(6)?;
             Ok(NewspaperSchedule {
                 id: row.get(0)?,
                 enabled: row.get(1)?,
                 cron_time: row.get(2)?,
                 destination: row.get(3)?,
                 edition_codes: serde_json::from_str(&edition_codes_json).unwrap_or_default(),
+                date_mode: DateMode::from_persisted(&date_mode).unwrap_or(DateMode::Single),
                 delay_seconds: row.get(5)?,
-                optimize_images: row.get(6)?,
-                optimization_profile: row.get(7)?,
-                optimization_quality: row.get(8)?,
-                keep_original_jpg: row.get(9)?,
-                last_run_date: row.get(10)?,
-                last_error: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                optimize_images: row.get(7)?,
+                optimization_profile: row.get(8)?,
+                optimization_quality: row.get(9)?,
+                keep_original_jpg: row.get(10)?,
+                last_run_date: row.get(11)?,
+                last_error: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -129,6 +133,12 @@ pub(super) fn validate_request(request: &CreateNewspaperScheduleRequest) -> Resu
     }
     if request.edition_codes.is_empty() {
         return Err("Select at least one newspaper edition.".to_string());
+    }
+    if request.date_mode == DateMode::Custom {
+        return Err(
+            "Daily schedules support Single date or Last 7 days. Use Download now for a custom range."
+                .to_string(),
+        );
     }
     NaiveTime::parse_from_str(&request.cron_time, "%H:%M")
         .map_err(|_| "Choose a valid daily schedule time.".to_string())?;
@@ -167,7 +177,7 @@ pub(super) fn materialize_due(db_path: &Path) -> Result<(), String> {
         }
         let request = CreateNewspaperBatchRequest {
             edition_codes: schedule.edition_codes.clone(),
-            date_mode: DateMode::Single,
+            date_mode: schedule.date_mode,
             start_date: today.clone(),
             end_date: None,
             destination: schedule.destination.clone(),

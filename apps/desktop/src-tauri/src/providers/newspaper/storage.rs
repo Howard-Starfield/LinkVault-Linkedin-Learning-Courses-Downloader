@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS newspaper_schedules (
     cron_time TEXT NOT NULL,
     destination TEXT NOT NULL,
     edition_codes_json TEXT NOT NULL,
+    date_mode TEXT NOT NULL DEFAULT 'single' CHECK (date_mode IN ('single', 'last7_days')),
     delay_seconds INTEGER NOT NULL DEFAULT 15 CHECK (delay_seconds BETWEEN 0 AND 3600),
     optimize_images INTEGER NOT NULL,
     optimization_profile TEXT NOT NULL CHECK (optimization_profile IN ('webp_high', 'webp_balanced')),
@@ -224,6 +225,12 @@ pub fn initialize(connection: &Connection) -> Result<()> {
         "newspaper_batches",
         "delay_seconds",
         "ALTER TABLE newspaper_batches ADD COLUMN delay_seconds INTEGER NOT NULL DEFAULT 15 CHECK (delay_seconds BETWEEN 0 AND 3600)",
+    )?;
+    migrate_add_column(
+        connection,
+        "newspaper_schedules",
+        "date_mode",
+        "ALTER TABLE newspaper_schedules ADD COLUMN date_mode TEXT NOT NULL DEFAULT 'single' CHECK (date_mode IN ('single', 'last7_days'))",
     )?;
     migrate_optimization_quality(connection, "newspaper_batches")?;
     migrate_optimization_quality(connection, "newspaper_schedules")?;
@@ -415,6 +422,7 @@ fn rebuild_optimization_quality_constraint(connection: &Connection, table: &str)
                 cron_time TEXT NOT NULL,
                 destination TEXT NOT NULL,
                 edition_codes_json TEXT NOT NULL,
+                date_mode TEXT NOT NULL DEFAULT 'single' CHECK (date_mode IN ('single', 'last7_days')),
                 delay_seconds INTEGER NOT NULL DEFAULT 15 CHECK (delay_seconds BETWEEN 0 AND 3600),
                 optimize_images INTEGER NOT NULL,
                 optimization_profile TEXT NOT NULL CHECK (optimization_profile IN ('webp_high', 'webp_balanced')),
@@ -426,10 +434,10 @@ fn rebuild_optimization_quality_constraint(connection: &Connection, table: &str)
                 updated_at INTEGER NOT NULL
             );
             INSERT INTO newspaper_schedules
-                (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+                (id, enabled, cron_time, destination, edition_codes_json, date_mode, delay_seconds,
                  optimize_images, optimization_profile, optimization_quality,
                  keep_original_jpg, last_run_date, last_error, created_at, updated_at)
-            SELECT id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+            SELECT id, enabled, cron_time, destination, edition_codes_json, date_mode, delay_seconds,
                    optimize_images, optimization_profile, optimization_quality,
                    keep_original_jpg, last_run_date, last_error, created_at, updated_at
             FROM newspaper_schedules_quality_legacy;
@@ -931,9 +939,17 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
+        let schedule_columns = connection
+            .prepare("PRAGMA table_info(newspaper_schedules)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert!(batch_columns.contains(&"delay_seconds".to_string()));
         assert!(batch_columns.contains(&"optimization_quality".to_string()));
         assert!(batch_columns.contains(&"schedule_id".to_string()));
+        assert!(schedule_columns.contains(&"date_mode".to_string()));
         assert!(job_columns.contains(&"retry_at".to_string()));
         assert!(job_columns.contains(&"retry_count".to_string()));
         assert!(job_columns.contains(&"queue_position".to_string()));

@@ -2,14 +2,14 @@
 
 use std::path::Path;
 
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{
     catalog_service,
     models::{
-        expand_dates, CreateNewspaperBatchRequest, CreateNewspaperBatchResponse, DateMode,
-        EditionKind, NewspaperBatch, NewspaperEdition, NewspaperJob,
+        expand_dates, CreateNewspaperBatchRequest, CreateNewspaperBatchResponse, EditionKind,
+        NewspaperBatch, NewspaperEdition, NewspaperJob,
     },
     naming,
 };
@@ -43,11 +43,7 @@ fn create_with_origin(
     schedule_id: Option<&str>,
 ) -> Result<CreateNewspaperBatchResponse, String> {
     validate_request(&request)?;
-    let start = if request.date_mode == DateMode::Last7Days {
-        Local::now().date_naive()
-    } else {
-        parse_date(&request.start_date)?
-    };
+    let start = parse_date(&request.start_date)?;
     let end = request.end_date.as_deref().map(parse_date).transpose()?;
     let dates = expand_dates(request.date_mode, start, end).map_err(|error| error.to_string())?;
     let catalog = catalog_service::list_with_connection(connection)?;
