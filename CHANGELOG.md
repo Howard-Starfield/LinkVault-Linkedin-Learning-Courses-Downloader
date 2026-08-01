@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.15 - 2026-07-31
+
+- **Fixed the v0.2.13-v0.2.14 newspaper upgrade migration.** Existing databases were already marked as schema version 1, so the newly added `newspaper_batches.schedule_id` and `newspaper_schedules.date_mode` provider migrations were skipped even though fresh databases contained both columns. The global schema version now advances to 2, forcing a verified pre-migration backup and running the idempotent provider migrations before newspaper work starts.
+- **Added the missing installed-database regression path.** A persistence gate now starts from the released v1 table shape, proves both columns are added, preserves existing batch and schedule rows, defaults legacy schedules to Single date, and confirms the backup retains the untouched v1 schema.
+
 ## 0.2.14 - 2026-07-31
 
 - **Added rolling Last 7 days support to daily newspaper schedules.** The saved schedule now preserves the user's date mode and deterministically expands one local-today anchor into the seven calendar dates from today minus six days through today on every poll. Custom date ranges remain manual-only because a fixed historical range is not meaningful for a recurring daily schedule.

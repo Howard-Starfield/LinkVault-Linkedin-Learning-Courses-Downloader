@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+// Bump this whenever any provider-owned schema changes. Provider migrations run
+// only while advancing this global version, so leaving it unchanged would make
+// existing installations skip new columns that fresh databases already have.
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -1581,6 +1584,126 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_v1_newspaper_schema_receives_schedule_columns() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let legacy = Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE newspaper_batches (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    status TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    scheduled_at INTEGER,
+                    delay_minutes INTEGER NOT NULL,
+                    delay_seconds INTEGER NOT NULL DEFAULT 15,
+                    optimize_images INTEGER NOT NULL,
+                    optimization_profile TEXT NOT NULL,
+                    optimization_quality INTEGER NOT NULL DEFAULT 86
+                        CHECK (optimization_quality BETWEEN 25 AND 95),
+                    keep_original_jpg INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    completed_at INTEGER
+                );
+                INSERT INTO newspaper_batches
+                    (id, status, destination, scheduled_at, delay_minutes, delay_seconds,
+                     optimize_images, optimization_profile, optimization_quality,
+                     keep_original_jpg, created_at, updated_at, completed_at)
+                VALUES
+                    ('legacy-batch', 'completed', 'C:\Papers', NULL, 0, 15,
+                     1, 'webp_high', 92, 0, 1, 2, 2);
+
+                CREATE TABLE newspaper_schedules (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    cron_time TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    edition_codes_json TEXT NOT NULL,
+                    delay_seconds INTEGER NOT NULL DEFAULT 15,
+                    optimize_images INTEGER NOT NULL,
+                    optimization_profile TEXT NOT NULL,
+                    optimization_quality INTEGER NOT NULL DEFAULT 86
+                        CHECK (optimization_quality BETWEEN 25 AND 95),
+                    keep_original_jpg INTEGER NOT NULL,
+                    last_run_date TEXT,
+                    last_error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO newspaper_schedules
+                    (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+                     optimize_images, optimization_profile, optimization_quality,
+                     keep_original_jpg, last_run_date, last_error, created_at, updated_at)
+                VALUES
+                    ('legacy-schedule', 1, '06:30', 'C:\Papers', '["NY"]', 15,
+                     1, 'webp_high', 92, 0, NULL, NULL, 1, 2);
+
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .unwrap();
+        drop(legacy);
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+
+        assert_eq!(initialization.from_version, 1);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let backup_path = initialization
+            .backup_path
+            .expect("the populated v1 database must be backed up");
+        let batch_columns = connection
+            .prepare("PRAGMA table_info(newspaper_batches)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let schedule_columns = connection
+            .prepare("PRAGMA table_info(newspaper_schedules)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(batch_columns.contains(&"schedule_id".to_string()));
+        assert!(schedule_columns.contains(&"date_mode".to_string()));
+        assert_eq!(schema_version(&connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status, destination, schedule_id FROM newspaper_batches WHERE id = 'legacy-batch'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                )
+                .unwrap(),
+            ("completed".to_string(), r"C:\Papers".to_string(), None)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT cron_time, date_mode FROM newspaper_schedules WHERE id = 'legacy-schedule'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            ("06:30".to_string(), "single".to_string())
+        );
+
+        let backup = Connection::open(backup_path).unwrap();
+        assert_eq!(schema_version(&backup).unwrap(), 1);
+        let backup_batch_columns = backup
+            .prepare("PRAGMA table_info(newspaper_batches)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(!backup_batch_columns.contains(&"schedule_id".to_string()));
+    }
+
+    #[test]
     fn persistence_gate_runtime_open_does_not_modify_database() {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
@@ -1616,7 +1739,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE future_probe (value TEXT NOT NULL);
                  INSERT INTO future_probe (value) VALUES ('untouched');
-                 PRAGMA user_version = 2;",
+                 PRAGMA user_version = 3;",
             )
             .unwrap();
         drop(future);
@@ -1627,7 +1750,7 @@ mod tests {
         assert!(matches!(
             error,
             DatabaseLifecycleError::UnsupportedSchemaVersion {
-                found: 2,
+                found: 3,
                 supported: CURRENT_SCHEMA_VERSION
             }
         ));
