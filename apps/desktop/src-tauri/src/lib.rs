@@ -13,8 +13,8 @@ pub use providers::linkedin::{
 use providers::linkedin::{commands, linkedin};
 pub use providers::{coursera, newspaper};
 
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::Manager;
 
 pub fn run() {
     let app = tauri::Builder::default()
@@ -180,8 +180,7 @@ pub fn run() {
             if let Ok(decoded) = image::load_from_memory(icon_bytes) {
                 let rgba = decoded.to_rgba8();
                 let (w, h) = rgba.dimensions();
-                let taskbar_icon =
-                    tauri::image::Image::new_owned(rgba.into_raw(), w, h);
+                let taskbar_icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
 
                 for (_, window) in app.webview_windows() {
                     let _ = window.set_icon(taskbar_icon.clone());

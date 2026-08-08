@@ -82,8 +82,10 @@ impl ResourceGovernor {
         let worker_memory_budget_bytes = options
             .worker_memory_budget_mb
             .map(|megabytes| {
-                (u64::from(megabytes) * 1024 * 1024)
-                    .clamp(MIN_WORKER_MEMORY_BUDGET_BYTES, MAX_WORKER_MEMORY_BUDGET_BYTES)
+                (u64::from(megabytes) * 1024 * 1024).clamp(
+                    MIN_WORKER_MEMORY_BUDGET_BYTES,
+                    MAX_WORKER_MEMORY_BUDGET_BYTES,
+                )
             })
             .unwrap_or(DEFAULT_WORKER_MEMORY_BUDGET_BYTES);
         let memory_reserve_bytes = options
@@ -91,8 +93,8 @@ impl ResourceGovernor {
             .unwrap_or(DEFAULT_MEMORY_RESERVE_BYTES)
             .clamp(MIN_MEMORY_RESERVE_BYTES, MAX_MEMORY_RESERVE_BYTES);
         let sample = system_sample(None);
-        let memory_ceiling = memory_worker_limit(&sample, worker_memory_budget_bytes, memory_reserve_bytes)
-            .max(1);
+        let memory_ceiling =
+            memory_worker_limit(&sample, worker_memory_budget_bytes, memory_reserve_bytes).max(1);
         let safe_ceiling = requested.min(cpu_ceiling).min(memory_ceiling);
         let admitted = if mode == "auto" {
             AUTO_START_WORKERS.min(safe_ceiling).max(1)
@@ -131,7 +133,11 @@ impl ResourceGovernor {
             .max(1);
         self.limited_reason = limit_reason(self.requested, self.cpu_ceiling, memory_ceiling);
 
-        if self.sample.cpu_percent.is_some_and(|value| value >= AUTO_CPU_SCALE_DOWN_PERCENT) {
+        if self
+            .sample
+            .cpu_percent
+            .is_some_and(|value| value >= AUTO_CPU_SCALE_DOWN_PERCENT)
+        {
             self.high_cpu_samples = self.high_cpu_samples.saturating_add(1);
         } else {
             self.high_cpu_samples = 0;
@@ -342,7 +348,10 @@ mod tests {
             memory_reserve_bytes: Some(64 * 1024 * 1024 * 1024), // above 32 GB maximum
         };
         let governor = ResourceGovernor::new(options);
-        assert_eq!(governor.worker_memory_budget_bytes, MIN_WORKER_MEMORY_BUDGET_BYTES);
+        assert_eq!(
+            governor.worker_memory_budget_bytes,
+            MIN_WORKER_MEMORY_BUDGET_BYTES
+        );
         assert_eq!(governor.memory_reserve_bytes, MAX_MEMORY_RESERVE_BYTES);
     }
 
