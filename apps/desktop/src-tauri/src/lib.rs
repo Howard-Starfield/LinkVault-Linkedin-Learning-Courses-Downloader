@@ -180,13 +180,17 @@ pub fn run() {
                 writer.clone(),
                 clipping_layout,
             );
-            let recovery_summary = clipping_service.recover_startup(
-                &diagnostics,
-                commands::now_unix_timestamp(),
-            );
-            if recovery_summary.failures > 0 {
-                return Err(std::io::Error::other("Newspaper clipping recovery failed").into());
-            }
+            let _recovery_summary =
+                clipping_service.recover_startup(&diagnostics, commands::now_unix_timestamp());
+            // Row-level clipping recovery failures remain in their durable
+            // retryable states and are reported through safe diagnostics. A
+            // single clipping must not prevent unrelated providers or the
+            // application shell from starting.
+            let cleanup_service = clipping_service.clone();
+            let cleanup_diagnostics = diagnostics.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                cleanup_service.run_deferred_cleanup(&cleanup_diagnostics)
+            });
             app.manage(diagnostics);
             app.manage(writer);
             app.manage(clipping_service);

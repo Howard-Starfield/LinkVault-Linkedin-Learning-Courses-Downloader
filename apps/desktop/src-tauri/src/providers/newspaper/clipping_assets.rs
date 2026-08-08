@@ -202,6 +202,18 @@ impl ClippingAssetLayout {
     /// Write canonical bytes to staging using create-new semantics, then
     /// finalize the staging name (CREATE-STATE-001 steps 3-4, FR-ASSET-003).
     pub fn write_staging(&self, clipping_id: &str, bytes: &[u8]) -> Result<(), ClippingError> {
+        self.write_staging_inner(clipping_id, bytes, |_| {})
+    }
+
+    fn write_staging_inner<F>(
+        &self,
+        clipping_id: &str,
+        bytes: &[u8],
+        after_create: F,
+    ) -> Result<(), ClippingError>
+    where
+        F: FnOnce(&Path),
+    {
         if !validate_asset_byte_count(bytes.len() as u64) {
             return Err(ClippingError::new(ClippingErrorCode::AssetValidationFailed));
         }
@@ -220,6 +232,23 @@ impl ClippingAssetLayout {
         }
         fs::create_dir_all(&staging_dir)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        after_create(&staging_dir);
+
+        // Revalidate after creation so a staging-directory substitution cannot
+        // redirect the create-new file open through a symlink or reparse point.
+        let metadata = fs::symlink_metadata(&staging_dir)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        let staging_root = self.staging_dir()?;
+        let canonical_staging_dir = staging_dir
+            .canonicalize()
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?;
+        if !canonical_staging_dir.starts_with(&staging_root) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+
         let part_path = staging_dir.join(format!("{CANONICAL_FILE_NAME}{STAGING_PART_SUFFIX}"));
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -264,12 +293,18 @@ impl ClippingAssetLayout {
     pub fn promote_staging(&self, clipping_id: &str) -> Result<(), ClippingError> {
         let staging_dir = self.staging_dir_for(clipping_id)?;
         let canonical_dir = self.canonical_dir_for(clipping_id)?;
-        if !staging_dir
+        let staging_metadata = staging_dir
             .symlink_metadata()
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
+        if staging_metadata.file_type().is_symlink() || !staging_metadata.file_type().is_dir() {
             return Err(ClippingError::new(ClippingErrorCode::AssetPromotionFailed));
+        }
+        let staging_root = self.staging_dir()?;
+        let canonical_staging_dir = staging_dir
+            .canonicalize()
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
+        if !canonical_staging_dir.starts_with(&staging_root) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         if canonical_dir.symlink_metadata().is_ok() {
             return Err(ClippingError::new(ClippingErrorCode::AssetCollision));
@@ -278,7 +313,7 @@ impl ClippingAssetLayout {
             fs::create_dir_all(parent)
                 .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
         }
-        fs::rename(&staging_dir, &canonical_dir)
+        fs::rename(&canonical_staging_dir, &canonical_dir)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
         Ok(())
     }
@@ -647,6 +682,45 @@ mod tests {
         layout
             .verify_canonical(TEST_ID, len, 24, 16, &checksum)
             .unwrap();
+    }
+
+    #[test]
+    fn staging_write_revalidates_containment_after_directory_creation() {
+        use std::cell::Cell;
+
+        let (directory, layout) = temp_layout();
+        let outside = directory.path().join("outside-staging");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        let (bytes, _, _) = valid_fixture();
+        let linked = Cell::new(false);
+
+        let result = layout.write_staging_inner(TEST_ID, &bytes, |created| {
+            fs::remove_dir(created).unwrap();
+            if create_dir_link(&outside, created) {
+                linked.set(true);
+            } else {
+                // The platform did not permit a directory link. Restore the
+                // ordinary directory so the helper can complete safely.
+                fs::create_dir(created).unwrap();
+            }
+        });
+
+        if !linked.get() {
+            layout.discard_staging(TEST_ID);
+            eprintln!("directory link creation unavailable on this machine");
+            return;
+        }
+        assert_eq!(
+            result
+                .expect_err("post-create directory escape must be rejected")
+                .code,
+            ClippingErrorCode::AssetPathInvalid
+        );
+        assert!(!outside
+            .join(format!("{CANONICAL_FILE_NAME}{STAGING_PART_SUFFIX}"))
+            .exists());
+        assert_eq!(fs::read(outside.join("sentinel.txt")).unwrap(), b"keep-me");
     }
 
     #[test]

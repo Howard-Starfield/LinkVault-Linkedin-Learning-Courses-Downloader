@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::app::database_diagnostics::{
     DatabaseDiagnosticInput, DatabaseDiagnosticKind, DatabaseDiagnosticOutcome,
-    DatabaseDiagnostics, DatabaseProvider,
+    DatabaseDiagnostics, DatabaseErrorClass, DatabaseProvider,
 };
 use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
 use crate::cache::open_runtime;
@@ -43,6 +43,41 @@ pub struct StartupRecoverySummary {
     pub creating_marked_missing: usize,
     pub deletions_completed: usize,
     pub failures: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeferredCleanupSummary {
+    pub processed: usize,
+    pub failures: usize,
+}
+
+impl DeferredCleanupSummary {
+    fn add(&mut self, other: Self) {
+        self.processed = self.processed.saturating_add(other.processed);
+        self.failures = self.failures.saturating_add(other.failures);
+    }
+}
+
+fn record_recovery_diagnostic(
+    diagnostics: &DatabaseDiagnostics,
+    operation: &'static str,
+    elapsed: Duration,
+    failed: bool,
+) {
+    diagnostics.record(DatabaseDiagnosticInput {
+        kind: DatabaseDiagnosticKind::Recovery,
+        operation,
+        provider: DatabaseProvider::Newspaper,
+        workflow_id: None,
+        elapsed,
+        queue_depth: 0,
+        outcome: if failed {
+            DatabaseDiagnosticOutcome::Error
+        } else {
+            DatabaseDiagnosticOutcome::Ok
+        },
+        error_class: failed.then_some(DatabaseErrorClass::Recovery),
+    });
 }
 
 /// Recover one creating-state clipping to a terminal state (RECOVERY-001).
@@ -89,35 +124,28 @@ pub fn recover_creating_id(
     }
 
     // 2. Complete staging file present and valid -> promote, then mark ready.
-    let staging_path = layout.staging_complete_path(&target.id)?;
-    if let Ok(metadata) = fs::symlink_metadata(&staging_path) {
-        if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-            if let Ok(bytes) = fs::read(&staging_path) {
-                let valid = ClippingAssetLayout::validate_canonical_bytes(
-                    &bytes,
-                    target.asset_byte_count,
-                    target.asset_pixel_width,
-                    target.asset_pixel_height,
-                    &target.asset_checksum_sha256,
-                )
-                .is_ok();
-                if valid
-                    && layout.promote_staging(&target.id).is_ok()
-                    && layout
-                        .verify_canonical(
-                            &target.id,
-                            target.asset_byte_count,
-                            target.asset_pixel_width,
-                            target.asset_pixel_height,
-                            &target.asset_checksum_sha256,
-                        )
-                        .is_ok()
-                {
-                    mark_ready(writer, &target.id, now)?;
-                    return Ok(ClippingAssetState::Ready);
-                }
-            }
-        }
+    if layout
+        .verify_staging(
+            &target.id,
+            target.asset_byte_count,
+            target.asset_pixel_width,
+            target.asset_pixel_height,
+            &target.asset_checksum_sha256,
+        )
+        .is_ok()
+        && layout.promote_staging(&target.id).is_ok()
+        && layout
+            .verify_canonical(
+                &target.id,
+                target.asset_byte_count,
+                target.asset_pixel_width,
+                target.asset_pixel_height,
+                &target.asset_checksum_sha256,
+            )
+            .is_ok()
+    {
+        mark_ready(writer, &target.id, now)?;
+        return Ok(ClippingAssetState::Ready);
     }
 
     // 3. Otherwise the asset is unrecoverable; preserve the row as missing.
@@ -249,20 +277,12 @@ pub fn run_startup_recovery(
     if outcome.is_err() {
         summary.failures = summary.failures.saturating_add(1);
     }
-    diagnostics.record(DatabaseDiagnosticInput {
-        kind: DatabaseDiagnosticKind::Recovery,
-        operation: "clipping_startup_recovery",
-        provider: DatabaseProvider::Newspaper,
-        workflow_id: None,
-        elapsed: started.elapsed(),
-        queue_depth: 0,
-        outcome: if outcome.is_err() {
-            DatabaseDiagnosticOutcome::Error
-        } else {
-            DatabaseDiagnosticOutcome::Ok
-        },
-        error_class: None,
-    });
+    record_recovery_diagnostic(
+        diagnostics,
+        "clipping_startup_recovery",
+        started.elapsed(),
+        outcome.is_err() || summary.failures > 0,
+    );
     summary
 }
 
@@ -274,9 +294,18 @@ pub fn run_deferred_cleanup(
     db_path: &Path,
     layout: &ClippingAssetLayout,
     diagnostics: &DatabaseDiagnostics,
-) -> usize {
+) -> DeferredCleanupSummary {
+    run_deferred_cleanup_at(db_path, layout, diagnostics, SystemTime::now())
+}
+
+pub(crate) fn run_deferred_cleanup_at(
+    db_path: &Path,
+    layout: &ClippingAssetLayout,
+    diagnostics: &DatabaseDiagnostics,
+    now_system: SystemTime,
+) -> DeferredCleanupSummary {
     let started = std::time::Instant::now();
-    let mut processed = 0usize;
+    let mut summary = DeferredCleanupSummary::default();
     let outcome = (|| -> Result<(), ClippingError> {
         let known_ids = {
             let connection = open_runtime(db_path)
@@ -284,61 +313,78 @@ pub fn run_deferred_cleanup(
             repository::load_all_ids(&connection)
                 .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
         };
-        let now_system = SystemTime::now();
-
         // Staging directories without a row older than the grace period move
         // to quarantine.
-        processed += quarantine_orphans(
+        summary.add(quarantine_orphans(
             layout,
             &layout.staging_dir()?,
             &known_ids,
             now_system,
             ORPHAN_GRACE,
             "stale-staging",
-        )?;
+        )?);
 
         // Canonical asset directories without a row older than the grace
         // period move to quarantine rather than immediate deletion.
-        processed += quarantine_orphans(
+        summary.add(quarantine_orphans(
             layout,
             &layout.assets_dir()?,
             &known_ids,
             now_system,
             ORPHAN_GRACE,
             "stale-asset",
-        )?;
+        )?);
 
         // Trash entries without a row older than the grace period may be
         // deleted outright; their rows were already removed by confirmed
         // deletion.
-        processed += delete_orphan_trash(layout, &known_ids, now_system, ORPHAN_GRACE)?;
+        summary.add(delete_orphan_trash(
+            layout,
+            &known_ids,
+            now_system,
+            ORPHAN_GRACE,
+        )?);
 
         // Quarantine entries are retained for seven days, then deleted.
-        processed += delete_expired_quarantine(layout, now_system, QUARANTINE_RETENTION)?;
+        summary.add(delete_expired_quarantine(
+            layout,
+            now_system,
+            QUARANTINE_RETENTION,
+        )?);
 
         Ok(())
     })();
-    diagnostics.record(DatabaseDiagnosticInput {
-        kind: DatabaseDiagnosticKind::Recovery,
-        operation: "clipping_deferred_cleanup",
-        provider: DatabaseProvider::Newspaper,
-        workflow_id: None,
-        elapsed: started.elapsed(),
-        queue_depth: 0,
-        outcome: if outcome.is_err() {
-            DatabaseDiagnosticOutcome::Error
-        } else {
-            DatabaseDiagnosticOutcome::Ok
-        },
-        error_class: None,
-    });
-    processed
+    if outcome.is_err() {
+        summary.failures = summary.failures.saturating_add(1);
+    }
+    record_recovery_diagnostic(
+        diagnostics,
+        "clipping_deferred_cleanup",
+        started.elapsed(),
+        outcome.is_err() || summary.failures > 0,
+    );
+    summary
 }
 
-fn directory_age(entry: &fs::DirEntry, now: SystemTime) -> Option<Duration> {
-    let metadata = entry.metadata().ok()?;
+fn directory_age(metadata: &fs::Metadata, now: SystemTime) -> Option<Duration> {
     let modified = metadata.modified().ok()?;
     now.duration_since(modified).ok()
+}
+
+fn quarantine_age(
+    entry: &fs::DirEntry,
+    metadata: &fs::Metadata,
+    now: SystemTime,
+) -> Option<Duration> {
+    let timestamp = entry
+        .file_name()
+        .to_str()
+        .and_then(|name| name.split('-').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+    timestamp
+        .and_then(|created| now.duration_since(created).ok())
+        .or_else(|| directory_age(metadata, now))
 }
 
 fn quarantine_orphans(
@@ -348,30 +394,50 @@ fn quarantine_orphans(
     now: SystemTime,
     grace: Duration,
     reason: &'static str,
-) -> Result<usize, ClippingError> {
-    let mut processed = 0usize;
-    let read = match fs::read_dir(directory) {
-        Ok(read) => read,
-        Err(_) => return Ok(0),
-    };
-    for entry in read.flatten() {
-        if processed >= CLEANUP_BUDGET_PER_CATEGORY {
+) -> Result<DeferredCleanupSummary, ClippingError> {
+    let mut summary = DeferredCleanupSummary::default();
+    let mut attempted = 0usize;
+    let read = fs::read_dir(directory)
+        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
+    for entry in read {
+        if attempted >= CLEANUP_BUDGET_PER_CATEGORY {
             break;
         }
-        let is_dir = entry
-            .metadata()
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false);
-        if !is_dir {
-            continue;
-        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                attempted += 1;
+                summary.failures += 1;
+                continue;
+            }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            attempted += 1;
+            summary.failures += 1;
             continue;
         };
-        if known_ids.iter().any(|id| name.starts_with(id.as_str())) {
+        if known_ids.contains(&name) {
             continue;
         }
-        let Some(age) = directory_age(&entry, now) else {
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                attempted += 1;
+                summary.failures += 1;
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            attempted += 1;
+            summary.failures += 1;
+            continue;
+        }
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let Some(age) = directory_age(&metadata, now) else {
+            attempted += 1;
+            summary.failures += 1;
             continue;
         };
         if age < grace {
@@ -381,14 +447,13 @@ fn quarantine_orphans(
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_secs() as i64)
             .unwrap_or_default();
-        if layout
-            .quarantine_directory(&entry.path(), reason, timestamp)
-            .is_ok()
-        {
-            processed += 1;
+        attempted += 1;
+        match layout.quarantine_directory(&entry.path(), reason, timestamp) {
+            Ok(()) => summary.processed += 1,
+            Err(_) => summary.failures += 1,
         }
     }
-    Ok(processed)
+    Ok(summary)
 }
 
 fn delete_orphan_trash(
@@ -396,68 +461,114 @@ fn delete_orphan_trash(
     known_ids: &[String],
     now: SystemTime,
     grace: Duration,
-) -> Result<usize, ClippingError> {
+) -> Result<DeferredCleanupSummary, ClippingError> {
     let trash_root = layout.trash_dir()?;
-    let mut processed = 0usize;
-    let read = match fs::read_dir(&trash_root) {
-        Ok(read) => read,
-        Err(_) => return Ok(0),
-    };
-    for entry in read.flatten() {
-        if processed >= CLEANUP_BUDGET_PER_CATEGORY {
+    let mut summary = DeferredCleanupSummary::default();
+    let mut attempted = 0usize;
+    let read = fs::read_dir(&trash_root)
+        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
+    for entry in read {
+        if attempted >= CLEANUP_BUDGET_PER_CATEGORY {
             break;
         }
-        let is_dir = entry
-            .metadata()
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false);
-        if !is_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                attempted += 1;
+                summary.failures += 1;
+                continue;
+            }
+        };
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                attempted += 1;
+                summary.failures += 1;
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            attempted += 1;
+            summary.failures += 1;
+            continue;
+        }
+        if !metadata.file_type().is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         // Trash entries are named <clipping-id>-<nonce>; keep entries whose
         // clipping ID still exists.
-        let owned = known_ids.iter().any(|id| name.starts_with(id.as_str()));
+        let owned = known_ids
+            .iter()
+            .any(|id| name.starts_with(&format!("{id}-")));
         if owned {
             continue;
         }
-        let Some(age) = directory_age(&entry, now) else {
+        let Some(age) = directory_age(&metadata, now) else {
+            attempted += 1;
+            summary.failures += 1;
             continue;
         };
         if age < grace {
             continue;
         }
-        if layout.remove_trash_entry(&entry.path()).is_ok() {
-            processed += 1;
+        attempted += 1;
+        match layout.remove_trash_entry(&entry.path()) {
+            Ok(()) => summary.processed += 1,
+            Err(_) => summary.failures += 1,
         }
     }
-    Ok(processed)
+    Ok(summary)
 }
 
 fn delete_expired_quarantine(
     layout: &ClippingAssetLayout,
     now: SystemTime,
     retention: Duration,
-) -> Result<usize, ClippingError> {
+) -> Result<DeferredCleanupSummary, ClippingError> {
     let quarantine_root = layout.quarantine_dir()?;
-    let mut processed = 0usize;
-    let read = match fs::read_dir(&quarantine_root) {
-        Ok(read) => read,
-        Err(_) => return Ok(0),
-    };
-    for entry in read.flatten() {
-        if processed >= CLEANUP_BUDGET_PER_CATEGORY {
+    let mut summary = DeferredCleanupSummary::default();
+    let mut attempted = 0usize;
+    let read = fs::read_dir(&quarantine_root)
+        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
+    for entry in read {
+        if attempted >= CLEANUP_BUDGET_PER_CATEGORY {
             break;
         }
-        let Some(age) = directory_age(&entry, now) else {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                attempted += 1;
+                summary.failures += 1;
+                continue;
+            }
+        };
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                attempted += 1;
+                summary.failures += 1;
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            attempted += 1;
+            summary.failures += 1;
+            continue;
+        }
+        let Some(age) = quarantine_age(&entry, &metadata, now) else {
+            attempted += 1;
+            summary.failures += 1;
             continue;
         };
         if age < retention {
             continue;
         }
-        if layout.remove_quarantine_entry(&entry.path()).is_ok() {
-            processed += 1;
+        attempted += 1;
+        match layout.remove_quarantine_entry(&entry.path()) {
+            Ok(()) => summary.processed += 1,
+            Err(_) => summary.failures += 1,
         }
     }
-    Ok(processed)
+    Ok(summary)
 }

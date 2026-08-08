@@ -182,7 +182,6 @@ pub enum ClippingErrorCode {
     DatabaseReadFailed,
     RecoveryFailed,
     DeleteFailed,
-    InvalidProvenance,
 }
 
 impl ClippingErrorCode {
@@ -208,7 +207,6 @@ impl ClippingErrorCode {
             Self::DatabaseReadFailed => "CLIPPING_DATABASE_READ_FAILED",
             Self::RecoveryFailed => "CLIPPING_RECOVERY_FAILED",
             Self::DeleteFailed => "CLIPPING_DELETE_FAILED",
-            Self::InvalidProvenance => "CLIPPING_INVALID_PROVENANCE",
         }
     }
 }

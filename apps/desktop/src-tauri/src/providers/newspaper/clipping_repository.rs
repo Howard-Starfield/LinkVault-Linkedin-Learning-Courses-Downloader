@@ -444,6 +444,14 @@ pub fn excerpt_from_markdown(markdown: &str) -> String {
     result
 }
 
+fn excerpt_from_bounded_markdown_bytes(bytes: &[u8]) -> String {
+    let valid = match std::str::from_utf8(bytes) {
+        Ok(markdown) => markdown,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default(),
+    };
+    excerpt_from_markdown(valid)
+}
+
 fn ordering_for(sort: NewspaperClippingSort) -> &'static str {
     match sort {
         NewspaperClippingSort::UpdatedDesc => "updated_at DESC, id DESC",
@@ -519,10 +527,20 @@ pub fn list_clippings(
         ("?1", "?2")
     };
     let sql = format!(
-        "SELECT id, title, note_markdown, edition_code_snapshot, edition_name_snapshot,
+        "SELECT id, title,
+                COALESCE(substr(CAST(note_markdown AS BLOB), 1, 4096), X''),
+                edition_code_snapshot, edition_name_snapshot,
                 publication_date_snapshot, page_number_snapshot, asset_state,
                 asset_error_code, asset_version, asset_pixel_width, asset_pixel_height,
-                source_job_id, source_page_id, revision, created_at, updated_at
+                EXISTS(
+                    SELECT 1
+                    FROM newspaper_pages p
+                    JOIN newspaper_jobs j ON j.id = p.job_id
+                    WHERE p.id = newspaper_clippings.source_page_id
+                      AND j.id = newspaper_clippings.source_job_id
+                      AND p.status = 'completed'
+                ),
+                revision, created_at, updated_at
          FROM newspaper_clippings
          WHERE {where_sql}
          ORDER BY {order}
@@ -532,7 +550,7 @@ pub fn list_clippings(
     let raw_rows: Vec<(
         String,
         String,
-        String,
+        Vec<u8>,
         String,
         String,
         String,
@@ -542,8 +560,7 @@ pub fn list_clippings(
         u32,
         u32,
         u32,
-        Option<String>,
-        Option<String>,
+        bool,
         u64,
         i64,
         i64,
@@ -568,7 +585,6 @@ pub fn list_clippings(
                     row.get(13)?,
                     row.get(14)?,
                     row.get(15)?,
-                    row.get(16)?,
                 ))
             })?
             .collect::<Result<Vec<_>>>()?
@@ -593,7 +609,6 @@ pub fn list_clippings(
                     row.get(13)?,
                     row.get(14)?,
                     row.get(15)?,
-                    row.get(16)?,
                 ))
             })?
             .collect::<Result<Vec<_>>>()?
@@ -612,22 +627,16 @@ pub fn list_clippings(
         asset_version,
         asset_pixel_width,
         asset_pixel_height,
-        source_job_id,
-        source_page_id,
+        source_available,
         revision,
         created_at,
         updated_at,
     ) in raw_rows
     {
-        let available = source_available(
-            connection,
-            source_job_id.as_deref(),
-            source_page_id.as_deref(),
-        )?;
         summaries.push(ClippingSummary {
             id,
             title,
-            excerpt: excerpt_from_markdown(&note_markdown),
+            excerpt: excerpt_from_bounded_markdown_bytes(&note_markdown),
             edition_code,
             edition_name,
             publication_date,
@@ -638,7 +647,7 @@ pub fn list_clippings(
             asset_version,
             asset_pixel_width,
             asset_pixel_height,
-            source_available: available,
+            source_available,
             revision,
             created_at,
             updated_at,

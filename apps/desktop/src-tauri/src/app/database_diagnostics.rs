@@ -47,6 +47,7 @@ pub enum DatabaseErrorClass {
     DatabaseIntegrity,
     Io,
     Migration,
+    Recovery,
     Sqlite,
     TaskPanicked,
     UnsupportedSchema,
