@@ -8,7 +8,7 @@ use std::{
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-use super::{batch_service, storage};
+use super::{batch_service, clipping_repository, storage};
 
 pub(super) fn retry(db_path: &Path, job_id: &str) -> Result<usize, String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
@@ -178,6 +178,8 @@ pub(super) fn delete_with_connection(
     }
     remove_output_directory(Path::new(&destination), Path::new(&output_dir))?;
     remove_cached_thumbnail(&transaction, job_id)?;
+    clipping_repository::unlink_sources_for_job(&transaction, job_id)
+        .map_err(|error| error.to_string())?;
     transaction
         .execute("DELETE FROM newspaper_jobs WHERE id = ?1", params![job_id])
         .map_err(|error| error.to_string())?;

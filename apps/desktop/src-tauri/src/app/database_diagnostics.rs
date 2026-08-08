@@ -16,6 +16,7 @@ pub enum DatabaseDiagnosticKind {
     Backup,
     WriterRequest,
     Contention,
+    Recovery,
     Shutdown,
 }
 

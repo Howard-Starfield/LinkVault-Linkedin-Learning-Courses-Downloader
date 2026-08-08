@@ -61,6 +61,17 @@ pub fn resolve_data_dir() -> Result<PathBuf, StoragePathError> {
     ensure_writable_data_dir(data_dir)
 }
 
+const CLIPPINGS_DIR_NAME: &str = "newspaper-clippings";
+
+/// Resolve the application-managed root for canonical Newspaper clipping
+/// assets. The root lives beneath the resolved LinkVaultData directory, never
+/// inside a user-selected newspaper download folder, so clippings survive
+/// edition deletion and World Journal reset (ADR-002, D-009).
+pub fn resolve_newspaper_clippings_root() -> Result<PathBuf, StoragePathError> {
+    let root = resolve_data_dir()?.join(CLIPPINGS_DIR_NAME);
+    ensure_writable_data_dir(root)
+}
+
 fn data_dir_for_exe_path(exe_path: &Path) -> Result<PathBuf, StoragePathError> {
     let exe_dir = exe_path
         .parent()
@@ -175,6 +186,30 @@ mod tests {
                 r"C:\Users\howard\AppData\Local\Programs\LinkVault\LinkVaultData\linkvault.sqlite3"
             )
         );
+    }
+
+    #[test]
+    fn clipping_root_resolves_beneath_data_dir_and_is_created() {
+        use std::sync::{Mutex, OnceLock};
+
+        // The resolver honors the LINKVAULT_DATA_DIR override, which is
+        // process-global; serialize any test that touches it.
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("LinkVaultData");
+        let expected = data_dir.join("newspaper-clippings");
+
+        env::set_var("LINKVAULT_DATA_DIR", &data_dir);
+        let resolved = resolve_newspaper_clippings_root();
+        env::remove_var("LINKVAULT_DATA_DIR");
+
+        assert_eq!(resolved.unwrap(), expected);
+        assert!(expected.is_dir());
     }
 
     #[test]
