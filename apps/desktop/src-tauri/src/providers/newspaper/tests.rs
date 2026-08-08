@@ -297,13 +297,11 @@ fn set_all_paused_flips_active_queued_and_optimizing_only() {
         ("2026-07-22", "queued"),
         ("2026-07-23", "optimizing"),
     ] {
-        let job = batch_service::create_with_connection(
-            &mut connection,
-            request(&destination, date),
-        )
-        .unwrap()
-        .jobs
-        .remove(0);
+        let job =
+            batch_service::create_with_connection(&mut connection, request(&destination, date))
+                .unwrap()
+                .jobs
+                .remove(0);
         connection
             .execute(
                 "UPDATE newspaper_jobs SET status = ?1, paused = 0 WHERE id = ?2",
@@ -341,7 +339,10 @@ fn set_all_paused_flips_active_queued_and_optimizing_only() {
     returned.sort();
     let mut wanted = expected_ids.clone();
     wanted.sort();
-    assert_eq!(returned, wanted, "bulk pause should target the visible queue only");
+    assert_eq!(
+        returned, wanted,
+        "bulk pause should target the visible queue only"
+    );
     assert!(
         outcome_paused.triggered_cancel,
         "pausing an active in-flight job must signal the cooperative cancellation flag"
@@ -854,7 +855,9 @@ fn due_last_seven_days_schedule_materializes_the_rolling_window() {
     let jobs = connection
         .prepare("SELECT id, output_dir FROM newspaper_jobs")
         .unwrap()
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
@@ -1207,8 +1210,7 @@ fn ensure_catalog_populated_is_a_noop_when_the_built_in_catalog_is_intact() {
         .unwrap();
     assert_eq!(pre_seed_count, 13);
 
-    let reseeded =
-        super::storage::ensure_catalog_populated(&mut connection, 1).unwrap();
+    let reseeded = super::storage::ensure_catalog_populated(&mut connection, 1).unwrap();
     assert!(
         !reseeded,
         "the self-heal must be a no-op when the built-in catalog is already present"
@@ -1250,11 +1252,9 @@ fn ensure_catalog_populated_restores_built_in_editions_after_a_wipe() {
         .execute("DELETE FROM newspaper_editions", [])
         .unwrap();
     let wiped_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM newspaper_editions",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(
         wiped_count, 0,
@@ -1262,8 +1262,7 @@ fn ensure_catalog_populated_restores_built_in_editions_after_a_wipe() {
     );
 
     // Run the v0.2.8 self-heal.
-    let reseeded =
-        super::storage::ensure_catalog_populated(&mut connection, 1).unwrap();
+    let reseeded = super::storage::ensure_catalog_populated(&mut connection, 1).unwrap();
     assert!(
         reseeded,
         "the self-heal must re-seed when the built-in catalog is missing"
@@ -1301,8 +1300,7 @@ fn ensure_catalog_populated_restores_built_in_editions_after_a_wipe() {
     );
 
     // And re-running the self-heal is now a no-op.
-    let second_pass =
-        super::storage::ensure_catalog_populated(&mut connection, 2).unwrap();
+    let second_pass = super::storage::ensure_catalog_populated(&mut connection, 2).unwrap();
     assert!(
         !second_pass,
         "the self-heal must be a no-op once the catalog is restored"
@@ -1400,7 +1398,9 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
         .unwrap();
 
     let pre_wipe_editions: i64 = connection
-        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(
         pre_wipe_editions >= 14,
@@ -1438,7 +1438,9 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
         "newspaper_read_pages",
     ] {
         let count: i64 = connection
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0, "{table} should be empty after the wipe");
     }
@@ -1446,7 +1448,9 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
     // Regression guard for v0.2.7: the catalog (built-in + previously
     // discovered specials) must survive a newspaper reset unchanged.
     let post_wipe_editions: i64 = connection
-        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM newspaper_editions", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(
         post_wipe_editions, pre_wipe_editions,
@@ -1478,7 +1482,10 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
     let linkedin_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(linkedin_count, 1, "LinkedIn jobs must survive a newspaper reset");
+    assert_eq!(
+        linkedin_count, 1,
+        "LinkedIn jobs must survive a newspaper reset"
+    );
     let settings_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM settings WHERE key = 'download.folder'",

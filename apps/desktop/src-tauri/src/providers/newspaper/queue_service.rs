@@ -19,7 +19,9 @@ use super::{
     downloader::{download_validated_page, validate_existing_page, PageDownloadError},
     job_repository, manifest,
     models::{NewspaperJob, OptimizationRunOptions},
-    naming, state::NewspaperState, storage,
+    naming,
+    state::NewspaperState,
+    storage,
 };
 
 /// Jobs whose terminal download status carries at least one optimizable
@@ -73,10 +75,7 @@ pub(super) async fn process_queue(
             // `run_optimization_pass` via the `optimization_running` flag,
             // so a manual "Optimize now" overlapping with this trigger
             // resolves to whichever caller arrived second becoming a no-op.
-            spawn_per_edition_optimization(
-                app.clone(),
-                outcome_status,
-            );
+            spawn_per_edition_optimization(app.clone(), outcome_status);
         }
         let has_next_due_job = {
             let connection =
@@ -103,16 +102,10 @@ pub(super) async fn process_queue(
 fn spawn_per_edition_optimization(app: tauri::AppHandle, job_status: String) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<NewspaperState>();
-        let result = run_optimization_pass(
-            &app,
-            state.inner(),
-            OptimizationRunOptions::default(),
-        )
-        .await;
+        let result =
+            run_optimization_pass(&app, state.inner(), OptimizationRunOptions::default()).await;
         if let Err(error) = result {
-            eprintln!(
-                "per-edition optimization trigger failed after {job_status} job: {error}"
-            );
+            eprintln!("per-edition optimization trigger failed after {job_status} job: {error}");
         }
     });
 }

@@ -100,14 +100,7 @@ pub async fn process_newspaper_queue(
     }
     state.cancelled.store(false, Ordering::SeqCst);
     let result = match schedule_service::materialize_due(state.db_path()) {
-        Ok(()) => {
-            queue_service::process_queue(
-                state.db_path(),
-                &state.cancelled,
-                &app,
-            )
-            .await
-        }
+        Ok(()) => queue_service::process_queue(state.db_path(), &state.cancelled, &app).await,
         Err(error) => Err(error),
     };
     state.download_running.store(false, Ordering::SeqCst);
@@ -234,7 +227,8 @@ pub fn set_all_newspaper_jobs_paused(
     state: State<'_, NewspaperState>,
     paused: bool,
 ) -> Result<Vec<String>, String> {
-    let mut connection = crate::cache::open_runtime(state.db_path()).map_err(|error| error.to_string())?;
+    let mut connection =
+        crate::cache::open_runtime(state.db_path()).map_err(|error| error.to_string())?;
     let outcome = job_service::set_all_paused(&mut connection, paused, Utc::now().timestamp())?;
     if outcome.triggered_cancel {
         state.cancelled.store(true, Ordering::SeqCst);
@@ -260,13 +254,14 @@ pub fn reset_newspaper_database(
     state.cancelled.store(true, Ordering::SeqCst);
     state.download_running.store(false, Ordering::SeqCst);
     state.optimization_running.store(false, Ordering::SeqCst);
-    state.dimension_backfill_running.store(false, Ordering::SeqCst);
+    state
+        .dimension_backfill_running
+        .store(false, Ordering::SeqCst);
     state.set_optimization_runtime(OptimizationRuntimeStatus::default());
 
-    let connection = crate::cache::open_runtime(state.db_path())
-        .map_err(|error| error.to_string())?;
-    let counts = clear_newspaper_provider_data(&connection)
-        .map_err(|error| error.to_string())?;
+    let connection =
+        crate::cache::open_runtime(state.db_path()).map_err(|error| error.to_string())?;
+    let counts = clear_newspaper_provider_data(&connection).map_err(|error| error.to_string())?;
 
     // Wipe the on-disk thumbnail cache (canonicalize + starts_with safety
     // pattern, same as remove_cached_thumbnail). Failure here is not fatal —
