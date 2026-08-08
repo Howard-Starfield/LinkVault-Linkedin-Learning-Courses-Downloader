@@ -474,12 +474,11 @@ fn rebuild_optimization_quality_constraint(connection: &Connection, table: &str)
 /// and safe (the seed uses `ON CONFLICT DO UPDATE` and only conflicts on
 /// the built-in `(code, '')` rows, never on discovered specials).
 pub fn ensure_catalog_populated(connection: &Connection, updated_at: i64) -> Result<bool> {
-    let built_in_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM newspaper_editions WHERE publication_date = ''",
-            [],
-            |row| row.get(0),
-        )?;
+    let built_in_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM newspaper_editions WHERE publication_date = ''",
+        [],
+        |row| row.get(0),
+    )?;
     if built_in_count > 0 {
         return Ok(false);
     }

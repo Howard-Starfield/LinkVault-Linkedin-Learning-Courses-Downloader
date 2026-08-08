@@ -12,8 +12,8 @@ use crate::cache::{
     get_course_cache_entry, get_job, get_setting, insert_job, list_artifacts_for_job,
     list_download_history, list_job_events, list_jobs_by_status, list_ready_queued_jobs,
     list_recent_jobs, open_runtime, remove_completed_download_job, remove_download_job,
-    retry_failed_job, set_all_download_jobs_paused, set_download_job_paused,
-    upsert_setting_json, DownloadHistoryEntry, JobRecord, NewJobEvent, ProviderResetCounts,
+    retry_failed_job, set_all_download_jobs_paused, set_download_job_paused, upsert_setting_json,
+    DownloadHistoryEntry, JobRecord, NewJobEvent, ProviderResetCounts,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
