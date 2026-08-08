@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: navigation, deletion, and reset
 
-**Status:** Proposed
+**Status:** Approved
 
 **Primary implementation phase:** Phase 5
 

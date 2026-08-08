@@ -1,6 +1,6 @@
 # Newspaper Clippings V1 decision register
 
-**Status:** Proposed for approval with the V1 specification set
+**Status:** Approved with the V1 specification set
 
 **Last updated:** 2026-08-07
 

@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: domain, persistence, and managed assets
 
-**Status:** Proposed
+**Status:** Approved
 
 **Primary implementation phase:** Phase 1
 

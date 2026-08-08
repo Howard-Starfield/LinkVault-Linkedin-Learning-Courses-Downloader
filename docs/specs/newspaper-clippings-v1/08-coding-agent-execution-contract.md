@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: coding-agent execution contract
 
-**Status:** Proposed
+**Status:** Approved
 
 **Audience:** Any coding agent, automated contributor, or human implementer
 working on an approved Newspaper Clippings V1 phase

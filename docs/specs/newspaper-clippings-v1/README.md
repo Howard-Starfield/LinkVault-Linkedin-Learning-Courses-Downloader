@@ -2,7 +2,7 @@
 
 **Document role:** Master product and implementation control document
 
-**Status:** Proposed — specification review only
+**Status:** Approved
 
 **Date:** 2026-08-07
 
@@ -10,9 +10,9 @@
 
 **Architecture owner:** LinkVault engineering
 
-**Implementation authorized:** No. Implementation becomes authorized only after
-this specification set and ADR-002 are approved and merged to the default
-branch.
+**Implementation authorized:** Yes. Approved by Howard Deng on 2026-08-08 after
+specification review. ADR-002 is Accepted and this specification set is
+approved and merged to the default branch.
 
 **Related architecture:**
 
@@ -204,8 +204,8 @@ reader save path and the editor decision gate are complete.
 
 | Phase | Scope | Entry gate | Exit gate | Status |
 |---|---|---|---|---|
-| 0 | Review ADR-002 and all V1 specifications. Resolve blocking decisions. | Documentation branch exists. | ADR-002 and all documents approved and merged. | In review |
-| 1 | Schema, repository, managed roots, asset state machine, protocol route, recovery foundations. No crop UI. | Phase 0 complete. | Migration, reset-preservation, repository, protocol, lifecycle, and persistence gates pass. | Blocked |
+| 0 | Review ADR-002 and all V1 specifications. Resolve blocking decisions. | Documentation branch exists. | ADR-002 and all documents approved and merged. | Complete |
+| 1 | Schema, repository, managed roots, asset state machine, protocol route, recovery foundations. No crop UI. | Phase 0 complete. | Migration, reset-preservation, repository, protocol, lifecycle, and persistence gates pass. | Ready |
 | 2 | Native source resolver, normalized-to-pixel conversion, crop encoder, checksum, bounded blocking execution, create command. No reader selection UI. | Phase 1 complete. | Deterministic crop and failure-path tests pass; measured crop baseline recorded. | Blocked |
 | 3 | Reader Clip action, pointer/keyboard state machine, selection overlay, save confirmation, non-disruptive success flow. | Phase 2 complete. | Browser interaction matrix and native DPI smoke pass without reader virtualization regression. | Blocked |
 | 4A | Compare approved editor candidates behind an isolated adapter. No production note UI. | Phase 1 complete and editor criteria approved. | One candidate is recorded as Approved in the decision register with evidence. | Blocked |

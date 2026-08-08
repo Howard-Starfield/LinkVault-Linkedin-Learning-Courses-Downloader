@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: deterministic native crop pipeline
 
-**Status:** Proposed
+**Status:** Approved
 
 **Primary implementation phase:** Phase 2
 

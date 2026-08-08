@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: reader selection interface
 
-**Status:** Proposed
+**Status:** Approved
 
 **Primary implementation phase:** Phase 3
 

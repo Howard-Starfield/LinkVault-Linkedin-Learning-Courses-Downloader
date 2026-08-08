@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: verification, performance, and release gates
 
-**Status:** Proposed
+**Status:** Approved
 
 **Primary implementation phase:** Phase 6, with mandatory checkpoints in every
 prior phase

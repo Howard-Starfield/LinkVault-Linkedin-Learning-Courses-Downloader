@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: library and Markdown note editor
 
-**Status:** Proposed
+**Status:** Approved
 
 **Primary implementation phases:** Phase 4A editor evaluation and Phase 4B
 production integration

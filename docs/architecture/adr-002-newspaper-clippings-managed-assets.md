@@ -1,6 +1,6 @@
 # ADR-002: Newspaper clippings as provider-owned managed assets
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-08-07
 

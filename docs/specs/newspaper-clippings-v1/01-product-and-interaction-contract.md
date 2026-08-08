@@ -1,6 +1,6 @@
 # Newspaper Clippings V1: product and interaction contract
 
-**Status:** Proposed
+**Status:** Approved
 
 **Related decisions:** D-001 through D-016, D-025 through D-030
 
