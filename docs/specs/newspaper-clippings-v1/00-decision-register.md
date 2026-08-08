@@ -1,0 +1,583 @@
+# Newspaper Clippings V1 decision register
+
+**Status:** Approved with the V1 specification set
+
+**Last updated:** 2026-08-07
+
+This register is the authoritative record for choices that materially constrain
+Newspaper Clippings V1. A coding agent may not replace an approved decision
+with a local implementation preference. Any change requires a new entry that
+explicitly supersedes the earlier decision and identifies affected documents,
+migrations, tests, and rollback impact.
+
+## Status vocabulary
+
+- **Approved:** Binding for V1.
+- **Proposed:** Recommended, but implementation is blocked until approved.
+- **Deferred:** Deliberately postponed beyond the current phase or V1.
+- **Rejected:** Considered and intentionally not selected.
+- **Superseded:** Replaced by a later approved decision.
+
+## Summary
+
+| ID | Decision | Status |
+|---|---|---|
+| D-001 | Feature and sidebar label is `Clippings`. | Approved |
+| D-002 | Reader action is `Clip` with shortcut `C`. | Approved |
+| D-003 | V1 selection is one rectangle on one page. | Approved |
+| D-004 | Canonical capture is a native source-image crop. | Approved |
+| D-005 | Frontend sends normalized coordinates; backend persists source pixels. | Approved |
+| D-006 | Expected page media version is required and stale media is rejected. | Approved |
+| D-007 | Source priority is retained original, then current optimized image. | Approved |
+| D-008 | Canonical output is lossless WebP with no resize. | Approved |
+| D-009 | Canonical assets are application-managed durable data. | Approved |
+| D-010 | One clipping owns one note in V1. | Approved |
+| D-011 | SQLite Markdown is the note source of truth. | Approved |
+| D-012 | Source image is a fixed card outside the editable document. | Approved |
+| D-013 | Saving keeps the reader open and offers `Open note`. | Approved |
+| D-014 | Default title derives from edition, date, and page. | Approved |
+| D-015 | Clippings use a two-pane paged and virtualized library. | Approved |
+| D-016 | Source deletion and World Journal reset preserve clippings. | Approved |
+| D-017 | Source provenance is denormalized and foreign keys use `SET NULL`. | Approved |
+| D-018 | Note updates use optimistic revisions. | Approved |
+| D-019 | Search is local substring search; FTS is deferred. | Approved |
+| D-020 | Derived thumbnails are regenerable cache data. | Approved |
+| D-021 | Clipping media is served by the protected newspaper media protocol. | Approved |
+| D-022 | Crop work is bounded and performed outside database transactions. | Approved |
+| D-023 | Editor integration is hidden behind an internal Markdown adapter. | Approved |
+| D-024 | Exact WYSIWYG package is selected by a gated compatibility spike. | Proposed |
+| D-025 | Plain Markdown subset excludes executable MDX and arbitrary HTML. | Approved |
+| D-026 | Autosave debounce is 800 ms with explicit flush boundaries. | Approved |
+| D-027 | Clipping deletion is explicit and removes note plus managed asset. | Approved |
+| D-028 | Missing source and missing asset are separate UI states. | Approved |
+| D-029 | OCR, AI, annotations, multiple attachments, tags, and sync are deferred. | Deferred |
+| D-030 | Canonical screenshots are rejected for V1. | Rejected |
+
+---
+
+## D-001: Feature and sidebar label
+
+**Status:** Approved
+
+**Decision:** The World Journal navigation adds a third child named
+**Clippings**. The page heading and empty-state language use the same term.
+
+**Rationale:** “Clipping” is the established mental model for preserving a
+newspaper excerpt together with notes. “Snapshot” emphasizes capture mechanics
+but not the resulting durable reading artifact. “Saved sections” is less
+specific and conflicts with newspaper section terminology.
+
+**Rejected alternatives:** `Snapshots`, `Saved sections`, `Reading notes`,
+`Scrapbook`.
+
+**Affected specifications:** 01, 05, 06.
+
+## D-002: Reader action and keyboard shortcut
+
+**Status:** Approved
+
+**Decision:** The reader toolbar action is **Clip**, represented by the existing
+Lucide scissors icon. Pressing unmodified `C` enters or exits clipping mode when
+the reader canvas owns keyboard context and no editable element is focused.
+
+**Rationale:** The label is compact enough for the reader header and matches the
+feature name. An unmodified mnemonic shortcut is discoverable and does not
+conflict with existing left/right page navigation.
+
+**Constraints:**
+
+- `C` is ignored in inputs, selects, textareas, contenteditable regions, and the
+  future clipping note editor.
+- `Ctrl/Cmd+C` remains copy and never toggles clipping mode.
+- Repeated keydown events are ignored.
+- `Escape` has state-dependent behavior defined in specification 04.
+
+**Affected specifications:** 01, 04.
+
+## D-003: Selection scope
+
+**Status:** Approved
+
+**Decision:** A V1 clipping contains exactly one axis-aligned rectangular region
+from exactly one newspaper page.
+
+**Rationale:** This is deterministic, maps directly to source pixels, works with
+the existing virtualized reader, and avoids annotation-layer or multi-page data
+models before the basic workflow is proven.
+
+**Deferred alternatives:** Multiple rectangles, lasso selection, article-column
+detection, cross-page clipping, stitched captures.
+
+**Affected specifications:** 01, 03, 04.
+
+## D-004: Canonical capture mechanism
+
+**Status:** Approved
+
+**Decision:** Rust crops registered source media. The WebView never supplies
+screenshot bytes for canonical clipping creation.
+
+**Rationale:** Source cropping preserves available resolution and excludes CSS
+page tone, reader zoom, viewport clipping, display scaling, browser
+rasterization, overlays, and accidental UI chrome.
+
+**Consequences:** The backend must resolve and validate the page, decode image
+bytes, convert normalized coordinates to source pixels, encode the clipping,
+and maintain a managed-file lifecycle.
+
+**Affected specifications:** ADR-002, 02, 03, 04.
+
+## D-005: Coordinate contract
+
+**Status:** Approved
+
+**Decision:** React sends finite normalized coordinates measured against the
+rendered `<img>` rectangle. Rust validates those values against decoded source
+dimensions, applies the specified floor/ceil conversion, and persists integer
+source-pixel coordinates.
+
+**Rationale:** Normalized request coordinates remain independent of reader zoom,
+window size, device-pixel ratio, and CSS layout. Persisted pixels are
+deterministic and can reconstruct the region without recreating browser
+geometry.
+
+**Affected specifications:** 02, 03, 04.
+
+## D-006: Media-version consistency
+
+**Status:** Approved
+
+**Decision:** Every create request includes the page media version displayed by
+the reader. The backend rejects a mismatch with `SOURCE_MEDIA_STALE` and checks
+again before committing the clipping record.
+
+**Rationale:** Page optimization can replace display media while the reader is
+open. A silent crop against a different version would make selection and saved
+pixels disagree.
+
+**User behavior:** The selection remains visible and the reader offers a retry
+after refreshing the page manifest. It does not silently rebind the request.
+
+**Affected specifications:** 03, 04.
+
+## D-007: Source priority
+
+**Status:** Approved
+
+**Decision:** The crop service uses the first valid candidate in this order:
+
+1. Retained original page image.
+2. Current optimized page image.
+3. Typed `SOURCE_MEDIA_UNAVAILABLE` failure.
+
+**Rationale:** A retained original is the highest-fidelity provenance source.
+When originals were intentionally removed after optimization, the optimized
+page is still the authoritative available source and retains page dimensions.
+
+**Constraint:** The chosen source kind, MIME type, checksum when available, and
+media version are recorded as provenance snapshots. Raw source paths are not
+persisted in the clipping row or returned to React.
+
+**Affected specifications:** 02, 03.
+
+## D-008: Canonical image format
+
+**Status:** Approved
+
+**Decision:** Canonical clipping output is lossless WebP, with no resize and no
+second lossy quality pass.
+
+**Rationale:** Newspaper text has hard edges and small glyphs that reveal lossy
+artifacts. The repository already includes WebP encode/decode support, and
+lossless WebP provides a compact canonical file without binding the result to
+the source’s original lossy quality.
+
+**Constraints:**
+
+- Output dimensions exactly equal the validated source-pixel rectangle.
+- The encoder must use an actual lossless mode; a quality value alone is not
+  accepted as evidence of losslessness.
+- Encoded bytes are decoded and dimensions verified before promotion.
+- SHA-256 is calculated over final canonical bytes.
+
+**Rejected alternatives:** PNG as the default, lossy WebP, JPEG, screenshot
+PNG. PNG may be reconsidered only if the gated encoder test proves lossless WebP
+unavailable or unreliable in the supported Rust build.
+
+**Affected specifications:** 02, 03, 07.
+
+## D-009: Asset ownership and location
+
+**Status:** Approved
+
+**Decision:** Canonical clipping assets live under an application-managed root
+beneath resolved `LinkVaultData/newspaper-clippings`. They do not live under the
+user-selected edition output directory.
+
+**Rationale:** A clipping is user-created durable data. Downloaded editions are
+replaceable source data and may be moved, deleted, re-registered, or reset.
+
+**Constraint:** SQLite stores a backend-generated relative path only. React
+never chooses or receives the absolute canonical path.
+
+**Affected specifications:** ADR-002, 02, 06.
+
+## D-010: Clipping-to-note cardinality
+
+**Status:** Approved
+
+**Decision:** Saving creates one clipping aggregate containing one canonical
+image, one title, and one Markdown note. A note cannot own multiple clipping
+images in V1.
+
+**Rationale:** This creates a complete workflow with simple ownership,
+delete/recovery semantics, and a clear two-pane library. Multiple attachments
+would require ordering, reassignment, partial deletion, and generalized note
+ownership decisions.
+
+**Affected specifications:** 02, 05.
+
+## D-011: Note source of truth
+
+**Status:** Approved
+
+**Decision:** SQLite stores `title` and `note_markdown`. Markdown is canonical;
+editor-specific document JSON is not persisted.
+
+**Rationale:** SQLite already provides migration, backup, serialization,
+search, and local durability. Markdown remains portable and permits later
+export without coupling data to a WYSIWYG package.
+
+**Deferred alternative:** A per-clipping `note.md` bundle. It may be added as an
+export format, but not as a second live source of truth.
+
+**Affected specifications:** 02, 05.
+
+## D-012: Source-card placement
+
+**Status:** Approved
+
+**Decision:** The canonical clipping image and provenance render in a fixed
+source card above the editor. The image is not represented as a movable or
+deletable node inside Markdown.
+
+**Rationale:** The clipping is the evidence that gives the note meaning. Keeping
+it outside the editor prevents accidental deletion, keeps provenance
+structured, and allows the editor package to change independently.
+
+**Affected specifications:** 01, 05.
+
+## D-013: Post-save behavior
+
+**Status:** Approved
+
+**Decision:** A successful save returns to reader browse mode, displays a
+success toast with edition/date/page provenance, and offers **Open note**. The
+user is not automatically navigated away.
+
+**Rationale:** Capturing should be a low-friction reading action. Forced
+navigation would interrupt users who save several sections from one edition.
+
+**Affected specifications:** 01, 04, 06.
+
+## D-014: Default title
+
+**Status:** Approved
+
+**Decision:** New clipping titles use:
+
+```text
+<Edition name> · <YYYY-MM-DD> · <Page number>
+```
+
+Example:
+
+```text
+New York · 2026-08-07 · A06
+```
+
+**Rationale:** The value is deterministic, available without OCR, meaningful in
+lists, and safe when an article headline is not fully included in the crop.
+
+**Constraints:** The title is user-editable, trimmed, 1–200 Unicode scalar
+values, and never generated by AI in V1.
+
+**Affected specifications:** 02, 05.
+
+## D-015: Clippings library layout and loading
+
+**Status:** Approved
+
+**Decision:** The Clippings view uses a desktop two-pane layout: paged and
+virtualized rows on the left, selected source card and note editor on the right.
+The default sort is most recently updated.
+
+**Rationale:** A gallery-only view is weak for note review and editing. A
+master-detail layout supports rapid scanning while keeping one full clipping
+and editor mounted.
+
+**Constraints:** Page size is 50, list overscan is 4 rows, list thumbnails are
+requested only for visible rows, and fixture gates cover 8, 50, and 500
+clippings.
+
+**Affected specifications:** 05, 07.
+
+## D-016: Source deletion and reset preservation
+
+**Status:** Approved
+
+**Decision:** Deleting a source edition, clearing newspaper jobs/pages, or
+using Reset World Journal preserves clipping rows, notes, canonical assets, and
+derived clipping thumbnails.
+
+**Rationale:** Clippings are durable user-created data. Reset is intended to
+repair or clear replaceable provider downloads and must not destroy notes.
+
+**Constraint:** Reset copy must state this preservation explicitly, and
+persistence tests must prove it.
+
+**Affected specifications:** 02, 06, 07.
+
+## D-017: Provenance and nullable source links
+
+**Status:** Approved
+
+**Decision:** The clipping stores nullable source job/page foreign keys using
+`ON DELETE SET NULL` and also stores immutable snapshots of edition code/name,
+publication date, page number, media version, source dimensions, selected
+source kind, source MIME type, and source-pixel crop rectangle.
+
+**Rationale:** Foreign keys enable exact navigation while source data exists;
+snapshots preserve context after it is removed.
+
+**Affected specifications:** 02, 06.
+
+## D-018: Optimistic note revisions
+
+**Status:** Approved
+
+**Decision:** Every mutable clipping update includes `expectedRevision`. The
+repository updates only when it matches and increments revision on success.
+Zero changed rows return `CLIPPING_REVISION_CONFLICT`.
+
+**Rationale:** Multiple windows, stale detail loads, rapid navigation, or future
+companion views must not silently lose user text.
+
+**Affected specifications:** 02, 05.
+
+## D-019: Search implementation
+
+**Status:** Approved
+
+**Decision:** V1 provides local substring search over title, Markdown,
+edition name/code, date, and page number using bounded escaped SQLite `LIKE`
+queries. SQLite FTS is deferred.
+
+**Rationale:** The expected V1 scale is modest, the result list is paged, and
+introducing an FTS index adds migration and synchronization behavior before
+there is measured need.
+
+**Constraints:** Search input is trimmed, capped at 200 UTF-8 characters, uses
+an explicit escape character, and never interpolates SQL.
+
+**Affected specifications:** 02, 05, 07.
+
+## D-020: Derived thumbnail lifecycle
+
+**Status:** Approved
+
+**Decision:** List thumbnails are regenerable cache files derived from the
+canonical clipping, generated on demand for visible rows. They preserve aspect
+ratio, do not upscale, and fit within a 512×320 pixel box.
+
+**Rationale:** Loading full-resolution canonical crops in every visible row can
+create avoidable decode and memory cost. Derived thumbnails can be safely
+removed and rebuilt.
+
+**Constraints:** Thumbnail cache schema version and canonical asset version are
+part of the URL/version key. Thumbnail absence does not make a clipping
+unavailable.
+
+**Affected specifications:** 02, 05, 07.
+
+## D-021: Media protocol
+
+**Status:** Approved
+
+**Decision:** Canonical clipping and thumbnail bytes are served through new
+versioned variants of the existing `newspaper-media` protocol.
+
+**Rationale:** The protocol already keeps page and thumbnail filesystem paths
+out of React and centralizes MIME, version, symlink, and error handling.
+
+**Conceptual routes:**
+
+```text
+newspaper-media://clipping/<clipping-id>?v=<asset-version>
+newspaper-media://clipping-thumbnail/<clipping-id>?v=<asset-version>-<cache-schema-version>
+```
+
+**Affected specifications:** 02, 05.
+
+## D-022: Crop concurrency and transaction boundary
+
+**Status:** Approved
+
+**Decision:** Full-page crop work runs in a bounded blocking executor with one
+concurrent crop permit in V1. No database transaction spans file read, image
+decode, crop, encode, checksum, validation, or filesystem promotion.
+
+**Rationale:** Newspaper pages are large and the current persistence contract
+forbids holding writes across image work. One permit gives predictable memory
+usage until release measurements justify a different limit.
+
+**Affected specifications:** 02, 03, 07.
+
+## D-023: Internal editor adapter
+
+**Status:** Approved
+
+**Decision:** Production components depend on a LinkVault-owned
+`ClippingNoteEditor` interface, not directly on a third-party editor package.
+
+**Rationale:** The persistent format is Markdown and the package must remain
+replaceable. The adapter localizes plugin configuration, event semantics,
+accessibility fixes, and Markdown normalization.
+
+**Affected specifications:** 05.
+
+## D-024: WYSIWYG package selection
+
+**Status:** Proposed — blocking Phase 4B only
+
+**Decision:** Select the exact package in a dedicated Phase 4A compatibility
+spike. The spike must compare at least two viable React 19 candidates and must
+not persist editor-specific JSON.
+
+**Required evidence:**
+
+- React 19 and Strict Mode operation.
+- Chinese IME composition and candidate selection.
+- Plain Markdown round trips for the approved subset.
+- Undo/redo across controlled-value updates and autosave.
+- Keyboard and screen-reader behavior.
+- Offline operation with no remote dependency.
+- Dark/light theme integration.
+- Production build and bundle impact.
+- License compatibility and third-party notice requirement.
+- No executable MDX or arbitrary raw HTML requirement.
+
+**Approval result:** The selected package, exact version range, adapter design,
+and rejected candidate evidence must be added here before Phase 4B starts.
+
+**Affected specifications:** 05, 07, 08.
+
+## D-025: Markdown subset and executable content
+
+**Status:** Approved
+
+**Decision:** V1 supports paragraphs, headings 1–4, bold, italic,
+strikethrough, unordered/ordered lists, blockquotes, links, and line breaks.
+Executable MDX, JSX, arbitrary raw HTML, embedded scripts, remote iframes,
+editor-inserted images, tables, code blocks, and task lists are excluded.
+
+**Rationale:** This covers ordinary reading notes while keeping rendering,
+security, round-trip tests, and toolbar scope bounded.
+
+**Affected specifications:** 05.
+
+## D-026: Autosave policy
+
+**Status:** Approved
+
+**Decision:** Note changes autosave 800 ms after the last edit. Dirty state is
+flushed before clipping switch, route change, editor unmount, application blur,
+and a cooperative native close request.
+
+**Rationale:** The delay avoids a write per keystroke while preserving a low
+loss window. Explicit boundaries protect navigation and shutdown paths.
+
+**Constraint:** Force termination or power loss during the debounce window is a
+known limitation; no implementation may claim stronger durability without an
+additional local draft journal.
+
+**Affected specifications:** 05, 07.
+
+## D-027: Clipping deletion
+
+**Status:** Approved
+
+**Decision:** Deleting a clipping is an explicit confirmed action that removes
+its title, note, canonical managed asset, and derived thumbnail cache. It never
+deletes the source page or edition.
+
+**Rationale:** The clipping is one aggregate. Retaining orphan notes or images
+would confuse ownership and cleanup.
+
+**Constraint:** Deletion uses a recoverable asset state/rename flow so a crash or
+database error does not silently leave an unreadable row.
+
+**Affected specifications:** 02, 06.
+
+## D-028: Missing source versus missing asset
+
+**Status:** Approved
+
+**Decision:** These are distinct states:
+
+- **Source unavailable:** The clipping and note remain fully usable; `Open
+  source` is disabled with explanatory copy.
+- **Canonical asset missing/corrupt:** The note and provenance remain visible,
+  the source card shows an integrity warning, and repair/recovery is attempted
+  or offered. The row is not silently removed.
+
+**Rationale:** Source removal is expected lifecycle behavior. Canonical asset
+loss is a data-integrity problem and must be surfaced differently.
+
+**Affected specifications:** 02, 05, 06.
+
+## D-029: Deferred V1 extensions
+
+**Status:** Deferred
+
+**Decision:** OCR, AI summaries, translation, embeddings, semantic search,
+annotations, multiple attachments, tags, folders, favorites, reminders,
+spaced repetition, export bundles, sharing, and synchronization are excluded
+from V1.
+
+**Rationale:** They require independent product, privacy, model, indexing,
+schema, or attachment decisions. The V1 aggregate preserves sufficient stable
+provenance for later additions without implementing them now.
+
+**Affected specifications:** All.
+
+## D-030: Screenshot-based canonical clipping
+
+**Status:** Rejected
+
+**Decision:** A browser or operating-system screenshot is not accepted as the
+canonical V1 clipping.
+
+**Rationale:** It loses resolution when zoomed out, includes display-scale and
+browser-rasterization effects, may bake in dim/inverted tone, and can capture
+UI overlays. A future **Export current appearance** command could be separately
+specified, but it must not replace the managed source crop.
+
+**Affected specifications:** ADR-002, 03, 04.
+
+## Change procedure
+
+A proposed decision change must include:
+
+1. New decision ID and status `Proposed`.
+2. The decision it supersedes, if any.
+3. Product rationale.
+4. Persistence and migration impact.
+5. Security and privacy impact.
+6. Test and release-gate impact.
+7. Backward-compatibility and rollback impact.
+8. Affected specification links.
+9. Reviewer and approval date.
+
+Until approved, implementation follows the latest approved entry and stops if
+that is impossible.
