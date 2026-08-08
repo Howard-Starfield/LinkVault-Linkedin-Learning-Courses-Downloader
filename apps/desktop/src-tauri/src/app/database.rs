@@ -2892,7 +2892,12 @@ mod tests {
             .unwrap();
     }
 
-    fn insert_test_clipping(connection: &Connection, id: &str, state: &str, error_code: Option<&str>) {
+    fn insert_test_clipping(
+        connection: &Connection,
+        id: &str,
+        state: &str,
+        error_code: Option<&str>,
+    ) {
         connection
             .execute(
                 &format!(
@@ -2956,7 +2961,10 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
             .count();
-        assert_eq!(backup_count, 0, "fresh database must not create an empty migration backup");
+        assert_eq!(
+            backup_count, 0,
+            "fresh database must not create an empty migration backup"
+        );
     }
 
     #[test]
@@ -2971,8 +2979,9 @@ mod tests {
             legacy.pragma_update(None, "foreign_keys", true).unwrap();
             initialize(&legacy).unwrap();
             insert_representative_provider_rows(&legacy);
-            legacy.execute_batch(
-                "DROP TABLE newspaper_clippings;
+            legacy
+                .execute_batch(
+                    "DROP TABLE newspaper_clippings;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_updated;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_created;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_publication;
@@ -2980,8 +2989,8 @@ mod tests {
                  DROP INDEX IF EXISTS idx_newspaper_clippings_source_page;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_asset_state;
                  PRAGMA user_version = 2;",
-            )
-            .unwrap();
+                )
+                .unwrap();
         }
 
         let (connection, initialization) = initialize_database(&db_path).unwrap();
@@ -3011,66 +3020,81 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!backup_clippings_table, "the backup must capture the pre-migration v2 shape");
+        assert!(
+            !backup_clippings_table,
+            "the backup must capture the pre-migration v2 shape"
+        );
 
         // Representative rows from every provider survive the migration.
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM settings", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM job_events", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM job_events", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM course_cache", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM course_cache", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM coursera_jobs", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM coursera_jobs", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM coursera_job_events", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM coursera_job_events", [], |row| row
+                    .get::<_, usize>(
+                    0
+                ))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM coursera_settings", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM coursera_settings", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row
+                    .get::<_, usize>(0))
                 .unwrap(),
             1
         );
@@ -3086,7 +3110,10 @@ mod tests {
         );
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM newspaper_settings", [], |row| row.get::<_, usize>(0))
+                .query_row("SELECT COUNT(*) FROM newspaper_settings", [], |row| row
+                    .get::<_, usize>(
+                    0
+                ))
                 .unwrap(),
             1
         );
@@ -3100,7 +3127,9 @@ mod tests {
         assert!(clipping_table_exists);
         assert_eq!(schema_version(&connection).unwrap(), CURRENT_SCHEMA_VERSION);
         let foreign_key_check: usize = connection
-            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(foreign_key_check, 0);
         drop(connection);
@@ -3118,7 +3147,12 @@ mod tests {
         let db_path = directory.path().join("linkvault.sqlite3");
         let (connection, _) = initialize_database(&db_path).unwrap();
         insert_representative_provider_rows(&connection);
-        insert_test_clipping(&connection, "11111111-1111-4111-8111-111111111111", "ready", None);
+        insert_test_clipping(
+            &connection,
+            "11111111-1111-4111-8111-111111111111",
+            "ready",
+            None,
+        );
 
         // Page cascade (job deletion cascades into pages) and direct page
         // deletion both null the clipping source references.
@@ -3152,11 +3186,18 @@ mod tests {
         assert!(job_ref.is_none());
         assert_eq!(revision, 1);
         let remaining: usize = connection
-            .query_row("SELECT COUNT(*) FROM newspaper_clippings", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM newspaper_clippings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(remaining, 1, "source deletion must never delete the clipping row");
+        assert_eq!(
+            remaining, 1,
+            "source deletion must never delete the clipping row"
+        );
         let foreign_key_check: usize = connection
-            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(foreign_key_check, 0);
     }
@@ -3167,7 +3208,12 @@ mod tests {
         let db_path = directory.path().join("linkvault.sqlite3");
         let (connection, _) = initialize_database(&db_path).unwrap();
         insert_representative_provider_rows(&connection);
-        insert_test_clipping(&connection, "22222222-2222-4222-8222-222222222222", "ready", None);
+        insert_test_clipping(
+            &connection,
+            "22222222-2222-4222-8222-222222222222",
+            "ready",
+            None,
+        );
         insert_test_clipping(
             &connection,
             "33333333-3333-4333-8333-333333333333",
@@ -3182,13 +3228,21 @@ mod tests {
             )
             .unwrap()
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
         assert_eq!(before.len(), 2);
-        assert!(before.iter().all(|(_, job, page, _, _)| job.is_some() && page.is_some()));
+        assert!(before
+            .iter()
+            .all(|(_, job, page, _, _)| job.is_some() && page.is_some()));
 
         let counts = clear_newspaper_provider_data(&connection).unwrap();
 
@@ -3202,14 +3256,22 @@ mod tests {
             )
             .unwrap()
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
         assert_eq!(after.len(), 2);
-        for ((id_before, _, _, note_before, revision_before), (id_after, job_after, page_after, note_after, revision_after)) in
-            before.iter().zip(after.iter())
+        for (
+            (id_before, _, _, note_before, revision_before),
+            (id_after, job_after, page_after, note_after, revision_after),
+        ) in before.iter().zip(after.iter())
         {
             assert_eq!(id_before, id_after);
             assert!(job_after.is_none(), "reset must null source_job_id");
@@ -3237,7 +3299,9 @@ mod tests {
             .unwrap();
         assert_eq!(remaining_pages, 0);
         let foreign_key_check: usize = connection
-            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(foreign_key_check, 0);
         let quick_check: String = connection
@@ -3245,5 +3309,4 @@ mod tests {
             .unwrap();
         assert_eq!(quick_check, "ok");
     }
-
 }

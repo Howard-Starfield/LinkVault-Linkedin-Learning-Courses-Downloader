@@ -171,13 +171,9 @@ fn resolve_clipping(
     {
         return Err(MediaError::NotFound);
     }
-    if let Err(error) = layout.verify_canonical(
-        clipping_id,
-        record.3,
-        record.4,
-        record.5,
-        &record.6,
-    ) {
+    if let Err(error) =
+        layout.verify_canonical(clipping_id, record.3, record.4, record.5, &record.6)
+    {
         let safe_code = match error.code {
             ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
             _ => "CLIPPING_ASSET_MISSING",
@@ -191,8 +187,13 @@ fn resolve_clipping(
                 workflow_id: None,
             },
             move |db| {
-                clipping_repository::mark_missing_from_ready(db, &id, &code, chrono::Utc::now().timestamp())
-                    .map_err(Into::into)
+                clipping_repository::mark_missing_from_ready(
+                    db,
+                    &id,
+                    &code,
+                    chrono::Utc::now().timestamp(),
+                )
+                .map_err(Into::into)
             },
         );
         return Err(MediaError::NotFound);
@@ -444,7 +445,8 @@ mod tests {
         drop(connection);
         let clipping_layout =
             ClippingAssetLayout::new(directory.path().join("newspaper-clippings"));
-        let writer = DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
+        let writer =
+            DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
         (directory, db_path, cache_root, clipping_layout, writer)
     }
 
@@ -492,11 +494,8 @@ mod tests {
         let (directory, db_path, cache_root, clipping_layout, writer) = fixture();
         let bytes = encode_test_webp(24, 16);
         clipping_layout.write_staging(ID, &bytes).unwrap();
-        let service = ClippingService::new(
-            db_path.clone(),
-            writer.clone(),
-            clipping_layout.clone(),
-        );
+        let service =
+            ClippingService::new(db_path.clone(), writer.clone(), clipping_layout.clone());
         service
             .register_staged(NewClippingRecord {
                 id: ID.to_string(),
@@ -549,8 +548,7 @@ mod tests {
             "http://newspaper-media.localhost/clipping/{ID}?v=1"
         ))
         .unwrap();
-        let response =
-            handle_request(&db_path, &cache_root, &clipping_layout, &writer, &corrupt);
+        let response = handle_request(&db_path, &cache_root, &clipping_layout, &writer, &corrupt);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(!String::from_utf8_lossy(response.body())
             .contains(&directory.path().to_string_lossy().to_string()));
