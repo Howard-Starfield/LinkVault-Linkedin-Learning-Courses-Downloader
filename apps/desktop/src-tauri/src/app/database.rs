@@ -1059,9 +1059,7 @@ pub struct NewspaperResetCounts {
 /// The caller is responsible for pausing the queue first (via
 /// `set_all_download_jobs_paused`) and for resetting the in-memory
 /// `LinkVaultState` flags afterwards. This helper touches only the database.
-pub fn clear_linkedin_provider_data(
-    connection: &Connection,
-) -> CacheResult<ProviderResetCounts> {
+pub fn clear_linkedin_provider_data(connection: &Connection) -> CacheResult<ProviderResetCounts> {
     let transaction = connection.unchecked_transaction()?;
     // FKs use ON DELETE CASCADE on job_events.job_id → jobs.id, but
     // artifacts.job_id → jobs.id does not. Delete the dependent rows first to
@@ -1081,9 +1079,7 @@ pub fn clear_linkedin_provider_data(
 
 /// Wipe the Coursera provider's data while keeping the schema intact.
 /// Runs in a single transaction.
-pub fn clear_coursera_provider_data(
-    connection: &Connection,
-) -> CacheResult<CourseraResetCounts> {
+pub fn clear_coursera_provider_data(connection: &Connection) -> CacheResult<CourseraResetCounts> {
     let transaction = connection.unchecked_transaction()?;
     let events = transaction.execute("DELETE FROM coursera_job_events", [])?;
     let jobs = transaction.execute("DELETE FROM coursera_jobs", [])?;
@@ -1109,9 +1105,7 @@ pub fn clear_coursera_provider_data(
 /// regions until the next `refresh_newspaper_catalog` happened to rediscover
 /// them — and most days the world journal site only surfaces specials, so
 /// the regions would never come back on their own.
-pub fn clear_newspaper_provider_data(
-    connection: &Connection,
-) -> CacheResult<NewspaperResetCounts> {
+pub fn clear_newspaper_provider_data(connection: &Connection) -> CacheResult<NewspaperResetCounts> {
     let transaction = connection.unchecked_transaction()?;
     // Dependent rows first to keep the wipe robust regardless of
     // foreign_keys pragma state.
@@ -1152,8 +1146,7 @@ pub fn delete_newspaper_schedule_and_cancel_owned_work(
     schedule_id: &str,
     now: i64,
 ) -> CacheResult<bool> {
-    let transaction =
-        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let interrupted_active_work = transaction.query_row(
         "SELECT EXISTS(
              SELECT 1
@@ -2640,7 +2633,9 @@ mod tests {
 
     fn table_row_count(connection: &Connection, table: &str) -> i64 {
         connection
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap()
     }
 
