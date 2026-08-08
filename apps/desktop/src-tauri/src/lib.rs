@@ -35,16 +35,11 @@ pub fn run() {
                         .state::<newspaper::clipping_service::ClippingService>()
                         .inner()
                         .clone();
-                    let writer = app
-                        .state::<app::database_writer::DatabaseWriter>()
-                        .inner()
-                        .clone();
                     let response = tauri::async_runtime::spawn_blocking(move || {
                         newspaper::media_protocol::handle_request(
                             &db_path,
                             &cache_root,
-                            clipping_service.layout(),
-                            &writer,
+                            &clipping_service,
                             &request,
                         )
                     })
@@ -179,6 +174,7 @@ pub fn run() {
                 db_path.clone(),
                 writer.clone(),
                 clipping_layout,
+                diagnostics.clone(),
             );
             let _recovery_summary =
                 clipping_service.recover_startup(&diagnostics, commands::now_unix_timestamp());

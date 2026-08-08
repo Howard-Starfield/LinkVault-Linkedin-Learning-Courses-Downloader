@@ -38,6 +38,7 @@ pub const THUMBNAIL_VERSION_DIR: &str = "v1";
 #[derive(Clone, Debug)]
 pub struct ClippingAssetLayout {
     root: PathBuf,
+    data_parent: PathBuf,
 }
 
 impl ClippingAssetLayout {
@@ -45,7 +46,11 @@ impl ClippingAssetLayout {
     /// `app::storage::resolve_newspaper_clippings_root`; tests inject
     /// temporary directories.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        let data_parent = root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        Self { root, data_parent }
     }
 
     pub fn root(&self) -> &Path {
@@ -53,35 +58,82 @@ impl ClippingAssetLayout {
     }
 
     fn ensure_root(&self) -> Result<PathBuf, ClippingError> {
-        if let Ok(metadata) = fs::symlink_metadata(&self.root) {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        let parent_metadata = fs::symlink_metadata(&self.data_parent)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+        if is_symlink_or_reparse(&parent_metadata) || !parent_metadata.file_type().is_dir() {
+            return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+        }
+        let canonical_parent = self
+            .data_parent
+            .canonicalize()
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => {
+                if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                    return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&self.root)
+                    .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+            }
+            Err(_) => {
                 return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
             }
         }
-        fs::create_dir_all(&self.root)
+
+        let metadata = fs::symlink_metadata(&self.root)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
-        self.root
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+            return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+        }
+        let canonical_root = self
+            .root
             .canonicalize()
-            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+        if !canonical_root.starts_with(&canonical_parent) || canonical_root == canonical_parent {
+            return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+        }
+        Ok(canonical_root)
     }
 
     fn ensure_dir(&self, relative: &str) -> Result<PathBuf, ClippingError> {
         let root = self.ensure_root()?;
-        let dir = root.join(relative);
-        if let Ok(metadata) = fs::symlink_metadata(&dir) {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        let mut dir = root.clone();
+        for component in Path::new(relative).components() {
+            let Component::Normal(component) = component else {
+                return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+            };
+            dir.push(component);
+            match fs::symlink_metadata(&dir) {
+                Ok(metadata) => {
+                    if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                        return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&dir)
+                        .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+                }
+                Err(_) => {
+                    return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+                }
+            }
+            let metadata = fs::symlink_metadata(&dir)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+            if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
                 return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
             }
+            let canonical = dir
+                .canonicalize()
+                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+            if !canonical.starts_with(&root) {
+                return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+            }
+            dir = canonical;
         }
-        fs::create_dir_all(&dir)
-            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
-        let canonical = dir
-            .canonicalize()
-            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
-        if !canonical.starts_with(&root) {
-            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
-        }
-        Ok(canonical)
+        Ok(dir)
     }
 
     pub fn assets_dir(&self) -> Result<PathBuf, ClippingError> {
@@ -190,13 +242,17 @@ impl ClippingAssetLayout {
 
     /// Deterministic thumbnail cache file name (D-020). Absence is not an
     /// error state; thumbnails are regenerable cache data.
-    pub fn thumbnail_path(&self, clipping_id: &str) -> Result<PathBuf, ClippingError> {
-        if !validate_clipping_id(clipping_id) {
+    pub fn thumbnail_path(
+        &self,
+        clipping_id: &str,
+        asset_version: u32,
+    ) -> Result<PathBuf, ClippingError> {
+        if !validate_clipping_id(clipping_id) || asset_version == 0 {
             return Err(ClippingError::new(ClippingErrorCode::InvalidId));
         }
         Ok(self
             .thumbnails_dir()?
-            .join(format!("{clipping_id}-asset-1.webp")))
+            .join(format!("{clipping_id}-asset-{asset_version}.webp")))
     }
 
     /// Write canonical bytes to staging using create-new semantics, then
@@ -238,7 +294,7 @@ impl ClippingAssetLayout {
         // redirect the create-new file open through a symlink or reparse point.
         let metadata = fs::symlink_metadata(&staging_dir)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
             return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         let staging_root = self.staging_dir()?;
@@ -296,7 +352,7 @@ impl ClippingAssetLayout {
         let staging_metadata = staging_dir
             .symlink_metadata()
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
-        if staging_metadata.file_type().is_symlink() || !staging_metadata.file_type().is_dir() {
+        if is_symlink_or_reparse(&staging_metadata) || !staging_metadata.file_type().is_dir() {
             return Err(ClippingError::new(ClippingErrorCode::AssetPromotionFailed));
         }
         let staging_root = self.staging_dir()?;
@@ -318,9 +374,7 @@ impl ClippingAssetLayout {
         Ok(())
     }
 
-    /// Verify a canonical asset in place: contained regular non-symlink file,
-    /// expected byte count, decoded dimensions, and SHA-256 (aggregate
-    /// invariant for `asset_state = ready`, CREATE-STATE-003 post-check).
+    /// Verify a canonical asset in place from one contained read buffer.
     pub fn verify_canonical(
         &self,
         clipping_id: &str,
@@ -329,21 +383,14 @@ impl ClippingAssetLayout {
         expected_height: u32,
         expected_sha256: &str,
     ) -> Result<(), ClippingError> {
-        let path = self.contained_regular_file(&self.canonical_path(clipping_id)?)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        if metadata.len() != expected_byte_count {
-            return Err(ClippingError::new(ClippingErrorCode::AssetValidationFailed));
-        }
-        let bytes =
-            fs::read(&path).map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        Self::validate_canonical_bytes(
-            &bytes,
+        self.read_validated_canonical_for_protocol(
+            clipping_id,
             expected_byte_count,
             expected_width,
             expected_height,
             expected_sha256,
         )
+        .map(|_| ())
     }
 
     pub fn verify_staging(
@@ -375,6 +422,30 @@ impl ClippingAssetLayout {
         expected_height: u32,
         expected_sha256: &str,
     ) -> Result<(), ClippingError> {
+        Self::validate_canonical_bytes_with_inspector(
+            bytes,
+            expected_byte_count,
+            expected_width,
+            expected_height,
+            expected_sha256,
+            |candidate| {
+                let decoded = webp::Decoder::new(candidate).decode()?;
+                Some((decoded.width(), decoded.height()))
+            },
+        )
+    }
+
+    fn validate_canonical_bytes_with_inspector<F>(
+        bytes: &[u8],
+        expected_byte_count: u64,
+        expected_width: u32,
+        expected_height: u32,
+        expected_sha256: &str,
+        inspect_dimensions: F,
+    ) -> Result<(), ClippingError>
+    where
+        F: FnOnce(&[u8]) -> Option<(u32, u32)>,
+    {
         let invalid = || ClippingError::new(ClippingErrorCode::AssetValidationFailed);
         if !validate_asset_byte_count(bytes.len() as u64) {
             return Err(invalid());
@@ -382,15 +453,17 @@ impl ClippingAssetLayout {
         if bytes.len() as u64 != expected_byte_count {
             return Err(invalid());
         }
+        // Reject substituted bytes before any decoder can allocate from
+        // attacker-controlled dimensions or compressed payloads.
+        if sha256_hex(bytes) != expected_sha256 {
+            return Err(ClippingError::new(ClippingErrorCode::AssetChecksumMismatch));
+        }
         if !is_webp_container(bytes) {
             return Err(invalid());
         }
-        let decoded = webp::Decoder::new(bytes).decode().ok_or_else(invalid)?;
-        if decoded.width() != expected_width || decoded.height() != expected_height {
+        let (width, height) = inspect_dimensions(bytes).ok_or_else(invalid)?;
+        if width != expected_width || height != expected_height {
             return Err(invalid());
-        }
-        if sha256_hex(bytes) != expected_sha256 {
-            return Err(ClippingError::new(ClippingErrorCode::AssetChecksumMismatch));
         }
         Ok(())
     }
@@ -401,7 +474,7 @@ impl ClippingAssetLayout {
         let root = self.ensure_root()?;
         let metadata = fs::symlink_metadata(candidate)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_file() {
             return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         let canonical = candidate
@@ -427,7 +500,7 @@ impl ClippingAssetLayout {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(ClippingError::new(ClippingErrorCode::DeleteFailed)),
         };
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
             return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         let trash_root = self.trash_dir()?;
@@ -489,20 +562,36 @@ impl ClippingAssetLayout {
         Ok(())
     }
 
-    /// Remove a derived thumbnail cache file when present. Thumbnails are
-    /// cache data; absence is success (D-020).
-    pub fn remove_thumbnail(&self, clipping_id: &str) {
-        if let Ok(path) = self.thumbnail_path(clipping_id) {
-            if let Ok(contained) = self.contained_regular_file(&path) {
-                let _ = fs::remove_file(contained);
-            }
+    /// Remove every exact ID-owned thumbnail asset version. Prefix-lookalike
+    /// IDs and malformed filenames are never deletion targets (D-020/D-027).
+    pub fn remove_thumbnails(&self, clipping_id: &str) -> Result<usize, ClippingError> {
+        if !validate_clipping_id(clipping_id) {
+            return Err(ClippingError::new(ClippingErrorCode::InvalidId));
         }
+        let directory = self.thumbnails_dir()?;
+        let mut removed = 0usize;
+        let entries = fs::read_dir(&directory)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if thumbnail_asset_version(&name, clipping_id).is_none() {
+                continue;
+            }
+            let contained = self.contained_regular_file(&entry.path())?;
+            fs::remove_file(contained)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub fn remove_quarantine_entry(&self, entry: &Path) -> Result<(), ClippingError> {
         let metadata = fs::symlink_metadata(entry)
             .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
             return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         let canonical = entry
@@ -516,24 +605,55 @@ impl ClippingAssetLayout {
             .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))
     }
 
-    /// Serve-side validation for the media protocol (FR-MEDIA-001): contained
-    /// regular non-symlink file with supported MIME and non-empty bytes.
-    /// Returns the bytes only after every check passes.
-    pub fn read_canonical_for_protocol(
+    /// Read, validate, and return one canonical buffer for the media protocol.
+    /// The exact bytes checked here are the bytes the protocol serves.
+    pub fn read_validated_canonical_for_protocol(
         &self,
         clipping_id: &str,
+        expected_byte_count: u64,
+        expected_width: u32,
+        expected_height: u32,
+        expected_sha256: &str,
     ) -> Result<(Vec<u8>, &'static str), ClippingError> {
+        self.read_validated_canonical_for_protocol_inner(
+            clipping_id,
+            expected_byte_count,
+            expected_width,
+            expected_height,
+            expected_sha256,
+            |_| {},
+        )
+    }
+
+    fn read_validated_canonical_for_protocol_inner<F>(
+        &self,
+        clipping_id: &str,
+        expected_byte_count: u64,
+        expected_width: u32,
+        expected_height: u32,
+        expected_sha256: &str,
+        after_validation: F,
+    ) -> Result<(Vec<u8>, &'static str), ClippingError>
+    where
+        F: FnOnce(&Path),
+    {
         let path = self.contained_regular_file(&self.canonical_path(clipping_id)?)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        if metadata.len() == 0 {
-            return Err(ClippingError::new(ClippingErrorCode::AssetMissing));
+        if !validate_asset_byte_count(expected_byte_count) || metadata.len() != expected_byte_count
+        {
+            return Err(ClippingError::new(ClippingErrorCode::AssetValidationFailed));
         }
         let bytes =
             fs::read(&path).map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        if bytes.is_empty() || !is_webp_container(&bytes) {
-            return Err(ClippingError::new(ClippingErrorCode::AssetValidationFailed));
-        }
+        Self::validate_canonical_bytes(
+            &bytes,
+            expected_byte_count,
+            expected_width,
+            expected_height,
+            expected_sha256,
+        )?;
+        after_validation(&path);
         Ok((bytes, CLIPPING_ASSET_MIME))
     }
 
@@ -541,8 +661,10 @@ impl ClippingAssetLayout {
     pub fn read_thumbnail_for_protocol(
         &self,
         clipping_id: &str,
+        asset_version: u32,
     ) -> Result<(Vec<u8>, &'static str), ClippingError> {
-        let path = self.contained_regular_file(&self.thumbnail_path(clipping_id)?)?;
+        let path =
+            self.contained_regular_file(&self.thumbnail_path(clipping_id, asset_version)?)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
         if metadata.len() == 0 {
@@ -572,6 +694,29 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// decode; decoding happens separately through the image pipeline.
 pub fn is_webp_container(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+}
+
+fn thumbnail_asset_version(file_name: &str, clipping_id: &str) -> Option<u32> {
+    let version = file_name
+        .strip_prefix(&format!("{clipping_id}-asset-"))?
+        .strip_suffix(".webp")?
+        .parse::<u32>()
+        .ok()?;
+    (version > 0).then_some(version)
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// Generate a lossless WebP test fixture of the given pixel size
@@ -648,6 +793,38 @@ mod tests {
             "assets/{TEST_ID}/clipping-v1.webp"
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn managed_root_rejects_file_and_junction_with_path_free_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let file_root = directory.path().join("file-root");
+        fs::write(&file_root, b"not-a-directory").unwrap();
+        let file_error = ClippingAssetLayout::new(file_root)
+            .assets_dir()
+            .unwrap_err();
+        assert_eq!(
+            file_error.as_safe_string(),
+            "CLIPPING_ASSET_ROOT_UNAVAILABLE"
+        );
+
+        let outside = directory.path().join("outside-root");
+        let linked_root = directory.path().join("linked-root");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        if !create_dir_link(&outside, &linked_root) {
+            eprintln!("directory junction creation unavailable on this machine");
+            return;
+        }
+        let link_error = ClippingAssetLayout::new(linked_root)
+            .assets_dir()
+            .unwrap_err();
+        assert_eq!(
+            link_error.as_safe_string(),
+            "CLIPPING_ASSET_ROOT_UNAVAILABLE"
+        );
+        assert_eq!(fs::read(outside.join("sentinel.txt")).unwrap(), b"keep-me");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
     }
 
     #[test]
@@ -743,6 +920,8 @@ mod tests {
 
     #[test]
     fn canonical_validation_rejects_wrong_dimensions_checksum_and_non_webp() {
+        use std::cell::Cell;
+
         let (bytes, len, checksum) = valid_fixture();
         assert_eq!(
             ClippingAssetLayout::validate_canonical_bytes(&bytes, len, 999, 16, &checksum)
@@ -756,13 +935,14 @@ mod tests {
                 .code,
             ClippingErrorCode::AssetChecksumMismatch
         );
+        let malformed = b"RIFFxxxxWEBPvp8 ";
         assert_eq!(
             ClippingAssetLayout::validate_canonical_bytes(
-                b"RIFFxxxxWEBPvp8 ",
-                16,
+                malformed,
+                malformed.len() as u64,
                 24,
                 16,
-                &checksum
+                &sha256_hex(malformed)
             )
             .unwrap_err()
             .code,
@@ -773,6 +953,25 @@ mod tests {
                 .unwrap_err()
                 .code,
             ClippingErrorCode::AssetValidationFailed
+        );
+
+        let decoder_called = Cell::new(false);
+        let error = ClippingAssetLayout::validate_canonical_bytes_with_inspector(
+            &bytes,
+            len,
+            24,
+            16,
+            &"0".repeat(64),
+            |_| {
+                decoder_called.set(true);
+                Some((24, 16))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ClippingErrorCode::AssetChecksumMismatch);
+        assert!(
+            !decoder_called.get(),
+            "checksum rejection must precede decode"
         );
     }
 
@@ -831,7 +1030,7 @@ mod tests {
             return;
         }
         let error = layout
-            .read_canonical_for_protocol(TEST_ID)
+            .read_validated_canonical_for_protocol(TEST_ID, 1, 1, 1, &"0".repeat(64))
             .expect_err("symlinked asset must be rejected");
         assert!(matches!(
             error.code,
@@ -863,39 +1062,105 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_managed_child_junction_is_rejected_before_directory_creation() {
+        let (directory, layout) = temp_layout();
+        let root = layout.ensure_root().unwrap();
+        let outside = directory.path().join("outside-intermediate");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        let intermediate = root.join(THUMBNAILS_DIR);
+        if !create_dir_junction(&outside, &intermediate) {
+            eprintln!("directory junction creation unavailable on this machine");
+            return;
+        }
+
+        let error = layout
+            .thumbnails_dir()
+            .expect_err("intermediate reparse point must fail before creating v1");
+        assert_eq!(error.code, ClippingErrorCode::AssetPathInvalid);
+        assert!(!outside.join(THUMBNAIL_VERSION_DIR).exists());
+        assert_eq!(fs::read(outside.join("sentinel.txt")).unwrap(), b"keep-me");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+    }
+
+    #[test]
     fn protocol_reads_reject_missing_empty_and_directory_targets() {
         let (_directory, layout) = temp_layout();
         assert_eq!(
             layout
-                .read_canonical_for_protocol(TEST_ID)
+                .read_validated_canonical_for_protocol(TEST_ID, 1, 1, 1, &"0".repeat(64))
                 .unwrap_err()
                 .code,
             ClippingErrorCode::AssetMissing
         );
 
-        let (bytes, _, _) = valid_fixture();
+        let (bytes, len, checksum) = valid_fixture();
         layout.write_staging(TEST_ID, &bytes).unwrap();
         layout.promote_staging(TEST_ID).unwrap();
-        let (served, mime) = layout.read_canonical_for_protocol(TEST_ID).unwrap();
+        let (served, mime) = layout
+            .read_validated_canonical_for_protocol(TEST_ID, len, 24, 16, &checksum)
+            .unwrap();
         assert_eq!(served, bytes);
         assert_eq!(mime, CLIPPING_ASSET_MIME);
 
         // Replace the canonical file with an empty file: serve fails safe.
         let canonical = layout.canonical_path(TEST_ID).unwrap();
         fs::write(&canonical, []).unwrap();
-        assert!(layout.read_canonical_for_protocol(TEST_ID).is_err());
+        assert!(layout
+            .read_validated_canonical_for_protocol(TEST_ID, len, 24, 16, &checksum)
+            .is_err());
     }
 
     #[test]
-    fn thumbnail_paths_are_deterministic_and_cache_scoped() {
+    fn canonical_protocol_returns_the_same_buffer_it_validated_after_file_substitution() {
         let (_directory, layout) = temp_layout();
-        let path = layout.thumbnail_path(TEST_ID).unwrap();
-        assert!(path.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-1.webp")));
+        let (bytes, len, checksum) = valid_fixture();
+        let replacement = encode_test_webp(8, 8);
+        layout.write_staging(TEST_ID, &bytes).unwrap();
+        layout.promote_staging(TEST_ID).unwrap();
+
+        let (served, mime) = layout
+            .read_validated_canonical_for_protocol_inner(TEST_ID, len, 24, 16, &checksum, |path| {
+                fs::write(path, &replacement).unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(served, bytes, "served bytes must be the validated buffer");
+        assert_ne!(
+            served,
+            fs::read(layout.canonical_path(TEST_ID).unwrap()).unwrap()
+        );
+        assert_eq!(mime, CLIPPING_ASSET_MIME);
+    }
+
+    #[test]
+    fn thumbnail_paths_are_versioned_and_exact_id_cleanup_is_scoped() {
+        let (_directory, layout) = temp_layout();
+        let first = layout.thumbnail_path(TEST_ID, 1).unwrap();
+        let second = layout.thumbnail_path(TEST_ID, 2).unwrap();
+        let other = layout.thumbnail_path(OTHER_ID, 1).unwrap();
+        let lookalike = layout
+            .thumbnails_dir()
+            .unwrap()
+            .join(format!("{TEST_ID}0-asset-1.webp"));
+        assert_ne!(first, second);
+        assert!(first.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-1.webp")));
+        assert!(second.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-2.webp")));
+        for path in [&first, &second, &other, &lookalike] {
+            fs::write(path, encode_test_webp(4, 4)).unwrap();
+        }
+
+        assert_eq!(layout.remove_thumbnails(TEST_ID).unwrap(), 2);
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(other.exists());
+        assert!(lookalike.exists());
+        assert!(layout.remove_thumbnails("not-a-uuid").is_err());
+
         // Absence is not an error for cache data.
-        layout.remove_thumbnail(TEST_ID);
         assert_eq!(
             layout
-                .read_thumbnail_for_protocol(TEST_ID)
+                .read_thumbnail_for_protocol(TEST_ID, 1)
                 .unwrap_err()
                 .code,
             ClippingErrorCode::AssetMissing
@@ -968,6 +1233,28 @@ mod tests {
             if std::os::windows::fs::symlink_dir(target, link).is_ok() {
                 return true;
             }
+            std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    fn create_dir_junction(target: &Path, link: &Path) -> bool {
+        #[cfg(not(windows))]
+        {
+            let _ = (target, link);
+            false
+        }
+        #[cfg(windows)]
+        {
             std::process::Command::new("cmd")
                 .args([
                     "/C",

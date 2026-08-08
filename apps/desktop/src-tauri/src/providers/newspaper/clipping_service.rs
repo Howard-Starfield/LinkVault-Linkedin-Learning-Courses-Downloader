@@ -3,9 +3,16 @@
 //! complete, validated staging asset and never performs image work in a writer
 //! closure.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Instant;
 
-use crate::app::database_diagnostics::{DatabaseDiagnostics, DatabaseProvider};
+use crate::app::database_diagnostics::{
+    DatabaseDiagnosticInput, DatabaseDiagnosticKind, DatabaseDiagnosticOutcome,
+    DatabaseDiagnostics, DatabaseErrorClass, DatabaseProvider,
+};
 use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
 use crate::cache::open_runtime;
 
@@ -25,14 +32,183 @@ pub struct ClippingService {
     db_path: PathBuf,
     writer: DatabaseWriter,
     layout: ClippingAssetLayout,
+    integrity_scheduler: Arc<IntegrityTransitionScheduler>,
+}
+
+pub(crate) const MEDIA_INTEGRITY_QUEUE_CAPACITY: usize = 32;
+
+struct IntegrityTransition {
+    clipping_id: String,
+    error_code: &'static str,
+    now: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntegrityScheduleOutcome {
+    Scheduled,
+    Coalesced,
+    Unavailable,
+}
+
+struct IntegrityTransitionScheduler {
+    sender: mpsc::SyncSender<IntegrityTransition>,
+    pending: Arc<IntegrityPending>,
+    diagnostics: DatabaseDiagnostics,
+}
+
+struct IntegrityPending {
+    ids: Mutex<HashSet<String>>,
+    changed: Condvar,
+}
+
+impl IntegrityTransitionScheduler {
+    fn new(writer: DatabaseWriter, diagnostics: DatabaseDiagnostics) -> Self {
+        let (sender, receiver) =
+            mpsc::sync_channel::<IntegrityTransition>(MEDIA_INTEGRITY_QUEUE_CAPACITY);
+        let pending = Arc::new(IntegrityPending {
+            ids: Mutex::new(HashSet::new()),
+            changed: Condvar::new(),
+        });
+        let worker_pending = Arc::clone(&pending);
+        let worker_diagnostics = diagnostics.clone();
+        let _ = thread::Builder::new()
+            .name("linkvault-clipping-integrity".to_string())
+            .spawn(move || {
+                while let Ok(transition) = receiver.recv() {
+                    let started = Instant::now();
+                    let id = transition.clipping_id.clone();
+                    let code = transition.error_code.to_string();
+                    let result = writer.execute(
+                        ClippingService::context("clipping_media_mark_missing"),
+                        move |db| {
+                            repository::mark_missing_from_ready(db, &id, &code, transition.now)
+                                .map_err(Into::into)
+                        },
+                    );
+                    worker_pending
+                        .ids
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&transition.clipping_id);
+                    worker_pending.changed.notify_all();
+                    if result.is_err() {
+                        record_integrity_diagnostic(
+                            &worker_diagnostics,
+                            "clipping_media_integrity_transition",
+                            started.elapsed(),
+                        );
+                    }
+                }
+            });
+        Self {
+            sender,
+            pending,
+            diagnostics,
+        }
+    }
+
+    fn schedule(
+        &self,
+        clipping_id: &str,
+        error_code: &'static str,
+        now: i64,
+    ) -> IntegrityScheduleOutcome {
+        let mut pending = self
+            .pending
+            .ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.contains(clipping_id) {
+            return IntegrityScheduleOutcome::Coalesced;
+        }
+        if pending.len() >= MEDIA_INTEGRITY_QUEUE_CAPACITY {
+            drop(pending);
+            record_integrity_diagnostic(
+                &self.diagnostics,
+                "clipping_media_integrity_schedule",
+                std::time::Duration::ZERO,
+            );
+            return IntegrityScheduleOutcome::Unavailable;
+        }
+        pending.insert(clipping_id.to_string());
+        let transition = IntegrityTransition {
+            clipping_id: clipping_id.to_string(),
+            error_code,
+            now,
+        };
+        match self.sender.try_send(transition) {
+            Ok(()) => IntegrityScheduleOutcome::Scheduled,
+            Err(_) => {
+                pending.remove(clipping_id);
+                drop(pending);
+                record_integrity_diagnostic(
+                    &self.diagnostics,
+                    "clipping_media_integrity_schedule",
+                    std::time::Duration::ZERO,
+                );
+                IntegrityScheduleOutcome::Unavailable
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Deterministic queue-bound instrumentation for Phase 1 verification.
+    fn pending_count(&self) -> usize {
+        self.pending
+            .ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[allow(dead_code)] // Deterministic queue-drain instrumentation for Phase 1 verification.
+    fn wait_until_idle(&self, timeout: std::time::Duration) -> bool {
+        let pending = self
+            .pending
+            .ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (pending, _) = self
+            .pending
+            .changed
+            .wait_timeout_while(pending, timeout, |ids| !ids.is_empty())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.is_empty()
+    }
+}
+
+fn record_integrity_diagnostic(
+    diagnostics: &DatabaseDiagnostics,
+    operation: &'static str,
+    elapsed: std::time::Duration,
+) {
+    diagnostics.record(DatabaseDiagnosticInput {
+        kind: DatabaseDiagnosticKind::Recovery,
+        operation,
+        provider: DatabaseProvider::Newspaper,
+        workflow_id: None,
+        elapsed,
+        queue_depth: 0,
+        outcome: DatabaseDiagnosticOutcome::Error,
+        error_class: Some(DatabaseErrorClass::Recovery),
+    });
 }
 
 impl ClippingService {
-    pub fn new(db_path: PathBuf, writer: DatabaseWriter, layout: ClippingAssetLayout) -> Self {
+    pub fn new(
+        db_path: PathBuf,
+        writer: DatabaseWriter,
+        layout: ClippingAssetLayout,
+        diagnostics: DatabaseDiagnostics,
+    ) -> Self {
+        let integrity_scheduler = Arc::new(IntegrityTransitionScheduler::new(
+            writer.clone(),
+            diagnostics,
+        ));
         Self {
             db_path,
             writer,
             layout,
+            integrity_scheduler,
         }
     }
 
@@ -139,6 +315,21 @@ impl ClippingService {
         note_markdown: &str,
         now: i64,
     ) -> Result<NewspaperClipping, ClippingError> {
+        self.update_note_inner(id, expected_revision, title, note_markdown, now, || {})
+    }
+
+    fn update_note_inner<F>(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        title: &str,
+        note_markdown: &str,
+        now: i64,
+        after_writer: F,
+    ) -> Result<NewspaperClipping, ClippingError>
+    where
+        F: FnOnce(),
+    {
         if !validate_clipping_id(id) {
             return Err(ClippingError::new(ClippingErrorCode::InvalidId));
         }
@@ -153,11 +344,10 @@ impl ClippingService {
                     .map_err(Into::into)
             })
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))?;
+        after_writer();
         match outcome {
-            repository::NoteUpdateOutcome::Updated { .. }
-            | repository::NoteUpdateOutcome::Unchanged { .. } => self
-                .read_by_id(id)?
-                .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound)),
+            repository::NoteUpdateOutcome::Updated { clipping }
+            | repository::NoteUpdateOutcome::Unchanged { clipping } => Ok(clipping),
             repository::NoteUpdateOutcome::NotFound => {
                 Err(ClippingError::new(ClippingErrorCode::NotFound))
             }
@@ -168,6 +358,32 @@ impl ClippingService {
                 Err(ClippingError::new(ClippingErrorCode::NotEditable))
             }
         }
+    }
+
+    pub(crate) fn schedule_media_integrity_transition(
+        &self,
+        clipping_id: &str,
+        error_code: &'static str,
+        now: i64,
+    ) -> IntegrityScheduleOutcome {
+        if !validate_clipping_id(clipping_id) {
+            return IntegrityScheduleOutcome::Unavailable;
+        }
+        self.integrity_scheduler
+            .schedule(clipping_id, error_code, now)
+    }
+
+    #[allow(dead_code)] // Exposed to the media protocol Phase 1 verification fixtures.
+    pub(crate) fn pending_media_integrity_transitions(&self) -> usize {
+        self.integrity_scheduler.pending_count()
+    }
+
+    #[allow(dead_code)] // Exposed to the media protocol Phase 1 verification fixtures.
+    pub(crate) fn wait_for_media_integrity_transitions(
+        &self,
+        timeout: std::time::Duration,
+    ) -> bool {
+        self.integrity_scheduler.wait_until_idle(timeout)
     }
 
     pub fn delete(&self, id: &str, expected_revision: u64) -> Result<(), ClippingError> {
@@ -243,7 +459,12 @@ impl ClippingService {
         &self,
         diagnostics: &DatabaseDiagnostics,
     ) -> clipping_recovery::DeferredCleanupSummary {
-        clipping_recovery::run_deferred_cleanup(&self.db_path, &self.layout, diagnostics)
+        clipping_recovery::run_deferred_cleanup(
+            &self.db_path,
+            &self.writer,
+            &self.layout,
+            diagnostics,
+        )
     }
 }
 
@@ -313,7 +534,7 @@ mod tests {
         let layout = ClippingAssetLayout::new(temp.path().join("newspaper-clippings"));
         (
             temp,
-            ClippingService::new(db_path, writer, layout),
+            ClippingService::new(db_path, writer, layout, diagnostics.clone()),
             diagnostics,
         )
     }
@@ -423,6 +644,95 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_note_update_returns_its_own_writer_acknowledged_snapshot() {
+        let (_temp, service, _diagnostics) = fixture();
+        let created = service
+            .register_staged(staged_record(&service, ID))
+            .unwrap();
+        let (acknowledged_tx, acknowledged_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let first_service = service.clone();
+        let first = thread::spawn(move || {
+            first_service.update_note_inner(
+                ID,
+                created.revision,
+                "  Revision two  ",
+                "first caller",
+                101,
+                || {
+                    acknowledged_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+
+        acknowledged_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("revision two must commit before the response is released");
+        let third = service
+            .update_note(ID, 2, "Revision three", "second caller", 102)
+            .unwrap();
+        assert_eq!(third.revision, 3);
+        release_tx.send(()).unwrap();
+
+        let acknowledged = first.join().unwrap().unwrap();
+        assert_eq!(acknowledged.revision, 2);
+        assert_eq!(acknowledged.title, "Revision two");
+        assert_eq!(acknowledged.note_markdown, "first caller");
+        let stored = service.detail(ID).unwrap().unwrap().clipping;
+        assert_eq!(stored.revision, 3);
+        assert_eq!(stored.note_markdown, "second caller");
+    }
+
+    #[test]
+    fn persistence_gate_note_update_preserves_noop_not_found_and_not_editable_outcomes() {
+        let (_temp, service, _diagnostics) = fixture();
+        let created = service
+            .register_staged(staged_record(&service, ID))
+            .unwrap();
+        let unchanged = service
+            .update_note(
+                ID,
+                created.revision,
+                &created.title,
+                &created.note_markdown,
+                101,
+            )
+            .unwrap();
+        assert_eq!(unchanged.revision, created.revision);
+        assert_eq!(unchanged.updated_at, created.updated_at);
+
+        let missing = service.update_note(
+            "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+            1,
+            "Missing",
+            "note",
+            102,
+        );
+        assert_eq!(missing.unwrap_err().code, ClippingErrorCode::NotFound);
+
+        let owned_id = ID.to_string();
+        service
+            .writer
+            .execute(
+                ClippingService::context("test_make_clipping_not_editable"),
+                move |db| {
+                    db.execute(
+                        "UPDATE newspaper_clippings SET asset_state = 'creating' WHERE id = ?1",
+                        rusqlite::params![owned_id],
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let not_editable = service.update_note(ID, created.revision, "Blocked", "note", 103);
+        assert_eq!(
+            not_editable.unwrap_err().code,
+            ClippingErrorCode::NotEditable
+        );
+    }
+
+    #[test]
     fn persistence_gate_list_searches_full_note_but_returns_only_bounded_excerpt() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
@@ -456,9 +766,22 @@ mod tests {
         let created = service
             .register_staged(staged_record(&service, ID))
             .unwrap();
+        let other_id = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        for version in [1, 2] {
+            std::fs::write(
+                service.layout.thumbnail_path(ID, version).unwrap(),
+                encode_test_webp(4, 4),
+            )
+            .unwrap();
+        }
+        let other_thumbnail = service.layout.thumbnail_path(other_id, 1).unwrap();
+        std::fs::write(&other_thumbnail, encode_test_webp(4, 4)).unwrap();
         service.delete(ID, created.revision).unwrap();
         assert!(service.detail(ID).unwrap().is_none());
         assert!(!service.layout.canonical_path(ID).unwrap().exists());
+        assert!(!service.layout.thumbnail_path(ID, 1).unwrap().exists());
+        assert!(!service.layout.thumbnail_path(ID, 2).unwrap().exists());
+        assert!(other_thumbnail.exists());
         assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
     }
 
@@ -561,6 +884,7 @@ mod tests {
             service.db_path.clone(),
             retry_writer,
             service.layout.clone(),
+            retry_diagnostics.clone(),
         );
         let recovered = retry_service.recover_startup(&retry_diagnostics, 102);
         assert_eq!(recovered.creating_marked_ready, 1);
@@ -612,6 +936,7 @@ mod tests {
             service.db_path.clone(),
             retry_writer,
             service.layout.clone(),
+            retry_diagnostics.clone(),
         );
         let recovered = retry_service.recover_startup(&retry_diagnostics, 102);
         assert_eq!(recovered.deletions_completed, 1);
@@ -647,6 +972,7 @@ mod tests {
             .unwrap();
         let summary = clipping_recovery::run_deferred_cleanup_at(
             &service.db_path,
+            &service.writer,
             &service.layout,
             &diagnostics,
             future,
@@ -698,6 +1024,7 @@ mod tests {
         for _ in 0..2 {
             let summary = clipping_recovery::run_deferred_cleanup_at(
                 &service.db_path,
+                &service.writer,
                 &service.layout,
                 &diagnostics,
                 future,
@@ -734,7 +1061,7 @@ mod tests {
             .as_secs();
         let staging = service.layout.staging_dir().unwrap();
         let quarantine = service.layout.quarantine_dir().unwrap();
-        for index in 0..(clipping_recovery::CLEANUP_BUDGET_PER_CATEGORY + 8) {
+        for index in 0..(clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8) {
             let name = format!("orphan-{index:02}");
             std::fs::create_dir_all(staging.join(&name)).unwrap();
             // Force the quarantine move to collide so failed attempts remain
@@ -745,6 +1072,7 @@ mod tests {
 
         let summary = clipping_recovery::run_deferred_cleanup_at(
             &service.db_path,
+            &service.writer,
             &service.layout,
             &diagnostics,
             future,
@@ -752,12 +1080,104 @@ mod tests {
         assert_eq!(summary.processed, 0);
         assert_eq!(
             summary.failures,
-            clipping_recovery::CLEANUP_BUDGET_PER_CATEGORY
+            clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
+        );
+        assert_eq!(
+            summary.max_category_inspected,
+            clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY
+        );
+        assert_eq!(
+            summary.max_category_mutations,
+            clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
         );
         assert_eq!(
             std::fs::read_dir(staging).unwrap().count(),
-            clipping_recovery::CLEANUP_BUDGET_PER_CATEGORY + 8
+            clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8
         );
+    }
+
+    #[test]
+    fn persistence_gate_cleanup_cursors_reach_later_orphan_and_expired_entries() {
+        let (temp, service, diagnostics) = fixture();
+        let outside_downloads = temp.path().join("newspaper-downloads-never-enumerated");
+        std::fs::create_dir(&outside_downloads).unwrap();
+        std::fs::write(outside_downloads.join("sentinel.txt"), b"keep-me").unwrap();
+
+        for index in 0..(clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8) {
+            let id = format!("{index:08x}-1111-4111-8111-{index:012x}");
+            service
+                .register_staged(staged_record(&service, &id))
+                .unwrap();
+        }
+        let later_orphan = service
+            .layout
+            .assets_dir()
+            .unwrap()
+            .join("ffffffff-ffff-4fff-8fff-ffffffffffff");
+        std::fs::create_dir(&later_orphan).unwrap();
+
+        let future = SystemTime::now()
+            .checked_add(Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+        let fresh_timestamp = future
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 24 * 60 * 60;
+        let quarantine = service.layout.quarantine_dir().unwrap();
+        for index in 0..(clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8) {
+            std::fs::create_dir(quarantine.join(format!("{fresh_timestamp}-fresh-{index:04}")))
+                .unwrap();
+        }
+        let later_expired = quarantine.join("z-expired-entry");
+        std::fs::create_dir(&later_expired).unwrap();
+
+        let first = clipping_recovery::run_deferred_cleanup_at(
+            &service.db_path,
+            &service.writer,
+            &service.layout,
+            &diagnostics,
+            future,
+        );
+        assert!(later_orphan.exists());
+        assert!(later_expired.exists());
+        assert!(
+            first.max_category_inspected
+                <= clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY
+        );
+        assert!(
+            first.max_category_mutations <= clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
+        );
+
+        let second = clipping_recovery::run_deferred_cleanup_at(
+            &service.db_path,
+            &service.writer,
+            &service.layout,
+            &diagnostics,
+            future,
+        );
+        assert!(
+            !later_orphan.exists(),
+            "persisted cursor must reach later orphan"
+        );
+        assert!(
+            !later_expired.exists(),
+            "persisted cursor must reach later expiry"
+        );
+        assert!(
+            second.max_category_inspected
+                <= clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY
+        );
+        assert!(
+            second.max_category_mutations
+                <= clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
+        );
+        assert_eq!(
+            std::fs::read(outside_downloads.join("sentinel.txt")).unwrap(),
+            b"keep-me"
+        );
+        let diagnostics_text = format!("{:?}", diagnostics.snapshot());
+        assert!(!diagnostics_text.contains(&temp.path().to_string_lossy().to_string()));
     }
 
     fn create_dir_link(target: &Path, link: &Path) -> bool {

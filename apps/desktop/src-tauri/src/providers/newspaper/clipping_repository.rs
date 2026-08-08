@@ -213,10 +213,10 @@ pub fn mark_missing_from_ready(
     Ok(changed == 1)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NoteUpdateOutcome {
-    Updated { revision: u64 },
-    Unchanged { revision: u64 },
+    Updated { clipping: NewspaperClipping },
+    Unchanged { clipping: NewspaperClipping },
     NotFound,
     Conflict { current_revision: u64 },
     NotEditable,
@@ -262,7 +262,8 @@ pub fn update_note(
         });
     }
     if stored_title == title && stored_note == note_markdown {
-        return Ok(NoteUpdateOutcome::Unchanged { revision });
+        let clipping = load_by_id(connection, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        return Ok(NoteUpdateOutcome::Unchanged { clipping });
     }
     let changed = connection.execute(
         "UPDATE newspaper_clippings
@@ -276,9 +277,8 @@ pub fn update_note(
         params![id, title, note_markdown, now, expected_revision],
     )?;
     if changed == 1 {
-        return Ok(NoteUpdateOutcome::Updated {
-            revision: expected_revision + 1,
-        });
+        let clipping = load_by_id(connection, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        return Ok(NoteUpdateOutcome::Updated { clipping });
     }
     let current_revision: Option<u64> = connection
         .query_row(
@@ -728,6 +728,33 @@ pub fn load_all_ids(connection: &Connection) -> Result<Vec<String>> {
         .prepare("SELECT id FROM newspaper_clippings ORDER BY id ASC")?
         .query_map([], |row| row.get(0))?
         .collect()
+}
+
+pub fn load_newspaper_setting(connection: &Connection, key: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT value_json FROM newspaper_settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+pub fn save_newspaper_setting(
+    connection: &Connection,
+    key: &str,
+    value_json: &str,
+    now: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO newspaper_settings (key, value_json, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+             value_json = excluded.value_json,
+             updated_at = excluded.updated_at",
+        params![key, value_json, now],
+    )?;
+    Ok(())
 }
 
 /// Explicit source unlink for the World Journal reset transaction

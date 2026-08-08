@@ -6,9 +6,12 @@
 //! the same terminal states (AC-PERSIST-009). Diagnostics record only safe
 //! IDs, states, operations, elapsed time, and error classes (RECOVERY-005).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::app::database_diagnostics::{
     DatabaseDiagnosticInput, DatabaseDiagnosticKind, DatabaseDiagnosticOutcome,
@@ -26,8 +29,10 @@ pub const ASSET_CREATION_INCOMPLETE: &str = "ASSET_CREATION_INCOMPLETE";
 /// Orphan age thresholds (RECOVERY-004).
 pub const ORPHAN_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 pub const QUARANTINE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Bounded per-launch cleanup budget per category (RECOVERY-004).
-pub const CLEANUP_BUDGET_PER_CATEGORY: usize = 32;
+/// Independent bounded per-launch budgets per managed category (RECOVERY-004).
+pub const CLEANUP_INSPECTION_BUDGET_PER_CATEGORY: usize = 32;
+pub const CLEANUP_MUTATION_BUDGET_PER_CATEGORY: usize = 32;
+const CLEANUP_CURSOR_SETTING_KEY: &str = "clipping_cleanup_cursor_v1";
 
 fn write_context(operation: &'static str) -> DatabaseWriteContext {
     DatabaseWriteContext {
@@ -47,15 +52,42 @@ pub struct StartupRecoverySummary {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeferredCleanupSummary {
+    pub inspected: usize,
+    pub mutations_attempted: usize,
     pub processed: usize,
     pub failures: usize,
+    pub max_category_inspected: usize,
+    pub max_category_mutations: usize,
 }
 
 impl DeferredCleanupSummary {
     fn add(&mut self, other: Self) {
+        self.inspected = self.inspected.saturating_add(other.inspected);
+        self.mutations_attempted = self
+            .mutations_attempted
+            .saturating_add(other.mutations_attempted);
         self.processed = self.processed.saturating_add(other.processed);
         self.failures = self.failures.saturating_add(other.failures);
+        self.max_category_inspected = self
+            .max_category_inspected
+            .max(other.max_category_inspected.max(other.inspected));
+        self.max_category_mutations = self
+            .max_category_mutations
+            .max(other.max_category_mutations.max(other.mutations_attempted));
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct CleanupCursors {
+    staging: Option<String>,
+    assets: Option<String>,
+    trash: Option<String>,
+    quarantine: Option<String>,
+}
+
+struct CategoryCleanupResult {
+    summary: DeferredCleanupSummary,
+    cursor: Option<String>,
 }
 
 fn record_recovery_diagnostic(
@@ -212,7 +244,7 @@ pub fn complete_delete_pending_id(
         .unwrap_or_default()
         .as_nanos();
     let trash_entry = layout.move_canonical_to_trash(clipping_id, nonce)?;
-    layout.remove_thumbnail(clipping_id);
+    layout.remove_thumbnails(clipping_id)?;
     let id = clipping_id.to_string();
     let deleted = writer
         .execute(write_context("clipping_delete_row"), move |connection| {
@@ -288,18 +320,20 @@ pub fn run_startup_recovery(
 
 /// Bounded deferred cleanup for orphaned managed directories (RECOVERY-004).
 /// Scans only the managed clipping root - never user newspaper download
-/// directories - and processes at most `CLEANUP_BUDGET_PER_CATEGORY` entries
-/// per category so work resumes on later launches.
+/// directories, inspects and mutates independently bounded windows, and
+/// persists per-category progress so later entries resume on later launches.
 pub fn run_deferred_cleanup(
     db_path: &Path,
+    writer: &DatabaseWriter,
     layout: &ClippingAssetLayout,
     diagnostics: &DatabaseDiagnostics,
 ) -> DeferredCleanupSummary {
-    run_deferred_cleanup_at(db_path, layout, diagnostics, SystemTime::now())
+    run_deferred_cleanup_at(db_path, writer, layout, diagnostics, SystemTime::now())
 }
 
 pub(crate) fn run_deferred_cleanup_at(
     db_path: &Path,
+    writer: &DatabaseWriter,
     layout: &ClippingAssetLayout,
     diagnostics: &DatabaseDiagnostics,
     now_system: SystemTime,
@@ -307,50 +341,93 @@ pub(crate) fn run_deferred_cleanup_at(
     let started = std::time::Instant::now();
     let mut summary = DeferredCleanupSummary::default();
     let outcome = (|| -> Result<(), ClippingError> {
-        let known_ids = {
+        let (known_ids, mut cursors) = {
             let connection = open_runtime(db_path)
                 .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
-            repository::load_all_ids(&connection)
+            let known_ids: HashSet<_> = repository::load_all_ids(&connection)
                 .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
+                .into_iter()
+                .collect();
+            let cursor_json =
+                repository::load_newspaper_setting(&connection, CLEANUP_CURSOR_SETTING_KEY)
+                    .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+            let cursors: CleanupCursors = cursor_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default();
+            (known_ids, cursors)
         };
         // Staging directories without a row older than the grace period move
         // to quarantine.
-        summary.add(quarantine_orphans(
+        let staging = quarantine_orphans(
             layout,
             &layout.staging_dir()?,
             &known_ids,
+            cursors.staging.as_deref(),
             now_system,
             ORPHAN_GRACE,
             "stale-staging",
-        )?);
+        )?;
+        cursors.staging = staging.cursor;
+        summary.add(staging.summary);
 
         // Canonical asset directories without a row older than the grace
         // period move to quarantine rather than immediate deletion.
-        summary.add(quarantine_orphans(
+        let assets = quarantine_orphans(
             layout,
             &layout.assets_dir()?,
             &known_ids,
+            cursors.assets.as_deref(),
             now_system,
             ORPHAN_GRACE,
             "stale-asset",
-        )?);
+        )?;
+        cursors.assets = assets.cursor;
+        summary.add(assets.summary);
 
         // Trash entries without a row older than the grace period may be
         // deleted outright; their rows were already removed by confirmed
         // deletion.
-        summary.add(delete_orphan_trash(
+        let trash = delete_orphan_trash(
             layout,
             &known_ids,
+            cursors.trash.as_deref(),
             now_system,
             ORPHAN_GRACE,
-        )?);
+        )?;
+        cursors.trash = trash.cursor;
+        summary.add(trash.summary);
 
         // Quarantine entries are retained for seven days, then deleted.
-        summary.add(delete_expired_quarantine(
+        let quarantine = delete_expired_quarantine(
             layout,
+            cursors.quarantine.as_deref(),
             now_system,
             QUARANTINE_RETENTION,
-        )?);
+        )?;
+        cursors.quarantine = quarantine.cursor;
+        summary.add(quarantine.summary);
+
+        let cursor_json = serde_json::to_string(&cursors)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
+        let now = now_system
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or_default();
+        writer
+            .execute(
+                write_context("clipping_cleanup_save_cursor"),
+                move |connection| {
+                    repository::save_newspaper_setting(
+                        connection,
+                        CLEANUP_CURSOR_SETTING_KEY,
+                        &cursor_json,
+                        now,
+                    )
+                    .map_err(Into::into)
+                },
+            )
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))?;
 
         Ok(())
     })();
@@ -390,45 +467,30 @@ fn quarantine_age(
 fn quarantine_orphans(
     layout: &ClippingAssetLayout,
     directory: &Path,
-    known_ids: &[String],
+    known_ids: &HashSet<String>,
+    cursor: Option<&str>,
     now: SystemTime,
     grace: Duration,
     reason: &'static str,
-) -> Result<DeferredCleanupSummary, ClippingError> {
-    let mut summary = DeferredCleanupSummary::default();
-    let mut attempted = 0usize;
-    let read = fs::read_dir(directory)
-        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
-    for entry in read {
-        if attempted >= CLEANUP_BUDGET_PER_CATEGORY {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                attempted += 1;
-                summary.failures += 1;
-                continue;
-            }
-        };
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            attempted += 1;
-            summary.failures += 1;
-            continue;
-        };
+) -> Result<CategoryCleanupResult, ClippingError> {
+    let window = bounded_directory_window(directory, cursor)?;
+    let mut summary = DeferredCleanupSummary {
+        inspected: window.inspected,
+        failures: window.failures,
+        ..Default::default()
+    };
+    for (entry, name) in window.entries {
         if known_ids.contains(&name) {
             continue;
         }
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => {
-                attempted += 1;
                 summary.failures += 1;
                 continue;
             }
         };
         if metadata.file_type().is_symlink() {
-            attempted += 1;
             summary.failures += 1;
             continue;
         }
@@ -436,139 +498,200 @@ fn quarantine_orphans(
             continue;
         }
         let Some(age) = directory_age(&metadata, now) else {
-            attempted += 1;
             summary.failures += 1;
             continue;
         };
         if age < grace {
             continue;
+        }
+        if summary.mutations_attempted >= CLEANUP_MUTATION_BUDGET_PER_CATEGORY {
+            break;
         }
         let timestamp = now
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_secs() as i64)
             .unwrap_or_default();
-        attempted += 1;
+        summary.mutations_attempted += 1;
         match layout.quarantine_directory(&entry.path(), reason, timestamp) {
             Ok(()) => summary.processed += 1,
             Err(_) => summary.failures += 1,
         }
     }
-    Ok(summary)
+    summary.max_category_inspected = summary.inspected;
+    summary.max_category_mutations = summary.mutations_attempted;
+    Ok(CategoryCleanupResult {
+        summary,
+        cursor: window.cursor,
+    })
 }
 
 fn delete_orphan_trash(
     layout: &ClippingAssetLayout,
-    known_ids: &[String],
+    known_ids: &HashSet<String>,
+    cursor: Option<&str>,
     now: SystemTime,
     grace: Duration,
-) -> Result<DeferredCleanupSummary, ClippingError> {
-    let trash_root = layout.trash_dir()?;
-    let mut summary = DeferredCleanupSummary::default();
-    let mut attempted = 0usize;
-    let read = fs::read_dir(&trash_root)
-        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
-    for entry in read {
-        if attempted >= CLEANUP_BUDGET_PER_CATEGORY {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                attempted += 1;
-                summary.failures += 1;
-                continue;
-            }
-        };
+) -> Result<CategoryCleanupResult, ClippingError> {
+    let window = bounded_directory_window(&layout.trash_dir()?, cursor)?;
+    let mut summary = DeferredCleanupSummary {
+        inspected: window.inspected,
+        failures: window.failures,
+        ..Default::default()
+    };
+    for (entry, name) in window.entries {
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => {
-                attempted += 1;
                 summary.failures += 1;
                 continue;
             }
         };
         if metadata.file_type().is_symlink() {
-            attempted += 1;
             summary.failures += 1;
             continue;
         }
         if !metadata.file_type().is_dir() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_string();
         // Trash entries are named <clipping-id>-<nonce>; keep entries whose
         // clipping ID still exists.
-        let owned = known_ids
-            .iter()
-            .any(|id| name.starts_with(&format!("{id}-")));
+        let owned = name
+            .get(..36)
+            .filter(|_| name.as_bytes().get(36) == Some(&b'-'))
+            .is_some_and(|id| known_ids.contains(id));
         if owned {
             continue;
         }
         let Some(age) = directory_age(&metadata, now) else {
-            attempted += 1;
             summary.failures += 1;
             continue;
         };
         if age < grace {
             continue;
         }
-        attempted += 1;
+        if summary.mutations_attempted >= CLEANUP_MUTATION_BUDGET_PER_CATEGORY {
+            break;
+        }
+        summary.mutations_attempted += 1;
         match layout.remove_trash_entry(&entry.path()) {
             Ok(()) => summary.processed += 1,
             Err(_) => summary.failures += 1,
         }
     }
-    Ok(summary)
+    summary.max_category_inspected = summary.inspected;
+    summary.max_category_mutations = summary.mutations_attempted;
+    Ok(CategoryCleanupResult {
+        summary,
+        cursor: window.cursor,
+    })
 }
 
 fn delete_expired_quarantine(
     layout: &ClippingAssetLayout,
+    cursor: Option<&str>,
     now: SystemTime,
     retention: Duration,
-) -> Result<DeferredCleanupSummary, ClippingError> {
-    let quarantine_root = layout.quarantine_dir()?;
-    let mut summary = DeferredCleanupSummary::default();
-    let mut attempted = 0usize;
-    let read = fs::read_dir(&quarantine_root)
-        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
-    for entry in read {
-        if attempted >= CLEANUP_BUDGET_PER_CATEGORY {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                attempted += 1;
-                summary.failures += 1;
-                continue;
-            }
-        };
+) -> Result<CategoryCleanupResult, ClippingError> {
+    let window = bounded_directory_window(&layout.quarantine_dir()?, cursor)?;
+    let mut summary = DeferredCleanupSummary {
+        inspected: window.inspected,
+        failures: window.failures,
+        ..Default::default()
+    };
+    for (entry, _) in window.entries {
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => {
-                attempted += 1;
                 summary.failures += 1;
                 continue;
             }
         };
         if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            attempted += 1;
             summary.failures += 1;
             continue;
         }
         let Some(age) = quarantine_age(&entry, &metadata, now) else {
-            attempted += 1;
             summary.failures += 1;
             continue;
         };
         if age < retention {
             continue;
         }
-        attempted += 1;
+        if summary.mutations_attempted >= CLEANUP_MUTATION_BUDGET_PER_CATEGORY {
+            break;
+        }
+        summary.mutations_attempted += 1;
         match layout.remove_quarantine_entry(&entry.path()) {
             Ok(()) => summary.processed += 1,
             Err(_) => summary.failures += 1,
         }
     }
-    Ok(summary)
+    summary.max_category_inspected = summary.inspected;
+    summary.max_category_mutations = summary.mutations_attempted;
+    Ok(CategoryCleanupResult {
+        summary,
+        cursor: window.cursor,
+    })
+}
+
+struct DirectoryWindow {
+    entries: Vec<(fs::DirEntry, String)>,
+    inspected: usize,
+    failures: usize,
+    cursor: Option<String>,
+}
+
+fn bounded_directory_window(
+    directory: &Path,
+    cursor: Option<&str>,
+) -> Result<DirectoryWindow, ClippingError> {
+    let mut window = collect_directory_window(directory, cursor, false)?;
+    if window.entries.is_empty() && window.failures == 0 && cursor.is_some() {
+        window = collect_directory_window(directory, cursor, true)?;
+    }
+    Ok(window)
+}
+
+fn collect_directory_window(
+    directory: &Path,
+    cursor: Option<&str>,
+    wrapped: bool,
+) -> Result<DirectoryWindow, ClippingError> {
+    let mut result = DirectoryWindow {
+        entries: Vec::new(),
+        inspected: 0,
+        failures: 0,
+        cursor: cursor.map(str::to_string),
+    };
+    let read = fs::read_dir(directory)
+        .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
+    for entry in read {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                result.inspected += 1;
+                result.failures += 1;
+                if result.inspected >= CLEANUP_INSPECTION_BUDGET_PER_CATEGORY {
+                    break;
+                }
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(cursor) = cursor {
+            let after_cursor = name.as_str() > cursor;
+            if (!wrapped && !after_cursor) || (wrapped && after_cursor) {
+                continue;
+            }
+        } else if wrapped {
+            continue;
+        }
+        result.inspected += 1;
+        result.cursor = Some(name.clone());
+        result.entries.push((entry, name));
+        if result.inspected >= CLEANUP_INSPECTION_BUDGET_PER_CATEGORY {
+            break;
+        }
+    }
+    Ok(result)
 }

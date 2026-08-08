@@ -11,21 +11,17 @@ use tauri::http::{
 
 const CACHE_SCHEMA_VERSION: i64 = 1;
 
-use crate::app::database_diagnostics::DatabaseProvider;
-use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
-
 use super::clipping_assets::ClippingAssetLayout;
 use super::clipping_models::{validate_clipping_id, ClippingErrorCode};
-use super::clipping_repository;
+use super::clipping_service::ClippingService;
 
 pub fn handle_request(
     db_path: &Path,
     cache_root: &Path,
-    clipping_layout: &ClippingAssetLayout,
-    writer: &DatabaseWriter,
+    clipping_service: &ClippingService,
     request: &Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
-    match resolve_media(db_path, cache_root, clipping_layout, writer, request) {
+    match resolve_media(db_path, cache_root, clipping_service, request) {
         Ok(media) => response(
             StatusCode::OK,
             media.bytes,
@@ -75,8 +71,7 @@ enum MediaError {
 fn resolve_media(
     db_path: &Path,
     cache_root: &Path,
-    clipping_layout: &ClippingAssetLayout,
-    writer: &DatabaseWriter,
+    clipping_service: &ClippingService,
     request: &Request<Vec<u8>>,
 ) -> Result<ResolvedMedia, MediaError> {
     let segments = request
@@ -107,10 +102,10 @@ fn resolve_media(
     let connection = crate::cache::open_runtime(db_path).map_err(|_| MediaError::Internal)?;
 
     if segments[0] == "clipping" {
-        return resolve_clipping(&connection, clipping_layout, writer, segments[1], &version);
+        return resolve_clipping(&connection, clipping_service, segments[1], &version);
     }
     if segments[0] == "clipping-thumbnail" {
-        return resolve_clipping_thumbnail(&connection, clipping_layout, segments[1], &version);
+        return resolve_clipping_thumbnail(&connection, clipping_service, segments[1], &version);
     }
 
     let (path, mime_type, etag) = match segments[0] {
@@ -135,8 +130,7 @@ fn resolve_media(
 
 fn resolve_clipping(
     connection: &Connection,
-    layout: &ClippingAssetLayout,
-    writer: &DatabaseWriter,
+    service: &ClippingService,
     clipping_id: &str,
     requested_version: &str,
 ) -> Result<ResolvedMedia, MediaError> {
@@ -171,36 +165,28 @@ fn resolve_clipping(
     {
         return Err(MediaError::NotFound);
     }
-    if let Err(error) =
-        layout.verify_canonical(clipping_id, record.3, record.4, record.5, &record.6)
-    {
-        let safe_code = match error.code {
-            ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
-            _ => "CLIPPING_ASSET_MISSING",
-        };
-        let id = clipping_id.to_string();
-        let code = safe_code.to_string();
-        let _ = writer.execute(
-            DatabaseWriteContext {
-                operation: "clipping_media_mark_missing",
-                provider: DatabaseProvider::Newspaper,
-                workflow_id: None,
-            },
-            move |db| {
-                clipping_repository::mark_missing_from_ready(
-                    db,
-                    &id,
-                    &code,
-                    chrono::Utc::now().timestamp(),
-                )
-                .map_err(Into::into)
-            },
-        );
-        return Err(MediaError::NotFound);
-    }
-    let (bytes, mime) = layout
-        .read_canonical_for_protocol(clipping_id)
-        .map_err(|_| MediaError::NotFound)?;
+    let validated = service.layout().read_validated_canonical_for_protocol(
+        clipping_id,
+        record.3,
+        record.4,
+        record.5,
+        &record.6,
+    );
+    let (bytes, mime) = match validated {
+        Ok(validated) => validated,
+        Err(error) => {
+            let safe_code = match error.code {
+                ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
+                _ => "CLIPPING_ASSET_MISSING",
+            };
+            let _ = service.schedule_media_integrity_transition(
+                clipping_id,
+                safe_code,
+                chrono::Utc::now().timestamp(),
+            );
+            return Err(MediaError::NotFound);
+        }
+    };
     Ok(ResolvedMedia {
         bytes,
         mime_type: mime.to_string(),
@@ -210,7 +196,7 @@ fn resolve_clipping(
 
 fn resolve_clipping_thumbnail(
     connection: &Connection,
-    layout: &ClippingAssetLayout,
+    service: &ClippingService,
     clipping_id: &str,
     requested_version: &str,
 ) -> Result<ResolvedMedia, MediaError> {
@@ -227,8 +213,9 @@ fn resolve_clipping_thumbnail(
     if record.1 != "ready" || requested_version != expected {
         return Err(MediaError::NotFound);
     }
-    let (bytes, mime) = layout
-        .read_thumbnail_for_protocol(clipping_id)
+    let (bytes, mime) = service
+        .layout()
+        .read_thumbnail_for_protocol(clipping_id, record.0)
         .map_err(|_| MediaError::NotFound)?;
     Ok(ResolvedMedia {
         bytes,
@@ -377,11 +364,13 @@ pub fn request_for_url(url: &str) -> Result<Request<Vec<u8>>, String> {
 mod tests {
     use super::*;
     use crate::app::database_diagnostics::DatabaseDiagnostics;
-    use crate::app::database_writer::DatabaseWriter;
+    use crate::app::database_diagnostics::DatabaseProvider;
+    use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
     use crate::newspaper::clipping_assets::{encode_test_webp, sha256_hex};
     use crate::newspaper::clipping_models::ClippingSourceKind;
     use crate::newspaper::clipping_repository::NewClippingRecord;
     use crate::newspaper::clipping_service::ClippingService;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn fixture() -> (
@@ -390,6 +379,8 @@ mod tests {
         PathBuf,
         ClippingAssetLayout,
         DatabaseWriter,
+        ClippingService,
+        DatabaseDiagnostics,
     ) {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
@@ -445,16 +436,31 @@ mod tests {
         drop(connection);
         let clipping_layout =
             ClippingAssetLayout::new(directory.path().join("newspaper-clippings"));
-        let writer =
-            DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
-        (directory, db_path, cache_root, clipping_layout, writer)
+        let diagnostics = DatabaseDiagnostics::default();
+        let writer = DatabaseWriter::start(db_path.clone(), diagnostics.clone()).unwrap();
+        let service = ClippingService::new(
+            db_path.clone(),
+            writer.clone(),
+            clipping_layout.clone(),
+            diagnostics.clone(),
+        );
+        (
+            directory,
+            db_path,
+            cache_root,
+            clipping_layout,
+            writer,
+            service,
+            diagnostics,
+        )
     }
 
     #[test]
     fn registered_page_and_thumbnail_receive_cacheable_responses() {
-        let (_directory, db_path, cache_root, clipping_layout, writer) = fixture();
+        let (_directory, db_path, cache_root, _clipping_layout, _writer, service, _diagnostics) =
+            fixture();
         let page = request_for_url("http://newspaper-media.localhost/page/page?v=3").unwrap();
-        let page_response = handle_request(&db_path, &cache_root, &clipping_layout, &writer, &page);
+        let page_response = handle_request(&db_path, &cache_root, &service, &page);
         assert_eq!(page_response.status(), StatusCode::OK);
         assert_eq!(page_response.headers()[CONTENT_TYPE], "image/jpeg");
         assert_eq!(
@@ -464,15 +470,15 @@ mod tests {
 
         let thumbnail =
             request_for_url("http://newspaper-media.localhost/thumbnail/job?v=3-1").unwrap();
-        let thumbnail_response =
-            handle_request(&db_path, &cache_root, &clipping_layout, &writer, &thumbnail);
+        let thumbnail_response = handle_request(&db_path, &cache_root, &service, &thumbnail);
         assert_eq!(thumbnail_response.status(), StatusCode::OK);
         assert_eq!(thumbnail_response.headers()[CONTENT_TYPE], "image/webp");
     }
 
     #[test]
     fn malformed_unknown_and_stale_requests_are_rejected_without_paths() {
-        let (directory, db_path, cache_root, clipping_layout, writer) = fixture();
+        let (directory, db_path, cache_root, _clipping_layout, _writer, service, _diagnostics) =
+            fixture();
         for url in [
             "http://newspaper-media.localhost/page/..%2Fsecret?v=3",
             "http://newspaper-media.localhost/page/missing?v=3",
@@ -480,8 +486,7 @@ mod tests {
             "http://newspaper-media.localhost/other/page?v=3",
         ] {
             let request = request_for_url(url).unwrap();
-            let response =
-                handle_request(&db_path, &cache_root, &clipping_layout, &writer, &request);
+            let response = handle_request(&db_path, &cache_root, &service, &request);
             assert!(!response.status().is_success());
             let body = String::from_utf8_lossy(response.body());
             assert!(!body.contains(&directory.path().to_string_lossy().to_string()));
@@ -491,11 +496,10 @@ mod tests {
     #[test]
     fn clipping_routes_require_current_versions_and_mark_corruption_missing() {
         const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
-        let (directory, db_path, cache_root, clipping_layout, writer) = fixture();
+        let (directory, db_path, cache_root, clipping_layout, _writer, service, _diagnostics) =
+            fixture();
         let bytes = encode_test_webp(24, 16);
         clipping_layout.write_staging(ID, &bytes).unwrap();
-        let service =
-            ClippingService::new(db_path.clone(), writer.clone(), clipping_layout.clone());
         service
             .register_staged(NewClippingRecord {
                 id: ID.to_string(),
@@ -522,15 +526,14 @@ mod tests {
                 now: 100,
             })
             .unwrap();
-        std::fs::write(clipping_layout.thumbnail_path(ID).unwrap(), &bytes).unwrap();
+        std::fs::write(clipping_layout.thumbnail_path(ID, 1).unwrap(), &bytes).unwrap();
 
         for (route, expected) in [("clipping", "1"), ("clipping-thumbnail", "1-1")] {
             let request = request_for_url(&format!(
                 "http://newspaper-media.localhost/{route}/{ID}?v={expected}"
             ))
             .unwrap();
-            let response =
-                handle_request(&db_path, &cache_root, &clipping_layout, &writer, &request);
+            let response = handle_request(&db_path, &cache_root, &service, &request);
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[CONTENT_TYPE], "image/webp");
         }
@@ -539,7 +542,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            handle_request(&db_path, &cache_root, &clipping_layout, &writer, &stale).status(),
+            handle_request(&db_path, &cache_root, &service, &stale).status(),
             StatusCode::NOT_FOUND
         );
 
@@ -548,10 +551,11 @@ mod tests {
             "http://newspaper-media.localhost/clipping/{ID}?v=1"
         ))
         .unwrap();
-        let response = handle_request(&db_path, &cache_root, &clipping_layout, &writer, &corrupt);
+        let response = handle_request(&db_path, &cache_root, &service, &corrupt);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(!String::from_utf8_lossy(response.body())
             .contains(&directory.path().to_string_lossy().to_string()));
+        assert!(service.wait_for_media_integrity_transitions(Duration::from_secs(2)));
         let connection = crate::cache::open_runtime(&db_path).unwrap();
         let state: String = connection
             .query_row(
@@ -561,5 +565,267 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "missing");
+    }
+
+    #[test]
+    fn corrupt_media_response_is_nonblocking_coalesced_and_eventually_marks_missing() {
+        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let (directory, db_path, cache_root, layout, writer, service, diagnostics) = fixture();
+        let bytes = encode_test_webp(24, 16);
+        layout.write_staging(ID, &bytes).unwrap();
+        let created = service
+            .register_staged(NewClippingRecord {
+                id: ID.to_string(),
+                source_job_id: None,
+                source_page_id: None,
+                source_media_version_snapshot: 1,
+                source_kind_snapshot: ClippingSourceKind::Optimized,
+                source_mime_type_snapshot: "image/webp".to_string(),
+                source_checksum_snapshot: None,
+                edition_code_snapshot: "NY".to_string(),
+                edition_name_snapshot: "New York".to_string(),
+                publication_date_snapshot: "2026-08-08".to_string(),
+                page_number_snapshot: "A01".to_string(),
+                source_pixel_width: 24,
+                source_pixel_height: 16,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 24,
+                crop_height: 16,
+                asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
+                asset_byte_count: bytes.len() as u64,
+                asset_checksum_sha256: sha256_hex(&bytes),
+                title: "New York".to_string(),
+                now: 100,
+            })
+            .unwrap();
+        service
+            .update_note(
+                ID,
+                created.revision,
+                "New York",
+                "secret-note-sentinel",
+                101,
+            )
+            .unwrap();
+        std::fs::write(layout.canonical_path(ID).unwrap(), b"corrupt").unwrap();
+
+        let (writer_entered_tx, writer_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::sync_channel(1);
+        let occupied_writer = writer.clone();
+        let blocker = std::thread::spawn(move || {
+            occupied_writer.execute(
+                DatabaseWriteContext {
+                    operation: "test_occupy_writer_for_media",
+                    provider: DatabaseProvider::Newspaper,
+                    workflow_id: None,
+                },
+                move |_db| {
+                    writer_entered_tx.send(()).unwrap();
+                    release_writer_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        writer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer must be deliberately occupied");
+
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let response_service = service.clone();
+        let response_db = db_path.clone();
+        let response_cache = cache_root.clone();
+        std::thread::spawn(move || {
+            let request = request_for_url(&format!(
+                "http://newspaper-media.localhost/clipping/{ID}?v=1"
+            ))
+            .unwrap();
+            response_tx
+                .send(handle_request(
+                    &response_db,
+                    &response_cache,
+                    &response_service,
+                    &request,
+                ))
+                .unwrap();
+        });
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("media response must not wait for the occupied writer");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(service.pending_media_integrity_transitions(), 1);
+
+        for _ in 0..(super::super::clipping_service::MEDIA_INTEGRITY_QUEUE_CAPACITY * 4) {
+            let request = request_for_url(&format!(
+                "http://newspaper-media.localhost/clipping/{ID}?v=1"
+            ))
+            .unwrap();
+            assert_eq!(
+                handle_request(&db_path, &cache_root, &service, &request).status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert_eq!(service.pending_media_integrity_transitions(), 1);
+
+        release_writer_tx.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        assert!(service.wait_for_media_integrity_transitions(Duration::from_secs(2)));
+        let connection = crate::cache::open_runtime(&db_path).unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT asset_state FROM newspaper_clippings WHERE id = ?1",
+                params![ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "missing");
+
+        let diagnostics_text = format!("{:?}", diagnostics.snapshot());
+        assert!(!diagnostics_text.contains("secret-note-sentinel"));
+        assert!(!diagnostics_text.contains(&directory.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn writer_shutdown_never_hangs_corrupt_media_response() {
+        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let (_directory, db_path, cache_root, layout, writer, service, diagnostics) = fixture();
+        let bytes = encode_test_webp(24, 16);
+        layout.write_staging(ID, &bytes).unwrap();
+        service
+            .register_staged(NewClippingRecord {
+                id: ID.to_string(),
+                source_job_id: None,
+                source_page_id: None,
+                source_media_version_snapshot: 1,
+                source_kind_snapshot: ClippingSourceKind::Optimized,
+                source_mime_type_snapshot: "image/webp".to_string(),
+                source_checksum_snapshot: None,
+                edition_code_snapshot: "NY".to_string(),
+                edition_name_snapshot: "New York".to_string(),
+                publication_date_snapshot: "2026-08-08".to_string(),
+                page_number_snapshot: "A01".to_string(),
+                source_pixel_width: 24,
+                source_pixel_height: 16,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 24,
+                crop_height: 16,
+                asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
+                asset_byte_count: bytes.len() as u64,
+                asset_checksum_sha256: sha256_hex(&bytes),
+                title: "New York".to_string(),
+                now: 100,
+            })
+            .unwrap();
+        std::fs::write(layout.canonical_path(ID).unwrap(), b"corrupt").unwrap();
+        writer.shutdown().unwrap();
+
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let request = request_for_url(&format!(
+            "http://newspaper-media.localhost/clipping/{ID}?v=1"
+        ))
+        .unwrap();
+        std::thread::spawn(move || {
+            response_tx
+                .send(handle_request(&db_path, &cache_root, &service, &request))
+                .unwrap();
+        });
+        assert_eq!(
+            response_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("closed writer must not block the protocol")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && !diagnostics
+                .snapshot()
+                .iter()
+                .any(|event| event.operation == "clipping_media_integrity_transition")
+        {
+            std::thread::yield_now();
+        }
+        assert!(diagnostics
+            .snapshot()
+            .iter()
+            .any(|event| event.operation == "clipping_media_integrity_transition"));
+    }
+
+    #[test]
+    fn thumbnail_protocol_requires_the_canonical_asset_version_file() {
+        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let (_directory, db_path, cache_root, layout, writer, service, _diagnostics) = fixture();
+        let canonical = encode_test_webp(24, 16);
+        layout.write_staging(ID, &canonical).unwrap();
+        service
+            .register_staged(NewClippingRecord {
+                id: ID.to_string(),
+                source_job_id: None,
+                source_page_id: None,
+                source_media_version_snapshot: 1,
+                source_kind_snapshot: ClippingSourceKind::Optimized,
+                source_mime_type_snapshot: "image/webp".to_string(),
+                source_checksum_snapshot: None,
+                edition_code_snapshot: "NY".to_string(),
+                edition_name_snapshot: "New York".to_string(),
+                publication_date_snapshot: "2026-08-08".to_string(),
+                page_number_snapshot: "A01".to_string(),
+                source_pixel_width: 24,
+                source_pixel_height: 16,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 24,
+                crop_height: 16,
+                asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
+                asset_byte_count: canonical.len() as u64,
+                asset_checksum_sha256: sha256_hex(&canonical),
+                title: "New York".to_string(),
+                now: 100,
+            })
+            .unwrap();
+        let version_one = encode_test_webp(8, 8);
+        let version_two = encode_test_webp(9, 9);
+        std::fs::write(layout.thumbnail_path(ID, 1).unwrap(), &version_one).unwrap();
+        let owned_id = ID.to_string();
+        writer
+            .execute(
+                DatabaseWriteContext {
+                    operation: "test_increment_clipping_asset_version",
+                    provider: DatabaseProvider::Newspaper,
+                    workflow_id: None,
+                },
+                move |db| {
+                    db.execute(
+                        "UPDATE newspaper_clippings SET asset_version = 2 WHERE id = ?1",
+                        params![owned_id],
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let current = request_for_url(&format!(
+            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=2-1"
+        ))
+        .unwrap();
+        assert_eq!(
+            handle_request(&db_path, &cache_root, &service, &current).status(),
+            StatusCode::NOT_FOUND,
+            "asset-version-1 bytes must not satisfy a version-2 request"
+        );
+        std::fs::write(layout.thumbnail_path(ID, 2).unwrap(), &version_two).unwrap();
+        let current_response = handle_request(&db_path, &cache_root, &service, &current);
+        assert_eq!(current_response.status(), StatusCode::OK);
+        assert_eq!(current_response.body(), &version_two);
+
+        let stale = request_for_url(&format!(
+            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=1-1"
+        ))
+        .unwrap();
+        assert_eq!(
+            handle_request(&db_path, &cache_root, &service, &stale).status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
