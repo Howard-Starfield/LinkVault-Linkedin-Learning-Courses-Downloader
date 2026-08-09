@@ -21,6 +21,7 @@ use crate::cache::open_runtime;
 use super::clipping_assets::{thumbnail_owner, ClippingAssetLayout};
 use super::clipping_models::{ClippingAssetState, ClippingError, ClippingErrorCode};
 use super::clipping_repository::{self as repository};
+use super::clipping_roots::ClippingRootRegistry;
 
 /// Missing canonical bytes recorded by creation recovery.
 pub const ASSET_CREATION_INCOMPLETE: &str = "ASSET_CREATION_INCOMPLETE";
@@ -59,7 +60,7 @@ pub struct DeferredCleanupSummary {
 }
 
 impl DeferredCleanupSummary {
-    fn add(&mut self, other: Self) {
+    pub(crate) fn add(&mut self, other: Self) {
         self.enumerated = self.enumerated.saturating_add(other.enumerated);
         self.mutations_attempted = self
             .mutations_attempted
@@ -123,12 +124,13 @@ pub fn recover_creating_id(
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
             .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound));
     };
-    ClippingAssetLayout::validate_relative_path(&target.asset_relative_path)?;
+    ClippingAssetLayout::validate_relative_path_for_id(&target.asset_relative_path, &target.id)?;
 
     // 1. Canonical final file present and valid -> mark ready.
     if layout
-        .verify_canonical(
+        .verify_canonical_at(
             &target.id,
+            &target.asset_relative_path,
             target.asset_byte_count,
             target.asset_pixel_width,
             target.asset_pixel_height,
@@ -150,10 +152,13 @@ pub fn recover_creating_id(
             &target.asset_checksum_sha256,
         )
         .is_ok()
-        && layout.promote_staging(&target.id).is_ok()
         && layout
-            .verify_canonical(
+            .promote_staging_to(&target.id, &target.asset_relative_path)
+            .is_ok()
+        && layout
+            .verify_canonical_at(
                 &target.id,
+                &target.asset_relative_path,
                 target.asset_byte_count,
                 target.asset_pixel_width,
                 target.asset_pixel_height,
@@ -213,23 +218,41 @@ pub fn complete_delete_pending_id(
     diagnostics: &DatabaseDiagnostics,
     clipping_id: &str,
 ) -> Result<(), ClippingError> {
-    let still_pending = {
+    let target = {
         let connection = open_runtime(db_path)
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
-        matches!(
-            repository::row_state(&connection, clipping_id)
-                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?,
-            Some(ClippingAssetState::DeletePending)
-        )
+        repository::load_delete_pending_rows(&connection)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
+            .into_iter()
+            .find(|row| row.id == clipping_id)
     };
-    if !still_pending {
+    let Some(target) = target else {
         return Ok(());
-    }
+    };
+    complete_delete_pending_target(
+        writer,
+        layout,
+        layout,
+        diagnostics,
+        &target.id,
+        &target.asset_relative_path,
+    )
+}
+
+pub fn complete_delete_pending_target(
+    writer: &DatabaseWriter,
+    asset_layout: &ClippingAssetLayout,
+    thumbnail_layout: &ClippingAssetLayout,
+    diagnostics: &DatabaseDiagnostics,
+    clipping_id: &str,
+    asset_relative_path: &str,
+) -> Result<(), ClippingError> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let trash_entry = layout.move_canonical_to_trash(clipping_id, nonce)?;
+    let trash_entry =
+        asset_layout.move_canonical_to_trash_at(clipping_id, asset_relative_path, nonce)?;
     let id = clipping_id.to_string();
     let deleted = writer
         .execute(write_context("clipping_delete_row"), move |connection| {
@@ -242,7 +265,7 @@ pub fn complete_delete_pending_id(
         return Err(ClippingError::new(ClippingErrorCode::DeleteFailed));
     }
     let thumbnail_started = std::time::Instant::now();
-    let thumbnail_cleanup_failed = match layout.remove_thumbnails(clipping_id) {
+    let thumbnail_cleanup_failed = match thumbnail_layout.remove_thumbnails(clipping_id) {
         Ok(summary) => summary.failures > 0,
         Err(_) => true,
     };
@@ -255,7 +278,7 @@ pub fn complete_delete_pending_id(
         );
     }
     if let Some(entry) = trash_entry {
-        if layout.remove_trash_entry(&entry).is_err() {
+        if asset_layout.remove_trash_entry(&entry).is_err() {
             // Trash cleanup failures are retryable through orphan cleanup and
             // never recreate the deleted clipping.
             return Err(ClippingError::new(ClippingErrorCode::DeleteFailed));
@@ -316,6 +339,67 @@ pub fn run_startup_recovery(
     summary
 }
 
+pub fn run_startup_recovery_roots(
+    db_path: &Path,
+    writer: &DatabaseWriter,
+    roots: &ClippingRootRegistry,
+    thumbnail_layout: &ClippingAssetLayout,
+    diagnostics: &DatabaseDiagnostics,
+    now: i64,
+) -> StartupRecoverySummary {
+    let started = std::time::Instant::now();
+    let mut summary = StartupRecoverySummary::default();
+    let outcome = (|| -> Result<(), ClippingError> {
+        let (creating, deleting) = {
+            let connection = open_runtime(db_path)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+            (
+                repository::load_creating_rows(&connection)
+                    .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?,
+                repository::load_delete_pending_rows(&connection)
+                    .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?,
+            )
+        };
+        for target in creating {
+            let result = roots
+                .resolve(&target.asset_root_id)
+                .and_then(|layout| recover_creating_id(db_path, writer, &layout, &target.id, now));
+            match result {
+                Ok(ClippingAssetState::Ready) => summary.creating_marked_ready += 1,
+                Ok(_) => summary.creating_marked_missing += 1,
+                Err(_) => summary.failures += 1,
+            }
+        }
+        for target in deleting {
+            let result = roots.resolve(&target.asset_root_id).and_then(|layout| {
+                complete_delete_pending_target(
+                    writer,
+                    &layout,
+                    thumbnail_layout,
+                    diagnostics,
+                    &target.id,
+                    &target.asset_relative_path,
+                )
+            });
+            match result {
+                Ok(()) => summary.deletions_completed += 1,
+                Err(_) => summary.failures += 1,
+            }
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        summary.failures = summary.failures.saturating_add(1);
+    }
+    record_recovery_diagnostic(
+        diagnostics,
+        "clipping_startup_recovery",
+        started.elapsed(),
+        outcome.is_err() || summary.failures > 0,
+    );
+    summary
+}
+
 /// Detached deferred cleanup for orphaned managed entries (RECOVERY-004).
 /// It completely and streaming-enumerates only managed clipping categories,
 /// reports actual iterator consumption, and independently caps mutation
@@ -334,16 +418,44 @@ pub(crate) fn run_deferred_cleanup_at(
     diagnostics: &DatabaseDiagnostics,
     now_system: SystemTime,
 ) -> DeferredCleanupSummary {
+    run_deferred_cleanup_at_scope(db_path, layout, diagnostics, now_system, None)
+}
+
+pub fn run_deferred_cleanup_for_root(
+    db_path: &Path,
+    layout: &ClippingAssetLayout,
+    root_id: &str,
+    diagnostics: &DatabaseDiagnostics,
+) -> DeferredCleanupSummary {
+    run_deferred_cleanup_at_scope(
+        db_path,
+        layout,
+        diagnostics,
+        SystemTime::now(),
+        Some(root_id),
+    )
+}
+
+fn run_deferred_cleanup_at_scope(
+    db_path: &Path,
+    layout: &ClippingAssetLayout,
+    diagnostics: &DatabaseDiagnostics,
+    now_system: SystemTime,
+    root_id: Option<&str>,
+) -> DeferredCleanupSummary {
     let started = std::time::Instant::now();
     let mut summary = DeferredCleanupSummary::default();
     let outcome = (|| -> Result<(), ClippingError> {
         let known_ids = {
             let connection = open_runtime(db_path)
                 .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
-            repository::load_all_ids(&connection)
-                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
-                .into_iter()
-                .collect::<HashSet<_>>()
+            match root_id {
+                Some(root_id) => repository::load_all_ids_for_root(&connection, root_id),
+                None => repository::load_all_ids(&connection),
+            }
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
+            .into_iter()
+            .collect::<HashSet<_>>()
         };
         // Staging directories without a row older than the grace period move
         // to quarantine.
@@ -401,6 +513,60 @@ pub(crate) fn run_deferred_cleanup_at(
     record_recovery_diagnostic(
         diagnostics,
         "clipping_deferred_cleanup",
+        started.elapsed(),
+        outcome.is_err() || summary.failures > 0,
+    );
+    summary
+}
+
+/// Cleanup for a download snapshot root. Only the reserved internal subtree is
+/// enumerated; visible edition/date directories are durable user data and are
+/// never recursively swept as cache or orphan space.
+pub fn run_deferred_internal_cleanup(
+    db_path: &Path,
+    layout: &ClippingAssetLayout,
+    root_id: &str,
+    diagnostics: &DatabaseDiagnostics,
+) -> DeferredCleanupSummary {
+    let started = std::time::Instant::now();
+    let now_system = SystemTime::now();
+    let mut summary = DeferredCleanupSummary::default();
+    let outcome = (|| -> Result<(), ClippingError> {
+        let known_ids = {
+            let connection = open_runtime(db_path)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+            repository::load_all_ids_for_root(&connection, root_id)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
+        summary.add(quarantine_orphans(
+            layout,
+            &layout.staging_dir()?,
+            &known_ids,
+            now_system,
+            ORPHAN_GRACE,
+            "stale-staging",
+        )?);
+        summary.add(delete_orphan_trash(
+            layout,
+            &known_ids,
+            now_system,
+            ORPHAN_GRACE,
+        )?);
+        summary.add(delete_expired_quarantine(
+            layout,
+            now_system,
+            QUARANTINE_RETENTION,
+        )?);
+        Ok(())
+    })();
+    if outcome.is_err() {
+        summary.failures = summary.failures.saturating_add(1);
+    }
+    record_recovery_diagnostic(
+        diagnostics,
+        "clipping_snapshot_root_cleanup",
         started.elapsed(),
         outcome.is_err() || summary.failures > 0,
     );

@@ -93,6 +93,7 @@ Each implementation PR owns one phase from the master PRD.
 | Phase | Allowed primary scope | Explicitly prohibited in the same PR |
 |---|---|---|
 | 1 | Schema, repository, managed roots, asset lifecycle/recovery foundation, clipping media routes | Crop algorithm, reader Clip UI, editor dependency, production Clippings view |
+| 1A storage amendment | D-032 schema v4 root registry/marker, legacy backfill, multi-root asset/recovery/media ownership, snapshot-tree guards | Crop algorithm, Reader UI, production editor/library |
 | 2 | Source resolver, geometry, native crop, lossless encode, idempotent create command, crop baseline | Reader selection UI, editor/library, source navigation/delete UI |
 | 3 | Reader selection state machine and hidden/test-only integration with Phase 2 command | Production Clippings view, editor dependency, deletion/reset UI, release bump |
 | 4A | Isolated editor candidate evaluation, adapter proof, evidence, D-024 update | Production note view, unrelated UI refactor, persistence changes beyond test fixture needs |
@@ -121,6 +122,7 @@ Recommended branch names:
 
 ```text
 feat/newspaper-clippings-phase-1-persistence
+codex/newspaper-clippings-snapshot-storage
 feat/newspaper-clippings-phase-2-crop
 feat/newspaper-clippings-phase-3-reader
 spike/newspaper-clippings-phase-4a-editor

@@ -4,6 +4,8 @@
 
 **Date:** 2026-08-07
 
+**Storage amendment:** 2026-08-09 (D-032)
+
 **Decision owners:** Howard Deng and LinkVault engineering
 
 **Related architecture:** [ADR-001: Unified workflow modular monolith](adr-001-unified-workflow-modular-monolith.md)
@@ -88,10 +90,15 @@ deferred.
 
 ### Asset storage
 
-- Canonical clipping bytes live beneath an application-owned root inside
-  `LinkVaultData`, not inside the user-selected newspaper download directory.
-- The database stores an application-controlled relative path, never an
-  arbitrary frontend path.
+- New canonical clipping bytes live beneath the source batch's persisted
+  download destination at `Newspaper snapshots/<edition>/<date>/<clipping-id>/`.
+- SQLite stores a stable backend-owned root ID plus an application-controlled
+  relative path, never an arbitrary frontend path.
+- A marker in the root's reserved `.linkvault` subtree binds the registered
+  root ID to that physical directory. Read/recovery paths never recreate a
+  missing registered root.
+- Existing schema-v3 assets remain under `LinkVaultData/newspaper-clippings`
+  through a read-only `legacy_managed` root; they are not moved automatically.
 - Asset writes use a staging file, validation, and atomic promotion.
 - The clipping row is inserted only after the canonical asset has been promoted.
 - If the database insert fails, the newly promoted asset is removed or moved to
@@ -154,7 +161,8 @@ flowchart LR
     Service --> Assets["Managed clipping asset service"]
     Service --> Crop["Native crop pipeline"]
     Repository --> Writer["Application DatabaseWriter"]
-    Assets --> DataRoot["LinkVaultData/newspaper-clippings"]
+    Assets --> SnapshotRoot["Download destination/Newspaper snapshots"]
+    Assets --> LegacyRoot["LinkVaultData/newspaper-clippings (legacy read/recovery)"]
     Crop --> Source["Registered newspaper page media"]
     Protocol["newspaper-media protocol"] --> Repository
     Protocol --> Assets
@@ -173,10 +181,12 @@ reader zoom, device scaling, CSS tone, and clipping by the window. It can be a
 future export option for preserving visual appearance, but it is not suitable
 for durable high-resolution source capture.
 
-### Store clipping files beside the downloaded edition
+### Store clipping files inside the downloaded edition directory
 
-Rejected. Edition folders are user-controlled, movable, and deletable.
-User-created clippings must survive removal or replacement of source downloads.
+Rejected. Source-edition deletion must not own clipping deletion. The approved
+snapshot root is a protected sibling under the persisted download destination,
+not a child of an individual downloaded edition. Archive scans and source reset
+explicitly exclude `Newspaper snapshots`.
 
 ### Embed the image as the first node in a rich-text document
 

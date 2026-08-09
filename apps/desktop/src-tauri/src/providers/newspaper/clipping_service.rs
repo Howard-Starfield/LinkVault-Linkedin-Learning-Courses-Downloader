@@ -26,12 +26,14 @@ use super::clipping_models::{
 };
 use super::clipping_recovery;
 use super::clipping_repository::{self as repository, ClippingDetail, ClippingSummary};
+use super::clipping_roots::ClippingRootRegistry;
 
 #[derive(Clone)]
 pub struct ClippingService {
     db_path: PathBuf,
     writer: DatabaseWriter,
     layout: ClippingAssetLayout,
+    roots: ClippingRootRegistry,
     diagnostics: DatabaseDiagnostics,
     integrity_scheduler: Arc<IntegrityTransitionScheduler>,
 }
@@ -205,10 +207,12 @@ impl ClippingService {
             writer.clone(),
             diagnostics.clone(),
         ));
+        let roots = ClippingRootRegistry::new(db_path.clone(), writer.clone(), layout.clone());
         Self {
             db_path,
             writer,
             layout,
+            roots,
             diagnostics,
             integrity_scheduler,
         }
@@ -216,6 +220,35 @@ impl ClippingService {
 
     pub fn layout(&self) -> &ClippingAssetLayout {
         &self.layout
+    }
+
+    pub(crate) fn root_layout(&self, root_id: &str) -> Result<ClippingAssetLayout, ClippingError> {
+        self.roots.resolve(root_id)
+    }
+
+    #[allow(dead_code)] // Consumed by the Phase 2 crop service after its storage rebase.
+    pub(crate) fn register_source_job_root(
+        &self,
+        source_job_id: &str,
+        now: i64,
+    ) -> Result<super::clipping_models::ClippingRoot, ClippingError> {
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let destination = repository::load_batch_destination_for_job(&connection, source_job_id)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+        drop(connection);
+        self.roots
+            .register_download_destination(std::path::Path::new(&destination), now)
+    }
+
+    #[allow(dead_code)] // Direct-path harness for isolated root tests; no command exposes it.
+    pub(crate) fn register_download_destination(
+        &self,
+        destination: &std::path::Path,
+        now: i64,
+    ) -> Result<super::clipping_models::ClippingRoot, ClippingError> {
+        self.roots.register_download_destination(destination, now)
     }
 
     fn context(operation: &'static str) -> DatabaseWriteContext {
@@ -235,13 +268,26 @@ impl ClippingService {
 
     pub fn register_staged(
         &self,
+        record: repository::NewClippingRecord,
+    ) -> Result<NewspaperClipping, ClippingError> {
+        self.register_staged_inner(record, false)
+    }
+
+    fn register_staged_inner(
+        &self,
         mut record: repository::NewClippingRecord,
+        allow_legacy_fixture: bool,
     ) -> Result<NewspaperClipping, ClippingError> {
         validate_record(&mut record)?;
         if let Some(existing) = self.read_by_id(&record.id)? {
             return self.resolve_idempotent(existing, record.now);
         }
-        self.layout.verify_staging(
+        let asset_layout = if allow_legacy_fixture {
+            self.roots.resolve(&record.asset_root_id)?
+        } else {
+            self.roots.resolve_for_creation(&record.asset_root_id)?
+        };
+        asset_layout.verify_staging(
             &record.id,
             record.asset_byte_count,
             record.crop_width,
@@ -259,13 +305,14 @@ impl ClippingService {
             if let Some(existing) = self.read_by_id(&record.id)? {
                 return self.resolve_idempotent(existing, record.now);
             }
-            self.layout.discard_staging(&record.id);
+            asset_layout.discard_staging(&record.id);
             return Err(ClippingError::new(ClippingErrorCode::DatabaseWriteFailed));
         }
 
-        self.layout.promote_staging(&record.id)?;
-        self.layout.verify_canonical(
+        asset_layout.promote_staging_to(&record.id, &record.asset_relative_path)?;
+        asset_layout.verify_canonical_at(
             &record.id,
+            &record.asset_relative_path,
             record.asset_byte_count,
             record.crop_width,
             record.crop_height,
@@ -296,10 +343,11 @@ impl ClippingService {
                 Err(ClippingError::new(ClippingErrorCode::OperationConflict))
             }
             ClippingAssetState::Creating => {
+                let layout = self.roots.resolve(&existing.asset_root_id)?;
                 clipping_recovery::recover_creating_id(
                     &self.db_path,
                     &self.writer,
-                    &self.layout,
+                    &layout,
                     &existing.id,
                     now,
                 )?;
@@ -392,6 +440,9 @@ impl ClippingService {
         if !validate_clipping_id(id) {
             return Err(ClippingError::new(ClippingErrorCode::InvalidId));
         }
+        let existing = self
+            .read_by_id(id)?
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))?;
         let owned_id = id.to_string();
         let outcome = self
             .writer
@@ -402,12 +453,14 @@ impl ClippingService {
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))?;
         match outcome {
             repository::DeleteIntentOutcome::Marked => {
-                clipping_recovery::complete_delete_pending_id(
-                    &self.db_path,
+                let asset_layout = self.roots.resolve(&existing.asset_root_id)?;
+                clipping_recovery::complete_delete_pending_target(
                     &self.writer,
+                    &asset_layout,
                     &self.layout,
                     &self.diagnostics,
                     id,
+                    &existing.asset_relative_path,
                 )
             }
             repository::DeleteIntentOutcome::NotFound => {
@@ -449,9 +502,10 @@ impl ClippingService {
         diagnostics: &DatabaseDiagnostics,
         now: i64,
     ) -> clipping_recovery::StartupRecoverySummary {
-        clipping_recovery::run_startup_recovery(
+        clipping_recovery::run_startup_recovery_roots(
             &self.db_path,
             &self.writer,
+            &self.roots,
             &self.layout,
             diagnostics,
             now,
@@ -462,7 +516,41 @@ impl ClippingService {
         &self,
         diagnostics: &DatabaseDiagnostics,
     ) -> clipping_recovery::DeferredCleanupSummary {
-        clipping_recovery::run_deferred_cleanup(&self.db_path, &self.layout, diagnostics)
+        let mut summary = clipping_recovery::run_deferred_cleanup_for_root(
+            &self.db_path,
+            &self.layout,
+            super::storage::LEGACY_CLIPPING_ROOT_ID,
+            diagnostics,
+        );
+        let Ok(roots) = self.roots.list() else {
+            summary.failures = summary.failures.saturating_add(1);
+            return summary;
+        };
+        for root in roots {
+            if root.kind != super::clipping_models::ClippingRootKind::DownloadSnapshot {
+                continue;
+            }
+            match self.roots.resolve(&root.id) {
+                Ok(layout) => summary.add(clipping_recovery::run_deferred_internal_cleanup(
+                    &self.db_path,
+                    &layout,
+                    &root.id,
+                    diagnostics,
+                )),
+                Err(_) => summary.failures = summary.failures.saturating_add(1),
+            }
+        }
+        summary
+    }
+}
+
+#[cfg(test)]
+impl ClippingService {
+    pub(crate) fn register_staged_legacy_fixture(
+        &self,
+        record: repository::NewClippingRecord,
+    ) -> Result<NewspaperClipping, ClippingError> {
+        self.register_staged_inner(record, true)
     }
 }
 
@@ -498,10 +586,7 @@ fn validate_record(record: &mut repository::NewClippingRecord) -> Result<(), Cli
     {
         return Err(invalid());
     }
-    let expected_path = ClippingAssetLayout::canonical_relative_path(&record.id)?;
-    if record.asset_relative_path != expected_path {
-        return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
-    }
+    ClippingAssetLayout::validate_relative_path_for_id(&record.asset_relative_path, &record.id)?;
     record.title = normalize_title(&record.title).map_err(ClippingError::new)?;
     Ok(())
 }
@@ -558,6 +643,7 @@ mod tests {
             crop_y: 0,
             crop_width: 24,
             crop_height: 16,
+            asset_root_id: crate::newspaper::storage::LEGACY_CLIPPING_ROOT_ID.to_owned(),
             asset_relative_path: ClippingAssetLayout::canonical_relative_path(id).unwrap(),
             asset_byte_count: bytes.len() as u64,
             asset_checksum_sha256: sha256_hex(&bytes),
@@ -566,14 +652,41 @@ mod tests {
         }
     }
 
+    fn staged_snapshot_record(
+        service: &ClippingService,
+        destination: &Path,
+        id: &str,
+    ) -> repository::NewClippingRecord {
+        std::fs::create_dir_all(destination).unwrap();
+        let root = service
+            .register_download_destination(destination, 10)
+            .unwrap();
+        let layout = service.root_layout(&root.id).unwrap();
+        let bytes = encode_test_webp(24, 16);
+        layout.write_staging(id, &bytes).unwrap();
+        let mut record = staged_record(service, id);
+        service.layout.discard_staging(id);
+        record.asset_root_id = root.id;
+        record.asset_relative_path = ClippingAssetLayout::snapshot_relative_path(
+            &record.edition_name_snapshot,
+            &record.edition_code_snapshot,
+            &record.publication_date_snapshot,
+            id,
+        )
+        .unwrap();
+        record
+    }
+
     #[test]
     fn persistence_gate_clipping_creation_is_ready_and_idempotent() {
         let (_temp, service, _diagnostics) = fixture();
         let record = staged_record(&service, ID);
-        let created = service.register_staged(record.clone()).unwrap();
+        let created = service
+            .register_staged_legacy_fixture(record.clone())
+            .unwrap();
         assert_eq!(created.asset_state, ClippingAssetState::Ready);
         assert!(service.layout.canonical_path(ID).unwrap().is_file());
-        let retried = service.register_staged(record).unwrap();
+        let retried = service.register_staged_legacy_fixture(record).unwrap();
         assert_eq!(retried.id, created.id);
         let query = NewspaperClippingListQuery {
             query: String::new(),
@@ -585,10 +698,43 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_snapshot_root_creation_promotes_to_visible_nested_path() {
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let record = staged_snapshot_record(&service, &destination, ID);
+        let root_id = record.asset_root_id.clone();
+        let relative = record.asset_relative_path.clone();
+
+        let clipping = service.register_staged(record).unwrap();
+
+        assert_eq!(clipping.asset_root_id, root_id);
+        assert_eq!(clipping.asset_relative_path, relative);
+        let layout = service.root_layout(&root_id).unwrap();
+        assert!(layout.canonical_path_at(ID, &relative).unwrap().is_file());
+        assert!(destination
+            .join(super::super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+            .join(".linkvault")
+            .join("clipping-root-v1.json")
+            .is_file());
+        assert!(!service.layout.canonical_path(ID).unwrap().exists());
+    }
+
+    #[test]
+    fn persistence_gate_new_creation_rejects_legacy_managed_root() {
+        let (_temp, service, _diagnostics) = fixture();
+        let error = service
+            .register_staged(staged_record(&service, ID))
+            .unwrap_err();
+        assert_eq!(error.code, ClippingErrorCode::AssetRootUnavailable);
+        assert!(service.read_by_id(ID).unwrap().is_none());
+        service.layout.discard_staging(ID);
+    }
+
+    #[test]
     fn persistence_gate_clipping_update_rejects_stale_revision() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let updated = service
             .update_note(ID, created.revision, "A title", "winner", 101)
@@ -606,7 +752,7 @@ mod tests {
     fn persistence_gate_concurrent_updates_have_one_revision_winner() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let mut callers = Vec::new();
@@ -645,7 +791,7 @@ mod tests {
     fn persistence_gate_note_update_returns_its_own_writer_acknowledged_snapshot() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let (acknowledged_tx, acknowledged_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -686,7 +832,7 @@ mod tests {
     fn persistence_gate_note_update_preserves_noop_not_found_and_not_editable_outcomes() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let unchanged = service
             .update_note(
@@ -734,7 +880,7 @@ mod tests {
     fn persistence_gate_list_searches_full_note_but_returns_only_bounded_excerpt() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let note = format!("visible {} TAIL_MARKER", "x".repeat(5_000));
         service
@@ -762,7 +908,7 @@ mod tests {
         let sentinel = temp.path().join("sentinel.txt");
         std::fs::write(&sentinel, b"keep").unwrap();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let other_id = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
         for version in [1, 2] {
@@ -787,11 +933,11 @@ mod tests {
     fn persistence_gate_thumbnail_cache_failures_do_not_block_confirmed_deletion() {
         let (temp, service, diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let other_id = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
         service
-            .register_staged(staged_record(&service, other_id))
+            .register_staged_legacy_fixture(staged_record(&service, other_id))
             .unwrap();
         let thumbnails = service.layout.thumbnails_dir().unwrap();
         let undeletable = service.layout.thumbnail_path(ID, 1).unwrap();
@@ -891,7 +1037,7 @@ mod tests {
     fn persistence_gate_reset_preserves_canonical_asset_bytes() {
         let (_temp, service, _diagnostics) = fixture();
         service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let canonical = service.layout.canonical_path(ID).unwrap();
         let before = std::fs::read(&canonical).unwrap();
@@ -1006,7 +1152,7 @@ mod tests {
     fn persistence_gate_delete_recovery_retries_after_database_failure() {
         let (_temp, service, diagnostics) = fixture();
         let created = service
-            .register_staged(staged_record(&service, ID))
+            .register_staged_legacy_fixture(staged_record(&service, ID))
             .unwrap();
         let owned_id = ID.to_string();
         service
@@ -1219,7 +1365,7 @@ mod tests {
         for index in 0..(clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8) {
             let id = format!("{index:08x}-1111-4111-8111-{index:012x}");
             service
-                .register_staged(staged_record(&service, &id))
+                .register_staged_legacy_fixture(staged_record(&service, &id))
                 .unwrap();
         }
         let later_orphan = service

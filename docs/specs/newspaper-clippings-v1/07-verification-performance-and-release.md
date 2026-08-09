@@ -5,7 +5,7 @@
 **Primary implementation phase:** Phase 6, with mandatory checkpoints in every
 prior phase
 
-**Related decisions:** All V1 decisions, especially D-004 through D-009,
+**Related decisions:** All V1 decisions, especially D-004 through D-008, D-032,
 D-015 through D-028
 
 ## 1. Purpose
@@ -296,6 +296,8 @@ The clipping migration and reset suite passes from at least:
 
 - A fresh database.
 - The immediately previous supported schema.
+- A populated schema-v3 clipping table backfilled to the legacy root with a
+  verified backup and byte-identical note/asset metadata.
 - A populated realistic test database with all providers represented.
 
 ## 7. Managed asset and recovery suite
@@ -322,6 +324,8 @@ clipping_recovery_
 - Thumbnail path outside root.
 - Stale media version URL.
 - Checksum mismatch.
+- Missing/mismatched root marker and reused destination path.
+- Offline removable/network root remains transient and is not recreated.
 - Error body/log redaction.
 
 ### Creation recovery tests
@@ -337,7 +341,8 @@ without touching source media or another clipping.
 ### Orphan cleanup tests
 
 - Grace period respected.
-- Staging/canonical orphans move to quarantine before deletion.
+- Staging orphans and legacy-root canonical orphans move to quarantine before
+  deletion. Visible snapshot edition/date trees are never recursively swept.
 - Trash orphan cleanup.
 - Exact-ID derived-thumbnail orphan cleanup without touching malformed,
   prefix-lookalike, symlinked, or another clipping's entries.
@@ -348,6 +353,10 @@ without touching source media or another clipping.
 - 500-entry and 5,000-entry Windows measurements record wall time and
   approximate/peak memory.
 - No recursive scan outside managed root.
+- Cleanup ownership is root-scoped; an ID in one root does not retain an
+  orphan staging/trash entry in another root.
+- Archive import and job deletion cannot descend into or remove
+  `Newspaper snapshots`.
 
 ### Media protocol tests
 
@@ -361,6 +370,7 @@ without touching source media or another clipping.
 - Error responses use `no-store`.
 - Absolute paths never appear in body/header.
 - Only ready canonical assets are served.
+- Root-unavailable requests do not transition ready rows to missing.
 
 ### AC-VERIFY-ASSET-001
 

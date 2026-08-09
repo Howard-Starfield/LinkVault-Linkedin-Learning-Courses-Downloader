@@ -208,8 +208,23 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_thumbnail_source
 /// Column names and constraints follow the approved specification; the table
 /// is installed by the application database lifecycle whenever the global
 /// schema version advances past version 2.
-const CLIPPING_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS newspaper_clippings (
+pub const LEGACY_CLIPPING_ROOT_ID: &str = "legacy-managed-v1";
+pub const LEGACY_CLIPPING_ROOT_LOCATOR: &str = "app-data:newspaper-clippings";
+
+const CLIPPING_ROOT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS newspaper_clipping_roots (
+    id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL
+        CHECK (kind IN ('legacy_managed', 'download_snapshot')),
+    locator TEXT NOT NULL,
+    locator_key TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+
+const CLIPPING_TABLE_SCHEMA: &str = r#"
+CREATE TABLE newspaper_clippings (
     id TEXT PRIMARY KEY NOT NULL,
 
     source_job_id TEXT,
@@ -239,6 +254,7 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     crop_height INTEGER NOT NULL
         CHECK (crop_height > 0),
 
+    asset_root_id TEXT NOT NULL,
     asset_relative_path TEXT NOT NULL,
     asset_mime_type TEXT NOT NULL
         CHECK (asset_mime_type = 'image/webp'),
@@ -269,6 +285,9 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     FOREIGN KEY (source_page_id)
         REFERENCES newspaper_pages(id)
         ON DELETE SET NULL,
+    FOREIGN KEY (asset_root_id)
+        REFERENCES newspaper_clipping_roots(id)
+        ON DELETE RESTRICT,
 
     CHECK (crop_x + crop_width <= source_pixel_width),
     CHECK (crop_y + crop_height <= source_pixel_height),
@@ -280,7 +299,9 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
         (asset_state != 'missing')
     )
 );
+"#;
 
+const CLIPPING_INDEX_SCHEMA: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_updated
     ON newspaper_clippings(updated_at DESC, id DESC);
 
@@ -303,10 +324,94 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_source_page
 
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
     ON newspaper_clippings(asset_state, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_root
+    ON newspaper_clippings(asset_root_id, asset_state, updated_at);
 "#;
 
 pub fn install_clipping_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(CLIPPING_SCHEMA)
+    connection.execute_batch(CLIPPING_ROOT_SCHEMA)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO newspaper_clipping_roots
+            (id, kind, locator, locator_key, created_at, updated_at)
+         VALUES (?1, 'legacy_managed', ?2, ?2, 0, 0)",
+        params![LEGACY_CLIPPING_ROOT_ID, LEGACY_CLIPPING_ROOT_LOCATOR],
+    )?;
+
+    let clipping_table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'newspaper_clippings'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !clipping_table_exists {
+        connection.execute_batch(CLIPPING_TABLE_SCHEMA)?;
+    } else if !table_has_column(connection, "newspaper_clippings", "asset_root_id")? {
+        migrate_clippings_to_root_registry(connection)?;
+    }
+    connection.execute_batch(CLIPPING_INDEX_SCHEMA)
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
+fn migrate_clippings_to_root_registry(connection: &Connection) -> Result<()> {
+    let foreign_keys_enabled: bool =
+        connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    if foreign_keys_enabled {
+        connection.pragma_update(None, "foreign_keys", false)?;
+    }
+    connection.pragma_update(None, "legacy_alter_table", true)?;
+
+    let migration = (|| {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE newspaper_clippings RENAME TO newspaper_clippings_v3;",
+        )?;
+        connection.execute_batch(CLIPPING_TABLE_SCHEMA)?;
+        connection.execute(
+            "INSERT INTO newspaper_clippings (
+                id, source_job_id, source_page_id, source_media_version_snapshot,
+                source_kind_snapshot, source_mime_type_snapshot, source_checksum_snapshot,
+                edition_code_snapshot, edition_name_snapshot, publication_date_snapshot,
+                page_number_snapshot, source_pixel_width, source_pixel_height,
+                crop_x, crop_y, crop_width, crop_height, asset_root_id,
+                asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+                asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
+                asset_error_code, title, note_markdown, revision, created_at, updated_at
+             )
+             SELECT id, source_job_id, source_page_id, source_media_version_snapshot,
+                source_kind_snapshot, source_mime_type_snapshot, source_checksum_snapshot,
+                edition_code_snapshot, edition_name_snapshot, publication_date_snapshot,
+                page_number_snapshot, source_pixel_width, source_pixel_height,
+                crop_x, crop_y, crop_width, crop_height, ?1,
+                asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+                asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
+                asset_error_code, title, note_markdown, revision, created_at, updated_at
+             FROM newspaper_clippings_v3",
+            params![LEGACY_CLIPPING_ROOT_ID],
+        )?;
+        connection.execute_batch(
+            "DROP TABLE newspaper_clippings_v3;
+             COMMIT;",
+        )
+    })();
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    connection.pragma_update(None, "legacy_alter_table", false)?;
+    if foreign_keys_enabled {
+        connection.pragma_update(None, "foreign_keys", true)?;
+    }
+    migration
 }
 
 pub fn initialize(connection: &Connection) -> Result<()> {
@@ -426,12 +531,7 @@ fn migrate_add_column(
     column: &str,
     statement: &str,
 ) -> Result<()> {
-    let exists = connection
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == column);
+    let exists = table_has_column(connection, table, column)?;
     if !exists {
         connection.execute(statement, [])?;
     }
@@ -916,6 +1016,7 @@ mod tests {
             names,
             vec![
                 "newspaper_batches",
+                "newspaper_clipping_roots",
                 "newspaper_clippings",
                 "newspaper_editions",
                 "newspaper_events",

@@ -58,8 +58,9 @@ are treated as requirements unless superseded in the decision register.
 9. The source image is a fixed attachment card above the note editor; it is not
    an editable image node inside the note body.
 10. SQLite stores the title and Markdown source of truth.
-11. Canonical clipping images live in an application-managed clipping root
-    beneath `LinkVaultData`, not beside downloaded editions.
+11. New canonical clipping images live under the source download destination
+    in `Newspaper snapshots/<edition>/<date>/<clipping-id>/`. Existing v3
+    assets remain readable in the legacy app-data root.
 12. Saving returns the user to reader browse mode and offers an **Open note**
     action rather than forcing navigation away from the newspaper.
 13. Deleting or resetting downloaded newspaper data preserves clipping images

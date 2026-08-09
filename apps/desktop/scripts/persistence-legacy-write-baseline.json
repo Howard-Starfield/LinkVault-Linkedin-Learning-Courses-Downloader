@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 1,
@@ -8,7 +8,8 @@
     "src-tauri/src/providers/newspaper/batch_service.rs": 11,
     "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
     "src-tauri/src/providers/newspaper/clipping_recovery.rs": 3,
-    "src-tauri/src/providers/newspaper/clipping_repository.rs": 9,
+    "src-tauri/src/providers/newspaper/clipping_repository.rs": 10,
+    "src-tauri/src/providers/newspaper/clipping_roots.rs": 1,
     "src-tauri/src/providers/newspaper/clipping_service.rs": 5,
     "src-tauri/src/providers/newspaper/job_service.rs": 9,
     "src-tauri/src/providers/newspaper/media_protocol.rs": 0,
@@ -17,7 +18,7 @@
     "src-tauri/src/providers/newspaper/queue_service.rs": 17,
     "src-tauri/src/providers/newspaper/reader_service.rs": 3,
     "src-tauri/src/providers/newspaper/schedule_service.rs": 4,
-    "src-tauri/src/providers/newspaper/storage.rs": 25,
+    "src-tauri/src/providers/newspaper/storage.rs": 33,
     "src-tauri/src/providers/newspaper/thumbnails.rs": 1
   },
   "sharedWriteHelperCallCounts": {
@@ -60,6 +61,7 @@
     "4": "Moved atomic schedule deletion and owned-work cancellation behind the shared app database boundary, reducing the schedule service direct SQL baseline by one and pinning the new helper call site. Added one reviewed storage migration write for the schedule ownership index.",
     "5": "Added the approved Newspaper Clippings Phase 1 repository SQL primitives, DatabaseWriter service/recovery submissions, and provider schema installation. Clipping mutations remain owned by DatabaseWriter; image and filesystem work stays outside writer closures.",
     "6": "Moved the media protocol's integrity mutation behind the clipping service, reducing protocol SQL primitives to zero and recording the coalesced service DatabaseWriter submission plus cleanup-cursor setting write in their service, recovery, and repository owners. No filesystem or image work enters a writer closure.",
-    "7": "Removed the draft filename-cursor setting write after D-031 approved detached complete managed-directory enumeration with per-category mutation caps. This reduces the recovery DatabaseWriter submission count and repository SQL primitive count by one each; no enforcement rule is weakened."
+    "7": "Removed the draft filename-cursor setting write after D-031 approved detached complete managed-directory enumeration with per-category mutation caps. This reduces the recovery DatabaseWriter submission count and repository SQL primitive count by one each; no enforcement rule is weakened.",
+    "8": "Added the reviewed schema-v4 clipping root table, legacy-root seed, populated-v3 table rebuild, one root-registry repository insert, and its one DatabaseWriter submission. The root row commits before crop staging; filesystem and marker work remain outside writer closures."
   }
 }

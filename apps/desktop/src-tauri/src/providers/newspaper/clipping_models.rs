@@ -32,6 +32,45 @@ pub const CLIPPING_ASSET_MIME: &str = "image/webp";
 pub const SUPPORTED_SOURCE_MIME_TYPES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClippingRootKind {
+    LegacyManaged,
+    DownloadSnapshot,
+}
+
+impl ClippingRootKind {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::LegacyManaged => "legacy_managed",
+            Self::DownloadSnapshot => "download_snapshot",
+        }
+    }
+
+    pub fn from_sql(value: &str) -> Option<Self> {
+        match value {
+            "legacy_managed" => Some(Self::LegacyManaged),
+            "download_snapshot" => Some(Self::DownloadSnapshot),
+            _ => None,
+        }
+    }
+
+    pub fn accepts_new_clippings(self) -> bool {
+        matches!(self, Self::DownloadSnapshot)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClippingRoot {
+    pub id: String,
+    pub kind: ClippingRootKind,
+    /// Backend locator. For download roots this is an absolute snapshot-root
+    /// path; the legacy locator is resolved through application storage.
+    pub locator: String,
+    pub locator_key: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClippingSourceKind {
     Original,
     Optimized,
@@ -113,6 +152,7 @@ pub struct NewspaperClipping {
     pub crop_width: u32,
     pub crop_height: u32,
 
+    pub asset_root_id: String,
     pub asset_relative_path: String,
     pub asset_mime_type: String,
     pub asset_pixel_width: u32,
