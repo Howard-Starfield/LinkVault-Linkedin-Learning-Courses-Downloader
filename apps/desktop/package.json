@@ -18,6 +18,7 @@
     "verify:ui": "node ./scripts/verify-ui.mjs",
     "verify:newspaper-performance": "node --experimental-strip-types ./scripts/verify-newspaper-performance.mjs",
     "verify:newspaper-performance-browser": "node ./scripts/verify-newspaper-performance-browser.mjs",
+    "verify:newspaper-clippings": "node ./scripts/verify-newspaper-clippings.mjs",
     "verify:visual": "node ./scripts/verify-visual.mjs",
     "verify:tauri-smoke": "node ./scripts/verify-tauri-smoke.mjs",
     "verify:release": "npm run verify:architecture && npm run verify:persistence && npm run verify:persistence-baseline && node ./scripts/verify-release.mjs",

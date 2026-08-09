@@ -56,6 +56,45 @@ export type NewspaperReadingProgress = {
   updatedAt: number;
 };
 
+/** Backend-only Phase 2 contract. Reader selection UI remains deliberately
+ * absent until its separately approved phase. */
+export type NormalizedCropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type CreateNewspaperClippingRequest = {
+  operationId: string;
+  pageId: string;
+  expectedMediaVersion: number;
+  rect: NormalizedCropRect;
+};
+
+export type CreateNewspaperClippingResponse = {
+  clippingId: string;
+  title: string;
+  editionCode: string;
+  editionName: string;
+  publicationDate: string;
+  pageNumber: string;
+  imageUrl: string;
+  assetVersion: number;
+  assetWidth: number;
+  assetHeight: number;
+  assetByteCount: number;
+  revision: number;
+  createdAt: number;
+};
+
+export type CreateNewspaperClippingFailure = {
+  code: string;
+  safeMessage: string;
+  retryable: boolean;
+  operationId: string;
+};
+
 export type EnsureThumbnailResult =
   | {
       status: "ready" | "generated";
@@ -95,5 +134,11 @@ export function saveReadingProgress(jobId: string, pageId: string) {
   return invoke<NewspaperReadingProgress>("save_newspaper_reading_progress", {
     jobId,
     pageId
+  });
+}
+
+export function createNewspaperClipping(request: CreateNewspaperClippingRequest) {
+  return invoke<CreateNewspaperClippingResponse>("create_newspaper_clipping", {
+    request
   });
 }
