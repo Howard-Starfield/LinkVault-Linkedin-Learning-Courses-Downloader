@@ -32,6 +32,8 @@ clipping, and types a note in the approved Tiptap editor with safe autosave.
   only by the LinkVault-owned `ClippingNoteEditor` adapter.
 - SQLite stores title and plain Markdown. Tiptap/ProseMirror JSON is never
   persisted.
+- Keyword search uses SQLite clipping metadata and note Markdown. Folder depth,
+  image names, and filesystem enumeration are never part of search.
 - Autosave uses the approved 800 ms debounce and optimistic revision contract.
 - Screen-reader UAT is not a blocker. Keyboard labels, focus order, pressed and
   disabled states, and visible focus remain required.
@@ -436,6 +438,27 @@ List requirements:
 - Never load canonical images or full Markdown for all rows.
 - Explicit 0/1/8/50/51/500 row tests and loading/error/empty states.
 
+Search requirements:
+
+- Render the specified `Search titles, notes, editions, dates, or pages` field
+  in the Clippings list and debounce backend queries by 200 ms.
+- Search server-side across title, full `note_markdown`, edition name/code,
+  publication date, and page number. Do not filter only the currently loaded
+  virtual rows.
+- Trim and cap input at 200 UTF-8 characters and preserve literal `%`, `_`,
+  backslash, apostrophe, punctuation, English, and Chinese queries through the
+  existing parameterized escaped-`LIKE` repository contract.
+- Reset paging for a new query, reject stale query generations, and allow a
+  direct **Open note** target to load by ID even when excluded by the current
+  search.
+- Search never walks `Newspaper snapshots`, opens WebP files, or depends on the
+  storage-root locator. Moving from `LIKE` to SQLite FTS later must remain an
+  internal repository/index migration behind the same list API.
+- Keep D-019's simple substring search for V1 and record 8/50/500 response and
+  visible-update timings. Propose FTS only after a larger representative
+  fixture demonstrates a measured responsiveness problem; do not introduce an
+  FTS synchronization lifecycle speculatively.
+
 Detail requirements:
 
 - Abort/ignore stale detail responses by clipping ID and request generation.
@@ -520,6 +543,8 @@ Automated proof must include:
 - IPC DTO serialization and safe error mapping;
 - list/detail/update/thumbnail repository-service-command integration;
 - visible-only thumbnails and 8/50/500 list performance;
+- keyword search over title/note/provenance, including English, Chinese,
+  literal wildcard characters, deep matches, and stale-query rejection;
 - source card ready/missing behavior;
 - title and Markdown validation boundaries;
 - 800 ms debounce, one in-flight save, queued-latest acknowledgement, retry,
@@ -589,6 +614,7 @@ The core goal is complete only when all rows pass in the real Tauri app:
 | Type note | Tiptap edits safe plain Markdown; Chinese IME works in the integrated Tauri WebView. |
 | Autosave | Stable draft saves after 800 ms; route/document/blur/close boundaries flush safely. |
 | Reopen | The persisted title, Markdown, image, and revision reload correctly. |
+| Find later | A keyword in the title or note finds the clipping through paged SQLite search without scanning the nested snapshot folders. |
 | Conflict | A concurrent update preserves the local draft and presents three explicit recovery actions. |
 | Scale | Reader selection remains correct at 100/125/150/200%; list remains bounded at 8/50/500 items. |
 
@@ -605,6 +631,8 @@ Stop and request review if implementation would:
 - persist editor JSON or unsupported executable Markdown;
 - let pan/click-zoom and clipping own the same pointer simultaneously;
 - load full Markdown/canonical images for every list row;
+- implement keyword search by walking snapshot folders or client-filtering only
+  the currently loaded virtual rows;
 - write on every editor transaction;
 - discard a failed/conflicting draft;
 - combine Phase 3 and Phase 4B in one implementation PR;
