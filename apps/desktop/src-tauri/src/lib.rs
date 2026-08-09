@@ -31,8 +31,17 @@ pub fn run() {
                         .state::<newspaper::thumbnails::ThumbnailCoordinator>()
                         .cache_root()
                         .to_path_buf();
+                    let clipping_service = app
+                        .state::<newspaper::clipping_service::ClippingService>()
+                        .inner()
+                        .clone();
                     let response = tauri::async_runtime::spawn_blocking(move || {
-                        newspaper::media_protocol::handle_request(&db_path, &cache_root, &request)
+                        newspaper::media_protocol::handle_request(
+                            &db_path,
+                            &cache_root,
+                            &clipping_service,
+                            &request,
+                        )
                     })
                     .await
                     .unwrap_or_else(|_| {
@@ -158,8 +167,29 @@ pub fn run() {
             drop(connection);
             let writer =
                 app::database_writer::DatabaseWriter::start(db_path.clone(), diagnostics.clone())?;
+            let clipping_layout = newspaper::clipping_assets::ClippingAssetLayout::new(
+                storage::resolve_newspaper_clippings_root()?,
+            );
+            let clipping_service = newspaper::clipping_service::ClippingService::new(
+                db_path.clone(),
+                writer.clone(),
+                clipping_layout,
+                diagnostics.clone(),
+            );
+            let _recovery_summary =
+                clipping_service.recover_startup(&diagnostics, commands::now_unix_timestamp());
+            // Row-level clipping recovery failures remain in their durable
+            // retryable states and are reported through safe diagnostics. A
+            // single clipping must not prevent unrelated providers or the
+            // application shell from starting.
+            let cleanup_service = clipping_service.clone();
+            let cleanup_diagnostics = diagnostics.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                cleanup_service.run_deferred_cleanup(&cleanup_diagnostics)
+            });
             app.manage(diagnostics);
             app.manage(writer);
+            app.manage(clipping_service);
             app.manage(commands::LinkVaultState::new(db_path.clone()));
             app.manage(coursera::commands::CourseraState::new(db_path.clone()));
             app.manage(newspaper::thumbnails::ThumbnailCoordinator::new(

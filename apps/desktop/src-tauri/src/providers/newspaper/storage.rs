@@ -204,8 +204,114 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_thumbnail_source
     ON newspaper_thumbnail_cache(source_page_id);
 "#;
 
+/// Newspaper clipping aggregate schema (ADR-002, specification 02 §4).
+/// Column names and constraints follow the approved specification; the table
+/// is installed by the application database lifecycle whenever the global
+/// schema version advances past version 2.
+const CLIPPING_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS newspaper_clippings (
+    id TEXT PRIMARY KEY NOT NULL,
+
+    source_job_id TEXT,
+    source_page_id TEXT,
+    source_media_version_snapshot INTEGER NOT NULL
+        CHECK (source_media_version_snapshot > 0),
+    source_kind_snapshot TEXT NOT NULL
+        CHECK (source_kind_snapshot IN ('original', 'optimized')),
+    source_mime_type_snapshot TEXT NOT NULL,
+    source_checksum_snapshot TEXT,
+
+    edition_code_snapshot TEXT NOT NULL,
+    edition_name_snapshot TEXT NOT NULL,
+    publication_date_snapshot TEXT NOT NULL,
+    page_number_snapshot TEXT NOT NULL,
+
+    source_pixel_width INTEGER NOT NULL
+        CHECK (source_pixel_width > 0),
+    source_pixel_height INTEGER NOT NULL
+        CHECK (source_pixel_height > 0),
+    crop_x INTEGER NOT NULL
+        CHECK (crop_x >= 0),
+    crop_y INTEGER NOT NULL
+        CHECK (crop_y >= 0),
+    crop_width INTEGER NOT NULL
+        CHECK (crop_width > 0),
+    crop_height INTEGER NOT NULL
+        CHECK (crop_height > 0),
+
+    asset_relative_path TEXT NOT NULL,
+    asset_mime_type TEXT NOT NULL
+        CHECK (asset_mime_type = 'image/webp'),
+    asset_pixel_width INTEGER NOT NULL
+        CHECK (asset_pixel_width > 0),
+    asset_pixel_height INTEGER NOT NULL
+        CHECK (asset_pixel_height > 0),
+    asset_byte_count INTEGER NOT NULL
+        CHECK (asset_byte_count > 0),
+    asset_checksum_sha256 TEXT NOT NULL,
+    asset_version INTEGER NOT NULL DEFAULT 1
+        CHECK (asset_version > 0),
+    asset_state TEXT NOT NULL
+        CHECK (asset_state IN ('creating', 'ready', 'missing', 'delete_pending')),
+    asset_error_code TEXT,
+
+    title TEXT NOT NULL,
+    note_markdown TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1
+        CHECK (revision > 0),
+
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+
+    FOREIGN KEY (source_job_id)
+        REFERENCES newspaper_jobs(id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (source_page_id)
+        REFERENCES newspaper_pages(id)
+        ON DELETE SET NULL,
+
+    CHECK (crop_x + crop_width <= source_pixel_width),
+    CHECK (crop_y + crop_height <= source_pixel_height),
+    CHECK (asset_pixel_width = crop_width),
+    CHECK (asset_pixel_height = crop_height),
+    CHECK (
+        (asset_state = 'missing' AND asset_error_code IS NOT NULL)
+        OR
+        (asset_state != 'missing')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_updated
+    ON newspaper_clippings(updated_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_created
+    ON newspaper_clippings(created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_publication
+    ON newspaper_clippings(
+        publication_date_snapshot DESC,
+        edition_code_snapshot,
+        page_number_snapshot,
+        id
+    );
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_title
+    ON newspaper_clippings(title COLLATE NOCASE, id);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_source_page
+    ON newspaper_clippings(source_page_id);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
+    ON newspaper_clippings(asset_state, updated_at);
+"#;
+
+pub fn install_clipping_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(CLIPPING_SCHEMA)
+}
+
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(SCHEMA)?;
+    install_clipping_schema(connection)?;
     connection.execute(
         "INSERT OR IGNORE INTO newspaper_read_pages (job_id, page_id, page_index, viewed_at)
          SELECT p.job_id, p.last_page_id, p.last_page_index, p.updated_at
@@ -810,6 +916,7 @@ mod tests {
             names,
             vec![
                 "newspaper_batches",
+                "newspaper_clippings",
                 "newspaper_editions",
                 "newspaper_events",
                 "newspaper_jobs",

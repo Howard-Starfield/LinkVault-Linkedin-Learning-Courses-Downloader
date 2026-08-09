@@ -61,6 +61,18 @@ pub fn resolve_data_dir() -> Result<PathBuf, StoragePathError> {
     ensure_writable_data_dir(data_dir)
 }
 
+const CLIPPINGS_DIR_NAME: &str = "newspaper-clippings";
+
+/// Resolve the application-managed root for canonical Newspaper clipping
+/// assets. The root lives beneath the resolved LinkVaultData directory, never
+/// inside a user-selected newspaper download folder, so clippings survive
+/// edition deletion and World Journal reset (ADR-002, D-009).
+pub fn resolve_newspaper_clippings_root() -> Result<PathBuf, StoragePathError> {
+    let data_dir = resolve_data_dir()?;
+    let root = data_dir.join(CLIPPINGS_DIR_NAME);
+    ensure_writable_child_dir(&data_dir, root)
+}
+
 fn data_dir_for_exe_path(exe_path: &Path) -> Result<PathBuf, StoragePathError> {
     let exe_dir = exe_path
         .parent()
@@ -69,11 +81,108 @@ fn data_dir_for_exe_path(exe_path: &Path) -> Result<PathBuf, StoragePathError> {
 }
 
 fn ensure_writable_data_dir(path: PathBuf) -> Result<PathBuf, StoragePathError> {
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+            return Err(StoragePathError::NotWritable {
+                path,
+                message: "directory is not a trusted regular directory".to_string(),
+            });
+        }
+    }
     fs::create_dir_all(&path).map_err(|error| StoragePathError::NotWritable {
         path: path.clone(),
         message: error.to_string(),
     })?;
 
+    let metadata = fs::symlink_metadata(&path).map_err(|error| StoragePathError::NotWritable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+        return Err(StoragePathError::NotWritable {
+            path,
+            message: "directory is not a trusted regular directory".to_string(),
+        });
+    }
+
+    probe_writable_dir(&path)?;
+    Ok(path)
+}
+
+fn ensure_writable_child_dir(
+    trusted_parent: &Path,
+    path: PathBuf,
+) -> Result<PathBuf, StoragePathError> {
+    let parent_metadata =
+        fs::symlink_metadata(trusted_parent).map_err(|error| StoragePathError::NotWritable {
+            path: trusted_parent.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    if is_symlink_or_reparse(&parent_metadata) || !parent_metadata.file_type().is_dir() {
+        return Err(StoragePathError::NotWritable {
+            path: trusted_parent.to_path_buf(),
+            message: "data parent is not a trusted regular directory".to_string(),
+        });
+    }
+    let canonical_parent =
+        trusted_parent
+            .canonicalize()
+            .map_err(|error| StoragePathError::NotWritable {
+                path: trusted_parent.to_path_buf(),
+                message: error.to_string(),
+            })?;
+
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                return Err(StoragePathError::NotWritable {
+                    path,
+                    message: "managed child is not a trusted regular directory".to_string(),
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&path).map_err(|error| StoragePathError::NotWritable {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        }
+        Err(error) => {
+            return Err(StoragePathError::NotWritable {
+                path,
+                message: error.to_string(),
+            });
+        }
+    }
+
+    let metadata = fs::symlink_metadata(&path).map_err(|error| StoragePathError::NotWritable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+        return Err(StoragePathError::NotWritable {
+            path,
+            message: "managed child is not a trusted regular directory".to_string(),
+        });
+    }
+    let canonical_child = path
+        .canonicalize()
+        .map_err(|error| StoragePathError::NotWritable {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    if !canonical_child.starts_with(&canonical_parent) || canonical_child == canonical_parent {
+        return Err(StoragePathError::NotWritable {
+            path,
+            message: "managed child escaped the data parent".to_string(),
+        });
+    }
+
+    probe_writable_dir(&canonical_child)?;
+    Ok(path)
+}
+
+fn probe_writable_dir(path: &Path) -> Result<(), StoragePathError> {
     let probe_path = path.join(format!(
         ".linkvault-write-probe-{}-{}",
         std::process::id(),
@@ -87,13 +196,27 @@ fn ensure_writable_data_dir(path: PathBuf) -> Result<PathBuf, StoragePathError> 
 
     if let Err(error) = probe_result {
         return Err(StoragePathError::NotWritable {
-            path,
+            path: path.to_path_buf(),
             message: error.to_string(),
         });
     }
 
     let _ = fs::remove_file(probe_path);
-    Ok(path)
+    Ok(())
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn copy_if_missing(source: &Path, destination: &Path) -> Result<(), StoragePathError> {
@@ -137,7 +260,16 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn data_dir_sits_beside_executable() {
@@ -178,6 +310,101 @@ mod tests {
     }
 
     #[test]
+    fn clipping_root_resolves_beneath_data_dir_and_is_created() {
+        // The resolver honors the LINKVAULT_DATA_DIR override, which is
+        // process-global; serialize any test that touches it.
+        let _guard = env_guard();
+
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("LinkVaultData");
+        let expected = data_dir.join("newspaper-clippings");
+
+        env::set_var("LINKVAULT_DATA_DIR", &data_dir);
+        let resolved = resolve_newspaper_clippings_root();
+        env::remove_var("LINKVAULT_DATA_DIR");
+
+        assert_eq!(resolved.unwrap(), expected);
+        assert!(expected.is_dir());
+    }
+
+    #[test]
+    fn clipping_root_file_is_rejected_before_any_probe() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("LinkVaultData");
+        fs::create_dir(&data_dir).unwrap();
+        let root = data_dir.join(CLIPPINGS_DIR_NAME);
+        fs::write(&root, b"not-a-directory").unwrap();
+
+        assert!(ensure_writable_child_dir(&data_dir, root.clone()).is_err());
+        assert_eq!(fs::read(root).unwrap(), b"not-a-directory");
+    }
+
+    #[test]
+    fn clipping_root_junction_is_rejected_without_writing_outside_data_parent() {
+        let _guard = env_guard();
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("LinkVaultData");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&data_dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        let root = data_dir.join(CLIPPINGS_DIR_NAME);
+        if !create_dir_junction(&outside, &root) {
+            eprintln!("directory junction creation unavailable on this machine");
+            return;
+        }
+
+        env::set_var(DATA_DIR_ENV, &data_dir);
+        let resolved = resolve_newspaper_clippings_root();
+        env::remove_var(DATA_DIR_ENV);
+
+        assert!(resolved.is_err());
+        assert_eq!(fs::read(outside.join("sentinel.txt")).unwrap(), b"keep-me");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn clipping_root_symbolic_link_is_rejected_when_platform_permits_it() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("LinkVaultData");
+        let outside = temp.path().join("outside-symlink");
+        fs::create_dir(&data_dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        let root = data_dir.join(CLIPPINGS_DIR_NAME);
+        if !create_dir_symlink(&outside, &root) {
+            eprintln!("directory symlink creation unavailable on this machine");
+            return;
+        }
+
+        assert!(ensure_writable_child_dir(&data_dir, root).is_err());
+        assert_eq!(fs::read(outside.join("sentinel.txt")).unwrap(), b"keep-me");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn data_dir_override_junction_is_rejected_before_writable_probe() {
+        let _guard = env_guard();
+        let temp = tempdir().unwrap();
+        let outside = temp.path().join("outside-override");
+        let override_link = temp.path().join("LinkVaultData-override");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        if !create_dir_junction(&outside, &override_link) {
+            eprintln!("directory junction creation unavailable on this machine");
+            return;
+        }
+
+        env::set_var(DATA_DIR_ENV, &override_link);
+        let resolved = resolve_newspaper_clippings_root();
+        env::remove_var(DATA_DIR_ENV);
+
+        assert!(resolved.is_err());
+        assert_eq!(fs::read(outside.join("sentinel.txt")).unwrap(), b"keep-me");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    #[test]
     fn legacy_app_data_migrates_db_and_removes_legacy_token_copy() {
         let temp = tempdir().unwrap();
         let legacy = temp.path().join("legacy");
@@ -196,5 +423,38 @@ mod tests {
         );
         assert!(!legacy.join(TOKEN_FILE_NAME).exists());
         assert!(legacy.join(DB_FILE_NAME).exists());
+    }
+
+    fn create_dir_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+    }
+
+    fn create_dir_junction(target: &Path, link: &Path) -> bool {
+        #[cfg(not(windows))]
+        {
+            let _ = (target, link);
+            false
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
     }
 }
