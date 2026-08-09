@@ -220,6 +220,112 @@ export type NewspaperClippingsInvalidatedEvent = {
 `clippingIds` is bounded. A large reset/source-change event may use an empty
 array to mean refresh affected pages rather than emit unbounded IDs.
 
+### 3.6 Ranked search queries
+
+Search uses dedicated commands rather than overloading the ordinary list query.
+The backend owns ranking, candidate bounds, and confident-result exclusion.
+
+```ts
+export type NewspaperClippingMatchField =
+  | "title"
+  | "note"
+  | "edition"
+  | "date"
+  | "page";
+
+export type NewspaperClippingSearchSnippet = {
+  field: NewspaperClippingMatchField;
+  parts: Array<{
+    text: string;
+    highlighted: boolean;
+  }>;
+};
+
+export type NewspaperClippingSearchResult = {
+  clipping: NewspaperClippingSummary;
+  matchedFields: NewspaperClippingMatchField[];
+  snippets: NewspaperClippingSearchSnippet[];
+  possibleMatch: boolean;
+};
+
+export type SearchNewspaperClippingsRequest = {
+  query: string;
+  offset: number;
+  limit: 50;
+};
+
+export type SearchNewspaperClippingsPage = {
+  items: NewspaperClippingSearchResult[];
+  total: number;
+  offset: number;
+  limit: 50;
+  noteSearchApplied: boolean;
+  revision: number;
+};
+
+export type SearchPossibleNewspaperClippingsRequest = {
+  query: string;
+};
+
+export type SearchPossibleNewspaperClippingsResponse = {
+  items: NewspaperClippingSearchResult[];
+  limit: 25;
+  revision: number;
+};
+```
+
+Commands:
+
+```text
+search_newspaper_clippings
+search_possible_newspaper_clippings
+```
+
+`parts` avoids ambiguous byte/Unicode offsets and is rendered as plain text;
+React must not interpret snippet text as HTML. Confident results always have
+`possibleMatch: false`; the second command always returns `true`, never returns
+more than 25 items, and internally excludes every confident match for the same
+normalized query. Neither response exposes a numeric relevance or similarity
+score. `noteSearchApplied` is authoritative after backend normalization and
+drives the short-query helper; React does not infer that notes were searched.
+
+### 3.7 Snapshot-location Settings queries
+
+```ts
+export type NewspaperSnapshotRootStatus =
+  | "unchecked"
+  | "connected"
+  | "offline"
+  | "marker_mismatch";
+
+export type NewspaperSnapshotRootSummary = {
+  rootId: string;
+  kind: "download_snapshot" | "legacy_managed";
+  displayPath: string;
+  status: NewspaperSnapshotRootStatus;
+  lastCheckedAt?: number | null;
+};
+
+export type ReconnectNewspaperSnapshotRootResult =
+  | { status: "cancelled" }
+  | { status: "connected"; root: NewspaperSnapshotRootSummary };
+```
+
+Commands:
+
+```text
+list_newspaper_snapshot_roots
+check_newspaper_snapshot_root
+reconnect_newspaper_snapshot_root
+open_newspaper_snapshot_root
+```
+
+All action inputs contain only `rootId`. `displayPath` is presentation data and
+must never be accepted back as filesystem authority. Reconnect owns the native
+directory picker at the Tauri boundary and returns `cancelled` without mutation
+when the user dismisses it. Legacy managed roots are listed for diagnostics but
+cannot be reconnected to a download destination.
+
 ## 4. Master-detail layout
 
 ### Desktop layout
@@ -252,6 +358,26 @@ At width <900 CSS px:
 - Selecting a clipping opens a full-width detail surface.
 - Detail has `Back to clippings`.
 - Dirty-navigation guards remain identical.
+
+When the Clippings toolbar query is non-empty, a search-results surface takes
+over the provider-owned main content area at every width. The toolbar remains
+visible. The ordinary list/detail composition and its Tiptap instance retain
+their state but are removed from focus/accessibility navigation; search does
+not destroy a draft merely because the first character was typed.
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ Clippings   [ Search clipping notes…                              ] │
+├──────────────────────────────────────────────────────────────────────┤
+│ 18 results · Relevance                                               │
+│ [Title] [Note]  Result title                                         │
+│ matching plain-text note excerpt with safe visual emphasis           │
+│ Edition · date · page                                                 │
+│                                                                      │
+│ Possible matches                                                     │
+│ [Possible match] [Edition] …                                         │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ### FR-LAYOUT-001
 
@@ -346,6 +472,58 @@ while restoring scroll anchor/selected ID after layout.
 - Empty query is represented as `""`, not `%` or null.
 - Search state is local to the Clippings view for V1; it need not persist across
   app restart.
+- Title, Edition, Date, and Page matching starts at one Unicode scalar value.
+  Note matching starts at three. With a one- or two-scalar query, show
+  `Type 3 characters to search notes` and do not produce a Note tag or snippet.
+- After the 200 ms debounce, a non-empty query replaces the ordinary
+  list/detail presentation with full-width ranked results without unmounting
+  or clearing the active editor draft.
+- Each request has a monotonically increasing frontend generation. Stale
+  responses are discarded and duplicate IDs are removed across pages.
+- Confident results load 50 at a time as the virtual scroll approaches its
+  tail. At most the current and one near-future page are in flight.
+- Only after the confident result count is exhausted may the frontend request
+  one fuzzy page. It is headed `Possible matches`, contains at most 25 unique
+  rows, and is never interleaved into confident ranking.
+- Clicking a result flushes/resolves any dirty note before changing detail. A
+  failed flush keeps the current note and query visible with a retry action.
+- Returning from a result restores the exact query, loaded-page boundary,
+  scroll anchor, and focused result when it still exists.
+
+### Match fields and snippets
+
+- Result tags are factual and cumulative: `Title`, `Note`, `Edition`, `Date`,
+  and `Page`.
+- Fuzzy rows also display `Possible match`; no numeric confidence is shown.
+- Confident matching covers all five fields. Fuzzy matching covers only Title,
+  Note, and Edition. Date and Page are literal and never approximated.
+- A safe bounded plain-text snippet is selected around a Note match. Markdown
+  syntax, raw HTML/MDX, and executable content are never rendered from a search
+  snippet.
+- Highlighting uses the returned plain-text `parts`; the UI does not reconstruct
+  byte or Unicode offsets and never uses `dangerouslySetInnerHTML`.
+- A title or provenance-only result does not invent a Note tag or note match.
+
+### Relevance contract
+
+Confident ordering is deterministic:
+
+1. Exact normalized title.
+2. Normalized title prefix.
+3. Weighted FTS relevance, with Title weighted above Note and Note above
+   Edition.
+4. Literal Date/Page match contribution below text-field matches.
+5. `updated_at DESC`, then clipping ID as final ties.
+
+FTS weights are frozen only after the committed mixed English/Chinese golden
+ranking fixture proves representative ordering. The UI does not expose the
+internal numeric score.
+
+Possible-match candidate generation uses the trigram index and a bounded
+candidate/window limit. Similarity evaluation never reads every full note per
+keystroke. It requires at least four Unicode scalar values and uses a documented
+Unicode-normalized edit-distance threshold. Confident IDs are excluded before
+the maximum 25 fuzzy rows are returned.
 
 ### Sort
 
@@ -361,6 +539,9 @@ Title A–Z         → title_asc
 Sort selection may persist in localStorage under a versioned clipping-specific
 key. It is preference data, not SQLite domain state.
 
+While search is non-empty, the sort control reads `Relevance` and ordinary sort
+choices are disabled/hidden. Clearing search restores the previous list sort.
+
 ### AC-LIBRARY-001
 
 Given `%`, `_`, backslash/escape, apostrophe, Chinese text, and mixed date/page
@@ -370,6 +551,19 @@ When search runs
 
 Then values are treated literally, results are paged deterministically, and no
 SQL syntax is interpolated.
+
+### AC-LIBRARY-002
+
+Given confident matches, typo candidates, one- to four-character queries,
+mixed English/Chinese text, a two-megabyte note, and more than 50 results
+
+When the user types, scrolls through confident pages, reaches Possible matches,
+opens a result, and returns
+
+Then ranking/tags/snippets are factual, one- and two-character queries exclude
+Note and explain its three-character minimum, no more than 25 fuzzy rows appear,
+stale pages cannot append, full notes are not linearly scanned for fuzzy
+scoring, and query/scroll/draft state is preserved.
 
 ## 7. Loading, empty, and failure states
 

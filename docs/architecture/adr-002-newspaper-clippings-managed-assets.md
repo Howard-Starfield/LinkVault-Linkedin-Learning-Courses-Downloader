@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-07
 
-**Storage amendment:** 2026-08-09 (D-032)
+**Storage amendments:** 2026-08-09 (D-032, D-033)
 
 **Decision owners:** Howard Deng and LinkVault engineering
 
@@ -99,6 +99,12 @@ deferred.
   missing registered root.
 - Existing schema-v3 assets remain under `LinkVaultData/newspaper-clippings`
   through a read-only `legacy_managed` root; they are not moved automatically.
+- Settings exposes the registered snapshot roots created from download
+  destinations; it does not provide an arbitrary global destination override.
+- A user may recheck an unavailable root or reconnect a moved root only by
+  selecting the existing marker-bound `Newspaper snapshots` directory. The
+  backend verifies the marker before changing the stored locator and never
+  scans, merges, moves, or creates snapshot content during reconnect.
 - Asset writes use a staging file, validation, and atomic promotion.
 - The clipping row is inserted only after the canonical asset has been promoted.
 - If the database insert fails, the newly promoted asset is removed or moved to
@@ -138,6 +144,9 @@ deferred.
   unreadable.
 - A missing canonical asset is surfaced as a recoverable data-integrity state;
   the database record is not silently deleted.
+- An offline or marker-mismatched snapshot root does not make SQLite titles or
+  notes unavailable and does not change clipping asset state merely because a
+  status probe failed.
 
 ### Concurrency and responsiveness
 
@@ -242,6 +251,8 @@ valid without reproducing browser layout calculations.
   merged.
 - No crop operation may hold a database transaction during decode or encode.
 - No frontend command may supply a destination filesystem path.
+- No reconnect flow may create or rewrite a root marker, search arbitrary
+  folders, or accept an unverified directory as an existing snapshot root.
 - No protocol response may disclose an absolute path.
 - No reset or source-edition deletion may cascade into clipping deletion.
 - No editor package may become the persistent document format.
