@@ -1,7 +1,7 @@
 # Newspaper Clippings core workflow implementation plan
 
-**Status:** Planning only — no production implementation is authorized by this
-document
+**Status:** Planning only — live owner/conflict audit completed 2026-08-09; no
+production implementation is authorized by this document
 
 **Date:** 2026-08-09
 
@@ -15,13 +15,17 @@ clipping, and types a note in the approved Tiptap editor with safe autosave.
 - The canonical crop is created by Rust from registered source media, never
   from a WebView screenshot.
 - React sends a normalized rectangle and the page's expected media version.
-- Canonical media lives under the source job's original newspaper download
+- New canonical media lives under the source job's original newspaper download
   destination in `Newspaper snapshots/<edition>/`. It is not duplicated under
   `LinkVaultData`.
-- The proposed collision-safe layout is
+- The approved collision-safe layout is
   `<destination>/Newspaper snapshots/<sanitized edition name - code>/<publication-date>/<clipping-id>/clipping-v1.webp`.
   The date prevents different issues of one edition from colliding, and the
   clipping ID preserves idempotent create/recovery semantics.
+- The edition segment must use a Windows-safe bounded backend normalizer with
+  the validated edition code as the stable suffix/fallback. It must reject or
+  escape reserved device names, trailing dots/spaces, empty output, ambiguous
+  case-folded collisions, and paths beyond the tested Windows path budget.
 - Rust derives the destination and every relative segment from registered
   source/job data. React never chooses or receives a raw filesystem path.
 - Saving creates exactly one clipping aggregate containing one immutable image
@@ -52,23 +56,50 @@ implements one application-data root across asset staging, atomic promotion,
 recovery, media protocol reads, cleanup, and database path validation. Do not
 merge PR #4 unchanged.
 
-The required Phase 2 amendment must:
+The required storage amendment must:
 
 - replace D-009 and update ADR-002/specifications before implementation;
 - derive the snapshot root from the crop source job's persisted batch
   destination, not from the frontend or the currently selected preference;
-- snapshot a backend-only storage-root locator on the clipping row so the asset
-  remains resolvable after its source job is deleted;
+- add a schema-versioned backend-only snapshot-root registry and reference its
+  stable ID from each clipping row, so the asset remains resolvable after its
+  source job/batch is deleted and equivalent Windows path spellings do not
+  create duplicate authorities;
+- place a small backend-owned root marker carrying that root ID in the reserved
+  internal subtree. Verify the marker before recovery, cleanup, deletion, or
+  media reads so a reused drive letter/path cannot silently become authority
+  for old clipping rows;
+- register/commit the root before staging begins. This lets startup cleanup
+  discover a crash-left staging directory even when no clipping row was ever
+  inserted;
 - keep only a backend-derived relative asset path in ordinary DTOs and never
   expose the absolute root over IPC;
 - preserve same-volume staging and atomic promotion inside the chosen snapshot
   root;
+- keep per-root staging/trash/quarantine in one reserved internal subtree, and
+  keep regenerable list thumbnails in the existing application cache rather
+  than cluttering or depending on the user-visible snapshot folder;
 - prove edition deletion/reset targets cannot reach the sibling
   `Newspaper snapshots` tree;
+- make archive import/repair skip the reserved `Newspaper snapshots` subtree so
+  recursive archive discovery neither re-imports nor repeatedly decodes saved
+  clipping WebPs;
 - preserve old snapshots at their original root when the user later changes
   the download preference; no implicit migration or cross-volume move;
-- define missing/unwritable/removable destination behavior without falling
-  back silently to `LinkVaultData` or a different download folder; and
+- distinguish a temporarily unavailable root (offline removable/network drive)
+  from a verified missing/corrupt canonical file. A transient root outage must
+  not permanently transition every clipping to `missing`;
+- never create a missing previously registered root during startup recovery,
+  cleanup, or media reads. Root/directory creation is allowed only during an
+  explicit new crop after the registered source destination and marker policy
+  have been revalidated;
+- define missing/unwritable/relative/UNC/removable destination behavior without
+  falling back silently to `LinkVaultData` or a different download folder;
+- resolve the correct root per row in create, idempotent retry, startup recovery,
+  delete-pending completion, canonical/thumbnail media serving, and integrity
+  transitions instead of retaining one process-global `ClippingAssetLayout`;
+- bound detached cleanup across all registered roots and prune an unused root
+  only after it owns no clipping, staging, trash, or quarantine evidence; and
 - revise recovery, cleanup, media-protocol, backup/rollback, and path-containment
   tests for multiple registered snapshot roots.
 
@@ -77,19 +108,87 @@ second exported copy. A duplicate managed copy would preserve the old ADR but
 would introduce two-file synchronization, deletion, integrity, and storage
 semantics that the product did not request.
 
+### 1.2 Storage-amendment implementation boundary
+
+Planned owners on a branch separate from Phase 2 crop:
+
+- `docs/architecture/adr-002-newspaper-clippings-managed-assets.md`
+- `docs/specs/newspaper-clippings-v1/00-decision-register.md` and every affected
+  asset/recovery/reset/verification specification
+- `apps/desktop/src-tauri/src/app/database.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/storage.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/clipping_models.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/clipping_repository.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/clipping_assets.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/clipping_recovery.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/clipping_service.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/media_protocol.rs`
+- `apps/desktop/src-tauri/src/providers/newspaper/archive_service.rs`
+- `apps/desktop/src-tauri/src/app/storage.rs` and `apps/desktop/src-tauri/src/lib.rs`
+
+Schema version 3 is already on `main`; this amendment therefore requires the
+next global schema version and a verified pre-migration backup. A root registry
+row contains a generated root ID plus a backend-only normalized/canonical
+locator. `newspaper_clippings` references the root ID and retains a
+root-relative canonical path.
+
+The migration must not assume the v3 table is empty. Existing v3 rows are
+backfilled to one `legacy_managed` root that resolves the old
+`LinkVaultData/newspaper-clippings` location. That root remains readable and
+recoverable but accepts no new clipping creation. Do not attempt an automatic
+cross-volume move into whichever download preference happens to be current.
+New rows use only `download_snapshot` roots.
+
+Suggested storage-amendment commit slices:
+
+1. ADR/D-009 replacement, v3-to-next migration, root models/repository, and
+   legacy-row preservation fixtures.
+2. Per-root layout/service/media resolution with offline-root classification.
+3. Multi-root recovery/cleanup, archive exclusion, reset/deletion safety, and
+   clean performance/release evidence.
+
+Minimum clean-head gates for the storage amendment:
+
+```powershell
+npm.cmd --prefix apps\desktop run verify:architecture
+npm.cmd --prefix apps\desktop run verify:persistence
+npm.cmd --prefix apps\desktop run verify:newspaper-clippings
+cargo fmt --manifest-path apps\desktop\src-tauri\Cargo.toml --check
+cargo clippy --manifest-path apps\desktop\src-tauri\Cargo.toml --all-targets
+cargo test --manifest-path apps\desktop\src-tauri\Cargo.toml
+npm.cmd --prefix apps\desktop run verify:release
+git diff --check
+```
+
+The evidence fixture includes at least two online roots, one offline registered
+root, one legacy-managed root, orphan staging without a clipping row, a reused
+path with the wrong root marker, and enough registered roots to prove cleanup
+enumeration/mutation work remains detached and bounded.
+
+Stop after this branch is review-ready. Do not fold Reader interaction or the
+Phase 2 crop algorithm into it.
+
 ## 2. Entry gates and branch order
 
-Implementation remains two reviewable PRs. Do not combine them without another
-explicit product decision.
+The storage change is a persistence/recovery phase, not crop UI work. Keep each
+review boundary explicit rather than expanding the already-reviewed crop PR.
 
-1. Phase 2 PR #4 must first be amended for section 1.1, reviewed, and merged.
-   Its current implementation commit is
+1. Phase 4A PR #5 may be reviewed/merged independently. Its approved decision
+   head is `559d78e22ea80caa5d6a81fbe7aa5cd1f1070f49`.
+2. Do not merge current Phase 2 PR #4. Its current implementation commit is
    `0796e78674dd16d4eb6a88f455ac2d63300712c0`; its evidence head is
-   `e81e8230aac50372f7b7d22d1482ab35ec18943a`.
-2. Phase 4A PR #5 must be reviewed and merged. Its approved decision head is
-   `559d78e22ea80caa5d6a81fbe7aa5cd1f1070f49`.
-3. Phase 3 branches from the main commit containing Phase 2.
-4. Phase 4B branches only after Phase 3 and Phase 4A are both on main.
+   `e81e8230aac50372f7b7d22d1482ab35ec18943a`, and all of that evidence assumes
+   one `LinkVaultData/newspaper-clippings` root.
+3. Create a dedicated storage-amendment branch from current `main` (after
+   rebasing on PR #5 if PR #5 has merged). It owns the ADR/D-009 replacement,
+   schema migration, root registry, per-root asset/recovery/media resolution,
+   reset/import exclusions, and their gates. Merge it separately.
+4. Rebase Phase 2 PR #4 onto the storage-amendment merge, adapt crop creation to
+   the per-source root resolver, rerun every Phase 2 clean-head baseline/gate,
+   and only then return PR #4 to review readiness.
+5. Phase 3 branches from the main commit containing the storage amendment and
+   adapted Phase 2 crop.
+6. Phase 4B branches only after Phase 3 and Phase 4A are both on main.
 
 Before either implementation branch changes code:
 
@@ -144,9 +243,17 @@ changes, or the live owner map materially differs from this plan.
   - Owns list/detail projections, excerpts, optimistic revisions, source
     availability, and clipping persistence.
 - `apps/desktop/src-tauri/src/providers/newspaper/clipping_assets.rs`
-  - Owns the snapshot-root registry, canonical/derived-thumbnail layout,
-    staging/promotion, containment, and protocol-safe reads after the Phase 2
-    storage amendment.
+  - Owns per-root canonical layout, same-volume staging/promotion, containment,
+    and protocol-safe reads after the storage amendment. The database repository
+    owns the root registry; regenerable clipping thumbnails use a dedicated
+    cache subtree beneath `LinkVaultData`, not a snapshot root.
+- `apps/desktop/src-tauri/src/providers/newspaper/archive_service.rs`
+  - Recursively discovers importable newspaper images today. The storage
+    amendment must prune `Newspaper snapshots` before descending into it.
+- `apps/desktop/src-tauri/src/app/database.rs`
+  - Owns the global schema version/migration backup and reset transaction. The
+    storage amendment, not Phase 3, must add the root registry/migration and
+    preserve it with clipping rows across Newspaper reset.
 
 Phase 4B must not create a second repository, database connection policy,
 asset root, crop command, or note data model.
@@ -231,8 +338,13 @@ Required invariants:
 - Pointer move updates render state at most once per animation frame.
 - Pointer cancel, lost capture, window blur, unmount, and Escape cleanly release
   selection locks.
+- A material image `ResizeObserver`/media-version change during drawing cancels
+  the draft instead of mixing points measured against two rectangles.
 - Confirmation freezes geometry. Wheel/touch scrolling, zoom, tone changes,
   and page navigation cannot silently move the confirmed target.
+- Confirmation/saving keeps the target virtual row mounted. A harmless window
+  resize redraws the overlay from the frozen normalized rectangle; it never
+  recomputes canonical geometry from stale CSS pixels.
 - Saving has exactly one retained operation ID and cannot double-submit.
 - Leaving any clipping state restores ordinary reader behavior.
 
@@ -279,12 +391,15 @@ invocation, manifest refresh, and navigation callbacks.
   - call `clippingCapability.onCreated(clippingId)` only when supplied;
   - expose **Open note** only after Phase 4B provides a real destination.
 - On `SOURCE_MEDIA_STALE`, retain visible geometry, refresh the authoritative
-  manifest, rebind only after the user confirms the refreshed page, and use a
-  new operation ID only when the old request is known not to have created a
-  clipping.
+  manifest, treat the retained overlay as reference-only, and require Redraw on
+  the refreshed page before another Save. Use a new operation ID only when the
+  old request is known not to have created a clipping.
 - On too-small, security/integrity, retryable storage, or ambiguous failures,
   preserve or discard selection exactly as specification 04 requires. Never
   silently crop a different page/version.
+- If IPC/response delivery fails after Save and creation outcome is unknown,
+  retry with the same retained operation ID. Never generate a second ID merely
+  because the frontend did not receive the first response.
 
 ### 4.8 Phase 3 verification
 
@@ -301,6 +416,11 @@ Automated proof must cover:
   crop remaining under its own original `Newspaper snapshots` root;
 - changing the current download preference after creation without relocating
   or orphaning an existing clipping;
+- relative, long, reserved-name, case-variant, UNC, read-only, offline, and
+  reparse/junction destination fixtures with safe errors and no fallback root;
+- source deletion/reset during decode/final recheck, plus restart at every
+  root-registration/staging/row/promotion/ready boundary;
+- recursive archive import/repair proving the snapshot subtree is pruned;
 - 8/50/500-page manifests with the existing mounted-image bound unchanged;
 - no new full-page canvas or screenshot path;
 - keyboard focus/labels and light/dark/high-contrast visuals.
@@ -400,8 +520,13 @@ response types plus safe error discrimination.
 - Add `newspaper-clippings` to `AppView`.
 - Add the third **Clippings** World Journal child.
 - Own `pendingClippingId` for Reader-to-detail navigation.
-- Render the dedicated Clippings surface without loading Tiptap on unrelated
-  routes.
+- Render a dedicated Clippings route component directly at the App boundary;
+  do not add it as another `NewspaperView` mode that constructs download-form
+  state. The route lazy-loads the editor adapter only for selected detail.
+- Replace direct `setActiveView(...)` calls with one guarded navigation request
+  boundary while a clipping editor is mounted. The boundary awaits the current
+  document flush before committing any sidebar/provider transition and does not
+  let a later click overtake an earlier pending flush.
 
 Thread one callback through the existing composition path:
 
@@ -433,6 +558,9 @@ List requirements:
 - Sparse paged model with stable ID keys and deterministic selection.
 - Default `updated_desc`; approved search and sort values only.
 - Reuse the existing virtualizer pattern.
+- Key loading/in-flight page ownership by both query generation and page offset;
+  do not copy the current Library's offset-only loading set, where a stale
+  request's `finally` can clear ownership for a newer generation.
 - Request thumbnails only for visible rows; dedupe/bound generation requests.
 - Preserve selection across refresh when the ID remains visible.
 - Never load canonical images or full Markdown for all rows.
@@ -455,15 +583,19 @@ Search requirements:
   storage-root locator. Moving from `LIKE` to SQLite FTS later must remain an
   internal repository/index migration behind the same list API.
 - Keep D-019's simple substring search for V1 and record 8/50/500 response and
-  visible-update timings. Propose FTS only after a larger representative
-  fixture demonstrates a measured responsiveness problem; do not introduce an
-  FTS synchronization lifecycle speculatively.
+  visible-update timings, including notes near the 2 MiB contract limit. Search
+  results need a bounded match-centered plain-text excerpt so a deep keyword is
+  visible without fetching full note bodies. Propose FTS if this worst-case
+  baseline misses the agreed responsiveness budget; do not introduce an FTS
+  synchronization lifecycle without that evidence.
 
 Detail requirements:
 
 - Abort/ignore stale detail responses by clipping ID and request generation.
 - Render one fixed source card above title/editor using the versioned media URL.
-- Handle ready versus missing canonical asset without deleting the note.
+- Handle ready, verified missing/corrupt, and temporarily unavailable snapshot
+  root states without deleting the note. Reconnecting a drive must make a
+  transiently unavailable image readable again without rewriting note data.
 - The ordinary source card cannot be removed or edited through Tiptap.
 - Expanded image viewing, if retained, is a bounded detail-only overlay and not
   a new persistent canvas architecture.
@@ -500,11 +632,15 @@ Rules:
 - Never invoke Tauri synchronously from an editor transaction.
 - Permit one update in flight. If the draft changes while saving, queue only
   the latest draft and schedule it after acknowledgement.
-- On success, advance persisted values/revision and remain dirty if a newer
-  draft exists.
+- On success, adopt the server-returned normalized title/Markdown/revision
+  rather than assuming the submitted bytes were canonical, and remain dirty if
+  a newer draft exists. An unchanged acknowledgement may retain its revision.
+- If the draft returns to the persisted value while a request is in flight,
+  clear redundant queued work after the acknowledgement instead of issuing a
+  second no-op save.
 - On safe failure, preserve the draft and expose Retry.
 - Flush before clipping switch, route change, editor unmount, application blur,
-  and cooperative native close.
+  provider reset, update/restart handoff, and cooperative native close.
 - A failed flush blocks navigation and offers Stay/Retry; no draft is silently
   discarded.
 - Empty/oversized title or Markdown blocks autosave with inline validation.
@@ -522,6 +658,10 @@ On `CLIPPING_REVISION_CONFLICT`:
    - **Copy my draft** — copy safe plain Markdown without changing state.
 5. Never retry in a loop or silently overwrite another window.
 
+If clipboard permission rejects **Copy my draft**, keep the draft visible and
+offer selectable plain text; clipboard failure is not permission to clear or
+replace local state.
+
 Test two controllers starting from revision 5: one reaches revision 6; the
 other enters conflict with its local draft preserved.
 
@@ -531,6 +671,11 @@ Emit or reuse one Newspaper clipping invalidation event after create/update and
 thumbnail readiness. Event payloads contain only IDs/revisions needed to refresh
 visible state. Do not reload the entire list or remount the editor after each
 keystroke acknowledgement.
+
+After an autosave changes whether the selected clipping matches the active
+search, keep its detail/editor pinned with a clear `Not in current results`
+state until the user selects another row or clears search. Never let a list
+refresh implicitly switch documents or discard local state.
 
 The Reader's successful create should make the new clipping selectable before
 the **Open note** action navigates. Detail navigation may fetch directly by ID;
@@ -545,10 +690,12 @@ Automated proof must include:
 - visible-only thumbnails and 8/50/500 list performance;
 - keyword search over title/note/provenance, including English, Chinese,
   literal wildcard characters, deep matches, and stale-query rejection;
-- source card ready/missing behavior;
+- source card ready, verified missing/corrupt, and transiently offline-root
+  behavior;
 - title and Markdown validation boundaries;
 - 800 ms debounce, one in-flight save, queued-latest acknowledgement, retry,
-  flush, unmount, blur, route change, and cooperative close;
+  flush, unmount, blur, guarded route change, provider reset, and cooperative
+  tray/window close;
 - three conflict actions with local draft preservation;
 - document switch isolation and stale detail/update response rejection;
 - React 19 Strict Mode, undo/redo, formatting, safe paste/links, dark/light,
@@ -565,6 +712,13 @@ Native Phase 4B Tauri smoke:
 - autosave only after stable composition;
 - clipping switch after successful flush and failed-flush draft preservation;
 - application blur/restore and light/dark themes.
+
+Native lifecycle integration must also cover the existing tray **Quit** path.
+It currently calls `app.exit(0)` from Rust, which cannot wait for an unsubmitted
+frontend debounce. Phase 4B must introduce one cooperative quit handshake that
+requests/awaits editor flush before normal exit, while still documenting that
+forced process termination or power loss can lose the latest unsubmitted
+debounce window.
 
 Minimum clean-worktree commands:
 
@@ -615,6 +769,7 @@ The core goal is complete only when all rows pass in the real Tauri app:
 | Autosave | Stable draft saves after 800 ms; route/document/blur/close boundaries flush safely. |
 | Reopen | The persisted title, Markdown, image, and revision reload correctly. |
 | Find later | A keyword in the title or note finds the clipping through paged SQLite search without scanning the nested snapshot folders. |
+| Storage temporarily offline | The note remains searchable/editable, the image reports temporary unavailability, and reconnecting the same marked root restores it without a database rewrite. |
 | Conflict | A concurrent update preserves the local draft and presents three explicit recovery actions. |
 | Scale | Reader selection remains correct at 100/125/150/200%; list remains bounded at 8/50/500 items. |
 
@@ -626,6 +781,8 @@ Stop and request review if implementation would:
 - expose raw filesystem paths or accept screenshot bytes;
 - merge the current Phase 2 storage implementation without replacing ADR-002
   and D-009 for the approved `Newspaper snapshots` location;
+- retain one process-global clipping layout or treat a missing registered root
+  as permission to recreate/scan an arbitrary download directory;
 - add a second crop/persistence/asset owner;
 - import Tiptap outside `ClippingNoteEditor`;
 - persist editor JSON or unsupported executable Markdown;
@@ -645,7 +802,8 @@ Stop and request review if implementation would:
 This file is the local implementation blueprint, not authorization to begin
 coding. The next authorization should name either:
 
-- **Phase 3 implementation**, after the storage-amended PR #4 is merged; or
+- **Phase 3 implementation**, after the separate storage amendment and adapted
+  PR #4 are merged; or
 - **Phase 4B implementation**, only after Phase 3 and PR #5 are merged.
 
 Each phase starts from a fresh live diff/owner audit and ends at its own review
