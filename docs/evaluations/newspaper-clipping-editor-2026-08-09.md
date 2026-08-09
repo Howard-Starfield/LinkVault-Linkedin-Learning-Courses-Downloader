@@ -1,7 +1,8 @@
 # Newspaper clipping note editor evaluation — 2026-08-09
 
 **Phase:** 4A — isolated compatibility spike only
-**Status:** Draft. D-024 remains Proposed; this report does not authorize Phase 4B.
+**Status:** Complete. D-024 approves the Tiptap 3.29.2 trio; production
+integration remains Phase 4B work.
 **Branch / base:** `spike/newspaper-clippings-phase-4a-editor` at the evaluation
 worktree based on `60071e4ee868dacb016c62ab0e69ba174e09b6f6`; merged target
 `main` is `2500d6da6022d85032689567ecc479de2df11bc1`.
@@ -11,10 +12,10 @@ worktree based on `60071e4ee868dacb016c62ab0e69ba174e09b6f6`; merged target
 
 ## Scope and entry gate
 
-The Phase 1 and rustfmt-baseline prerequisites are merged. The master PRD marks
-Phase 4A Ready and D-024 is the only applicable Proposed decision. This spike
-does not change the production app route, Newspaper library/reader UI, Tauri
-commands, persistence, Rust, autosave, navigation, or release version.
+The Phase 1 and rustfmt-baseline prerequisites are merged. Phase 4A and D-024
+are complete following the recorded comparison and product-owner acceptance.
+This spike does not change the production app route, Newspaper library/reader
+UI, Tauri commands, persistence, Rust, autosave, navigation, or release version.
 
 The adapter contract under evaluation is the D-023/FR-EDITOR-001 contract:
 `documentId`, `initialMarkdown`, read-only and autofocus inputs; Markdown and
@@ -207,10 +208,10 @@ coverage only; it is not native IME evidence.
 | Browser result | 10/17 passed; raw `<script` persisted | 15/15 passed; raw HTML/MDX, disabled GFM/code/task features, and unsafe links cannot round trip |
 | Lifecycle | Candidate-specific evidence only | One committed ready callback after deferred construction; keyed document recreation preserves history isolation |
 | Dependency audit | 2 high `js-yaml` findings, no fix at evaluation | 0 findings with production dependencies omitted |
-| Decision | Rejected and removed | Retained, pending native Windows IME gate |
+| Decision | Rejected and removed | Approved at exact version 3.29.2 behind the LinkVault adapter |
 
-Candidate B is the retained winner for this spike, subject to the native
-Windows gate below. It does not approve D-024 or Phase 4B.
+Candidate B is the approved winner for this spike. D-024 is resolved; this does
+not itself implement Phase 4B.
 
 ## Phase 4B integration instruction
 
@@ -222,28 +223,25 @@ active composition before the switch. It must not add `setContent` on ordinary
 parent acknowledgement or rerender. This spike deliberately implements none of
 that production integration.
 
-## Native Windows IME gate
+## User acceptance and deferred native Tauri IME gate
 
 The machine has Windows 11 and the user profile preloads English (`00000409`)
 and Chinese (`00000804`) input methods, with `zh-Hans-CN` listed in the user
-language profile. No real installed Tauri editor-evaluation session, candidate
-window interaction, or keyboard/IME result has yet been recorded. Therefore
-none of N-IME-01 through N-IME-10 is passed, and synthetic browser composition
-must not be presented as a substitute. D-024 remains Proposed and PR #5 must
-remain Draft unless every native case is completed against the retained
-candidate.
+language profile. On 2026-08-09 the product owner exercised the retained adapter
+in the visible Windows development harness after receiving the IME, formatting,
+undo/redo, document-switch, theme, read-only, and Markdown reload checklist and
+reported that it works. This is recorded as Phase 4A package-selection user
+acceptance without inventing per-case results that were not separately reported.
 
-### Required native UAT remains outstanding
+### Phase 4B native Tauri integration check remains outstanding
 
-The permitted Phase 4A process surface was worktree Node/Vite plus headless
-Chrome. It did not provide a real desktop editor window in which to observe an
-IME candidate window, and Phase 4A is prohibited from adding a production
-Clippings route or Tauri integration merely to create one. The automated
-composition case dispatches synthetic browser events and must never be claimed
-as native IME success.
+The Phase 4A surface was the isolated Node/Vite harness in headless and visible
+browser modes. It did not include production autosave or the Tauri Clippings
+route. Full native Tauri composition must therefore be checked after Phase 4B
+integrates those real owners; it no longer blocks selection of the package.
 
-A Windows reviewer must perform these steps against the retained adapter in an
-approved real desktop evaluation surface before D-024 can move from Proposed:
+A Windows reviewer must perform these steps against the integrated Phase 4B
+desktop flow before Phase 4B is complete:
 
 1. Record Windows version, keyboard layout, Microsoft Pinyin (or approved
    Traditional IME), Tiptap package versions, theme, and display scale.
@@ -255,11 +253,9 @@ approved real desktop evaluation surface before D-024 can move from Proposed:
 4. Trigger a parent acknowledgement while composing, request a document switch,
    and verify the guard preserves or resolves the active composition according
    to the editor contract.
-5. Perform the platform screen-reader smoke for the labelled body, toolbar,
-   heading selector, link dialog, read-only state, and visible focus.
-
-Native screen-reader smoke is also unverified. Neither native gap may be
-covered by the headless browser matrix.
+5. Confirm keyboard labels, focus order, pressed/disabled states, link-dialog
+   focus return, read-only behavior, and visible focus. Screen-reader UAT is
+   optional and is not a product blocker.
 
 ## Work-order verification status
 

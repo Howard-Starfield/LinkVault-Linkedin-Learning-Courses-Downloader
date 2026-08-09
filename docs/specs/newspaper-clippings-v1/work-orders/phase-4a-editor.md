@@ -209,7 +209,10 @@ Prove:
 
 ### Chinese IME
 
-Native Windows evidence must cover at minimum:
+Phase 4A records synthetic composition coverage and a visible Windows
+dev-harness user smoke. Phase 4B owns the final native Tauri matrix because it
+is the first phase with production autosave and document switching. That matrix
+must cover at minimum:
 
 - Simplified or Traditional Chinese IME candidate window;
 - typing and candidate selection without partial document commits;
@@ -220,10 +223,10 @@ Native Windows evidence must cover at minimum:
 - document-switch guard while composing;
 - light and dark theme candidate-window/focus behavior where observable.
 
-Browser automation may test synthetic composition events but may not be claimed
-as native IME proof. If Codex cannot perform native IME UAT in its environment,
-it must leave D-024 Proposed, keep the PR Draft, add exact human UAT steps, and
-stop without fabricating evidence.
+Browser automation alone may not be claimed as hands-on user acceptance. A
+visible Windows dev-harness smoke may close the Phase 4A package-selection gate;
+it does not replace Phase 4B native Tauri IME evidence. Screen-reader UAT is not
+a blocking requirement.
 
 ### Markdown fidelity
 
@@ -280,7 +283,7 @@ Record:
 - heading selector semantics;
 - link-dialog focus trap/return behavior when present;
 - read-only behavior;
-- screen-reader smoke with the platform tool available to the reviewer;
+- keyboard labels, focus order, pressed/disabled states, and visible focus;
 - high-contrast and reduced-motion compatibility.
 
 Required toolbar order:
@@ -396,11 +399,12 @@ Update D-024 from Proposed to Approved only when:
 
 - at least two candidates were meaningfully evaluated;
 - one candidate passes every blocking matrix row;
-- native Windows Chinese IME evidence is real and recorded;
+- synthetic composition and visible Windows dev-harness user acceptance are
+  recorded, with native Tauri IME explicitly assigned to Phase 4B;
 - React 19 production/Strict Mode tests pass;
 - approved Markdown round trips are stable;
 - unsupported HTML/MDX/images/tables/code are safe;
-- accessibility blocking issues are resolved or explicitly approved;
+- keyboard, labeling, focus, and theme blocking issues are resolved;
 - offline/network evidence is clean;
 - bundle behavior is acceptable and lazy;
 - license/notices/audit are complete;
