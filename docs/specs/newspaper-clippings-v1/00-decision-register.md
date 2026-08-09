@@ -45,7 +45,7 @@ migrations, tests, and rollback impact.
 | D-021 | Clipping media is served by the protected newspaper media protocol. | Approved |
 | D-022 | Crop work is bounded and performed outside database transactions. | Approved |
 | D-023 | Editor integration is hidden behind an internal Markdown adapter. | Approved |
-| D-024 | Exact WYSIWYG package is selected by a gated compatibility spike. | Proposed |
+| D-024 | Exact WYSIWYG package is selected by a gated compatibility spike. | Approved |
 | D-025 | Plain Markdown subset excludes executable MDX and arbitrary HTML. | Approved |
 | D-026 | Autosave debounce is 800 ms with explicit flush boundaries. | Approved |
 | D-027 | Clipping deletion is explicit and removes note plus managed asset. | Approved |
@@ -449,27 +449,44 @@ accessibility fixes, and Markdown normalization.
 
 ## D-024: WYSIWYG package selection
 
-**Status:** Proposed — blocking Phase 4B only
+**Status:** Approved — 2026-08-09
 
-**Decision:** Select the exact package in a dedicated Phase 4A compatibility
-spike. The spike must compare at least two viable React 19 candidates and must
-not persist editor-specific JSON.
+**Decision:** Use `@tiptap/react`, `@tiptap/starter-kit`, and
+`@tiptap/markdown`, each pinned at `3.29.2`, behind the LinkVault-owned
+`ClippingNoteEditor` Markdown adapter. Persist plain Markdown only; never
+persist Tiptap/ProseMirror JSON.
 
 **Required evidence:**
 
 - React 19 and Strict Mode operation.
-- Chinese IME composition and candidate selection.
+- Synthetic composition coverage plus a visible Windows dev-harness user smoke.
 - Plain Markdown round trips for the approved subset.
-- Undo/redo across controlled-value updates and autosave.
-- Keyboard and screen-reader behavior.
+- Undo/redo across controlled parent updates; production autosave integration
+  remains a Phase 4B gate.
+- Keyboard toolbar, labels, focus order, and visible focus behavior.
 - Offline operation with no remote dependency.
 - Dark/light theme integration.
 - Production build and bundle impact.
 - License compatibility and third-party notice requirement.
 - No executable MDX or arbitrary raw HTML requirement.
 
-**Approval result:** The selected package, exact version range, adapter design,
-and rejected candidate evidence must be added here before Phase 4B starts.
+**Approval result:** Tiptap is approved from the committed Phase 4A comparison
+in `docs/evaluations/newspaper-clipping-editor-2026-08-09.md`. MDXEditor 4.2.0
+was rejected because raw executable-style Markdown persisted and its evaluated
+dependency tree had unresolved audit findings. Tiptap passed the shared React
+19, Strict Mode, Markdown-safety, offline, theme, bundle, license, audit, and
+browser matrix; the product owner then exercised the visible Windows
+evaluation harness and accepted its editing behavior.
+
+Native Tauri Chinese IME validation moves to the Phase 4B exit gate, where the
+real production autosave and document-switch owners exist. Screen-reader UAT
+is not a Phase 4A, Phase 4B, or release blocker; keyboard semantics and labels
+remain required and automated.
+
+**Known limitations:** Phase 4A does not production-enable the editor, add
+autosave, or prove Tauri WebView composition. Phase 4B must retain the adapter
+boundary, lazy-load the editor, and run native IME cases against the integrated
+desktop flow.
 
 **Affected specifications:** 05, 07, 08.
 

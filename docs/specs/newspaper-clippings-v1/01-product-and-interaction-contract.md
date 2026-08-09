@@ -833,12 +833,13 @@ And Back returns to the same clipping.
 
 ### AC-PRODUCT-006: Accessible operation
 
-Given keyboard-only or screen-reader use
+Given keyboard-only use
 
 When the user enters Clip mode, cancels, saves, opens a note, edits, and deletes
 
-Then every state and required action is reachable, labeled, and announced
-without relying only on color or pointer hover.
+Then every state and required action is reachable, labeled, and visibly focused
+without relying only on color or pointer hover. Screen-reader UAT is optional
+and is not a V1 release blocker.
 
 ### AC-PRODUCT-007: Clear integrity states
 

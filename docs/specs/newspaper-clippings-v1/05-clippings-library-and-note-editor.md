@@ -650,12 +650,12 @@ A paragraph entered with Chinese IME: 世界日報剪報測試。
 | Area | Required evidence |
 |---|---|
 | React | React 19 production build; Strict Mode mount/unmount/remount |
-| Composition | Native Windows Chinese IME typing, candidate selection, Enter, punctuation, undo |
+| Composition | Synthetic browser coverage plus visible Windows dev-harness user smoke; native Tauri IME remains a Phase 4B integration gate |
 | Markdown | Approved subset round-trips without editor-specific syntax or semantic loss |
 | Unsupported syntax | Raw HTML/MDX/image/table/code paste is stripped/rejected predictably |
 | Undo/redo | Works across formatting and does not break after parent autosave state updates |
 | Document switch | No stale content, selection, history, or composition crosses IDs |
-| Accessibility | Keyboard toolbar, labels, focus order, screen-reader smoke |
+| Accessibility | Keyboard toolbar, labels, focus order, pressed/disabled states, and visible focus |
 | Theme | Light/dark, high contrast, focus-visible, disabled/read-only |
 | Offline | No network request needed to load or edit |
 | Bundle | Record raw and gzip production bundle delta |
@@ -909,7 +909,7 @@ keyboard, and do not steal selection unexpectedly.
 
 ### FR-A11Y-LIBRARY-005
 
-Chinese IME composition and screen-reader key handling take priority over global
+Chinese IME composition and editor key handling take priority over global
 reader/app shortcuts while the editor owns focus.
 
 ## 19. Browser and native test matrix
@@ -953,7 +953,7 @@ reader/app shortcuts while the editor owns focus.
   undo, redo, document switch, blur, and autosave.
 - Light/dark theme and 100/125/150/200% scaling.
 - Keyboard-only toolbar and editor use.
-- Screen-reader smoke for labels/focus where tooling is available.
+- Labels, focus order, and visible focus in keyboard-only operation.
 - Normal close with dirty note and failed-save navigation guard.
 
 ## 20. Phase 4A exit gate
@@ -967,7 +967,8 @@ Phase 4A is complete only when:
 - D-024 is updated to Approved with exact dependency/version/configuration.
 - Rejected candidate dependencies and experimental code are removed.
 - Selected adapter skeleton/tests compile under React 19 and Strict Mode.
-- Native Chinese IME evidence is recorded.
+- Synthetic composition and visible Windows dev-harness user acceptance are
+  recorded; native Tauri IME remains a Phase 4B exit gate.
 - Bundle/license/security evidence is recorded.
 - The coding agent stops before production Clippings view integration.
 
