@@ -4,7 +4,7 @@
 
 **Primary implementation phase:** Phase 2
 
-**Related decisions:** D-003 through D-009, D-014, D-017, D-022, D-030
+**Related decisions:** D-003 through D-008, D-014, D-017, D-022, D-030, D-032
 
 ## 1. Purpose
 

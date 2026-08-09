@@ -30,7 +30,7 @@ migrations, tests, and rollback impact.
 | D-006 | Expected page media version is required and stale media is rejected. | Approved |
 | D-007 | Source priority is retained original, then current optimized image. | Approved |
 | D-008 | Canonical output is lossless WebP with no resize. | Approved |
-| D-009 | Canonical assets are application-managed durable data. | Approved |
+| D-009 | Canonical assets are application-managed durable data. | Superseded by D-032 |
 | D-010 | One clipping owns one note in V1. | Approved |
 | D-011 | SQLite Markdown is the note source of truth. | Approved |
 | D-012 | Source image is a fixed card outside the editable document. | Approved |
@@ -53,6 +53,7 @@ migrations, tests, and rollback impact.
 | D-029 | OCR, AI, annotations, multiple attachments, tags, and sync are deferred. | Deferred |
 | D-030 | Canonical screenshots are rejected for V1. | Rejected |
 | D-031 | Deferred cleanup fully enumerates managed categories with bounded mutations. | Approved |
+| D-032 | New canonical assets live in a registered snapshot root under the source download destination. | Approved |
 
 ---
 
@@ -209,7 +210,7 @@ unavailable or unreliable in the supported Rust build.
 
 ## D-009: Asset ownership and location
 
-**Status:** Approved
+**Status:** Superseded by D-032
 
 **Decision:** Canonical clipping assets live under an application-managed root
 beneath resolved `LinkVaultData/newspaper-clippings`. They do not live under the
@@ -222,6 +223,41 @@ replaceable source data and may be moved, deleted, re-registered, or reset.
 never chooses or receives the absolute canonical path.
 
 **Affected specifications:** ADR-002, 02, 06.
+
+## D-032: Download-destination snapshot roots
+
+**Status:** Approved
+
+**Decision:** A new clipping uses the persisted `newspaper_batches.destination`
+of its source job. Its canonical image is stored beneath:
+
+```text
+<destination>/Newspaper snapshots/<sanitized edition name - code>/<publication-date>/<clipping-id>/clipping-v1.webp
+```
+
+SQLite stores `asset_root_id` and a root-relative asset path. The backend owns
+a root registry and a marker under the reserved `.linkvault` subtree. Staging,
+trash, and quarantine are on that same volume. Thumbnails remain regenerable
+cache data beneath `LinkVaultData`.
+
+Existing schema-v3 rows are backfilled to a read-only `legacy_managed` root and
+continue to resolve `LinkVaultData/newspaper-clippings`; migration does not move
+their bytes. New creation accepts only `download_snapshot` roots.
+
+An unavailable registered root is a transient storage state. Startup, media,
+and cleanup do not recreate it or mark all of its rows missing. A reused path or
+drive letter must present the matching marker. Archive import/repair and source
+reset must exclude `Newspaper snapshots`. V1 does not scan for or automatically
+rebind a moved root; a future reconnect flow must require the matching marker.
+
+**Rationale:** The user wants crops visible beside the newspaper collection,
+while the registry/marker boundary preserves deterministic ownership across
+multiple destinations, offline drives, source deletion, and path reuse.
+
+**Supersedes:** D-009 location only. Application ownership, backend-derived
+paths, explicit deletion, and durable note semantics remain binding.
+
+**Affected specifications:** ADR-002, README, 02, 06, 07, 08.
 
 ## D-010: Clipping-to-note cardinality
 

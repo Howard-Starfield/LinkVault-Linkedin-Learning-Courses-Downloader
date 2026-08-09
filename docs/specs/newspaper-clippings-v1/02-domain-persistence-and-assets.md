@@ -81,6 +81,7 @@ pub struct NewspaperClipping {
     pub crop_width: u32,
     pub crop_height: u32,
 
+    pub asset_root_id: String,
     pub asset_relative_path: String,
     pub asset_mime_type: String,
     pub asset_pixel_width: u32,
@@ -138,6 +139,15 @@ Column names and constraints are binding unless an approved migration review
 records a necessary SQLite compatibility adjustment.
 
 ```sql
+CREATE TABLE IF NOT EXISTS newspaper_clipping_roots (
+    id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('legacy_managed', 'download_snapshot')),
+    locator TEXT NOT NULL,
+    locator_key TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS newspaper_clippings (
     id TEXT PRIMARY KEY NOT NULL,
 
@@ -168,6 +178,7 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     crop_height INTEGER NOT NULL
         CHECK (crop_height > 0),
 
+    asset_root_id TEXT NOT NULL,
     asset_relative_path TEXT NOT NULL,
     asset_mime_type TEXT NOT NULL
         CHECK (asset_mime_type = 'image/webp'),
@@ -198,6 +209,9 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     FOREIGN KEY (source_page_id)
         REFERENCES newspaper_pages(id)
         ON DELETE SET NULL,
+    FOREIGN KEY (asset_root_id)
+        REFERENCES newspaper_clipping_roots(id)
+        ON DELETE RESTRICT,
 
     CHECK (crop_x + crop_width <= source_pixel_width),
     CHECK (crop_y + crop_height <= source_pixel_height),
@@ -232,6 +246,9 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_source_page
 
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
     ON newspaper_clippings(asset_state, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_root
+    ON newspaper_clippings(asset_root_id, asset_state, updated_at);
 ```
 
 ### Schema rationale
@@ -246,11 +263,9 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
 
 ## 5. Schema-version and migration contract
 
-At specification time, the application supports schema version `2`. The Phase
-1 implementation is expected to advance the then-current supported version by
-exactly one. If another approved migration lands first, the coding agent must
-rebase, inspect the new current version, and update the clipping migration
-without overwriting or skipping it.
+Phase 1 introduced the clipping table at schema version 3. D-032 advances the
+application to schema version 4, adds the root registry and `asset_root_id`, and
+rebuilds populated v3 clipping tables after the existing verified backup.
 
 ### FR-MIGRATION-001
 
@@ -285,7 +300,10 @@ Tests must prove:
   progress, and settings rows survive migration.
 - The backup passes integrity check and contains representative pre-migration
   data.
-- The new table has both `ON DELETE SET NULL` foreign keys.
+- The clipping table has both `ON DELETE SET NULL` source foreign keys and the
+  `ON DELETE RESTRICT` root foreign key.
+- Populated v3 clipping rows retain notes/assets and are backfilled to the
+  stable `legacy-managed-v1` root.
 - `PRAGMA foreign_key_check` is empty after migration.
 - Re-running initialization is idempotent.
 - A failed migration leaves `user_version` below the target and preserves the
@@ -317,39 +335,32 @@ a typed error and never writes files or rows.
 
 ## 7. Managed root and path contract
 
-The app storage module adds a resolver conceptually equivalent to:
-
-```rust
-pub fn resolve_newspaper_clippings_root() -> Result<PathBuf, StoragePathError>;
-```
-
-Resolved layout:
+Schema v4 adds `newspaper_clipping_roots`. A `download_snapshot` root resolves
+from the source job's persisted batch destination, never a frontend payload:
 
 ```text
-<LinkVaultData>/
-└─ newspaper-clippings/
-   ├─ assets/
-   │  └─ <clipping-id>/
-   │     └─ clipping-v1.webp
-   ├─ thumbnails/
-   │  └─ v1/
-   │     └─ <clipping-id>-asset-<asset-version>.webp
-   ├─ staging/
-   │  └─ <clipping-id>/
-   │     └─ clipping-v1.webp.part
-   ├─ trash/
-   │  └─ <clipping-id>-<deletion-nonce>/
-   │     └─ clipping-v1.webp
-   └─ quarantine/
-      └─ <timestamp>-<reason>-<name>/
+<destination>/
+└─ Newspaper snapshots/
+   ├─ .linkvault/
+   │  ├─ clipping-root-v1.json
+   │  ├─ staging/<clipping-id>/clipping-v1.webp.part
+   │  ├─ trash/<clipping-id>-<deletion-nonce>/clipping-v1.webp
+   │  └─ quarantine/<timestamp>-<reason>-<name>/
+   └─ <sanitized edition name - code>/
+      └─ <publication-date>/
+         └─ <clipping-id>/clipping-v1.webp
 ```
+
+Derived thumbnails remain under the dedicated app-data cache. Existing v3
+rows are assigned to `legacy-managed-v1`, which resolves the former
+`LinkVaultData/newspaper-clippings` layout for read/recovery only.
 
 ### FR-ASSET-001: Backend-derived paths
 
-The canonical relative path is exactly:
+The new canonical relative path is exactly:
 
 ```text
-assets/<clipping-id>/clipping-v1.webp
+<sanitized edition name - code>/<publication-date>/<clipping-id>/clipping-v1.webp
 ```
 
 React cannot override root, directory, filename, extension, asset version, or
@@ -359,19 +370,23 @@ relative path.
 
 Every managed read/write/delete operation:
 
-1. Resolves the application clipping root.
+1. Resolves the row's registered clipping root and verifies its marker.
 2. Rejects absolute or parent-component relative paths.
 3. Creates parent directories itself.
 4. Uses `symlink_metadata` and rejects symlinks.
 5. Canonicalizes existing targets and verifies containment before reading.
 6. Never follows a user-created symlink out of the managed root.
+7. Never recreates a registered root during read, recovery, or cleanup.
+8. Never scans for or automatically rebinds a moved root; any future explicit
+   reconnect flow must verify the root marker before updating its locator.
 
 ### FR-ASSET-003: File permissions and replacement
 
 - Files are written with create-new semantics in staging.
 - An existing canonical directory for a new clipping ID is treated as a
   collision/recovery condition, not overwritten.
-- Asset promotion uses a same-volume atomic rename from staging into `assets`.
+- Asset promotion uses a same-volume atomic rename from reserved staging into
+  the edition/date/clipping directory.
 - No canonical file is modified in place in V1.
 
 ## 8. Idempotency contract
@@ -424,13 +439,13 @@ Outside a database write transaction:
 
 1. Validate operation ID and request.
 2. Resolve and snapshot the source record.
-3. Decode, crop, and encode to
-   `staging/<id>/clipping-v1.webp.part`.
+3. Register/commit the verified root, then decode, crop, and encode to
+   `.linkvault/staging/<id>/clipping-v1.webp.part`.
 4. Flush/close the file.
 5. Decode final bytes and validate dimensions.
 6. Compute final byte count and SHA-256.
 7. Rename `.webp.part` to a complete staging filename
-   `staging/<id>/clipping-v1.webp`.
+   `.linkvault/staging/<id>/clipping-v1.webp`.
 
 No SQLite row exists yet. A failure removes the current operation’s staging
 directory when safe.
@@ -441,7 +456,8 @@ Through `DatabaseWriter`, insert one row with:
 
 ```text
 asset_state = creating
-asset_relative_path = assets/<id>/clipping-v1.webp
+asset_root_id = <registered download-snapshot root ID>
+asset_relative_path = <edition>/<date>/<id>/clipping-v1.webp
 asset_version = 1
 revision = 1
 note_markdown = ''
@@ -455,7 +471,7 @@ filesystem. A uniqueness conflict follows the idempotency contract.
 Outside a database transaction, atomically rename:
 
 ```text
-staging/<id>  →  assets/<id>
+.linkvault/staging/<id>  →  <edition>/<date>/<id>
 ```
 
 Before rename, reject an unexpected existing final directory. After rename,
@@ -834,7 +850,8 @@ Source availability is derived, not persisted as a mutable boolean.
 The existing reset operation must be reviewed and amended so that:
 
 - `newspaper_clippings` is excluded from delete statements.
-- `newspaper-clippings` managed root is not removed.
+- `newspaper_clipping_roots`, the legacy managed root, and registered snapshot
+  roots are not removed.
 - Clipping thumbnails remain or may be lazily regenerated; they are not part of
   the existing newspaper front-page thumbnail root.
 - Source `SET NULL` actions complete under foreign keys.

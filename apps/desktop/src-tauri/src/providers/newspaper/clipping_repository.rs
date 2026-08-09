@@ -10,8 +10,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
 use super::clipping_models::{
-    escape_like_pattern, ClippingAssetState, ClippingSourceKind, NewspaperClipping,
-    NewspaperClippingListQuery, NewspaperClippingSort,
+    escape_like_pattern, ClippingAssetState, ClippingRoot, ClippingRootKind, ClippingSourceKind,
+    NewspaperClipping, NewspaperClippingListQuery, NewspaperClippingSort,
 };
 
 /// Registration payload for the `creating` row (CREATE-STATE-002). The
@@ -35,6 +35,7 @@ pub struct NewClippingRecord {
     pub crop_y: u32,
     pub crop_width: u32,
     pub crop_height: u32,
+    pub asset_root_id: String,
     pub asset_relative_path: String,
     pub asset_byte_count: u64,
     pub asset_checksum_sha256: String,
@@ -42,12 +43,103 @@ pub struct NewClippingRecord {
     pub now: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewClippingRoot {
+    pub id: String,
+    pub kind: ClippingRootKind,
+    pub locator: String,
+    pub locator_key: String,
+    pub now: i64,
+}
+
+fn map_root_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClippingRoot> {
+    let kind = row.get::<_, String>(1)?;
+    let Some(kind) = ClippingRootKind::from_sql(&kind) else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    Ok(ClippingRoot {
+        id: row.get(0)?,
+        kind,
+        locator: row.get(2)?,
+        locator_key: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+pub fn insert_root(connection: &Connection, root: &NewClippingRoot) -> Result<()> {
+    connection.execute(
+        "INSERT INTO newspaper_clipping_roots
+            (id, kind, locator, locator_key, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![
+            root.id,
+            root.kind.as_sql(),
+            root.locator,
+            root.locator_key,
+            root.now
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_root_by_id(connection: &Connection, id: &str) -> Result<Option<ClippingRoot>> {
+    connection
+        .query_row(
+            "SELECT id, kind, locator, locator_key, created_at, updated_at
+             FROM newspaper_clipping_roots WHERE id = ?1",
+            params![id],
+            map_root_row,
+        )
+        .optional()
+}
+
+pub fn load_root_by_locator_key(
+    connection: &Connection,
+    locator_key: &str,
+) -> Result<Option<ClippingRoot>> {
+    connection
+        .query_row(
+            "SELECT id, kind, locator, locator_key, created_at, updated_at
+             FROM newspaper_clipping_roots WHERE locator_key = ?1 COLLATE NOCASE",
+            params![locator_key],
+            map_root_row,
+        )
+        .optional()
+}
+
+pub fn load_all_roots(connection: &Connection) -> Result<Vec<ClippingRoot>> {
+    connection
+        .prepare(
+            "SELECT id, kind, locator, locator_key, created_at, updated_at
+             FROM newspaper_clipping_roots ORDER BY created_at ASC, id ASC",
+        )?
+        .query_map([], map_root_row)?
+        .collect()
+}
+
+pub fn load_batch_destination_for_job(
+    connection: &Connection,
+    source_job_id: &str,
+) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT b.destination
+             FROM newspaper_jobs j
+             JOIN newspaper_batches b ON b.id = j.batch_id
+             WHERE j.id = ?1",
+            params![source_job_id],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
 const CLIPPING_COLUMNS: &str = "id, source_job_id, source_page_id,
     source_media_version_snapshot, source_kind_snapshot, source_mime_type_snapshot,
     source_checksum_snapshot, edition_code_snapshot, edition_name_snapshot,
     publication_date_snapshot, page_number_snapshot, source_pixel_width,
     source_pixel_height, crop_x, crop_y, crop_width, crop_height,
-    asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+    asset_root_id, asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
     asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
     asset_error_code, title, note_markdown, revision, created_at, updated_at";
 
@@ -56,8 +148,8 @@ pub fn insert_creating(connection: &Connection, record: &NewClippingRecord) -> R
         &format!(
             "INSERT INTO newspaper_clippings ({CLIPPING_COLUMNS})
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, 'image/webp', ?16, ?17, ?19, ?20,
-                     1, 'creating', NULL, ?21, '', 1, ?22, ?22)"
+                     ?14, ?15, ?16, ?17, ?18, ?19, 'image/webp', ?16, ?17, ?20, ?21,
+                     1, 'creating', NULL, ?22, '', 1, ?23, ?23)"
         ),
         params![
             record.id,
@@ -77,6 +169,7 @@ pub fn insert_creating(connection: &Connection, record: &NewClippingRecord) -> R
             record.crop_y,
             record.crop_width,
             record.crop_height,
+            record.asset_root_id,
             record.asset_relative_path,
             record.asset_byte_count,
             record.asset_checksum_sha256,
@@ -100,7 +193,7 @@ pub fn row_state(connection: &Connection, id: &str) -> Result<Option<ClippingAss
 
 fn map_clipping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NewspaperClipping> {
     let source_kind = row.get::<_, String>(3)?;
-    let asset_state = row.get::<_, String>(24)?;
+    let asset_state = row.get::<_, String>(25)?;
     Ok(NewspaperClipping {
         id: row.get(0)?,
         source_job_id: row.get(1)?,
@@ -120,21 +213,22 @@ fn map_clipping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NewspaperClippi
         crop_y: row.get(14)?,
         crop_width: row.get(15)?,
         crop_height: row.get(16)?,
-        asset_relative_path: row.get(17)?,
-        asset_mime_type: row.get(18)?,
-        asset_pixel_width: row.get(19)?,
-        asset_pixel_height: row.get(20)?,
-        asset_byte_count: row.get(21)?,
-        asset_checksum_sha256: row.get(22)?,
-        asset_version: row.get(23)?,
+        asset_root_id: row.get(17)?,
+        asset_relative_path: row.get(18)?,
+        asset_mime_type: row.get(19)?,
+        asset_pixel_width: row.get(20)?,
+        asset_pixel_height: row.get(21)?,
+        asset_byte_count: row.get(22)?,
+        asset_checksum_sha256: row.get(23)?,
+        asset_version: row.get(24)?,
         asset_state: ClippingAssetState::from_sql(&asset_state)
             .unwrap_or(ClippingAssetState::Missing),
-        asset_error_code: row.get(25)?,
-        title: row.get(26)?,
-        note_markdown: row.get(27)?,
-        revision: row.get(28)?,
-        created_at: row.get(29)?,
-        updated_at: row.get(30)?,
+        asset_error_code: row.get(26)?,
+        title: row.get(27)?,
+        note_markdown: row.get(28)?,
+        revision: row.get(29)?,
+        created_at: row.get(30)?,
+        updated_at: row.get(31)?,
     })
 }
 
@@ -143,7 +237,7 @@ const CLIPPING_SELECT: &str = "SELECT id, source_job_id, source_page_id,
     source_checksum_snapshot, edition_code_snapshot, edition_name_snapshot,
     publication_date_snapshot, page_number_snapshot, source_pixel_width,
     source_pixel_height, crop_x, crop_y, crop_width, crop_height,
-    asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+    asset_root_id, asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
     asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
     asset_error_code, title, note_markdown, revision, created_at, updated_at";
 
@@ -683,6 +777,7 @@ pub fn load_detail(connection: &Connection, id: &str) -> Result<Option<ClippingD
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreatingRecoveryTarget {
     pub id: String,
+    pub asset_root_id: String,
     pub asset_relative_path: String,
     pub asset_byte_count: u64,
     pub asset_pixel_width: u32,
@@ -693,7 +788,7 @@ pub struct CreatingRecoveryTarget {
 pub fn load_creating_rows(connection: &Connection) -> Result<Vec<CreatingRecoveryTarget>> {
     connection
         .prepare(
-            "SELECT id, asset_relative_path, asset_byte_count, asset_pixel_width,
+            "SELECT id, asset_root_id, asset_relative_path, asset_byte_count, asset_pixel_width,
                     asset_pixel_height, asset_checksum_sha256
              FROM newspaper_clippings
              WHERE asset_state = 'creating'
@@ -702,31 +797,62 @@ pub fn load_creating_rows(connection: &Connection) -> Result<Vec<CreatingRecover
         .query_map([], |row| {
             Ok(CreatingRecoveryTarget {
                 id: row.get(0)?,
-                asset_relative_path: row.get(1)?,
-                asset_byte_count: row.get(2)?,
-                asset_pixel_width: row.get(3)?,
-                asset_pixel_height: row.get(4)?,
-                asset_checksum_sha256: row.get(5)?,
+                asset_root_id: row.get(1)?,
+                asset_relative_path: row.get(2)?,
+                asset_byte_count: row.get(3)?,
+                asset_pixel_width: row.get(4)?,
+                asset_pixel_height: row.get(5)?,
+                asset_checksum_sha256: row.get(6)?,
+            })
+        })?
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletePendingTarget {
+    pub id: String,
+    pub asset_root_id: String,
+    pub asset_relative_path: String,
+}
+
+pub fn load_delete_pending_rows(connection: &Connection) -> Result<Vec<DeletePendingTarget>> {
+    connection
+        .prepare(
+            "SELECT id, asset_root_id, asset_relative_path FROM newspaper_clippings
+             WHERE asset_state = 'delete_pending'
+             ORDER BY updated_at ASC, id ASC",
+        )?
+        .query_map([], |row| {
+            Ok(DeletePendingTarget {
+                id: row.get(0)?,
+                asset_root_id: row.get(1)?,
+                asset_relative_path: row.get(2)?,
             })
         })?
         .collect()
 }
 
 pub fn load_delete_pending_ids(connection: &Connection) -> Result<Vec<String>> {
-    connection
-        .prepare(
-            "SELECT id FROM newspaper_clippings
-             WHERE asset_state = 'delete_pending'
-             ORDER BY updated_at ASC, id ASC",
-        )?
-        .query_map([], |row| row.get(0))?
-        .collect()
+    Ok(load_delete_pending_rows(connection)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect())
 }
 
 pub fn load_all_ids(connection: &Connection) -> Result<Vec<String>> {
     connection
         .prepare("SELECT id FROM newspaper_clippings ORDER BY id ASC")?
         .query_map([], |row| row.get(0))?
+        .collect()
+}
+
+pub fn load_all_ids_for_root(connection: &Connection, root_id: &str) -> Result<Vec<String>> {
+    connection
+        .prepare(
+            "SELECT id FROM newspaper_clippings
+             WHERE asset_root_id = ?1 ORDER BY id ASC",
+        )?
+        .query_map(params![root_id], |row| row.get(0))?
         .collect()
 }
 

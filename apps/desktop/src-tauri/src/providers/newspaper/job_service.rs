@@ -258,6 +258,20 @@ fn remove_output_directory(destination: &Path, output_dir: &Path) -> Result<(), 
             "Refusing to delete a newspaper folder outside its configured destination.".to_string(),
         );
     }
+    let targets_snapshots = resolved_output
+        .strip_prefix(&resolved_destination)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .is_some_and(|segment| {
+            segment.eq_ignore_ascii_case(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+        });
+    if targets_snapshots {
+        return Err("Refusing to delete the protected Newspaper snapshots folder.".to_string());
+    }
     std::fs::remove_dir_all(PathBuf::from(output_dir))
         .map_err(|error| format!("Could not delete the downloaded newspaper files: {error}"))
 }

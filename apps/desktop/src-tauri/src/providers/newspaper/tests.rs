@@ -159,6 +159,45 @@ fn archive_identity_uses_parent_date_or_filename_date() {
 }
 
 #[test]
+fn archive_import_prunes_newspaper_snapshot_tree() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    storage::initialize(&connection).unwrap();
+    drop(connection);
+
+    let archive = directory.path().join("archive");
+    std::fs::create_dir(&archive).unwrap();
+    image::DynamicImage::new_rgb8(4, 4)
+        .save(archive.join("NY_20260809_A01.png"))
+        .unwrap();
+    let snapshots = archive
+        .join(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+        .join("New York - NY")
+        .join("2026-08-09")
+        .join("11111111-1111-4111-8111-111111111111");
+    std::fs::create_dir_all(&snapshots).unwrap();
+    image::DynamicImage::new_rgb8(4, 4)
+        .save(snapshots.join("NY_20260809_A02.png"))
+        .unwrap();
+
+    assert_eq!(archive_service::import(&db_path, &archive).unwrap(), 1);
+    assert!(archive_service::import(
+        &db_path,
+        &archive.join(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+    )
+    .is_err());
+    let connection = Connection::open(&db_path).unwrap();
+    let pages: usize = connection
+        .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pages, 1, "snapshot crops must not be re-imported as pages");
+}
+
+#[test]
 fn duplicate_batch_request_skips_existing_job_instead_of_failing() {
     let directory = tempdir().unwrap();
     let db_path = directory.path().join("test.db");
@@ -568,6 +607,36 @@ fn removal_refuses_a_directory_outside_the_batch_destination() {
 
     assert!(result.is_err());
     assert!(outside.join("keep.txt").exists());
+}
+
+#[test]
+fn removal_refuses_the_protected_newspaper_snapshots_tree() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    let protected = destination
+        .join(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+        .join("New York - NY")
+        .join("2026-07-24");
+    std::fs::create_dir_all(&protected).unwrap();
+    std::fs::write(protected.join("keep.webp"), b"keep").unwrap();
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET output_dir = ?2 WHERE id = ?1",
+            params![job.id, protected.to_string_lossy()],
+        )
+        .unwrap();
+
+    let result = job_service::delete_with_connection(&mut connection, &job.id);
+
+    assert!(result.is_err());
+    assert!(protected.join("keep.webp").exists());
 }
 
 #[test]

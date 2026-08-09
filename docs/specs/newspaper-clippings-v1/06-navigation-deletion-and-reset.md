@@ -361,7 +361,9 @@ Inside the existing reset transaction:
 Outside the transaction:
 
 - Clear the existing front-page newspaper thumbnail cache as before.
-- Do not clear `LinkVaultData/newspaper-clippings`.
+- Do not clear the clipping root registry, legacy
+  `LinkVaultData/newspaper-clippings`, or any registered
+  `<destination>/Newspaper snapshots` tree.
 - Do not clear clipping thumbnail cache.
 - Emit clipping invalidation reason `source_changed`.
 
