@@ -1,6 +1,8 @@
 #![deny(unused)]
 
 mod app;
+#[cfg(feature = "crop-baseline")]
+pub use app::newspaper_clipping_crop_baseline as crop_baseline;
 mod providers;
 pub mod workflow;
 
@@ -103,6 +105,7 @@ pub fn run() {
             newspaper::commands::list_newspaper_catalog,
             newspaper::commands::refresh_newspaper_catalog,
             newspaper::commands::create_newspaper_batch,
+            newspaper::commands::create_newspaper_clipping,
             newspaper::commands::create_newspaper_schedule,
             newspaper::commands::toggle_newspaper_schedule,
             newspaper::commands::delete_newspaper_schedule,
@@ -251,6 +254,9 @@ pub fn run() {
             event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
+            handle
+                .state::<newspaper::clipping_service::ClippingService>()
+                .shutdown_crop_service();
             let _ = handle
                 .state::<app::database_writer::DatabaseWriter>()
                 .shutdown();

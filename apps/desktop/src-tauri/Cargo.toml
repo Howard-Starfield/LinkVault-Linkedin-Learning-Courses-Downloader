@@ -13,9 +13,17 @@ default-run = "linkvault"
 name = "linkvault_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+crop-baseline = []
+
 [[bin]]
 name = "linkvault"
 path = "src/main.rs"
+
+[[example]]
+name = "newspaper_clipping_crop_baseline"
+path = "examples/newspaper_clipping_crop_baseline.rs"
+required-features = ["crop-baseline"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

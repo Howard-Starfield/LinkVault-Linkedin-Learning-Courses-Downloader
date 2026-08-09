@@ -10,6 +10,7 @@ pub mod catalog;
 mod catalog_service;
 pub mod client;
 pub mod clipping_assets;
+pub mod clipping_crop;
 pub mod clipping_models;
 pub mod clipping_recovery;
 pub mod clipping_repository;

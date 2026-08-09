@@ -98,6 +98,69 @@ pub fn row_state(connection: &Connection, id: &str) -> Result<Option<ClippingAss
         .map(|value| value.and_then(|state| ClippingAssetState::from_sql(&state)))
 }
 
+/// Read-only source snapshot used by the Phase 2 crop service. This joins the
+/// authoritative page, job, and edition projection once; callers never derive
+/// provenance or filesystem locations from IPC input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CropSourceRecord {
+    pub page_id: String,
+    pub job_id: String,
+    pub page_number: String,
+    pub page_status: String,
+    pub original_path: Option<String>,
+    pub optimized_path: Option<String>,
+    pub stored_pixel_width: Option<u32>,
+    pub stored_pixel_height: Option<u32>,
+    pub media_version: i64,
+    pub edition_code: String,
+    pub edition_name: String,
+    pub publication_date: String,
+    pub output_dir: String,
+}
+
+/// Loads the complete provider-owned source projection needed for one crop.
+/// The `JOIN`s intentionally require an extant job and catalog edition; a
+/// missing relationship is indistinguishable from an ineligible page to the
+/// crop command and is handled as a typed source failure by the service.
+pub fn load_crop_source(
+    connection: &Connection,
+    page_id: &str,
+) -> Result<Option<CropSourceRecord>> {
+    connection
+        .query_row(
+            "SELECT p.id, p.job_id, p.page_number, p.status, p.original_path,
+                    p.optimized_path, p.pixel_width, p.pixel_height, p.media_version,
+                    j.edition_code,
+                    COALESCE(NULLIF(e.name_zh, ''), NULLIF(e.name_en, '')),
+                    j.publication_date, j.output_dir
+             FROM newspaper_pages p
+             JOIN newspaper_jobs j ON j.id = p.job_id
+             JOIN newspaper_editions e
+               ON e.code = j.edition_code
+              AND e.publication_date = j.edition_publication_date
+             WHERE p.id = ?1",
+            params![page_id],
+            |row| {
+                Ok(CropSourceRecord {
+                    page_id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    page_number: row.get(2)?,
+                    page_status: row.get(3)?,
+                    original_path: row.get(4)?,
+                    optimized_path: row.get(5)?,
+                    stored_pixel_width: row.get(6)?,
+                    stored_pixel_height: row.get(7)?,
+                    media_version: row.get(8)?,
+                    edition_code: row.get(9)?,
+                    edition_name: row.get(10)?,
+                    publication_date: row.get(11)?,
+                    output_dir: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+}
+
 fn map_clipping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NewspaperClipping> {
     let source_kind = row.get::<_, String>(3)?;
     let asset_state = row.get::<_, String>(24)?;

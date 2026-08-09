@@ -10,7 +10,13 @@ use chrono::Utc;
 use tauri::{Emitter, Manager, State};
 
 use super::{
-    archive_service, batch_service, catalog_service, job_service, library_events, library_service,
+    archive_service, batch_service, catalog_service,
+    clipping_models::{
+        ClippingErrorCode, CreateNewspaperClippingFailure, CreateNewspaperClippingRequest,
+        CreateNewspaperClippingResponse,
+    },
+    clipping_service::ClippingService,
+    job_service, library_events, library_service,
     models::{
         CreateNewspaperBatchRequest, CreateNewspaperBatchResponse, CreateNewspaperScheduleRequest,
         NewspaperActivitySnapshot, NewspaperBootstrap, NewspaperEdition, NewspaperJob,
@@ -60,6 +66,32 @@ pub fn create_newspaper_batch(
     request: CreateNewspaperBatchRequest,
 ) -> Result<CreateNewspaperBatchResponse, String> {
     batch_service::create(state.db_path(), request)
+}
+
+/// Thin Phase 2 adapter: all source resolution, filesystem work, staging,
+/// idempotency, and persistence ownership remain in `ClippingService`.
+#[tauri::command]
+pub async fn create_newspaper_clipping(
+    service: State<'_, ClippingService>,
+    request: CreateNewspaperClippingRequest,
+) -> Result<CreateNewspaperClippingResponse, CreateNewspaperClippingFailure> {
+    let operation_id = request.operation_id.clone();
+    let service = service.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        service.create_newspaper_clipping(request, Utc::now().timestamp())
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(CreateNewspaperClippingFailure::from_code(
+            operation_id,
+            error.code,
+        )),
+        Err(_) => Err(CreateNewspaperClippingFailure::from_code(
+            operation_id,
+            ClippingErrorCode::ServiceUnavailable,
+        )),
+    }
 }
 
 #[tauri::command]
