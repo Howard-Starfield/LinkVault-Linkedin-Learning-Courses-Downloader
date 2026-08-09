@@ -730,33 +730,6 @@ pub fn load_all_ids(connection: &Connection) -> Result<Vec<String>> {
         .collect()
 }
 
-pub fn load_newspaper_setting(connection: &Connection, key: &str) -> Result<Option<String>> {
-    connection
-        .query_row(
-            "SELECT value_json FROM newspaper_settings WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .optional()
-}
-
-pub fn save_newspaper_setting(
-    connection: &Connection,
-    key: &str,
-    value_json: &str,
-    now: i64,
-) -> Result<()> {
-    connection.execute(
-        "INSERT INTO newspaper_settings (key, value_json, updated_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET
-             value_json = excluded.value_json,
-             updated_at = excluded.updated_at",
-        params![key, value_json, now],
-    )?;
-    Ok(())
-}
-
 /// Explicit source unlink for the World Journal reset transaction
 /// (FR-SOURCE-DELETE-001). Runs on the reset connection so preservation is
 /// deterministic even when the foreign_keys pragma is disabled. Only the

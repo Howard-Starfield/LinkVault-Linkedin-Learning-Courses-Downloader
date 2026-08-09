@@ -25,6 +25,12 @@ pub const STAGING_PART_SUFFIX: &str = ".part";
 pub const CANONICAL_RELATIVE_TEMPLATE: &str = "assets/<clipping-id>/clipping-v1.webp";
 /// Cache schema version for derived clipping thumbnails (D-020).
 pub const THUMBNAIL_CACHE_SCHEMA_VERSION: u32 = 1;
+/// Conservative serve-side byte ceiling for regenerable clipping thumbnails.
+/// A 512x320 RGBA decode is under 1 MiB; 8 MiB leaves ample WebP/container
+/// overhead without permitting an unbounded cache-file allocation.
+pub const THUMBNAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub const THUMBNAIL_MAX_WIDTH: u32 = 512;
+pub const THUMBNAIL_MAX_HEIGHT: u32 = 320;
 
 /// Directory names beneath the managed clipping root.
 pub const ASSETS_DIR: &str = "assets";
@@ -39,6 +45,12 @@ pub const THUMBNAIL_VERSION_DIR: &str = "v1";
 pub struct ClippingAssetLayout {
     root: PathBuf,
     data_parent: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThumbnailCleanupSummary {
+    pub removed: usize,
+    pub failures: usize,
 }
 
 impl ClippingAssetLayout {
@@ -518,6 +530,11 @@ impl ClippingAssetLayout {
     /// cleanup and never recreates the clipping.
     pub fn remove_trash_entry(&self, entry: &Path) -> Result<(), ClippingError> {
         let root = self.ensure_root()?;
+        let metadata = fs::symlink_metadata(entry)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
         let canonical = entry
             .canonicalize()
             .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
@@ -538,6 +555,11 @@ impl ClippingAssetLayout {
         timestamp: i64,
     ) -> Result<(), ClippingError> {
         let root = self.ensure_root()?;
+        let metadata = fs::symlink_metadata(source_dir)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
+        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
         let canonical_source = source_dir
             .canonicalize()
             .map_err(|_| ClippingError::new(ClippingErrorCode::RecoveryFailed))?;
@@ -562,30 +584,56 @@ impl ClippingAssetLayout {
         Ok(())
     }
 
-    /// Remove every exact ID-owned thumbnail asset version. Prefix-lookalike
-    /// IDs and malformed filenames are never deletion targets (D-020/D-027).
-    pub fn remove_thumbnails(&self, clipping_id: &str) -> Result<usize, ClippingError> {
+    /// Best-effort removal of every exact ID-owned thumbnail asset version.
+    /// Prefix-lookalike IDs and malformed filenames are never deletion targets
+    /// (D-020/D-027). Per-entry failures are counted so disposable cache data
+    /// cannot block deletion of the durable aggregate.
+    pub fn remove_thumbnails(
+        &self,
+        clipping_id: &str,
+    ) -> Result<ThumbnailCleanupSummary, ClippingError> {
         if !validate_clipping_id(clipping_id) {
             return Err(ClippingError::new(ClippingErrorCode::InvalidId));
         }
         let directory = self.thumbnails_dir()?;
-        let mut removed = 0usize;
+        let mut summary = ThumbnailCleanupSummary::default();
         let entries = fs::read_dir(&directory)
             .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
         for entry in entries {
-            let entry = entry.map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    summary.failures = summary.failures.saturating_add(1);
+                    continue;
+                }
+            };
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
             if thumbnail_asset_version(&name, clipping_id).is_none() {
                 continue;
             }
-            let contained = self.contained_regular_file(&entry.path())?;
-            fs::remove_file(contained)
-                .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
-            removed += 1;
+            let result = self
+                .contained_regular_file(&entry.path())
+                .and_then(|contained| {
+                    fs::remove_file(contained)
+                        .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))
+                });
+            match result {
+                Ok(()) => summary.removed = summary.removed.saturating_add(1),
+                Err(_) => summary.failures = summary.failures.saturating_add(1),
+            }
         }
-        Ok(removed)
+        Ok(summary)
+    }
+
+    pub(crate) fn remove_thumbnail_entry(&self, entry: &Path) -> Result<(), ClippingError> {
+        let contained = self.contained_regular_file(entry)?;
+        let thumbnail_root = self.thumbnails_dir()?;
+        if !contained.starts_with(&thumbnail_root) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        fs::remove_file(contained).map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))
     }
 
     pub fn remove_quarantine_entry(&self, entry: &Path) -> Result<(), ClippingError> {
@@ -667,12 +715,28 @@ impl ClippingAssetLayout {
             self.contained_regular_file(&self.thumbnail_path(clipping_id, asset_version)?)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        if metadata.len() == 0 {
+        if metadata.len() == 0 || metadata.len() > THUMBNAIL_MAX_BYTES {
             return Err(ClippingError::new(ClippingErrorCode::AssetMissing));
         }
         let bytes =
             fs::read(&path).map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
-        if bytes.is_empty() || !is_webp_container(&bytes) {
+        if bytes.len() as u64 != metadata.len() || !is_webp_container(&bytes) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetMissing));
+        }
+        let features = webp::BitstreamFeatures::new(&bytes)
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetMissing))?;
+        if features.has_animation()
+            || features.width() == 0
+            || features.width() > THUMBNAIL_MAX_WIDTH
+            || features.height() == 0
+            || features.height() > THUMBNAIL_MAX_HEIGHT
+        {
+            return Err(ClippingError::new(ClippingErrorCode::AssetMissing));
+        }
+        let decoded = webp::Decoder::new(&bytes)
+            .decode()
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetMissing))?;
+        if decoded.width() != features.width() || decoded.height() != features.height() {
             return Err(ClippingError::new(ClippingErrorCode::AssetMissing));
         }
         Ok((bytes, CLIPPING_ASSET_MIME))
@@ -697,12 +761,18 @@ pub fn is_webp_container(bytes: &[u8]) -> bool {
 }
 
 fn thumbnail_asset_version(file_name: &str, clipping_id: &str) -> Option<u32> {
-    let version = file_name
-        .strip_prefix(&format!("{clipping_id}-asset-"))?
-        .strip_suffix(".webp")?
-        .parse::<u32>()
-        .ok()?;
-    (version > 0).then_some(version)
+    let (owner, version) = thumbnail_owner(file_name)?;
+    (owner == clipping_id).then_some(version)
+}
+
+pub(crate) fn thumbnail_owner(file_name: &str) -> Option<(&str, u32)> {
+    let stem = file_name.strip_suffix(".webp")?;
+    let (clipping_id, version) = stem.rsplit_once("-asset-")?;
+    if !validate_clipping_id(clipping_id) {
+        return None;
+    }
+    let version = version.parse::<u32>().ok()?;
+    (version > 0).then_some((clipping_id, version))
 }
 
 fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
@@ -759,6 +829,21 @@ mod tests {
         let checksum = sha256_hex(&bytes);
         let len = bytes.len() as u64;
         (bytes, len, checksum)
+    }
+
+    fn minimal_webp_animation() -> Vec<u8> {
+        vec![
+            0x52, 0x49, 0x46, 0x46, 0x84, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x58, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x41, 0x4e, 0x49, 0x4d, 0x06, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x41, 0x4e, 0x4d, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x02, 0x56, 0x50,
+            0x38, 0x4c, 0x0f, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x07, 0x10, 0xfd,
+            0x8f, 0xfe, 0x07, 0x22, 0xa2, 0xff, 0x01, 0x00, 0x41, 0x4e, 0x4d, 0x46, 0x28, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x64, 0x00, 0x00, 0x00, 0x56, 0x50, 0x38, 0x4c, 0x0f, 0x00, 0x00, 0x00, 0x2f, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x10, 0xd1, 0xff, 0xfe, 0x07, 0x22, 0xa2, 0xff, 0x01, 0x00,
+        ]
     }
 
     #[test]
@@ -1150,7 +1235,13 @@ mod tests {
             fs::write(path, encode_test_webp(4, 4)).unwrap();
         }
 
-        assert_eq!(layout.remove_thumbnails(TEST_ID).unwrap(), 2);
+        assert_eq!(
+            layout.remove_thumbnails(TEST_ID).unwrap(),
+            ThumbnailCleanupSummary {
+                removed: 2,
+                failures: 0,
+            }
+        );
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(other.exists());
@@ -1161,6 +1252,43 @@ mod tests {
         assert_eq!(
             layout
                 .read_thumbnail_for_protocol(TEST_ID, 1)
+                .unwrap_err()
+                .code,
+            ClippingErrorCode::AssetMissing
+        );
+    }
+
+    #[test]
+    fn thumbnail_protocol_enforces_byte_dimension_decode_and_static_limits() {
+        let (_directory, layout) = temp_layout();
+        let path = layout.thumbnail_path(TEST_ID, 2).unwrap();
+        let valid = encode_test_webp(THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+        fs::write(&path, &valid).unwrap();
+        let (served, mime) = layout.read_thumbnail_for_protocol(TEST_ID, 2).unwrap();
+        assert_eq!(served, valid);
+        assert_eq!(mime, CLIPPING_ASSET_MIME);
+
+        for invalid in [
+            Vec::new(),
+            b"RIFF\0\0\0\0WEBPmalformed".to_vec(),
+            encode_test_webp(THUMBNAIL_MAX_WIDTH + 1, THUMBNAIL_MAX_HEIGHT),
+            encode_test_webp(THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT + 1),
+            minimal_webp_animation(),
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                layout
+                    .read_thumbnail_for_protocol(TEST_ID, 2)
+                    .unwrap_err()
+                    .code,
+                ClippingErrorCode::AssetMissing
+            );
+        }
+
+        fs::write(&path, vec![0u8; THUMBNAIL_MAX_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            layout
+                .read_thumbnail_for_protocol(TEST_ID, 2)
                 .unwrap_err()
                 .code,
             ClippingErrorCode::AssetMissing

@@ -32,6 +32,7 @@ pub struct ClippingService {
     db_path: PathBuf,
     writer: DatabaseWriter,
     layout: ClippingAssetLayout,
+    diagnostics: DatabaseDiagnostics,
     integrity_scheduler: Arc<IntegrityTransitionScheduler>,
 }
 
@@ -202,12 +203,13 @@ impl ClippingService {
     ) -> Self {
         let integrity_scheduler = Arc::new(IntegrityTransitionScheduler::new(
             writer.clone(),
-            diagnostics,
+            diagnostics.clone(),
         ));
         Self {
             db_path,
             writer,
             layout,
+            diagnostics,
             integrity_scheduler,
         }
     }
@@ -404,6 +406,7 @@ impl ClippingService {
                     &self.db_path,
                     &self.writer,
                     &self.layout,
+                    &self.diagnostics,
                     id,
                 )
             }
@@ -459,12 +462,7 @@ impl ClippingService {
         &self,
         diagnostics: &DatabaseDiagnostics,
     ) -> clipping_recovery::DeferredCleanupSummary {
-        clipping_recovery::run_deferred_cleanup(
-            &self.db_path,
-            &self.writer,
-            &self.layout,
-            diagnostics,
-        )
+        clipping_recovery::run_deferred_cleanup(&self.db_path, &self.layout, diagnostics)
     }
 }
 
@@ -786,6 +784,110 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_thumbnail_cache_failures_do_not_block_confirmed_deletion() {
+        let (temp, service, diagnostics) = fixture();
+        let created = service
+            .register_staged(staged_record(&service, ID))
+            .unwrap();
+        let other_id = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        service
+            .register_staged(staged_record(&service, other_id))
+            .unwrap();
+        let thumbnails = service.layout.thumbnails_dir().unwrap();
+        let undeletable = service.layout.thumbnail_path(ID, 1).unwrap();
+        std::fs::create_dir(&undeletable).unwrap();
+
+        let outside = temp.path().join("outside-thumbnail-link");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel.txt"), b"keep-me").unwrap();
+        let reparse = service.layout.thumbnail_path(ID, 2).unwrap();
+        let reparse_created = create_dir_link(&outside, &reparse);
+
+        let removable = service.layout.thumbnail_path(ID, 3).unwrap();
+        std::fs::write(&removable, encode_test_webp(4, 4)).unwrap();
+        let other = service.layout.thumbnail_path(other_id, 1).unwrap();
+        std::fs::write(&other, encode_test_webp(4, 4)).unwrap();
+        let lookalike = thumbnails.join(format!("{ID}0-asset-1.webp"));
+        std::fs::write(&lookalike, encode_test_webp(4, 4)).unwrap();
+        let malformed = thumbnails.join("unrelated-malformed-entry");
+        std::fs::create_dir(&malformed).unwrap();
+
+        service.delete(ID, created.revision).unwrap();
+
+        let connection = open_runtime(&service.db_path).unwrap();
+        let row_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings WHERE id = ?1",
+                rusqlite::params![ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 0, "title and note row must be durably deleted");
+        assert!(!service.layout.canonical_path(ID).unwrap().exists());
+        assert!(undeletable.exists());
+        if reparse_created {
+            assert!(reparse.exists());
+        }
+        assert!(!removable.exists());
+        assert!(other.exists());
+        assert!(lookalike.exists());
+        assert!(malformed.exists());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel.txt")).unwrap(),
+            b"keep-me"
+        );
+
+        let event = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|event| event.operation == "clipping_thumbnail_cleanup")
+            .expect("cache failure must emit a safe diagnostic");
+        assert_eq!(event.outcome, DatabaseDiagnosticOutcome::Error);
+        assert_eq!(event.error_class, Some(DatabaseErrorClass::Recovery));
+        let diagnostics_text = format!("{event:?}");
+        assert!(!diagnostics_text.contains(&temp.path().to_string_lossy().to_string()));
+
+        // A later detached cleanup pass removes ordinary orphan cache files,
+        // while malformed and reparse entries remain contained and diagnosed.
+        for index in 0..=clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY {
+            let orphan_id = format!("{index:08x}-2222-4222-8222-{index:012x}");
+            std::fs::write(
+                service.layout.thumbnail_path(&orphan_id, 1).unwrap(),
+                encode_test_webp(2, 2),
+            )
+            .unwrap();
+        }
+        let later_leftover = service.layout.thumbnail_path(ID, 4).unwrap();
+        std::fs::write(&later_leftover, encode_test_webp(2, 2)).unwrap();
+        let future = SystemTime::now()
+            .checked_add(Duration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+        for _ in 0..3 {
+            let summary = clipping_recovery::run_deferred_cleanup_at(
+                &service.db_path,
+                &service.layout,
+                &diagnostics,
+                future,
+            );
+            assert!(
+                summary.max_category_mutations
+                    <= clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
+            );
+            if !later_leftover.exists() {
+                break;
+            }
+        }
+        assert!(!later_leftover.exists());
+        assert!(other.exists());
+        assert!(lookalike.exists());
+        assert!(malformed.exists());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel.txt")).unwrap(),
+            b"keep-me"
+        );
+    }
+
+    #[test]
     fn persistence_gate_reset_preserves_canonical_asset_bytes() {
         let (_temp, service, _diagnostics) = fixture();
         service
@@ -945,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_gate_deferred_cleanup_is_bounded_managed_and_retains_new_quarantine() {
+    fn persistence_gate_deferred_cleanup_is_managed_and_retains_new_quarantine() {
         const STAGING_ORPHAN: &str = "11111111-1111-4111-8111-111111111111";
         const ASSET_ORPHAN: &str = "22222222-2222-4222-8222-222222222222";
 
@@ -972,7 +1074,6 @@ mod tests {
             .unwrap();
         let summary = clipping_recovery::run_deferred_cleanup_at(
             &service.db_path,
-            &service.writer,
             &service.layout,
             &diagnostics,
             future,
@@ -1024,7 +1125,6 @@ mod tests {
         for _ in 0..2 {
             let summary = clipping_recovery::run_deferred_cleanup_at(
                 &service.db_path,
-                &service.writer,
                 &service.layout,
                 &diagnostics,
                 future,
@@ -1061,7 +1161,7 @@ mod tests {
             .as_secs();
         let staging = service.layout.staging_dir().unwrap();
         let quarantine = service.layout.quarantine_dir().unwrap();
-        for index in 0..(clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8) {
+        for index in 0..(clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8) {
             let name = format!("orphan-{index:02}");
             std::fs::create_dir_all(staging.join(&name)).unwrap();
             // Force the quarantine move to collide so failed attempts remain
@@ -1072,7 +1172,6 @@ mod tests {
 
         let summary = clipping_recovery::run_deferred_cleanup_at(
             &service.db_path,
-            &service.writer,
             &service.layout,
             &diagnostics,
             future,
@@ -1083,8 +1182,8 @@ mod tests {
             clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
         );
         assert_eq!(
-            summary.max_category_inspected,
-            clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY
+            summary.max_category_enumerated,
+            clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8
         );
         assert_eq!(
             summary.max_category_mutations,
@@ -1092,18 +1191,32 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_dir(staging).unwrap().count(),
-            clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8
+            clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8
         );
     }
 
     #[test]
-    fn persistence_gate_cleanup_cursors_reach_later_orphan_and_expired_entries() {
+    fn persistence_gate_cleanup_complete_enumeration_reaches_later_entries() {
         let (temp, service, diagnostics) = fixture();
+        service
+            .writer
+            .execute(
+                ClippingService::context("test_seed_retired_cleanup_cursor"),
+                |connection| {
+                    connection.execute(
+                        "INSERT INTO newspaper_settings (key, value_json, updated_at)
+                         VALUES ('clipping_cleanup_cursor_v1', 'retired-sentinel', 77)",
+                        [],
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
         let outside_downloads = temp.path().join("newspaper-downloads-never-enumerated");
         std::fs::create_dir(&outside_downloads).unwrap();
         std::fs::write(outside_downloads.join("sentinel.txt"), b"keep-me").unwrap();
 
-        for index in 0..(clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8) {
+        for index in 0..(clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8) {
             let id = format!("{index:08x}-1111-4111-8111-{index:012x}");
             service
                 .register_staged(staged_record(&service, &id))
@@ -1125,7 +1238,7 @@ mod tests {
             .as_secs()
             - 24 * 60 * 60;
         let quarantine = service.layout.quarantine_dir().unwrap();
-        for index in 0..(clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY + 8) {
+        for index in 0..(clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8) {
             std::fs::create_dir(quarantine.join(format!("{fresh_timestamp}-fresh-{index:04}")))
                 .unwrap();
         }
@@ -1134,16 +1247,15 @@ mod tests {
 
         let first = clipping_recovery::run_deferred_cleanup_at(
             &service.db_path,
-            &service.writer,
             &service.layout,
             &diagnostics,
             future,
         );
-        assert!(later_orphan.exists());
-        assert!(later_expired.exists());
+        assert!(!later_orphan.exists());
+        assert!(!later_expired.exists());
         assert!(
-            first.max_category_inspected
-                <= clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY
+            first.max_category_enumerated
+                >= clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 9
         );
         assert!(
             first.max_category_mutations <= clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY
@@ -1151,22 +1263,21 @@ mod tests {
 
         let second = clipping_recovery::run_deferred_cleanup_at(
             &service.db_path,
-            &service.writer,
             &service.layout,
             &diagnostics,
             future,
         );
         assert!(
             !later_orphan.exists(),
-            "persisted cursor must reach later orphan"
+            "complete enumeration must not recreate a removed orphan"
         );
         assert!(
             !later_expired.exists(),
-            "persisted cursor must reach later expiry"
+            "complete enumeration must not recreate removed quarantine"
         );
         assert!(
-            second.max_category_inspected
-                <= clipping_recovery::CLEANUP_INSPECTION_BUDGET_PER_CATEGORY
+            second.max_category_enumerated
+                >= clipping_recovery::CLEANUP_MUTATION_BUDGET_PER_CATEGORY + 8
         );
         assert!(
             second.max_category_mutations
@@ -1176,8 +1287,37 @@ mod tests {
             std::fs::read(outside_downloads.join("sentinel.txt")).unwrap(),
             b"keep-me"
         );
+        let connection = open_runtime(&service.db_path).unwrap();
+        let retired_cursor: (String, i64) = connection
+            .query_row(
+                "SELECT value_json, updated_at FROM newspaper_settings
+                 WHERE key = 'clipping_cleanup_cursor_v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retired_cursor, ("retired-sentinel".to_string(), 77));
         let diagnostics_text = format!("{:?}", diagnostics.snapshot());
         assert!(!diagnostics_text.contains(&temp.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn persistence_gate_production_cleanup_is_detached_from_application_setup() {
+        let source = include_str!("../../lib.rs");
+        let start = source
+            .find("let cleanup_service = clipping_service.clone();")
+            .expect("production setup must schedule clipping cleanup");
+        let end = source[start..]
+            .find("app.manage(diagnostics);")
+            .map(|offset| start + offset)
+            .expect("cleanup scheduling must finish before state management continues");
+        let scheduling = &source[start..end];
+        assert!(scheduling.contains("tauri::async_runtime::spawn_blocking"));
+        assert!(scheduling.contains("cleanup_service.run_deferred_cleanup"));
+        assert!(
+            !scheduling.contains(".await"),
+            "application setup must not wait for detached enumeration"
+        );
     }
 
     fn create_dir_link(target: &Path, link: &Path) -> bool {

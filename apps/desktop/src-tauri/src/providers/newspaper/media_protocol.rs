@@ -366,7 +366,10 @@ mod tests {
     use crate::app::database_diagnostics::DatabaseDiagnostics;
     use crate::app::database_diagnostics::DatabaseProvider;
     use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
-    use crate::newspaper::clipping_assets::{encode_test_webp, sha256_hex};
+    use crate::newspaper::clipping_assets::{
+        encode_test_webp, sha256_hex, THUMBNAIL_MAX_BYTES, THUMBNAIL_MAX_HEIGHT,
+        THUMBNAIL_MAX_WIDTH,
+    };
     use crate::newspaper::clipping_models::ClippingSourceKind;
     use crate::newspaper::clipping_repository::NewClippingRecord;
     use crate::newspaper::clipping_service::ClippingService;
@@ -785,7 +788,7 @@ mod tests {
             })
             .unwrap();
         let version_one = encode_test_webp(8, 8);
-        let version_two = encode_test_webp(9, 9);
+        let version_two = encode_test_webp(THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
         std::fs::write(layout.thumbnail_path(ID, 1).unwrap(), &version_one).unwrap();
         let owned_id = ID.to_string();
         writer
@@ -818,6 +821,47 @@ mod tests {
         let current_response = handle_request(&db_path, &cache_root, &service, &current);
         assert_eq!(current_response.status(), StatusCode::OK);
         assert_eq!(current_response.body(), &version_two);
+
+        let canonical_before = std::fs::read(layout.canonical_path(ID).unwrap()).unwrap();
+        let detail_before = service.detail(ID).unwrap().unwrap().clipping;
+        for (label, invalid) in [
+            ("empty", Vec::new()),
+            ("malformed", b"RIFF\0\0\0\0WEBPmalformed".to_vec()),
+            (
+                "width",
+                encode_test_webp(THUMBNAIL_MAX_WIDTH + 1, THUMBNAIL_MAX_HEIGHT),
+            ),
+            (
+                "height",
+                encode_test_webp(THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT + 1),
+            ),
+        ] {
+            std::fs::write(layout.thumbnail_path(ID, 2).unwrap(), invalid).unwrap();
+            let response = handle_request(&db_path, &cache_root, &service, &current);
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{label}");
+        }
+        std::fs::write(
+            layout.thumbnail_path(ID, 2).unwrap(),
+            vec![0u8; THUMBNAIL_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let oversized = handle_request(&db_path, &cache_root, &service, &current);
+        assert_eq!(oversized.status(), StatusCode::NOT_FOUND);
+        assert_eq!(oversized.headers()[CACHE_CONTROL], "no-store");
+
+        let detail_after = service.detail(ID).unwrap().unwrap().clipping;
+        assert_eq!(detail_after.title, detail_before.title);
+        assert_eq!(detail_after.note_markdown, detail_before.note_markdown);
+        assert_eq!(detail_after.revision, detail_before.revision);
+        assert_eq!(
+            detail_after.asset_checksum_sha256,
+            detail_before.asset_checksum_sha256
+        );
+        assert_eq!(
+            std::fs::read(layout.canonical_path(ID).unwrap()).unwrap(),
+            canonical_before
+        );
 
         let stale = request_for_url(&format!(
             "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=1-1"

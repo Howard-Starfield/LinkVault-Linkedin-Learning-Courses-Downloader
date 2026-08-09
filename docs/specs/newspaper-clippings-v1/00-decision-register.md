@@ -2,7 +2,7 @@
 
 **Status:** Approved with the V1 specification set
 
-**Last updated:** 2026-08-07
+**Last updated:** 2026-08-09
 
 This register is the authoritative record for choices that materially constrain
 Newspaper Clippings V1. A coding agent may not replace an approved decision
@@ -52,6 +52,7 @@ migrations, tests, and rollback impact.
 | D-028 | Missing source and missing asset are separate UI states. | Approved |
 | D-029 | OCR, AI, annotations, multiple attachments, tags, and sync are deferred. | Deferred |
 | D-030 | Canonical screenshots are rejected for V1. | Rejected |
+| D-031 | Deferred cleanup fully enumerates managed categories with bounded mutations. | Approved |
 
 ---
 
@@ -564,6 +565,58 @@ UI overlays. A future **Export current appearance** command could be separately
 specified, but it must not replace the managed source crop.
 
 **Affected specifications:** ADR-002, 03, 04.
+
+## D-031: Detached managed cleanup enumeration
+
+**Status:** Approved
+
+**Approval:** Approved by the product owner on 2026-08-09 for the Phase 1
+review correction.
+
+**Decision:** V1 deferred cleanup runs only in the detached blocking lifecycle
+task and may completely enumerate each application-managed clipping category.
+It does not claim that directory enumeration or inspection is bounded. Actual
+`ReadDir` items consumed are counted, while filesystem mutation attempts remain
+limited to 32 per managed category per launch.
+
+The managed categories are staging, canonical assets, trash, quarantine, and
+derived clipping thumbnails. Traversal streams entries without sorting or
+retaining a directory-sized filename collection. Cleanup does not persist or
+resume a filename cursor because stable `std::fs::read_dir` provides neither a
+defined ordering nor a portable durable directory position.
+
+**Supersedes:** The earlier interpretation of `RECOVERY-004` that all cleanup
+inspection/enumeration work was bounded per launch. It does not supersede the
+24-hour orphan grace period, seven-day quarantine retention, containment
+checks, path redaction, or the prohibition on scanning user newspaper download
+folders.
+
+**Product rationale:** The approved flat managed-path layout has no portable
+indexed directory cursor. Complete detached enumeration gives honest,
+repeatable classification and prevents known/fresh filename filtering from
+hiding later entries, while the mutation cap bounds destructive work.
+
+**Persistence and migration impact:** No schema or application schema-version
+change. The misleading `clipping_cleanup_cursor_v1` setting implementation and
+its writer calls are removed. A stale value left by an earlier draft is ignored.
+
+**Security and privacy impact:** Enumeration remains limited to backend-derived
+managed roots. Every mutation retains regular-file/directory, reparse/symlink,
+canonical-containment, exact-ID, and age checks. Diagnostics contain counts and
+safe classifications only.
+
+**Test and release-gate impact:** Phase 1 tests must count actual iterator items,
+prove at most 32 mutation attempts per category, prove repeated passes reach
+removable leftovers, and record 500-entry and 5,000-entry wall time plus
+approximate/peak memory evidence. Production composition must prove no UI or
+startup thread waits for enumeration.
+
+**Backward compatibility and rollback:** Managed paths and database rows are
+unchanged. Reverting before release restores the prior cleanup implementation;
+after release, a forward fix is preferred. Cleanup rollback never deletes the
+managed root or scans user download folders.
+
+**Affected specifications:** 02 and 07.
 
 ## Change procedure
 

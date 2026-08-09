@@ -339,14 +339,24 @@ without touching source media or another clipping.
 - Grace period respected.
 - Staging/canonical orphans move to quarantine before deletion.
 - Trash orphan cleanup.
+- Exact-ID derived-thumbnail orphan cleanup without touching malformed,
+  prefix-lookalike, symlinked, or another clipping's entries.
 - Seven-day quarantine retention.
-- Work per launch is bounded.
+- Actual managed-directory iterator consumption is reported honestly for
+  complete detached enumeration.
+- Mutation attempts are bounded to 32 independently per category per launch.
+- 500-entry and 5,000-entry Windows measurements record wall time and
+  approximate/peak memory.
 - No recursive scan outside managed root.
 
 ### Media protocol tests
 
 - Current canonical request returns correct bytes/MIME/ETag/cache policy.
 - Current thumbnail request returns correct cache bytes.
+- Thumbnail bytes are read only after a positive 8 MiB metadata limit and are
+  static decodable WebP within the 512×320 box.
+- Empty, oversized-byte, oversized-dimension, malformed, and animated
+  thumbnails fail safely without altering the clipping aggregate.
 - Stale/malformed/missing/corrupt/symlink/escaped requests fail safely.
 - Error responses use `no-store`.
 - Absolute paths never appear in body/header.

@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 1,
@@ -7,8 +7,8 @@
     "src-tauri/src/providers/newspaper/archive_service.rs": 6,
     "src-tauri/src/providers/newspaper/batch_service.rs": 11,
     "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
-    "src-tauri/src/providers/newspaper/clipping_recovery.rs": 4,
-    "src-tauri/src/providers/newspaper/clipping_repository.rs": 10,
+    "src-tauri/src/providers/newspaper/clipping_recovery.rs": 3,
+    "src-tauri/src/providers/newspaper/clipping_repository.rs": 9,
     "src-tauri/src/providers/newspaper/clipping_service.rs": 5,
     "src-tauri/src/providers/newspaper/job_service.rs": 9,
     "src-tauri/src/providers/newspaper/media_protocol.rs": 0,
@@ -59,6 +59,7 @@
     "3": "Added three new shared write helpers (clear_linkedin_provider_data, clear_coursera_provider_data, clear_newspaper_provider_data) and recorded one call site per provider. The provider reset path goes through app::cache helpers, keeping the provider's direct SQL surface flat; only the LinkedIn commands.rs file enters the sharedWriteHelperCallCounts map for the first time, because all of its write paths were previously either helpers or per-row UPDATEs that the gate does not track.",
     "4": "Moved atomic schedule deletion and owned-work cancellation behind the shared app database boundary, reducing the schedule service direct SQL baseline by one and pinning the new helper call site. Added one reviewed storage migration write for the schedule ownership index.",
     "5": "Added the approved Newspaper Clippings Phase 1 repository SQL primitives, DatabaseWriter service/recovery submissions, and provider schema installation. Clipping mutations remain owned by DatabaseWriter; image and filesystem work stays outside writer closures.",
-    "6": "Moved the media protocol's integrity mutation behind the clipping service, reducing protocol SQL primitives to zero and recording the coalesced service DatabaseWriter submission plus cleanup-cursor setting write in their service, recovery, and repository owners. No filesystem or image work enters a writer closure."
+    "6": "Moved the media protocol's integrity mutation behind the clipping service, reducing protocol SQL primitives to zero and recording the coalesced service DatabaseWriter submission plus cleanup-cursor setting write in their service, recovery, and repository owners. No filesystem or image work enters a writer closure.",
+    "7": "Removed the draft filename-cursor setting write after D-031 approved detached complete managed-directory enumeration with per-category mutation caps. This reduces the recovery DatabaseWriter submission count and repository SQL primitive count by one each; no enforcement rule is weakened."
   }
 }
