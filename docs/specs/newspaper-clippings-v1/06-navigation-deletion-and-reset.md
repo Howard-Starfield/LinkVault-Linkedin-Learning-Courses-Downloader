@@ -146,6 +146,34 @@ It must not clear the user’s search silently.
 If the clipping creation response is successful but detail load temporarily
 fails, keep the clipping ID and offer Retry. Do not create another clipping.
 
+### FR-NAV-009: Search takeover and return
+
+Typing into the Clippings toolbar changes only the provider-owned presentation
+mode. It does not create a global application route, browser-history entry, or
+implicit detail selection. The active detail/editor state remains owned by the
+Clippings view while the ranked result surface is active.
+
+Activating a result is a real clipping-to-clipping navigation boundary:
+
+1. Flush or explicitly resolve the current draft.
+2. Preserve query, result generation, loaded confident-page count, whether the
+   Possible matches section was loaded, scroll anchor, and focused result ID.
+3. Load the exact selected clipping by ID, independent of result offset.
+4. On **Back to search results**, restore that state without rerunning a stale
+   request over the top of newer invalidation state.
+
+Escape in a non-empty focused search clears it and restores the prior ordinary
+Clippings layout. Escape inside Tiptap or another editor-owned control retains
+the editor keyboard hierarchy and never clears search globally.
+
+### FR-NAV-010: Search invalidation
+
+Clipping create/update/delete invalidation increments the search generation.
+Already rendered IDs are deduplicated. If ranking-affecting content changed,
+the next fetch restarts from the first confident page while restoring the
+nearest surviving result anchor. An invalidation never appends a page produced
+for an older query or ranking generation.
+
 ## 5. Clipping → Open source
 
 ### FLOW-NAV-002

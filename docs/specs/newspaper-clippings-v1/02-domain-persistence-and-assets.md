@@ -249,6 +249,16 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
 
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_root
     ON newspaper_clippings(asset_root_id, asset_state, updated_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS newspaper_clippings_fts USING fts5(
+    title,
+    note_markdown,
+    edition_name_snapshot,
+    edition_code_snapshot,
+    content='newspaper_clippings',
+    content_rowid='rowid',
+    tokenize='trigram'
+);
 ```
 
 ### Schema rationale
@@ -259,13 +269,21 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_root
 - `asset_state` makes cross-filesystem/database operations recoverable.
 - No editor JSON, OCR text, AI output, tags, arbitrary attachments, or remote
   identifiers are added.
-- No full-text index is added in V1.
+- `newspaper_clippings_fts` is a derived search accelerator, never title/note
+  source of truth. Insert/update/delete triggers keep its external-content rows
+  synchronized in the same SQLite transaction as the clipping row.
+- Search joins back to `newspaper_clippings` and exposes only `ready` or
+  `missing` rows. Index corruption or absence cannot delete or rewrite a note.
 
 ## 5. Schema-version and migration contract
 
 Phase 1 introduced the clipping table at schema version 3. D-032 advances the
 application to schema version 4, adds the root registry and `asset_root_id`, and
 rebuilds populated v3 clipping tables after the existing verified backup.
+D-019 then advances the application to schema version 5, creates the external-
+content FTS table and synchronization triggers, and issues an FTS `rebuild`
+only after the canonical clipping rows are present. The verified backup occurs
+before either pending migration when upgrading an older database.
 
 ### FR-MIGRATION-001
 
@@ -291,6 +309,14 @@ creation or mutation.
 
 A database newer than the supported version remains rejected before backup or
 schema mutation.
+
+### FR-MIGRATION-006
+
+Schema-v5 installation verifies `ENABLE_FTS5`, creates all external-content
+triggers, rebuilds the index from existing rows, and proves row-count/content
+parity before writing `PRAGMA user_version = 5`. A failed create, trigger, or
+rebuild rolls back and preserves the verified backup. Repair may drop and
+rebuild only the derived FTS objects while leaving clipping rows untouched.
 
 ### Migration evidence
 
@@ -388,6 +414,41 @@ Every managed read/write/delete operation:
 - Asset promotion uses a same-volume atomic rename from reserved staging into
   the edition/date/clipping directory.
 - No canonical file is modified in place in V1.
+
+### FR-ROOT-RECONNECT-001: Settings list
+
+The root service lists registry identity, kind, and backend-derived display
+path from SQLite, plus any process-memory cached probe outcome. It does not add
+stale availability columns to the root registry or synchronously probe every
+filesystem path while listing. A root without a cached outcome begins as
+`unchecked`; Settings renders it as `checking` while requesting a probe.
+Availability probes run off the UI-sensitive thread, are coalesced per root,
+and are concurrency bounded so a disconnected removable or network destination
+cannot freeze Settings.
+
+### FR-ROOT-RECONNECT-002: Check again
+
+`Check again` accepts only a root ID. The backend resolves the stored locator,
+rejects reparse/symlink substitution, and verifies the exact marker. It returns
+`connected`, `offline`, or `marker_mismatch`; it does not create directories,
+rewrite markers, scan other locations, or mutate the locator.
+
+### FR-ROOT-RECONNECT-003: Reconnect
+
+`Reconnect…` uses a backend-owned native folder-selection flow (or an opaque
+selection token with equivalent ownership). React never submits an arbitrary
+path to the repository. The selected directory must be the existing
+`Newspaper snapshots` root and present the requested root ID in its marker.
+After canonicalization and uniqueness checks, one serialized writer transaction
+updates `locator`, `locator_key`, and `updated_at`. A failure leaves the old
+locator and all notes/assets unchanged.
+
+### FR-ROOT-RECONNECT-004: Offline behavior
+
+Offline or mismatched roots do not block title/note search, editing, or list
+metadata. Canonical images and thumbnails show the existing unavailable state.
+Visible thumbnail requests coalesce the root probe so one result page cannot
+perform one blocking offline-path check per row.
 
 ## 8. Idempotency contract
 

@@ -40,7 +40,7 @@ migrations, tests, and rollback impact.
 | D-016 | Source deletion and World Journal reset preserve clippings. | Approved |
 | D-017 | Source provenance is denormalized and foreign keys use `SET NULL`. | Approved |
 | D-018 | Note updates use optimistic revisions. | Approved |
-| D-019 | Search is local substring search; FTS is deferred. | Approved |
+| D-019 | Search uses ranked local FTS with bounded fuzzy suggestions. | Approved |
 | D-020 | Derived thumbnails are regenerable cache data. | Approved |
 | D-021 | Clipping media is served by the protected newspaper media protocol. | Approved |
 | D-022 | Crop work is bounded and performed outside database transactions. | Approved |
@@ -54,6 +54,7 @@ migrations, tests, and rollback impact.
 | D-030 | Canonical screenshots are rejected for V1. | Rejected |
 | D-031 | Deferred cleanup fully enumerates managed categories with bounded mutations. | Approved |
 | D-032 | New canonical assets live in a registered snapshot root under the source download destination. | Approved |
+| D-033 | Settings manages registered snapshot locations and marker-verified reconnection. | Approved |
 
 ---
 
@@ -259,6 +260,35 @@ paths, explicit deletion, and durable note semantics remain binding.
 
 **Affected specifications:** ADR-002, README, 02, 06, 07, 08.
 
+## D-033: Snapshot location management and reconnection
+
+**Status:** Approved
+
+**Decision:** Newspaper Settings shows the registered snapshot locations that
+were created automatically from persisted newspaper download destinations. It
+does not provide an arbitrary global snapshot-folder override.
+
+Each location exposes a backend-derived display path. A newly opened Settings
+view may briefly show `checking`; the verified outcome is `connected`,
+`offline`, or `marker_mismatch`. **Check again** retries the registered
+location. **Reconnect…** opens a backend-owned native folder selection flow for
+an offline or mismatched root and updates the locator only after the selected
+`Newspaper snapshots` directory presents the matching root marker. **Open
+folder** is available only after current marker verification.
+
+Reconnect never copies, merges, scans for, renames, or creates snapshot data.
+It rejects an empty/unmarked directory, a marker for another root, a location
+already registered to another root, symlinks/reparse points, and paths outside
+the selected marker-bound root. Notes and search remain available while a root
+is offline.
+
+**Rationale:** “Sync again” would imply data transfer or filesystem indexing.
+The actual operation restores the trusted locator for durable data that has
+moved, while preserving the same-download-destination ownership model and
+preventing drive-letter/path reuse from rebinding unrelated files.
+
+**Affected specifications:** 02, 05, 06, 07, 08.
+
 ## D-010: Clipping-to-note cardinality
 
 **Status:** Approved
@@ -406,16 +436,35 @@ companion views must not silently lose user text.
 
 **Status:** Approved
 
-**Decision:** V1 provides local substring search over title, Markdown,
-edition name/code, date, and page number using bounded escaped SQLite `LIKE`
-queries. SQLite FTS is deferred.
+**Decision:** V1 provides local relevance-ranked search over title, Markdown,
+edition name/code, date, and page number. Schema v5 adds a rebuildable SQLite
+FTS5 trigram index for title, note, and edition candidate retrieval. Exact and
+prefix title matches are ranked ahead of weighted FTS relevance; date and page
+matches are literal only. Updated time and clipping ID are deterministic final
+ties.
 
-**Rationale:** The expected V1 scale is modest, the result list is paged, and
-introducing an FTS index adds migration and synchronization behavior before
-there is measured need.
+Confident results lazy-load in pages of 50. After every confident result is
+exhausted, the UI may request one separately labelled **Possible matches**
+section capped at 25 unique rows. Fuzzy matching applies only to Title, Note,
+and Edition, requires at least four Unicode scalar values, and operates only on
+a bounded FTS candidate/window set. It never scans every full note per
+keystroke. Date and Page are never fuzzed.
 
-**Constraints:** Search input is trimmed, capped at 200 UTF-8 characters, uses
-an explicit escape character, and never interpolates SQL.
+**Rationale:** The user needs fast keyword retrieval independent of the nested
+snapshot folders, explainable field tags, useful typo tolerance, and stable
+ranking. A derived local index provides these without making filesystem layout
+or the index itself authoritative.
+
+**Constraints:** Search input is normalized, trimmed, capped at 200 Unicode
+scalar values, bound as data, and treated literally rather than as FTS syntax.
+Title, Edition, Date, and Page may match from one Unicode scalar value. Note
+body matching begins at three Unicode scalar values; shorter queries do not
+scan note bodies and the UI explains the limit. Results return factual
+cumulative match fields: `title`, `note`, `edition`, `date`, and `page`. No
+confidence percentage is shown. While a query is active, the visible sort is
+`Relevance`; ordinary list sort resumes after clearing it. The FTS index is
+derived, transactionally synchronized, integrity-checked, and rebuildable
+without changing title or note source data.
 
 **Affected specifications:** 02, 05, 07.
 

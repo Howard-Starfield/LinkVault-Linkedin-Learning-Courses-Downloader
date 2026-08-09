@@ -67,7 +67,14 @@ are treated as requirements unless superseded in the decision register.
     and notes.
 14. When the original edition still exists, a clipping can open the exact page
     and briefly highlight its saved region.
-15. OCR, AI summaries, drawing annotations, multiple clipping attachments in a
+15. Clippings search takes over the provider main view from the Clippings
+    toolbar. It ranks Title, Note, Edition, Date, and Page matches; then, only
+    after confident results are exhausted, offers at most 25 separately labeled
+    **Possible matches** for fuzzy Title, Note, and Edition matches.
+16. Settings lists the snapshot locations created from newspaper download
+    destinations. Users may open, recheck, or marker-verify a moved location,
+    but may not configure an unrelated global snapshot override.
+17. OCR, AI summaries, drawing annotations, multiple clipping attachments in a
     note, tags, cloud synchronization, and a general cross-provider notes
     workspace are outside V1.
 
@@ -171,6 +178,7 @@ Every implementation phase must preserve these invariants.
 | [06-navigation-deletion-and-reset.md](06-navigation-deletion-and-reset.md) | Sidebar routing, source return navigation, deletion semantics, reset preservation, and unavailable states. |
 | [07-verification-performance-and-release.md](07-verification-performance-and-release.md) | Test matrix, automated commands, evidence, performance measurement, accessibility, native UAT, and release gate. |
 | [08-coding-agent-execution-contract.md](08-coding-agent-execution-contract.md) | Mandatory rules and PR evidence contract for an implementation agent. |
+| [work-orders/phase-1b-search-reconnect.md](work-orders/phase-1b-search-reconnect.md) | Detailed backend work order for ranked search and snapshot-root status/reconnection. |
 
 If documents conflict, authority is resolved in this order:
 
@@ -188,18 +196,22 @@ conflict cannot be resolved by that order.
 ```mermaid
 flowchart TD
     P0["Phase 0: approve specifications"] --> P1["Phase 1: persistence and managed assets"]
-    P1 --> P2["Phase 2: deterministic native crop service"]
+    P1 --> P1A["Phase 1A: snapshot-root storage amendment"]
+    P1A --> P1B["Phase 1B: ranked search and root reconnect foundation"]
+    P1A --> P2["Phase 2: deterministic native crop service"]
     P2 --> P3["Phase 3: reader clipping interaction"]
     P1 --> P4A["Phase 4A: editor compatibility spike"]
     P3 --> P4B["Phase 4B: clippings library and editor integration"]
+    P1B --> P4B
     P4A --> P4B
     P4B --> P5["Phase 5: source navigation, deletion, and reset"]
     P5 --> P6["Phase 6: performance, native UAT, and release integration"]
 ```
 
-The graph means that Phase 4A may be evaluated after persistence contracts are
-stable, but full library/editor integration may not begin before both the
-reader save path and the editor decision gate are complete.
+The graph means that Phase 1B and the rebased Phase 2 crop work may proceed as
+separate branches after Phase 1A lands. Neither needs the other's implementation.
+Full library/editor integration may not begin before the reader save path,
+ranked-search/reconnect services, and editor decision gate are complete.
 
 ## Phase control table
 
@@ -207,10 +219,12 @@ reader save path and the editor decision gate are complete.
 |---|---|---|---|---|
 | 0 | Review ADR-002 and all V1 specifications. Resolve blocking decisions. | Documentation branch exists. | ADR-002 and all documents approved and merged. | Complete |
 | 1 | Schema, repository, managed roots, asset state machine, protocol route, recovery foundations. No crop UI. | Phase 0 complete. | Migration, reset-preservation, repository, protocol, lifecycle, and persistence gates pass. | Complete |
-| 2 | Native source resolver, normalized-to-pixel conversion, crop encoder, checksum, bounded blocking execution, create command. No reader selection UI. | Phase 1 complete. | Deterministic crop and failure-path tests pass; measured crop baseline recorded. | Ready |
+| 1A | Place new clipping assets under each download destination's protected `Newspaper snapshots` root; add root registry/marker and legacy reads. | Phase 1 complete. | Storage-amendment lifecycle, recovery, media, archive/reset, and migration gates pass. | Implemented locally; merge pending |
+| 1B | Add schema-v5 FTS, deterministic ranked/fuzzy repository contracts, and root list/check/reconnect services. No production UI. | Phase 1A merged. | Migration/index/ranking/root-service and full repository gates pass. | Planned |
+| 2 | Native source resolver, normalized-to-pixel conversion, crop encoder, checksum, bounded blocking execution, create command. No reader selection UI. | Phase 1A merged; Phase 2 branch rebased on it. | Deterministic crop and failure-path tests pass; measured crop baseline recorded. | Implemented; rebase pending |
 | 3 | Reader Clip action, pointer/keyboard state machine, selection overlay, save confirmation, non-disruptive success flow. | Phase 2 complete. | Browser interaction matrix and native DPI smoke pass without reader virtualization regression. | Blocked |
 | 4A | Compare approved editor candidates behind an isolated adapter. No production note UI. | Phase 1 complete and editor criteria approved. | One candidate is recorded as Approved in the decision register with evidence. | Complete |
-| 4B | Sidebar Clippings view, paged/virtualized list, detail source card, selected editor, autosave, optimistic conflict handling, search/sort. | Phases 3 and 4A complete. | List, editor, IME, autosave, search, and conflict tests pass. | Blocked |
+| 4B | Sidebar Clippings view, paged/virtualized list, detail source card, Tiptap editor, autosave, optimistic conflict handling, search takeover, and Snapshot locations Settings UI. | Phases 1B, 3, and 4A complete. | List, editor, IME, autosave, ranked-search, reconnect, and conflict tests pass. | Blocked |
 | 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4B complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Blocked |
 | 6 | Final performance budgets, accessibility audit, native installed-app UAT, visual evidence, release verification. | Phase 5 complete. | All automated and manual release gates pass and evidence is committed. | Blocked |
 
@@ -222,6 +236,8 @@ change.
 
 ```text
 PR 1  feat(newspaper): add clipping persistence and managed asset lifecycle
+PR 1A feat(newspaper): store clipping assets with newspaper snapshots
+PR 1B feat(newspaper): add ranked clipping search and root reconnect foundation
 PR 2  feat(newspaper): add deterministic native clipping crop service
 PR 3  feat(newspaper): add reader clipping selection workflow
 PR 4A test(editor): evaluate clipping note editor candidates

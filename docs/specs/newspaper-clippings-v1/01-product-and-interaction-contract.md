@@ -777,9 +777,10 @@ contract from specification 05. It never silently reloads or overwrites.
 
 ### EC-PRODUCT-009: Search excludes selected clipping
 
-The detail pane closes or selects the first result only after dirty content is
-flushed. It never discards an unsaved draft because a debounced search response
-arrived.
+The search takeover preserves the selected detail and editor draft outside the
+active focus/accessibility tree. Selecting a different result flushes or
+resolves dirty content first. A debounced response never closes the detail,
+selects a different clipping, or discards a draft by itself.
 
 ### EC-PRODUCT-010: App close during debounce
 
@@ -787,7 +788,46 @@ The cooperative close handler attempts an immediate flush and may delay normal
 close briefly. Forced process termination or power loss inside the debounce
 window remains a documented limitation.
 
-## 19. Final product acceptance criteria
+## 19. Snapshot locations and search retrieval
+
+### SETTINGS-SNAPSHOT-001
+
+The Newspaper section in LinkVault Settings includes **Snapshot locations**.
+Locations appear only after LinkVault creates them from persisted newspaper
+download destinations. There is no global snapshot-folder picker or override.
+
+Each row shows its backend-provided display path and one status:
+
+```text
+Connected       [Open folder] [Check again]
+Offline         [Check again] [Reconnect…]
+Marker mismatch [Check again] [Reconnect…]
+Checking…
+```
+
+`Reconnect…` means locate the same moved marker-bound folder. It never says
+`Sync`, creates a new root, moves files, or merges roots. Search and note editing
+remain available while the image location is offline.
+
+### SEARCH-PRODUCT-001
+
+Search belongs to the Clippings provider toolbar, not the global application
+chrome. Typing a non-empty query takes over the Clippings main content with
+ranked results. Confident matches lazy-load first; up to 25 lower-confidence
+rows appear later under **Possible matches**. Field tags use `Title`, `Note`,
+`Edition`, `Date`, and `Page`. Possible matches may use only Title, Note, or
+Edition and never approximate Date or Page.
+
+Title, Edition, Date, and Page begin matching from the first character. Note
+body matching begins at three Unicode characters. For a one- or two-character
+query the results surface says `Type 3 characters to search notes`; it still
+shows any matches from the other four fields and does not imply that notes were
+searched.
+
+Opening a result and returning preserves query, scroll, and draft state. Folder
+depth and snapshot availability never determine whether a note is searchable.
+
+## 20. Final product acceptance criteria
 
 ### AC-PRODUCT-002: Non-disruptive capture
 

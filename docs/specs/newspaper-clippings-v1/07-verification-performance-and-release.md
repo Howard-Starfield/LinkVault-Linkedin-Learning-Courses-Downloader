@@ -300,6 +300,18 @@ The clipping migration and reset suite passes from at least:
   verified backup and byte-identical note/asset metadata.
 - A populated realistic test database with all providers represented.
 
+### FTS migration and integrity
+
+- Bundled SQLite reports `ENABLE_FTS5` before schema-v5 installation.
+- A populated schema-v4 database receives a verified backup, FTS objects,
+  triggers, rebuild, parity check, and only then `user_version = 5`.
+- Insert, title/note update, delete, recovery-state change, reset/source unlink,
+  and optimistic-conflict paths keep canonical rows and the index consistent.
+- Forced trigger/rebuild failure rolls back without changing title/note bytes.
+- Repair drops/rebuilds only derived FTS objects and restores representative
+  English/Chinese results.
+- Corrupt/missing index never causes clipping or note deletion.
+
 ## 7. Managed asset and recovery suite
 
 Test prefix recommendation:
@@ -326,6 +338,14 @@ clipping_recovery_
 - Checksum mismatch.
 - Missing/mismatched root marker and reused destination path.
 - Offline removable/network root remains transient and is not recreated.
+- Settings list reads registry rows without probing every root synchronously.
+- Coalesced `Check again` returns connected/offline/marker-mismatch by root ID.
+- Marker-verified reconnect updates only the requested root locator/key.
+- Reconnect rejects empty/unmarked roots, another root's marker, duplicate
+  locator ownership, reparse points, and database-write failure without moving
+  or rewriting files.
+- Open folder is rejected unless the current marker verifies.
+- Search/note edit remain available with every canonical root offline.
 - Error body/log redaction.
 
 ### Creation recovery tests
@@ -506,6 +526,10 @@ Full Markdown bodies fetched for list = 0
 Canonical full images mounted in detail = 1
 Canonical full images mounted in list = 0
 Thumbnail ensure requests = visible rows only, coalesced per ID
+Offline root probes = coalesced per root, not per visible row
+Confident search page size = 50
+Possible matches total <= 25
+Fuzzy candidate/window set = bounded and measured before release
 ```
 
 A browser fixture must expose instrumentation so these conditions are asserted,
@@ -514,11 +538,25 @@ not judged visually.
 ### Search/sort
 
 - Literal wildcard/escape handling.
-- Chinese text.
-- Dates/pages.
-- All sort modes and tie-break IDs.
+- FTS query operators and quotes remain literal user text.
+- One- and two-character Title/Edition/Date/Page matching with Note excluded,
+  exact helper copy, and no Note tag/snippet; three characters enables Note.
+- Mixed English/Chinese exact, substring, and typo candidates.
+- Exact title, title prefix, weighted Title/Note/Edition relevance, and stable
+  updated-time/ID ties against a committed golden ranking fixture.
+- Exact Date/Page matching with proof that neither field is fuzzed.
+- Cumulative factual Title/Note/Edition/Date/Page match tags.
+- Safe bounded highlighted Note snippet.
+- Confident pages 0/1/50/51/500 and one Possible matches page capped at 25.
+- Confident IDs excluded from Possible matches.
+- Fuzzy query under four Unicode scalar values returns no fuzzy page.
+- Two-megabyte note does not cause per-keystroke full-note fuzzy scanning.
+- Search generation cancellation, cross-page dedupe, and invalidation restart.
+- Relevance enforced while searching; ordinary sort modes and ties resume after
+  clear.
 - Clear search.
-- Search excluding current detail with dirty guard.
+- Search takeover retains current editor state; result activation and return
+  preserve dirty guard, query, loaded boundary, anchor, and focus.
 
 ### Source card
 
@@ -811,6 +849,10 @@ List overscan = 4
 Canonical full images mounted = 1
 Canonical images in list = 0
 Visible-only thumbnail requests
+Offline root probes coalesced per root
+Confident search page size = 50
+Possible matches total <= 25
+No per-keystroke full-note fuzzy scan
 No image processing in database transactions
 No per-keystroke IPC autosave
 No editor eager load on unrelated routes
@@ -828,6 +870,9 @@ Add deterministic visual fixtures for:
 - World Journal sidebar with Clippings inactive/active.
 - Clippings empty state.
 - 8-row populated master-detail view.
+- Ranked search takeover with cumulative match tags.
+- Confident-results tail followed by a separated Possible matches section.
+- Snapshot locations in connected/offline/marker-mismatch/checking states.
 - Long Chinese/English title and note excerpt.
 - Source available/unavailable.
 - Asset missing warning.
@@ -914,6 +959,21 @@ confirm no reader shortcut fires in editor fields.
 
 Review 500-clipping fixture, search, scroll deeply, open/edit, and return without
 unbounded row/image loading or obvious UI stalls.
+
+#### UAT-011: Ranked and fuzzy retrieval
+
+Search representative English/Chinese Title, Note, Edition, Date, and Page
+values; verify explainable order, factual cumulative tags, safe snippets,
+literal short-query fallback, exact-only Date/Page, lazy confident pages, and no
+more than 25 visibly separated Possible matches. Open a result with a pending
+draft and return to the same query/anchor without data loss.
+
+#### UAT-012: Snapshot location reconnect
+
+With test-owned removable or moved snapshot data, verify Connected, Offline,
+Check again, marker mismatch, and Reconnect states. Reconnect only the matching
+marker-bound folder, confirm notes remain searchable while offline, and confirm
+that no file is copied, merged, created, or deleted.
 
 ### UAT result format
 
@@ -1060,7 +1120,9 @@ Final release notes/help must state, without overstating capability:
 - Missing canonical assets are not silently recopied from potentially changed
   source pages.
 - Deleted source editions are not heuristically relinked after redownload.
-- Search is local substring search, not OCR/full article text or semantic search.
+- Search is local ranked title/note/provenance retrieval with bounded typo
+  suggestions; it is not OCR/full article text, semantic search, or fuzzy
+  Date/Page matching.
 - One clipping contains one image/note.
 - OCR, AI summary, annotations, tags, export, sharing, and sync are not included.
 
