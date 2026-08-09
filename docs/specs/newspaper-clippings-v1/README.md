@@ -208,7 +208,7 @@ reader save path and the editor decision gate are complete.
 | 1 | Schema, repository, managed roots, asset state machine, protocol route, recovery foundations. No crop UI. | Phase 0 complete. | Migration, reset-preservation, repository, protocol, lifecycle, and persistence gates pass. | Complete |
 | 2 | Native source resolver, normalized-to-pixel conversion, crop encoder, checksum, bounded blocking execution, create command. No reader selection UI. | Phase 1 complete. | Deterministic crop and failure-path tests pass; measured crop baseline recorded. | Ready |
 | 3 | Reader Clip action, pointer/keyboard state machine, selection overlay, save confirmation, non-disruptive success flow. | Phase 2 complete. | Browser interaction matrix and native DPI smoke pass without reader virtualization regression. | Blocked |
-| 4A | Compare approved editor candidates behind an isolated adapter. No production note UI. | Phase 1 complete and editor criteria approved. | One candidate is recorded as Approved in the decision register with evidence. | Ready |
+| 4A | Compare approved editor candidates behind an isolated adapter. No production note UI. | Phase 1 complete and editor criteria approved. | One candidate is recorded as Approved in the decision register with evidence. | Complete |
 | 4B | Sidebar Clippings view, paged/virtualized list, detail source card, selected editor, autosave, optimistic conflict handling, search/sort. | Phases 3 and 4A complete. | List, editor, IME, autosave, search, and conflict tests pass. | Blocked |
 | 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4B complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Blocked |
 | 6 | Final performance budgets, accessibility audit, native installed-app UAT, visual evidence, release verification. | Phase 5 complete. | All automated and manual release gates pass and evidence is committed. | Blocked |
@@ -262,14 +262,12 @@ The following are deliberately excluded from V1 and must not be added as
 An excluded feature requires a separate decision and specification; it is not a
 reason to weaken the V1 data model or test gates.
 
-## Open decisions and blockers
+## Resolved editor decision
 
-The core product contract is approved. The following implementation choice is
-intentionally deferred and blocks Phase 4B only:
-
-- **OD-001: WYSIWYG package selection.** The persistent format and adapter are
-  fixed, but the package must pass the Phase 4A React 19, Chinese IME, Markdown
-  round-trip, Strict Mode, offline, accessibility, and bundle-impact spike.
+The core product contract and editor selection are approved. D-024 selects the
+exact Tiptap 3.29.2 trio behind the LinkVault-owned Markdown adapter. Phase 4B
+retains native Tauri IME validation as an integration exit gate; screen-reader
+UAT is not a product blocker.
 
 No other open decision may be invented by an implementation agent. New
 ambiguities must be added to the decision register and reviewed.

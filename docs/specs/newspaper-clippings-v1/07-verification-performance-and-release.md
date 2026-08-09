@@ -651,7 +651,8 @@ Use existing tooling where available and deterministic assertions for:
 ### Manual checks
 
 - Keyboard-only complete workflow.
-- Windows screen-reader smoke where available.
+- Optional Windows screen-reader observation where available; it is not a
+  blocking V1 gate.
 - Focus visibility in light/dark and page tones.
 - Contrast review for selection border/mask, badges, warnings, save/conflict
   states, and disabled controls.
@@ -964,7 +965,8 @@ Adds:
 
 - Editor evaluation artifact.
 - React 19/Strict Mode/Markdown/security/bundle tests.
-- Native Chinese IME evidence.
+- Synthetic composition coverage and visible Windows dev-harness user
+  acceptance; native Tauri IME remains in Phase 4B.
 
 ### Phase 4B
 
