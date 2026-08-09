@@ -37,6 +37,63 @@ pub const CLIPPING_ASSET_MIME: &str = "image/webp";
 /// Registered page image MIME types accepted as source snapshots.
 pub const SUPPORTED_SOURCE_MIME_TYPES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
 
+/// Frontend crop coordinates normalized against the rendered source image.
+/// The native crop pipeline validates and converts these values before any
+/// source file read (specification 03 sections 2, 3, and 15).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedCropRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Thin IPC request for the Phase 2 native crop command. All source
+/// provenance and destination paths are deliberately absent: Rust derives
+/// them from the registered Newspaper page record.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNewspaperClippingRequest {
+    pub operation_id: String,
+    pub page_id: String,
+    pub expected_media_version: i64,
+    pub rect: NormalizedCropRect,
+}
+
+/// Safe response returned only after Phase 1 has promoted and marked the
+/// clipping asset ready. No filesystem path crosses IPC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNewspaperClippingResponse {
+    pub clipping_id: String,
+    pub title: String,
+    pub edition_code: String,
+    pub edition_name: String,
+    pub publication_date: String,
+    pub page_number: String,
+    pub image_url: String,
+    pub asset_version: u32,
+    pub asset_width: u32,
+    pub asset_height: u32,
+    pub asset_byte_count: u64,
+    pub revision: u64,
+    pub created_at: i64,
+}
+
+/// Safe, structured failure returned by the asynchronous Phase 2 command.
+/// It intentionally carries only the stable code/message/retry classification
+/// and the caller-provided idempotency key, never raw paths or decoder/SQL
+/// causes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNewspaperClippingFailure {
+    pub code: String,
+    pub safe_message: String,
+    pub retryable: bool,
+    pub operation_id: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClippingRootKind {
     LegacyManaged,
@@ -390,6 +447,24 @@ pub enum ClippingErrorCode {
     DatabaseReadFailed,
     RecoveryFailed,
     DeleteFailed,
+    InvalidCropRect,
+    CropTooSmall,
+    SourcePageNotFound,
+    SourcePageNotReady,
+    SourceMediaStale,
+    SourceMediaUnavailable,
+    SourceMediaPathInvalid,
+    SourceMediaUnsupported,
+    SourceMediaTooLarge,
+    SourceMediaDecodeFailed,
+    SourceMediaChangedDuringRead,
+    SourceOrientationUnsupported,
+    SourceDimensionMismatch,
+    SourceCropFailed,
+    EncodeFailed,
+    OutputTooLarge,
+    OutputValidationFailed,
+    ServiceUnavailable,
 }
 
 impl ClippingErrorCode {
@@ -415,7 +490,83 @@ impl ClippingErrorCode {
             Self::DatabaseReadFailed => "CLIPPING_DATABASE_READ_FAILED",
             Self::RecoveryFailed => "CLIPPING_RECOVERY_FAILED",
             Self::DeleteFailed => "CLIPPING_DELETE_FAILED",
+            Self::InvalidCropRect => "INVALID_CROP_RECT",
+            Self::CropTooSmall => "CROP_TOO_SMALL",
+            Self::SourcePageNotFound => "SOURCE_PAGE_NOT_FOUND",
+            Self::SourcePageNotReady => "SOURCE_PAGE_NOT_READY",
+            Self::SourceMediaStale => "SOURCE_MEDIA_STALE",
+            Self::SourceMediaUnavailable => "SOURCE_MEDIA_UNAVAILABLE",
+            Self::SourceMediaPathInvalid => "SOURCE_MEDIA_PATH_INVALID",
+            Self::SourceMediaUnsupported => "SOURCE_MEDIA_UNSUPPORTED",
+            Self::SourceMediaTooLarge => "SOURCE_MEDIA_TOO_LARGE",
+            Self::SourceMediaDecodeFailed => "SOURCE_MEDIA_DECODE_FAILED",
+            Self::SourceMediaChangedDuringRead => "SOURCE_MEDIA_CHANGED_DURING_READ",
+            Self::SourceOrientationUnsupported => "SOURCE_ORIENTATION_UNSUPPORTED",
+            Self::SourceDimensionMismatch => "SOURCE_DIMENSION_MISMATCH",
+            Self::SourceCropFailed => "SOURCE_CROP_FAILED",
+            Self::EncodeFailed => "CLIPPING_ENCODE_FAILED",
+            Self::OutputTooLarge => "CLIPPING_OUTPUT_TOO_LARGE",
+            Self::OutputValidationFailed => "CLIPPING_OUTPUT_VALIDATION_FAILED",
+            Self::ServiceUnavailable => "CLIPPING_SERVICE_UNAVAILABLE",
         }
+    }
+
+    pub fn safe_message(self) -> &'static str {
+        match self {
+            Self::InvalidCropRect => "The selected crop area is invalid.",
+            Self::CropTooSmall => "Select an area at least 32 by 32 source pixels.",
+            Self::SourcePageNotFound => "The selected newspaper page is unavailable.",
+            Self::SourcePageNotReady => "The selected newspaper page is not ready.",
+            Self::SourceMediaStale => "The displayed page changed. Refresh it and try again.",
+            Self::SourceMediaUnavailable => "The source page media is unavailable.",
+            Self::SourceMediaPathInvalid => "The registered source media is unsafe to use.",
+            Self::SourceMediaUnsupported => "The source page media is unsupported.",
+            Self::SourceMediaTooLarge => "The source page exceeds the safe clipping limit.",
+            Self::SourceMediaDecodeFailed => "The source page could not be decoded.",
+            Self::SourceMediaChangedDuringRead => "The source page changed while it was read.",
+            Self::SourceOrientationUnsupported => "The source page orientation is unsupported.",
+            Self::SourceDimensionMismatch => {
+                "The retained original does not match the displayed page dimensions."
+            }
+            Self::SourceCropFailed => "The source page crop could not be created.",
+            Self::EncodeFailed => "The clipping image could not be encoded.",
+            Self::OutputTooLarge => "The clipping output exceeds the safe size limit.",
+            Self::OutputValidationFailed => "The clipping output could not be validated.",
+            Self::ServiceUnavailable => "Clipping is temporarily unavailable.",
+            Self::InvalidId => "The clipping operation identifier is invalid.",
+            Self::InvalidTitle => "The clipping title is invalid.",
+            Self::NoteTooLarge => "The clipping note is too large.",
+            Self::InvalidMarkdown => "The clipping note contains invalid content.",
+            Self::NotFound => "The clipping was not found.",
+            Self::NotEditable => "The clipping is not editable right now.",
+            Self::RevisionConflict => "The clipping changed in another window.",
+            Self::OperationConflict => "The clipping operation conflicts with existing state.",
+            Self::AssetRootUnavailable => "Clipping storage is unavailable.",
+            Self::AssetPathInvalid => "The clipping asset path is invalid.",
+            Self::AssetCollision => "A clipping asset already exists for this operation.",
+            Self::AssetWriteFailed => "The clipping asset could not be written.",
+            Self::AssetPromotionFailed => "The clipping asset could not be finalized.",
+            Self::AssetValidationFailed => "The clipping asset could not be validated.",
+            Self::AssetMissing => "The clipping asset is missing.",
+            Self::AssetChecksumMismatch => "The clipping asset failed an integrity check.",
+            Self::DatabaseWriteFailed => "The clipping could not be saved.",
+            Self::DatabaseReadFailed => "Clipping data could not be read.",
+            Self::RecoveryFailed => "Clipping recovery did not complete.",
+            Self::DeleteFailed => "The clipping could not be deleted.",
+        }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::SourcePageNotReady
+                | Self::SourceMediaChangedDuringRead
+                | Self::EncodeFailed
+                | Self::ServiceUnavailable
+                | Self::AssetWriteFailed
+                | Self::AssetPromotionFailed
+                | Self::DatabaseWriteFailed
+        )
     }
 }
 
@@ -439,6 +590,17 @@ impl ClippingError {
 impl From<ClippingErrorCode> for ClippingError {
     fn from(code: ClippingErrorCode) -> Self {
         Self::new(code)
+    }
+}
+
+impl CreateNewspaperClippingFailure {
+    pub fn from_code(operation_id: String, code: ClippingErrorCode) -> Self {
+        Self {
+            code: code.as_str().to_string(),
+            safe_message: code.safe_message().to_string(),
+            retryable: code.is_retryable(),
+            operation_id,
+        }
     }
 }
 
@@ -729,5 +891,27 @@ mod tests {
         assert_eq!(json["status"], "connected");
         assert_eq!(json["root"]["rootId"], "clipping-root-test");
         assert!(json["root"].get("locator").is_none());
+    }
+
+    #[test]
+    fn crop_failure_serialization_has_only_the_safe_ipc_contract() {
+        let failure = CreateNewspaperClippingFailure::from_code(
+            "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+            ClippingErrorCode::SourceMediaPathInvalid,
+        );
+        let json = serde_json::to_value(&failure).unwrap();
+        let object = json.as_object().unwrap();
+        let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, ["code", "operationId", "retryable", "safeMessage"]);
+        assert_eq!(object["code"], "SOURCE_MEDIA_PATH_INVALID");
+        assert_eq!(
+            object["safeMessage"],
+            "The registered source media is unsafe to use."
+        );
+        let serialized = json.to_string();
+        assert!(!serialized.contains("C:\\sensitive\\newspaper\\page.png"));
+        assert!(!serialized.contains("SELECT "));
+        assert!(!serialized.contains("decoder"));
     }
 }
