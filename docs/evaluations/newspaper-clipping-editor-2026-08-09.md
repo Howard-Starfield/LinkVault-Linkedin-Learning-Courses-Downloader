@@ -5,6 +5,9 @@
 **Branch / base:** `spike/newspaper-clippings-phase-4a-editor` at the evaluation
 worktree based on `60071e4ee868dacb016c62ab0e69ba174e09b6f6`; merged target
 `main` is `2500d6da6022d85032689567ecc479de2df11bc1`.
+**Implementation commit / clean-run base:**
+`c0a465d9560b7a6cd9406546fe8937cd47443926`
+(`test(editor): evaluate clipping note editor compatibility`).
 
 ## Scope and entry gate
 
@@ -260,25 +263,43 @@ covered by the headless browser matrix.
 
 ## Work-order verification status
 
+The following was rerun from the clean implementation commit above. Generated
+`apps/desktop/dist` and `apps/desktop/dist-editor-evaluation` outputs were
+removed after the commands; neither is part of the implementation commit.
+
 | Command | Exit / elapsed | Status |
 |---|---|---|
-| npm.cmd --prefix apps\desktop run build | 0 / 5,075 ms | Passed after the final scanner regression fix. |
-| npm.cmd --prefix apps\desktop run verify:clipping-note-editor-markdown | 0 / 474 ms | Passed: direct exact nested MDX, multiline import/export, standard/short pipe-less table, import/export-leading prose, and safe-link regression. |
-| npm.cmd --prefix apps\desktop run build:editor-evaluation | 0 / 4,421 ms | Passed after the final scanner regression fix. |
-| npm.cmd --prefix apps\desktop run verify:clipping-note-editor | 0 / 39,893 ms | Passed (15/15) after the final scanner and lifecycle regression fixes. |
-| npm.cmd --prefix apps\desktop run verify:architecture | 0 / 627 ms | Passed |
-| npm.cmd --prefix apps\desktop run verify:persistence | 0 / 103,566 ms | Passed (39 tests) |
-| npm.cmd --prefix apps\desktop run verify:ui | 0 / 638 ms | Passed |
-| npm.cmd --prefix apps\desktop run verify:visual | 1 / 33,233 ms | Existing unrelated failure: after a correctly owned local preview, the script timed out waiting for Register archive. An earlier 866 ms run also correctly failed because LINKVAULT_PREVIEW_URL was not set. |
-| npm.cmd --prefix apps\desktop run verify:newspaper-performance | 0 / 585 ms | Passed |
-| npm.cmd --prefix apps\desktop run verify:newspaper-performance-browser | 0 / 14,060 ms | Passed: 8/50/500 edition browser-mocked profiles |
-| npm.cmd --prefix apps\desktop run verify:newspaper-clippings | 1 / 517 ms | Script is absent from the manifest (Phase 4B gate gap). |
-| npm.cmd --prefix apps\desktop run verify:newspaper-clippings-browser | 1 / 482 ms | Script is absent from the manifest (Phase 4B gate gap). |
-| cargo fmt --manifest-path apps\desktop\src-tauri\Cargo.toml --check | 0 / 956 ms | Passed |
-| cargo clippy --manifest-path apps\desktop\src-tauri\Cargo.toml --all-targets | 0 / 6,644 ms | Passed with pre-existing warnings, no error. |
-| cargo test --manifest-path apps\desktop\src-tauri\Cargo.toml | 0 | Passed: 468 tests; the release verifier separately reports 464 passed and 4 intentionally ignored. |
-| npm.cmd --prefix apps\desktop run verify:release | 0 / 123,824 ms | Passed: release manifest, persistence baseline, UI/build, and release verification. |
+| npm.cmd --prefix apps\desktop run build | 0 / 3,831 ms | Passed. |
+| npm.cmd --prefix apps\desktop run verify:clipping-note-editor-markdown | 0 / 463 ms | Passed: direct exact nested MDX, multiline import/export, standard/short pipe-less table, import/export-leading prose, and safe-link regression. |
+| npm.cmd --prefix apps\desktop run build:editor-evaluation | 0 / 3,474 ms | Passed: lazy editor chunk 454.21 KiB raw / 142.53 KiB gzip; no Vite >500 KiB advisory. |
+| npm.cmd --prefix apps\desktop run verify:clipping-note-editor | 0 / 29,169 ms | Passed (15/15), including synthetic composition only; it is not native IME proof. |
+| npm.cmd --prefix apps\desktop audit --omit=dev --json | 0 / 830 ms | Passed: 0 production dependency vulnerabilities. |
+| npm.cmd --prefix apps\desktop run verify:architecture | 0 / 481 ms | Passed. |
+| npm.cmd --prefix apps\desktop run verify:persistence | 0 / 13,899 ms | Passed (39 tests). |
+| npm.cmd --prefix apps\desktop run verify:ui | 0 / 491 ms | Passed. |
+| npm.cmd --prefix apps\desktop run verify:visual | 1 / 32,189 ms | Existing unrelated baseline failure: against a verified worktree-local preview, the script timed out waiting for `Register archive`. |
+| npm.cmd --prefix apps\desktop run verify:newspaper-performance | 0 / 471 ms | Passed. |
+| npm.cmd --prefix apps\desktop run verify:newspaper-performance-browser | 0 / 12,967 ms | Passed: 8/50/500 edition browser-mocked profiles through a verified worktree-local preview. |
+| npm.cmd --prefix apps\desktop run verify:newspaper-clippings | 1 / 366 ms | Script is absent from the manifest (Phase 4B gate gap). |
+| npm.cmd --prefix apps\desktop run verify:newspaper-clippings-browser | 1 / 370 ms | Script is absent from the manifest (Phase 4B gate gap). |
+| cargo fmt --manifest-path apps\desktop\src-tauri\Cargo.toml --check | 0 / 457 ms | Passed. |
+| cargo clippy --manifest-path apps\desktop\src-tauri\Cargo.toml --all-targets | 0 / 1,201 ms | Passed with 36 pre-existing warnings, no error. |
+| cargo test --manifest-path apps\desktop\src-tauri\Cargo.toml | 0 / 11,567 ms | Passed: 464 passed and 4 intentionally ignored. |
+| npm.cmd --prefix apps\desktop run verify:release | 0 / 35,049 ms | Passed: architecture, persistence, release baseline, UI/build, and release verification. |
 | git diff --check | 0 / 59 ms | Passed after generated evaluation and normal-build artifacts were removed. |
+
+For the browser-dependent visual and performance checks, the evaluator first
+proved port 1420 free, started an exact worktree-local Vite Node process, and
+ended only that owned process after the check. The isolated editor harness used
+the same ownership rule on port 1421. No browser server remained after either
+run.
+
+Intermediate command setup failures were isolated and rerun: bare PowerShell
+`npx` resolved to the policy-blocked `npx.ps1`, while `npx.cmd --version` passed
+at 11.9.0; no gate depends on `npx`. An initial PowerShell timing wrapper
+incorrectly captured command output and reported false failures, and a direct
+Windows spawn of `npm.cmd` returned `EINVAL` before the visual verifier began.
+The streaming rerun and the npm CLI rerun above are the authoritative results.
 
 The first combined Rust/release group exceeded its 604,040 ms outer tool limit
 while compiling the release profile from scratch. Its child compilation was
