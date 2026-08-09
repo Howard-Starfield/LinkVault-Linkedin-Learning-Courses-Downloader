@@ -1,6 +1,7 @@
 node_modules
 .playwright-cli
 dist
+dist-editor-evaluation
 dist-ssr
 src-tauri/target
 src-tauri/gen
