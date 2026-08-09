@@ -20,7 +20,7 @@ use thiserror::Error;
 // Bump this whenever any provider-owned schema changes. Provider migrations run
 // only while advancing this global version, so leaving it unchanged would make
 // existing installations skip new columns that fresh databases already have.
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+pub const CURRENT_SCHEMA_VERSION: i32 = 3;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -1040,6 +1040,11 @@ pub struct CourseraResetCounts {
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct NewspaperResetCounts {
+    /// Clipping rows intentionally preserved by the reset. Reported as
+    /// `clippingsPreserved` semantics (FR-RESET-003): additive information,
+    /// never counted as removed data.
+    #[serde(rename = "clippingsPreserved")]
+    pub clippings_preserved: usize,
     pub batches: usize,
     pub jobs: usize,
     pub pages: usize,
@@ -1107,6 +1112,23 @@ pub fn clear_coursera_provider_data(connection: &Connection) -> CacheResult<Cour
 /// the regions would never come back on their own.
 pub fn clear_newspaper_provider_data(connection: &Connection) -> CacheResult<NewspaperResetCounts> {
     let transaction = connection.unchecked_transaction()?;
+    // Newspaper clippings are durable user data (ADR-002, D-016). Reset only
+    // unlinks their source references; rows, notes, and managed assets are
+    // preserved. The explicit unlink keeps preservation deterministic even on
+    // connections whose foreign_keys pragma is disabled (FR-SOURCE-DELETE-001).
+    let clippings_preserved: usize = transaction
+        .query_row("SELECT COUNT(*) FROM newspaper_clippings", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    transaction.execute(
+        "UPDATE newspaper_clippings
+         SET source_page_id = NULL,
+             source_job_id = NULL
+         WHERE source_page_id IS NOT NULL
+            OR source_job_id IS NOT NULL",
+        [],
+    )?;
     // Dependent rows first to keep the wipe robust regardless of
     // foreign_keys pragma state.
     let read_pages = transaction.execute("DELETE FROM newspaper_read_pages", [])?;
@@ -1126,6 +1148,7 @@ pub fn clear_newspaper_provider_data(connection: &Connection) -> CacheResult<New
     // caused v0.2.7 to wipe the regions on reset.
     transaction.commit()?;
     Ok(NewspaperResetCounts {
+        clippings_preserved,
         batches,
         jobs,
         pages,
@@ -1728,12 +1751,15 @@ mod tests {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
         let future = Connection::open(&db_path).unwrap();
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
         future
             .execute_batch(
                 "CREATE TABLE future_probe (value TEXT NOT NULL);
-                 INSERT INTO future_probe (value) VALUES ('untouched');
-                 PRAGMA user_version = 3;",
+                 INSERT INTO future_probe (value) VALUES ('untouched');",
             )
+            .unwrap();
+        future
+            .pragma_update(None, "user_version", future_version)
             .unwrap();
         drop(future);
         let before = fs::read(&db_path).unwrap();
@@ -1743,9 +1769,9 @@ mod tests {
         assert!(matches!(
             error,
             DatabaseLifecycleError::UnsupportedSchemaVersion {
-                found: 3,
+                found,
                 supported: CURRENT_SCHEMA_VERSION
-            }
+            } if found == future_version
         ));
         assert_eq!(fs::read(&db_path).unwrap(), before);
         let backup_count = fs::read_dir(directory.path())
@@ -2756,5 +2782,531 @@ mod tests {
             Some("\"C:/z\"")
         );
         assert_eq!(table_row_count(&connection, "jobs"), 1);
+    }
+
+    const CLIPPING_TEST_COLUMNS: &str = "(id, source_job_id, source_page_id,
+        source_media_version_snapshot, source_kind_snapshot, source_mime_type_snapshot,
+        source_checksum_snapshot, edition_code_snapshot, edition_name_snapshot,
+        publication_date_snapshot, page_number_snapshot, source_pixel_width,
+        source_pixel_height, crop_x, crop_y, crop_width, crop_height,
+        asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+        asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
+        asset_error_code, title, note_markdown, revision, created_at, updated_at)";
+
+    type ClippingResetSnapshot = (String, Option<String>, Option<String>, String, i64);
+
+    fn insert_representative_provider_rows(connection: &Connection) {
+        connection
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('app.pref', '{\"a\":1}', 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO course_cache (course_slug, source_url, title, payload_json, fetched_at)
+                 VALUES ('slug', 'https://example.test', 'Course', '{}', 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs (id, course_slug, source_url, status, selected_quality,
+                    download_videos, download_exercises, download_subtitles, output_dir, created_at, updated_at)
+                 VALUES ('li-job', 'slug', 'https://example.test', 'completed', '720', 1, 1, 1, 'C:\\Courses', 10, 11)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_events (job_id, event_type, message, created_at)
+                 VALUES ('li-job', 'started', 'go', 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO artifacts (id, job_id, artifact_type, path, status, created_at, updated_at)
+                 VALUES ('li-art', 'li-job', 'video', 'C:\\Courses\\v.mp4', 'completed', 10, 11)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coursera_jobs (id, class_name, status, options_json, output_dir, created_at, updated_at)
+                 VALUES ('co-job', 'Class', 'completed', '{}', 'C:\\Coursera', 10, 11)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coursera_job_events (job_id, event_type, payload_json, created_at)
+                 VALUES ('co-job', 'started', '{}', 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coursera_settings (key, value_json) VALUES ('co.pref', '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_batches (id, status, destination, delay_minutes,
+                    optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
+                 VALUES ('np-batch', 'completed', 'C:\\Papers', 0, 1, 'webp_high', 1, 10, 11)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_jobs (id, batch_id, edition_code, publication_date, status,
+                    output_dir, page_count, completed_count, created_at, updated_at)
+                 VALUES ('np-job', 'np-batch', 'NY', '2026-08-01', 'completed', 'C:\\Papers\\NY', 1, 1, 10, 11)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_pages (id, job_id, page_number, source_url, original_path,
+                    status, original_bytes, final_bytes, checksum, pixel_width, pixel_height,
+                    media_version, created_at, updated_at)
+                 VALUES ('np-page', 'np-job', 'A01', 'https://example.test/a01.jpg',
+                    'C:\\Papers\\NY\\A01.jpg', 'completed', 100, 80, 'sum', 800, 1200, 2, 10, 11)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_reading_progress (job_id, last_page_id, last_page_index, furthest_page_index, updated_at)
+                 VALUES ('np-job', 'np-page', 0, 3, 12)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_settings (key, value_json, updated_at) VALUES ('np.pref', '{}', 10)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_clipping(
+        connection: &Connection,
+        id: &str,
+        state: &str,
+        error_code: Option<&str>,
+    ) {
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO newspaper_clippings {CLIPPING_TEST_COLUMNS}
+                     VALUES (?1, 'np-job', 'np-page', 2, 'optimized', 'image/webp', NULL,
+                             'NY', 'New York', '2026-08-01', 'A01', 800, 1200,
+                             10, 20, 300, 400, ?2, 'image/webp', 300, 400, 64,
+                             '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+                             1, ?3, ?4, 'Title', 'note body', 1, 100, 100)"
+                ),
+                params![
+                    id,
+                    format!("assets/{id}/clipping-v1.webp"),
+                    state,
+                    error_code
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn persistence_gate_fresh_database_installs_newspaper_clippings_schema() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+
+        assert_eq!(initialization.from_version, 0);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        assert!(initialization.backup_path.is_none());
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'newspaper_clippings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+        let index_count: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name LIKE 'idx_newspaper_clippings_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 6);
+        let fk_actions: Vec<(String, String)> = connection
+            .prepare("PRAGMA foreign_key_list(newspaper_clippings)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(6)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(fk_actions.len(), 2);
+        assert!(fk_actions.iter().all(|(_, action)| action == "SET NULL"));
+        let backup_count = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert_eq!(
+            backup_count, 0,
+            "fresh database must not create an empty migration backup"
+        );
+    }
+
+    #[test]
+    fn persistence_gate_v2_database_migrates_to_clippings_with_verified_backup() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        // Build a representative schema-version-2 installation: every current
+        // table and provider row exists, but the clipping table does not.
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy.pragma_update(None, "foreign_keys", true).unwrap();
+            initialize(&legacy).unwrap();
+            insert_representative_provider_rows(&legacy);
+            legacy
+                .execute_batch(
+                    "DROP TABLE newspaper_clippings;
+                 DROP INDEX IF EXISTS idx_newspaper_clippings_updated;
+                 DROP INDEX IF EXISTS idx_newspaper_clippings_created;
+                 DROP INDEX IF EXISTS idx_newspaper_clippings_publication;
+                 DROP INDEX IF EXISTS idx_newspaper_clippings_title;
+                 DROP INDEX IF EXISTS idx_newspaper_clippings_source_page;
+                 DROP INDEX IF EXISTS idx_newspaper_clippings_asset_state;
+                 PRAGMA user_version = 2;",
+                )
+                .unwrap();
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+
+        assert_eq!(initialization.from_version, 2);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let backup_path = initialization
+            .backup_path
+            .expect("populated v2 database must receive a verified backup");
+        assert!(backup_path.is_file());
+
+        // Backup integrity and representative pre-migration content.
+        let backup = Connection::open(&backup_path).unwrap();
+        let integrity: String = backup
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(schema_version(&backup).unwrap(), 2);
+        let backup_jobs: usize = backup
+            .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_jobs, 1);
+        let backup_clippings_table: bool = backup
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'newspaper_clippings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !backup_clippings_table,
+            "the backup must capture the pre-migration v2 shape"
+        );
+
+        // Representative rows from every provider survive the migration.
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM settings", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM job_events", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM course_cache", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM coursera_jobs", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM coursera_job_events", [], |row| row
+                    .get::<_, usize>(
+                    0
+                ))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM coursera_settings", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT furthest_page_index FROM newspaper_reading_progress WHERE job_id = 'np-job'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM newspaper_settings", [], |row| row
+                    .get::<_, usize>(
+                    0
+                ))
+                .unwrap(),
+            1
+        );
+        let clipping_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'newspaper_clippings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(clipping_table_exists);
+        assert_eq!(schema_version(&connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        let foreign_key_check: usize = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+        drop(connection);
+
+        // Re-running initialization on the migrated database is a no-op.
+        let (reopened, rerun) = initialize_database(&db_path).unwrap();
+        assert_eq!(rerun.from_version, CURRENT_SCHEMA_VERSION);
+        assert!(rerun.backup_path.is_none());
+        assert_eq!(schema_version(&reopened).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn persistence_gate_clipping_source_deletion_sets_null_without_removing_rows() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let (connection, _) = initialize_database(&db_path).unwrap();
+        insert_representative_provider_rows(&connection);
+        insert_test_clipping(
+            &connection,
+            "11111111-1111-4111-8111-111111111111",
+            "ready",
+            None,
+        );
+
+        // Page cascade (job deletion cascades into pages) and direct page
+        // deletion both null the clipping source references.
+        connection
+            .execute("DELETE FROM newspaper_pages WHERE id = 'np-page'", [])
+            .unwrap();
+        let (page_ref, job_ref, note): (Option<String>, Option<String>, String) = connection
+            .query_row(
+                "SELECT source_page_id, source_job_id, note_markdown
+                 FROM newspaper_clippings WHERE id = '11111111-1111-4111-8111-111111111111'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(page_ref.is_none());
+        assert_eq!(job_ref.as_deref(), Some("np-job"));
+        assert_eq!(note, "note body");
+
+        connection
+            .execute("DELETE FROM newspaper_jobs WHERE id = 'np-job'", [])
+            .unwrap();
+        let (page_ref, job_ref, revision): (Option<String>, Option<String>, i64) = connection
+            .query_row(
+                "SELECT source_page_id, source_job_id, revision
+                 FROM newspaper_clippings WHERE id = '11111111-1111-4111-8111-111111111111'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(page_ref.is_none());
+        assert!(job_ref.is_none());
+        assert_eq!(revision, 1);
+        let remaining: usize = connection
+            .query_row("SELECT COUNT(*) FROM newspaper_clippings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "source deletion must never delete the clipping row"
+        );
+        let foreign_key_check: usize = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+    }
+
+    #[test]
+    fn persistence_gate_reset_preserves_newspaper_clippings() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let (connection, _) = initialize_database(&db_path).unwrap();
+        insert_representative_provider_rows(&connection);
+        insert_test_clipping(
+            &connection,
+            "22222222-2222-4222-8222-222222222222",
+            "ready",
+            None,
+        );
+        insert_test_clipping(
+            &connection,
+            "33333333-3333-4333-8333-333333333333",
+            "missing",
+            Some("ASSET_CREATION_INCOMPLETE"),
+        );
+        // Record the exact pre-reset row content.
+        let before: Vec<ClippingResetSnapshot> = connection
+            .prepare(
+                "SELECT id, source_job_id, source_page_id, note_markdown, revision
+                 FROM newspaper_clippings ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before
+            .iter()
+            .all(|(_, job, page, _, _)| job.is_some() && page.is_some()));
+
+        let counts = clear_newspaper_provider_data(&connection).unwrap();
+
+        assert_eq!(counts.clippings_preserved, 2);
+        assert_eq!(counts.jobs, 1);
+        assert_eq!(counts.pages, 1);
+        let after: Vec<ClippingResetSnapshot> = connection
+            .prepare(
+                "SELECT id, source_job_id, source_page_id, note_markdown, revision
+                 FROM newspaper_clippings ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(after.len(), 2);
+        for (
+            (id_before, _, _, note_before, revision_before),
+            (id_after, job_after, page_after, note_after, revision_after),
+        ) in before.iter().zip(after.iter())
+        {
+            assert_eq!(id_before, id_after);
+            assert!(job_after.is_none(), "reset must null source_job_id");
+            assert!(page_after.is_none(), "reset must null source_page_id");
+            assert_eq!(note_before, note_after);
+            assert_eq!(revision_before, revision_after);
+        }
+        // Missing-state rows keep their integrity code through the reset.
+        let error_code: Option<String> = connection
+            .query_row(
+                "SELECT asset_error_code FROM newspaper_clippings
+                 WHERE id = '33333333-3333-4333-8333-333333333333'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error_code.as_deref(), Some("ASSET_CREATION_INCOMPLETE"));
+        // Previously reset tables are cleared and the edition catalog survives.
+        let remaining_jobs: usize = connection
+            .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_jobs, 0);
+        let remaining_pages: usize = connection
+            .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_pages, 0);
+        let foreign_key_check: usize = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
     }
 }

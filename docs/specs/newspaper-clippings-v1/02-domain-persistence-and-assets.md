@@ -669,6 +669,11 @@ policy before responding.
 
 The thumbnail route verifies the clipping and requested composite version,
 derives the deterministic cache path, and serves only a regular contained file.
+Before reading, metadata must report a positive byte count no greater than
+8,388,608 bytes. The exact returned buffer must be a static, decodable WebP
+whose width is 1 through 512 and height is 1 through 320. Animated/multiframe,
+empty, malformed, oversized-byte, oversized-dimension, symlinked, reparse, and
+stale-version files are rejected.
 
 ### FR-MEDIA-003
 
@@ -708,11 +713,14 @@ Complete the confirmed deletion:
 
 1. Move canonical directory to trash when still under assets.
 2. Delete the row through the writer.
-3. Remove matching thumbnail cache.
+3. Remove matching thumbnail cache best-effort and record a safe diagnostic on
+   failure without recreating or retaining the row.
 4. Remove trash directory after row deletion.
 
-If a step fails, leave a retryable `delete_pending` row or trash entry and
-record a safe diagnostic.
+If a pre-row-deletion step fails, leave a retryable `delete_pending` row or
+trash entry and record a safe diagnostic. Cache or trash cleanup failure after
+row deletion never recreates the clipping; deferred managed cleanup may remove
+the leftover.
 
 ### RECOVERY-003: Ready rows
 
@@ -726,9 +734,27 @@ included in release diagnostics but not required on every launch.
 - Canonical asset directories without a row older than 24 hours move to
   quarantine rather than immediate deletion.
 - Trash entries without a row older than 24 hours may be deleted.
+- Exact-ID derived thumbnail files without a row older than 24 hours may be
+  deleted. Malformed names, non-regular entries, symlinks, and reparse points
+  are never deletion targets.
 - Quarantine entries are retained for seven days, then eligible for deletion.
-- Cleanup work is bounded per launch and resumes later; it must not scan user
+- Cleanup is submitted to a detached blocking task; application setup and the
+  UI/runtime startup thread do not wait for enumeration.
+- Each launch may completely enumerate the staging, assets, trash, quarantine,
+  and clipping-thumbnail managed categories. Actual `ReadDir` items consumed
+  are counted and reported honestly; enumeration/inspection is not described
+  as bounded.
+- Mutation attempts remain capped at 32 independently for each managed
+  category per launch. Repeated launches remove later eligible entries as
+  earlier successful mutations leave the directory.
+- Traversal is streaming and does not sort or retain all names. No persisted
+  filename cursor is used because directory order is unspecified and stable
+  Rust provides no portable durable `ReadDir` position.
+- Cleanup retains every containment and age rule above and must not scan user
   newspaper download directories.
+
+The 500-entry and 5,000-entry managed-directory measurements record wall time
+and approximate/peak process memory for the supported Windows environment.
 
 ### RECOVERY-005: Diagnostics
 
@@ -761,7 +787,9 @@ Outside a database transaction:
   it under `trash/<id>-<nonce>`.
 - If it is already absent, continue; missing asset must not prevent deletion of
   the note after explicit confirmation.
-- Remove or defer removal of derived thumbnails.
+- Remove derived thumbnails best-effort after the row deletion is durable, or
+  defer removal to managed cleanup. Cache failure records a safe diagnostic and
+  never blocks deletion of the title, note, row, or canonical aggregate.
 
 ### DELETE-STATE-003: Delete row
 

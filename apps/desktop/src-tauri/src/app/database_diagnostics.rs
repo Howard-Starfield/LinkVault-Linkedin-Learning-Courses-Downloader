@@ -16,6 +16,7 @@ pub enum DatabaseDiagnosticKind {
     Backup,
     WriterRequest,
     Contention,
+    Recovery,
     Shutdown,
 }
 
@@ -46,6 +47,7 @@ pub enum DatabaseErrorClass {
     DatabaseIntegrity,
     Io,
     Migration,
+    Recovery,
     Sqlite,
     TaskPanicked,
     UnsupportedSchema,
