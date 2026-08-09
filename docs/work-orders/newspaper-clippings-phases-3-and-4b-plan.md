@@ -7,17 +7,23 @@ document
 
 **Target outcome:** A user opens a downloaded newspaper, enters Clip mode,
 drags one rectangle over one page image, saves a source-resolution lossless
-WebP under the managed clipping root, opens the new clipping, and types a note
-in the approved Tiptap editor with safe autosave.
+WebP beneath the source edition's newspaper download destination, opens the new
+clipping, and types a note in the approved Tiptap editor with safe autosave.
 
 ## 1. Decisions frozen for implementation
 
 - The canonical crop is created by Rust from registered source media, never
   from a WebView screenshot.
 - React sends a normalized rectangle and the page's expected media version.
-- Canonical media remains under
-  `LinkVaultData/newspaper-clippings/assets/<clipping-id>/clipping-v1.webp`.
-  No raw path crosses IPC.
+- Canonical media lives under the source job's original newspaper download
+  destination in `Newspaper snapshots/<edition>/`. It is not duplicated under
+  `LinkVaultData`.
+- The proposed collision-safe layout is
+  `<destination>/Newspaper snapshots/<sanitized edition name - code>/<publication-date>/<clipping-id>/clipping-v1.webp`.
+  The date prevents different issues of one edition from colliding, and the
+  clipping ID preserves idempotent create/recovery semantics.
+- Rust derives the destination and every relative segment from registered
+  source/job data. React never chooses or receives a raw filesystem path.
 - Saving creates exactly one clipping aggregate containing one immutable image
   and one initially empty Markdown note.
 - The clipping image is a fixed source card above the note editor. It is not an
@@ -32,12 +38,50 @@ in the approved Tiptap editor with safe autosave.
 - Native Tauri Chinese IME validation is a Phase 4B exit gate, after the real
   autosave and document-switch owners exist.
 
+### 1.1 Required storage-decision amendment
+
+The product owner changed the meaning of "proper folder" on 2026-08-09:
+snapshots must be stored in the same selected newspaper download destination,
+under `Newspaper snapshots/<edition>/`.
+
+This supersedes ADR-002 and D-009's current `LinkVaultData/newspaper-clippings`
+location. It is not a frontend-only Phase 3 change. Phase 2 PR #4 currently
+implements one application-data root across asset staging, atomic promotion,
+recovery, media protocol reads, cleanup, and database path validation. Do not
+merge PR #4 unchanged.
+
+The required Phase 2 amendment must:
+
+- replace D-009 and update ADR-002/specifications before implementation;
+- derive the snapshot root from the crop source job's persisted batch
+  destination, not from the frontend or the currently selected preference;
+- snapshot a backend-only storage-root locator on the clipping row so the asset
+  remains resolvable after its source job is deleted;
+- keep only a backend-derived relative asset path in ordinary DTOs and never
+  expose the absolute root over IPC;
+- preserve same-volume staging and atomic promotion inside the chosen snapshot
+  root;
+- prove edition deletion/reset targets cannot reach the sibling
+  `Newspaper snapshots` tree;
+- preserve old snapshots at their original root when the user later changes
+  the download preference; no implicit migration or cross-volume move;
+- define missing/unwritable/removable destination behavior without falling
+  back silently to `LinkVaultData` or a different download folder; and
+- revise recovery, cleanup, media-protocol, backup/rollback, and path-containment
+  tests for multiple registered snapshot roots.
+
+The recommended V1 tradeoff is one canonical file in the snapshot tree, not a
+second exported copy. A duplicate managed copy would preserve the old ADR but
+would introduce two-file synchronization, deletion, integrity, and storage
+semantics that the product did not request.
+
 ## 2. Entry gates and branch order
 
 Implementation remains two reviewable PRs. Do not combine them without another
 explicit product decision.
 
-1. Phase 2 PR #4 must be reviewed and merged. Its implementation commit is
+1. Phase 2 PR #4 must first be amended for section 1.1, reviewed, and merged.
+   Its current implementation commit is
    `0796e78674dd16d4eb6a88f455ac2d63300712c0`; its evidence head is
    `e81e8230aac50372f7b7d22d1482ab35ec18943a`.
 2. Phase 4A PR #5 must be reviewed and merged. Its approved decision head is
@@ -98,7 +142,9 @@ changes, or the live owner map materially differs from this plan.
   - Owns list/detail projections, excerpts, optimistic revisions, source
     availability, and clipping persistence.
 - `apps/desktop/src-tauri/src/providers/newspaper/clipping_assets.rs`
-  - Owns the managed asset and derived-thumbnail layout and protocol-safe reads.
+  - Owns the snapshot-root registry, canonical/derived-thumbnail layout,
+    staging/promotion, containment, and protocol-safe reads after the Phase 2
+    storage amendment.
 
 Phase 4B must not create a second repository, database connection policy,
 asset root, crop command, or note data model.
@@ -118,8 +164,8 @@ selection, or application navigation.
 ### 4.1 Allowed scope
 
 Implement and verify the complete Reader selection/save workflow against the
-Phase 2 command, but keep the production capability disabled until Phase 4B
-provides the Clippings view and **Open note** destination.
+amended Phase 2 command, but keep the production capability disabled until
+Phase 4B provides the Clippings view and **Open note** destination.
 
 No Tiptap import, Clippings list/detail UI, autosave, deletion, source-return
 navigation, schema change, dependency change, or release-version change is
@@ -249,6 +295,10 @@ Automated proof must cover:
   and window-blur selections;
 - duplicate Save and idempotent retry;
 - typed stale/too-small/security/retryable error UI;
+- source jobs using two different download destinations, with each canonical
+  crop remaining under its own original `Newspaper snapshots` root;
+- changing the current download preference after creation without relocating
+  or orphaning an existing clipping;
 - 8/50/500-page manifests with the existing mounted-image bound unchanged;
 - no new full-page canvas or screenshot path;
 - keyboard focus/labels and light/dark/high-contrast visuals.
@@ -532,7 +582,7 @@ The core goal is complete only when all rows pass in the real Tauri app:
 |---|---|
 | Enter Clip mode | Clip button and `C` enter one explicit selection state without breaking pan/zoom outside that state. |
 | Draw | One rectangle clamps to one page and remains aligned across zoom/tone/scroll. |
-| Save | Rust crops registered source pixels and persists one lossless managed WebP plus one empty Markdown note. |
+| Save | Rust crops registered source pixels and persists one lossless canonical WebP beneath the source job's `<destination>/Newspaper snapshots/<edition>/` tree plus one empty Markdown note. |
 | Continue reading | Reader returns to the same position and ordinary gestures recover. |
 | Open note | Success toast opens the exact new clipping in the Clippings view. |
 | Source card | The saved crop renders above the editor and cannot be removed through note editing. |
@@ -548,6 +598,8 @@ Stop and request review if implementation would:
 
 - start before required PRs are merged;
 - expose raw filesystem paths or accept screenshot bytes;
+- merge the current Phase 2 storage implementation without replacing ADR-002
+  and D-009 for the approved `Newspaper snapshots` location;
 - add a second crop/persistence/asset owner;
 - import Tiptap outside `ClippingNoteEditor`;
 - persist editor JSON or unsupported executable Markdown;
@@ -565,7 +617,7 @@ Stop and request review if implementation would:
 This file is the local implementation blueprint, not authorization to begin
 coding. The next authorization should name either:
 
-- **Phase 3 implementation**, after PR #4 is merged; or
+- **Phase 3 implementation**, after the storage-amended PR #4 is merged; or
 - **Phase 4B implementation**, only after Phase 3 and PR #5 are merged.
 
 Each phase starts from a fresh live diff/owner audit and ends at its own review
