@@ -3,9 +3,10 @@
 mod app;
 #[cfg(feature = "crop-baseline")]
 pub use app::newspaper_clipping_crop_baseline as crop_baseline;
+#[cfg(feature = "durability-baseline")]
+pub use app::newspaper_clipping_note_durability_baseline as durability_baseline;
 mod providers;
 pub mod workflow;
-
 use app::cooperative_exit::{CooperativeExit, ExitReason, WaitOutcome};
 use app::updates as app_updates;
 pub use app::{database as cache, security, storage};

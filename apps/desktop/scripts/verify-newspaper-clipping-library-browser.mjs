@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { installClippingNoteExitBrowserHarness } from "./clipping-note-exit-browser-harness.mjs";
+import { measureClippingNoteDurabilityBrowser } from "./clipping-note-durability-browser-performance.mjs";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
 assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkVault preview.");
@@ -63,7 +64,8 @@ try {
       searchCalls: [],
       rootChecks: 0,
       conflictNext: false,
-      failNext: false
+      failNext: false,
+      updateDelayMs: 30
     };
     window.__NEWSPAPER_CLIPPINGS_API__ = {
       async checkpoint(request) {
@@ -146,7 +148,7 @@ try {
         const test = window.__CLIPPING_LIBRARY_TEST__;
         test.updateCalls.push(structuredClone(request));
         const detail = test.details.find((item) => item.id === request.clippingId);
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        await new Promise((resolve) => setTimeout(resolve, test.updateDelayMs));
         if (test.failNext) {
           test.failNext = false;
           throw "CLIPPING_DATABASE_WRITE_FAILED";
@@ -444,29 +446,9 @@ try {
   await page.getByLabel("Clipping note editor body").waitFor();
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.invalidRecoveryIds.size), 0);
 
-  await title.fill("Lifecycle flush draft");
-  await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.emitPrepare({ token: 501, reason: "close", deadlineMs: 15_000 }));
-  await page.waitForFunction(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.some((entry) => entry.token === 501));
-  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.find((entry) => entry.token === 501)), { token: 501, durable: true });
-  await page.getByText("Saved", { exact: true }).waitFor();
-
-  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.failNext = true; });
-  await title.fill("Lifecycle checkpoint fallback");
-  await page.waitForTimeout(950);
-  await page.getByText("Recovered draft saved locally.").waitFor();
-  await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.emitPrepare({ token: 502, reason: "exit", deadlineMs: 15_000 }));
-  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.find((entry) => entry.token === 502)), { token: 502, durable: true });
-  await page.getByRole("button", { name: "Retry" }).click();
-  await page.getByText("Saved", { exact: true }).waitFor();
-
-  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.checkpointFail = true; });
-  await title.fill("Lifecycle blocked draft");
-  await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.emitPrepare({ token: 503, reason: "close", deadlineMs: 15_000 }));
-  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.find((entry) => entry.token === 503)), { token: 503, durable: false });
-  assert.equal(await title.inputValue(), "Lifecycle blocked draft", "blocked close discarded the visible draft");
-  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.checkpointFail = false; });
-  await page.getByRole("button", { name: "Retry" }).click();
-  await page.getByText("Saved", { exact: true }).waitFor();
+  const durabilityPerformance = await measureClippingNoteDurabilityBrowser(page, title);
+  console.table(durabilityPerformance.exitLatency);
+  console.table(durabilityPerformance.editorHeap);
 
   await page.getByRole("button", { name: "Download editions" }).click();
   await page.locator(".newspaper-download").waitFor();
