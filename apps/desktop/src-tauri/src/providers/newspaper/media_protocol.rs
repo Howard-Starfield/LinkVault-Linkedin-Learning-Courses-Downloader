@@ -11,7 +11,7 @@ use tauri::http::{
 
 const CACHE_SCHEMA_VERSION: i64 = 1;
 
-use super::clipping_assets::ClippingAssetLayout;
+use super::clipping_assets::{ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION};
 use super::clipping_models::{validate_clipping_id, ClippingErrorCode};
 use super::clipping_service::ClippingService;
 
@@ -216,7 +216,7 @@ fn resolve_clipping_thumbnail(
         .optional()
         .map_err(|_| MediaError::Internal)?
         .ok_or(MediaError::NotFound)?;
-    let expected = format!("{}-{}", record.0, CACHE_SCHEMA_VERSION);
+    let expected = format!("{}-{}", record.0, THUMBNAIL_CACHE_SCHEMA_VERSION);
     if record.1 != "ready" || requested_version != expected {
         return Err(MediaError::NotFound);
     }
@@ -539,7 +539,7 @@ mod tests {
             .unwrap();
         std::fs::write(clipping_layout.thumbnail_path(ID, 1).unwrap(), &bytes).unwrap();
 
-        for (route, expected) in [("clipping", "1"), ("clipping-thumbnail", "1-1")] {
+        for (route, expected) in [("clipping", "1"), ("clipping-thumbnail", "1-2")] {
             let request = request_for_url(&format!(
                 "http://newspaper-media.localhost/{route}/{ID}?v={expected}"
             ))
@@ -597,7 +597,7 @@ mod tests {
         let bytes = encode_test_webp(24, 16);
         layout.write_staging(ID, &bytes).unwrap();
         let relative =
-            ClippingAssetLayout::snapshot_relative_path("New York", "NY", "2026-08-08", ID)
+            ClippingAssetLayout::snapshot_relative_path("New York", "NY", "2026-08-08", "A01", ID)
                 .unwrap();
         service
             .register_staged(NewClippingRecord {
@@ -892,7 +892,7 @@ mod tests {
             .unwrap();
 
         let current = request_for_url(&format!(
-            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=2-1"
+            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=2-2"
         ))
         .unwrap();
         assert_eq!(
@@ -947,7 +947,7 @@ mod tests {
         );
 
         let stale = request_for_url(&format!(
-            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=1-1"
+            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=1-2"
         ))
         .unwrap();
         assert_eq!(

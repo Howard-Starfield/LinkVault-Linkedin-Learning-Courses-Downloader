@@ -13,8 +13,8 @@ use std::path::{Component, Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::clipping_models::{
-    validate_asset_byte_count, validate_clipping_id, ClippingError, ClippingErrorCode,
-    CLIPPING_ASSET_MIME,
+    validate_asset_byte_count, validate_clipping_id, validate_page_number, ClippingError,
+    ClippingErrorCode, CLIPPING_ASSET_MIME,
 };
 
 /// Canonical clipping asset file name (FR-ASSET-001).
@@ -24,14 +24,16 @@ pub const STAGING_PART_SUFFIX: &str = ".part";
 /// Canonical relative path template (FR-ASSET-001).
 pub const CANONICAL_RELATIVE_TEMPLATE: &str = "assets/<clipping-id>/clipping-v1.webp";
 /// Cache schema version for derived clipping thumbnails (D-020).
-pub const THUMBNAIL_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const THUMBNAIL_CACHE_SCHEMA_VERSION: u32 = 2;
 /// Conservative serve-side byte ceiling for regenerable clipping thumbnails.
-/// A 512x320 RGBA decode is under 1 MiB; 8 MiB leaves ample WebP/container
+/// A 1024x640 RGBA decode is 2.5 MiB; 8 MiB leaves ample WebP/container
 /// overhead without permitting an unbounded cache-file allocation.
 pub const THUMBNAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
-pub const THUMBNAIL_MAX_WIDTH: u32 = 512;
-pub const THUMBNAIL_MAX_HEIGHT: u32 = 320;
+pub const THUMBNAIL_MAX_WIDTH: u32 = 1024;
+pub const THUMBNAIL_MAX_HEIGHT: u32 = 640;
 pub const SNAPSHOT_EDITION_SEGMENT_MAX_CHARS: usize = 96;
+pub const SNAPSHOT_CLIPPING_SEGMENT_MAX_CHARS: usize = 80;
+const SNAPSHOT_PAGE_LABEL_MAX_CHARS: usize = 32;
 
 /// Directory names beneath the managed clipping root.
 pub const ASSETS_DIR: &str = "assets";
@@ -39,7 +41,7 @@ pub const THUMBNAILS_DIR: &str = "thumbnails";
 pub const STAGING_DIR: &str = "staging";
 pub const TRASH_DIR: &str = "trash";
 pub const QUARANTINE_DIR: &str = "quarantine";
-pub const THUMBNAIL_VERSION_DIR: &str = "v1";
+pub const THUMBNAIL_VERSION_DIR: &str = "v2";
 
 /// The managed clipping root layout beneath `LinkVaultData`.
 #[derive(Clone, Debug)]
@@ -57,21 +59,22 @@ pub struct ThumbnailCleanupSummary {
 }
 
 impl ClippingAssetLayout {
+    fn sanitize_snapshot_segment(value: &str) -> String {
+        let filtered = value
+            .chars()
+            .filter(|character| !character.is_control() && !r#"\/:*?"<>|"#.contains(*character))
+            .collect::<String>();
+        filtered
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_matches([' ', '.'])
+            .to_owned()
+    }
+
     pub fn snapshot_edition_segment(edition_name: &str, edition_code: &str) -> String {
-        let sanitize = |value: &str| {
-            let filtered = value
-                .chars()
-                .filter(|character| !character.is_control() && !r#"\/:*?"<>|"#.contains(*character))
-                .collect::<String>();
-            filtered
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .trim_matches([' ', '.'])
-                .to_owned()
-        };
         let code = {
-            let candidate = sanitize(edition_code);
+            let candidate = Self::sanitize_snapshot_segment(edition_code);
             let candidate = candidate.chars().take(32).collect::<String>();
             if candidate.is_empty() {
                 "edition".to_owned()
@@ -81,7 +84,7 @@ impl ClippingAssetLayout {
         };
         let suffix = format!(" - {code}");
         let name_limit = SNAPSHOT_EDITION_SEGMENT_MAX_CHARS.saturating_sub(suffix.chars().count());
-        let name = sanitize(edition_name)
+        let name = Self::sanitize_snapshot_segment(edition_name)
             .chars()
             .take(name_limit)
             .collect::<String>();
@@ -94,10 +97,30 @@ impl ClippingAssetLayout {
         }
     }
 
+    pub fn snapshot_clipping_segment(
+        page_number: &str,
+        clipping_id: &str,
+    ) -> Result<String, ClippingError> {
+        if !validate_page_number(page_number) || !validate_clipping_id(clipping_id) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        let page = Self::sanitize_snapshot_segment(page_number)
+            .chars()
+            .take(SNAPSHOT_PAGE_LABEL_MAX_CHARS)
+            .collect::<String>();
+        let label = if page.is_empty() {
+            "Page".to_owned()
+        } else {
+            format!("Page {page}")
+        };
+        Ok(format!("{label} - {clipping_id}"))
+    }
+
     pub fn snapshot_relative_path(
         edition_name: &str,
         edition_code: &str,
         publication_date: &str,
+        page_number: &str,
         clipping_id: &str,
     ) -> Result<String, ClippingError> {
         if !validate_clipping_id(clipping_id)
@@ -109,7 +132,7 @@ impl ClippingAssetLayout {
             "{}/{}/{}/{}",
             Self::snapshot_edition_segment(edition_name, edition_code),
             publication_date,
-            clipping_id,
+            Self::snapshot_clipping_segment(page_number, clipping_id)?,
             CANONICAL_FILE_NAME
         ))
     }
@@ -323,8 +346,9 @@ impl ClippingAssetLayout {
     }
 
     /// Validate either the legacy v3 shape or the snapshot-root shape for one
-    /// exact clipping ID. Snapshot relative paths are
-    /// `<edition>/<yyyy-mm-dd>/<id>/clipping-v1.webp`.
+    /// exact clipping ID. Snapshot relative paths are either the legacy
+    /// `<edition>/<yyyy-mm-dd>/<id>/clipping-v1.webp` shape or the readable
+    /// `<edition>/<yyyy-mm-dd>/Page <page> - <id>/clipping-v1.webp` shape.
     pub fn validate_relative_path_for_id(
         relative: &str,
         clipping_id: &str,
@@ -368,12 +392,26 @@ impl ClippingAssetLayout {
                 matches!(index, 4 | 7) && ch == '-'
                     || !matches!(index, 4 | 7) && ch.is_ascii_digit()
             })
-            || normal[2] != clipping_id
+            || !Self::is_snapshot_clipping_segment_for_id(normal[2], clipping_id)
             || normal[3] != CANONICAL_FILE_NAME
         {
             return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         Ok(())
+    }
+
+    fn is_snapshot_clipping_segment_for_id(segment: &str, clipping_id: &str) -> bool {
+        if segment == clipping_id {
+            return true;
+        }
+        let suffix = format!(" - {clipping_id}");
+        segment.starts_with("Page ")
+            && segment.ends_with(&suffix)
+            && segment.chars().count() <= SNAPSHOT_CLIPPING_SEGMENT_MAX_CHARS
+            && !segment.ends_with([' ', '.'])
+            && !segment
+                .chars()
+                .any(|character| character.is_control() || r#"\/:*?"<>|"#.contains(character))
     }
 
     pub fn canonical_path_at(
@@ -1175,19 +1213,38 @@ mod tests {
             "World Journal / West",
             "WJ-LA",
             "2026-08-09",
+            "A01",
             TEST_ID,
         )
         .unwrap();
         assert_eq!(
             snapshot,
-            format!("World Journal West - WJ-LA/2026-08-09/{TEST_ID}/clipping-v1.webp")
+            format!("World Journal West - WJ-LA/2026-08-09/Page A01 - {TEST_ID}/clipping-v1.webp")
         );
         assert!(ClippingAssetLayout::validate_relative_path_for_id(&snapshot, TEST_ID).is_ok());
+        let legacy_snapshot =
+            format!("World Journal West - WJ-LA/2026-08-09/{TEST_ID}/clipping-v1.webp");
+        assert!(
+            ClippingAssetLayout::validate_relative_path_for_id(&legacy_snapshot, TEST_ID).is_ok()
+        );
         assert!(ClippingAssetLayout::snapshot_relative_path(
             "World Journal",
             "WJ",
             "2026-02-30",
+            "A01",
             TEST_ID
+        )
+        .is_err());
+        assert_eq!(
+            ClippingAssetLayout::snapshot_clipping_segment(" A/01:* ", TEST_ID).unwrap(),
+            format!("Page A01 - {TEST_ID}")
+        );
+        assert!(ClippingAssetLayout::snapshot_clipping_segment("", TEST_ID).is_err());
+        assert!(ClippingAssetLayout::validate_relative_path_for_id(
+            &format!(
+                "World Journal West - WJ-LA/2026-08-09/Page A01 - {OTHER_ID}/clipping-v1.webp"
+            ),
+            TEST_ID,
         )
         .is_err());
         let long = ClippingAssetLayout::snapshot_edition_segment(&"x".repeat(200), "NY");
@@ -1204,7 +1261,7 @@ mod tests {
             "../assets/x/clipping-v1.webp",
             "assets/../assets/x/clipping-v1.webp",
             "assets/../../secret.webp",
-            "thumbnails/v1/x.webp",
+            "thumbnails/v2/x.webp",
             &format!("assets/{TEST_ID}/other.webp"),
             &format!("assets/{TEST_ID}/sub/clipping-v1.webp"),
             &format!("assets/{OTHER_ID}"),
@@ -1603,8 +1660,8 @@ mod tests {
             .unwrap()
             .join(format!("{TEST_ID}0-asset-1.webp"));
         assert_ne!(first, second);
-        assert!(first.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-1.webp")));
-        assert!(second.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-2.webp")));
+        assert!(first.ends_with(format!("thumbnails/v2/{TEST_ID}-asset-1.webp")));
+        assert!(second.ends_with(format!("thumbnails/v2/{TEST_ID}-asset-2.webp")));
         for path in [&first, &second, &other, &lookalike] {
             fs::write(path, encode_test_webp(4, 4)).unwrap();
         }

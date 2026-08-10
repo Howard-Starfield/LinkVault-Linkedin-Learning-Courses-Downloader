@@ -435,6 +435,7 @@ impl ClippingService {
             &source_record.edition_name,
             &source_record.edition_code,
             &source_record.publication_date,
+            &source_record.page_number,
             &operation_id,
         )?;
         let record = repository::NewClippingRecord {
@@ -912,10 +913,18 @@ impl ClippingService {
             &clipping.asset_checksum_sha256,
         )?;
         let source = image::load_from_memory_with_format(&canonical, image::ImageFormat::WebP)
-            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetValidationFailed))?
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetValidationFailed))?;
+        // Cache density may grow between schema versions, but a derived preview
+        // must never invent pixels beyond the canonical clipping dimensions.
+        // DynamicImage::thumbnail computes the aspect-preserving fit before it
+        // delegates to imageops::thumbnail, whose buffer-level API takes exact
+        // output dimensions.
+        let resized = source
+            .thumbnail(
+                source.width().min(THUMBNAIL_MAX_WIDTH),
+                source.height().min(THUMBNAIL_MAX_HEIGHT),
+            )
             .to_rgba8();
-        let resized =
-            image::imageops::thumbnail(&source, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
         let width = resized.width();
         let height = resized.height();
         let encoded = webp::Encoder::from_rgba(resized.as_raw(), width, height)
@@ -1474,23 +1483,40 @@ mod tests {
         destination: &Path,
         id: &str,
     ) -> repository::NewClippingRecord {
+        staged_snapshot_record_with_dimensions(service, destination, id, 24, 16)
+    }
+
+    fn staged_snapshot_record_with_dimensions(
+        service: &ClippingService,
+        destination: &Path,
+        id: &str,
+        width: u32,
+        height: u32,
+    ) -> repository::NewClippingRecord {
         std::fs::create_dir_all(destination).unwrap();
         let root = service
             .register_download_destination(destination, 10)
             .unwrap();
         let layout = service.root_layout(&root.id).unwrap();
-        let bytes = encode_test_webp(24, 16);
+        let bytes = encode_test_webp(width, height);
         layout.write_staging(id, &bytes).unwrap();
         let mut record = staged_record(service, id);
         service.layout.discard_staging(id);
+        record.source_pixel_width = width;
+        record.source_pixel_height = height;
+        record.crop_width = width;
+        record.crop_height = height;
         record.asset_root_id = root.id;
         record.asset_relative_path = ClippingAssetLayout::snapshot_relative_path(
             &record.edition_name_snapshot,
             &record.edition_code_snapshot,
             &record.publication_date_snapshot,
+            &record.page_number_snapshot,
             id,
         )
         .unwrap();
+        record.asset_byte_count = bytes.len() as u64;
+        record.asset_checksum_sha256 = sha256_hex(&bytes);
         record
     }
 
@@ -1616,6 +1642,12 @@ mod tests {
         let clipping = service.detail(CROP_ID).unwrap().unwrap().clipping;
         assert_eq!(clipping.asset_state, ClippingAssetState::Ready);
         assert_eq!(clipping.source_kind_snapshot, ClippingSourceKind::Original);
+        assert_eq!(
+            clipping.asset_relative_path,
+            format!(
+                "Crop test edition - CROPTEST/2026-08-09/Page A01 - {CROP_ID}/clipping-v1.webp"
+            )
+        );
         assert_eq!((clipping.crop_x, clipping.crop_y), (16, 16));
         assert_eq!((clipping.crop_width, clipping.crop_height), (32, 32));
         assert_eq!(
@@ -1647,6 +1679,84 @@ mod tests {
             1,
             "an idempotent retry must not create another canonical directory"
         );
+    }
+
+    #[test]
+    fn clipping_crop_same_page_and_timestamp_creates_distinct_readable_folders() {
+        let (temp, service, _diagnostics) = fixture();
+        let source_root = temp.path().join("crop-source-root");
+        std::fs::create_dir(&source_root).unwrap();
+        let source_image = crop_fixture_image(64, 64);
+        let source_path = write_crop_source(&source_root, "page.png", &source_image);
+        insert_crop_source(&service, &source_root, Some(&source_path), None, 64, 64, 1);
+
+        let first_id = "11111111-1111-4111-8111-111111111111";
+        let second_id = "22222222-2222-4222-8222-222222222222";
+        service
+            .create_newspaper_clipping(crop_request(first_id), 123)
+            .unwrap();
+        service
+            .create_newspaper_clipping(crop_request(second_id), 123)
+            .unwrap();
+
+        let first = service.detail(first_id).unwrap().unwrap().clipping;
+        let second = service.detail(second_id).unwrap().unwrap().clipping;
+        assert_ne!(first.asset_relative_path, second.asset_relative_path);
+        assert!(first
+            .asset_relative_path
+            .contains(&format!("/Page A01 - {first_id}/")));
+        assert!(second
+            .asset_relative_path
+            .contains(&format!("/Page A01 - {second_id}/")));
+        let layout = service.root_layout(&first.asset_root_id).unwrap();
+        assert!(layout
+            .canonical_path_at(first_id, &first.asset_relative_path)
+            .unwrap()
+            .is_file());
+        assert!(layout
+            .canonical_path_at(second_id, &second.asset_relative_path)
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn clipping_crop_uses_registered_local_file_and_ignores_remote_source_url() {
+        let (temp, service, _diagnostics) = fixture();
+        let source_root = temp.path().join("crop-source-root");
+        std::fs::create_dir(&source_root).unwrap();
+        let source_image = crop_fixture_image(64, 64);
+        let source_path = write_crop_source(&source_root, "local-page.png", &source_image);
+        insert_crop_source(&service, &source_root, Some(&source_path), None, 64, 64, 1);
+
+        let connection = rusqlite::Connection::open(&service.db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE newspaper_pages SET source_url = 'http://127.0.0.1:9/must-not-fetch.png'
+                 WHERE id = ?1",
+                params![CROP_PAGE_ID],
+            )
+            .unwrap();
+        drop(connection);
+
+        service
+            .create_newspaper_clipping(crop_request(CROP_ID), 123)
+            .unwrap();
+        let clipping = service.detail(CROP_ID).unwrap().unwrap().clipping;
+        assert_eq!(clipping.source_kind_snapshot, ClippingSourceKind::Original);
+        assert_eq!(
+            clipping.source_checksum_snapshot.as_deref(),
+            Some(sha256_hex(&std::fs::read(&source_path).unwrap()).as_str())
+        );
+
+        let asset_layout = service.root_layout(&clipping.asset_root_id).unwrap();
+        let canonical_path = asset_layout
+            .canonical_path_at(CROP_ID, &clipping.asset_relative_path)
+            .unwrap();
+        let decoded = webp::Decoder::new(&std::fs::read(canonical_path).unwrap())
+            .decode()
+            .unwrap();
+        let expected = source_image.crop_imm(16, 16, 32, 32).to_rgba8().into_raw();
+        assert_eq!(&decoded[..], expected.as_slice());
     }
 
     #[test]
@@ -2342,6 +2452,9 @@ mod tests {
         assert_eq!(thumbnail.status, "generated");
         assert!(thumbnail.width <= THUMBNAIL_MAX_WIDTH);
         assert!(thumbnail.height <= THUMBNAIL_MAX_HEIGHT);
+        assert_eq!(thumbnail.width, created.asset_pixel_width);
+        assert_eq!(thumbnail.height, created.asset_pixel_height);
+        assert_eq!(thumbnail.thumbnail_version, "1-2");
         assert!(service
             .layout
             .thumbnail_path(ID, created.asset_version)
@@ -2359,6 +2472,52 @@ mod tests {
         assert!(
             canonical.is_file(),
             "thumbnail generation must retain canonical media"
+        );
+    }
+
+    #[test]
+    fn clipping_thumbnail_cache_increases_density_without_upscaling_canonical_media() {
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let created = service
+            .register_staged(staged_snapshot_record_with_dimensions(
+                &service,
+                &destination,
+                ID,
+                1600,
+                900,
+            ))
+            .unwrap();
+
+        let thumbnail = service.ensure_thumbnail(ID).unwrap();
+        assert_eq!(thumbnail.status, "generated");
+        assert_eq!((thumbnail.width, thumbnail.height), (1024, 576));
+        assert_eq!(thumbnail.thumbnail_version, "1-2");
+
+        let thumbnail_bytes = std::fs::read(
+            service
+                .layout
+                .thumbnail_path(ID, created.asset_version)
+                .unwrap(),
+        )
+        .unwrap();
+        let thumbnail_image = webp::Decoder::new(&thumbnail_bytes).decode().unwrap();
+        assert_eq!(
+            (thumbnail_image.width(), thumbnail_image.height()),
+            (1024, 576)
+        );
+
+        let canonical_path = service
+            .root_layout(&created.asset_root_id)
+            .unwrap()
+            .canonical_path_at(ID, &created.asset_relative_path)
+            .unwrap();
+        let canonical_image = webp::Decoder::new(&std::fs::read(canonical_path).unwrap())
+            .decode()
+            .unwrap();
+        assert_eq!(
+            (canonical_image.width(), canonical_image.height()),
+            (1600, 900)
         );
     }
 
@@ -3678,21 +3837,17 @@ mod tests {
     }
 
     #[test]
-    fn persistence_gate_production_cleanup_is_detached_from_application_setup() {
-        let source = include_str!("../../lib.rs");
-        let start = source
-            .find("let cleanup_service = clipping_service.clone();")
-            .expect("production setup must schedule clipping cleanup");
-        let end = source[start..]
-            .find("app.manage(diagnostics);")
-            .map(|offset| start + offset)
-            .expect("cleanup scheduling must finish before state management continues");
-        let scheduling = &source[start..end];
-        assert!(scheduling.contains("tauri::async_runtime::spawn_blocking"));
-        assert!(scheduling.contains("cleanup_service.run_deferred_cleanup"));
+    fn persistence_gate_production_cleanup_is_delayed_and_detached_from_application_setup() {
+        let setup = include_str!("../../lib.rs");
+        let startup = include_str!("clipping_startup.rs");
+        assert!(setup.contains("recover_and_schedule_reconciliation"));
+        assert!(!setup.contains("run_deferred_cleanup"));
+        assert!(startup.contains("tokio::time::sleep(STARTUP_FOLDER_RECONCILIATION_DELAY).await"));
+        assert!(startup.contains("tauri::async_runtime::spawn_blocking"));
+        assert!(startup.contains("service.run_deferred_cleanup"));
         assert!(
-            !scheduling.contains(".await"),
-            "application setup must not wait for detached enumeration"
+            startup.find("tokio::time::sleep").unwrap() < startup.find("spawn_blocking").unwrap(),
+            "managed-folder enumeration must begin only after the startup quiet period"
         );
     }
 

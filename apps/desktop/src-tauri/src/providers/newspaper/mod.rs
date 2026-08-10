@@ -19,6 +19,7 @@ pub mod clipping_recovery;
 pub mod clipping_repository;
 pub mod clipping_roots;
 pub mod clipping_service;
+pub mod clipping_startup;
 pub mod commands;
 pub mod downloader;
 mod job_repository;

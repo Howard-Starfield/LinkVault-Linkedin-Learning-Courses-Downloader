@@ -261,12 +261,11 @@ pub fn run() {
                 diagnostics.clone(),
             );
             let _recovery_summary =
-                clipping_service.recover_startup(&diagnostics, commands::now_unix_timestamp());
-            let cleanup_service = clipping_service.clone();
-            let cleanup_diagnostics = diagnostics.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                cleanup_service.run_deferred_cleanup(&cleanup_diagnostics)
-            });
+                newspaper::clipping_startup::recover_and_schedule_reconciliation(
+                    &clipping_service,
+                    &diagnostics,
+                    commands::now_unix_timestamp(),
+                );
             app.manage(diagnostics);
             app.manage(writer);
             app.manage(clipping_service);

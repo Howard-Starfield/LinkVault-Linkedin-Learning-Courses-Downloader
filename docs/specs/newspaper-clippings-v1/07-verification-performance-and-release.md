@@ -293,6 +293,17 @@ clipping_persistence_
 - One source-page delete unlinks one/multiple clippings without changing notes.
 - Job cascade unlinks source IDs without deleting clipping rows.
 - Reset preserves clipping rows/assets/thumbnails.
+
+#### Startup reconciliation scheduling
+
+- Database-driven `creating` and `delete_pending` recovery completes before
+  clipping state is exposed.
+- Managed-folder reconciliation waits for the approved five-second quiet
+  period, then runs once on a blocking worker.
+- Application setup performs no directory enumeration and does not wait for
+  deferred cleanup.
+- Reconciliation is limited to backend-derived managed categories and never
+  scans the visible newspaper edition/date tree for filename-based imports.
 - Reset preserves byte-identical note Markdown and checksums.
 - Reset works with foreign keys enabled.
 - Explicit unlink path protects legacy/test connections where foreign keys are
@@ -333,6 +344,12 @@ clipping_recovery_
 ### Path and security tests
 
 - Invalid/Unicode-lookalike operation IDs.
+- New snapshot paths use `Page <page> - <full UUID>` leaves, sanitize/bound the
+  page label, and retain the exact full operation ID.
+- Two same-edition/date/page crops at the same timestamp produce distinct
+  readable folders and both canonical assets remain intact.
+- Existing UUID-only snapshot paths remain readable; mismatched UUID suffixes
+  and malformed readable leaves are rejected.
 - Absolute paths.
 - Parent components.
 - Alternate separators.
@@ -392,7 +409,8 @@ without touching source media or another clipping.
 - Current canonical request returns correct bytes/MIME/ETag/cache policy.
 - Current thumbnail request returns correct cache bytes.
 - Thumbnail bytes are read only after a positive 8 MiB metadata limit and are
-  static decodable WebP within the 512×320 box.
+  static decodable WebP within the 1024×640 box without upscaling the canonical
+  clipping.
 - Empty, oversized-byte, oversized-dimension, malformed, and animated
   thumbnails fail safely without altering the clipping aggregate.
 - Stale/malformed/missing/corrupt/symlink/escaped requests fail safely.
