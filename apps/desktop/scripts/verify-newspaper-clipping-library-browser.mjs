@@ -157,6 +157,7 @@ try {
   });
   page.on("pageerror", (error) => consoleErrors.push(error.message));
   await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+  assert.equal(await page.locator(".lv-global-search").count(), 0, "clipping search row leaked onto the default page");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), false, "normal route fetched the editor chunk");
 
   await page.getByRole("button", { name: "Clippings", exact: true }).click();
@@ -222,9 +223,15 @@ try {
   await firstCard.click();
   await page.locator(".clipping-detail").waitFor();
   await page.getByLabel("Clipping note editor body").waitFor();
+  const topBack = page.locator(".lv-global-search").getByRole("button", { name: "Back", exact: true });
+  await topBack.waitFor();
+  assert.equal(await page.locator(".clipping-note-page__header").getByRole("button").count(), 0, "detail header still owns a duplicate Back control");
+  if (process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT) {
+    await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT });
+  }
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 1, "thumbnail selection did not fetch exactly one clipping detail");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), true, "detail did not lazy-load the editor chunk");
-  await page.getByRole("button", { name: "Back to clippings" }).click();
+  await topBack.click();
   await page.locator(".clipping-gallery").waitFor();
   await page.locator(".clipping-gallery__card").first().click();
   await page.getByLabel("Clipping note editor body").waitFor();
@@ -293,6 +300,7 @@ try {
   await page.getByText("Saved", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Download editions" }).click();
   await page.locator(".newspaper-download").waitFor();
+  assert.equal(await page.locator(".lv-global-search").count(), 0, "clipping search row remained on Download editions");
 
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.details = []; });
   await page.getByRole("button", { name: "Clippings", exact: true }).click();

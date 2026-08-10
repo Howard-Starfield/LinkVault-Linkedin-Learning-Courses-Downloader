@@ -3721,11 +3721,12 @@ textarea {
   background: var(--workspace-bg);
 }
 
-/* Newspaper clipping workspace: a compact evidence desk within LinkVault's
+/* Newspaper clipping workspace: a compact reading desk within LinkVault's
    existing shell, not a second visual theme. */
 .lv-main {
   grid-template-rows: auto minmax(0, 1fr);
 }
+.lv-main[data-clipping-search="false"] { grid-template-rows: minmax(0, 1fr); }
 
 .lv-global-search {
   display: grid;
@@ -3737,6 +3738,7 @@ textarea {
   border-bottom: 1px solid var(--border-soft);
   background: color-mix(in srgb, var(--workspace-bg) 92%, var(--section-bg));
 }
+.lv-global-search[data-detail="true"] { grid-template-columns: auto minmax(220px, 760px) auto; }
 
 .lv-global-search > svg { width: 16px; color: var(--text-soft); }
 .lv-global-search input {
@@ -3756,6 +3758,10 @@ textarea {
 }
 .lv-global-search button:hover { background: var(--surface-hover); color: var(--text-main); }
 .lv-global-search button svg { width: 15px; }
+.lv-global-search .lv-global-search__back {
+  display: inline-flex; width: auto; height: 32px; align-items: center; gap: 6px; padding: 0 9px;
+  color: var(--text-soft); font-size: 12px; font-weight: 650;
+}
 .lv-global-search > span { color: var(--text-soft); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 .lv-global-search__context { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
 .lv-global-search__context strong { color: var(--accent); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
@@ -3835,10 +3841,9 @@ textarea {
 
 .clipping-note-page { display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--workspace-bg); }
 .clipping-note-page__header {
-  display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px;
+  display: block;
   padding: 10px 18px; border-bottom: 1px solid var(--border-soft); background: var(--surface-faint);
 }
-.clipping-note-page__header .lv-button svg { width: 15px; }
 .clipping-note-page__header > div { display: grid; min-width: 0; gap: 1px; }
 .clipping-note-page__header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: Georgia, "Times New Roman", serif; font-size: 15px; }
 .clipping-note-page__body { min-width: 0; min-height: 0; overflow: auto; }

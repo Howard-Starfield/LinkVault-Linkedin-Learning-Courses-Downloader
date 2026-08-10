@@ -1,7 +1,6 @@
-import { ArrowLeft, LoaderCircle } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Button } from "../primitives";
 import { getNewspaperClipping, type NewspaperClippingDetail } from "./newspaper-api";
 import { NewspaperClippingDetail as ClippingDetailView } from "./NewspaperClippingDetail";
 import { NewspaperClippingList } from "./NewspaperClippingList";
@@ -10,12 +9,14 @@ export type ClippingFlush = () => Promise<boolean>;
 
 export function NewspaperClippings({
   pendingClippingId,
+  onDetailStateChange,
   onGallerySummaryChange,
   onOpenLibrary,
   onPendingConsumed,
   registerFlush
 }: {
   pendingClippingId: string | null;
+  onDetailStateChange: (open: boolean) => void;
   onGallerySummaryChange: (summary: { total: number; loading: boolean } | null) => void;
   onOpenLibrary: () => void;
   onPendingConsumed: () => void;
@@ -44,16 +45,11 @@ export function NewspaperClippings({
     setSelectedId(id);
   }, [selectedId]);
 
-  const returnToGallery = useCallback(async () => {
-    if (detailFlushRef.current && !(await detailFlushRef.current())) {
-      toast.error("This note still has unsaved changes", {
-        description: "Retry the save or resolve the conflict before returning to your clippings."
-      });
-      return;
-    }
-    setRegisteredFlush(null);
-    setSelectedId(null);
-  }, [setRegisteredFlush]);
+  useEffect(() => {
+    onDetailStateChange(selectedId !== null);
+  }, [onDetailStateChange, selectedId]);
+
+  useEffect(() => () => onDetailStateChange(false), [onDetailStateChange]);
 
   useEffect(() => {
     if (!pendingClippingId) return;
@@ -100,9 +96,6 @@ export function NewspaperClippings({
   return (
     <section className="clipping-note-page" aria-label="Clipping note">
       <header className="clipping-note-page__header">
-        <Button onClick={() => void returnToGallery()} size="sm" variant="ghost">
-          <ArrowLeft aria-hidden="true" /> Back to clippings
-        </Button>
         <div>
           <span>Clipping note</span>
           <strong>{detail?.title ?? "Opening clipping"}</strong>
