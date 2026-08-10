@@ -19,16 +19,20 @@ use crate::app::database_diagnostics::{
 use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
 use crate::cache::open_runtime;
 
-use super::clipping_assets::ClippingAssetLayout;
+use super::clipping_assets::{
+    ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION, THUMBNAIL_MAX_HEIGHT, THUMBNAIL_MAX_WIDTH,
+};
 use super::clipping_crop;
 use super::clipping_models::{
     normalize_search_query, normalize_search_text, normalize_title, validate_asset_byte_count,
     validate_clipping_id, validate_edition_code, validate_edition_name, validate_list_limit,
     validate_note_markdown, validate_page_number, validate_publication_date, validate_sha256_hex,
-    validate_source_mime, ClippingAssetState, ClippingError, ClippingErrorCode, ClippingSummary,
-    CreateNewspaperClippingRequest, CreateNewspaperClippingResponse, NewspaperClipping,
-    NewspaperClippingListQuery, NewspaperClippingMatchField, NewspaperClippingSearchResult,
-    NewspaperClippingSearchSnippet, NewspaperClippingSearchSnippetPart,
+    validate_source_mime, ClippingAssetState, ClippingError, ClippingErrorCode, ClippingRootStatus,
+    ClippingSummary, CreateNewspaperClippingRequest, CreateNewspaperClippingResponse,
+    EnsureNewspaperClippingThumbnailResponse, GetNewspaperClippingsPageRequest, NewspaperClipping,
+    NewspaperClippingDetail, NewspaperClippingListQuery, NewspaperClippingMatchField,
+    NewspaperClippingSearchResult, NewspaperClippingSearchSnippet,
+    NewspaperClippingSearchSnippetPart, NewspaperClippingSort, NewspaperClippingsPage,
     SearchNewspaperClippingsPage, SearchNewspaperClippingsRequest,
     SearchPossibleNewspaperClippingsRequest, SearchPossibleNewspaperClippingsResponse,
     FUZZY_CANDIDATE_LIMIT, POSSIBLE_MATCH_LIMIT, SEARCH_PAGE_LIMIT, SEARCH_SNIPPET_MAX_CHARS,
@@ -49,6 +53,9 @@ pub struct ClippingService {
     /// blocking mutex because callers reach it only from Tauri's blocking
     /// pool, never from the WebView-sensitive command path.
     crop_permit: Arc<Mutex<()>>,
+    /// Derived thumbnails are serialized separately from full-page crop work.
+    /// This prevents duplicate cache writers without blocking note updates.
+    thumbnail_permit: Arc<Mutex<()>>,
     /// Shutdown first closes admission, then waits on `crop_permit` so a
     /// started operation reaches the Phase 1 recoverable state machine.
     crop_accepting: Arc<AtomicBool>,
@@ -244,6 +251,7 @@ impl ClippingService {
             diagnostics,
             integrity_scheduler,
             crop_permit: Arc::new(Mutex::new(())),
+            thumbnail_permit: Arc::new(Mutex::new(())),
             crop_accepting: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -766,6 +774,139 @@ impl ClippingService {
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))
     }
 
+    pub fn list_page(
+        &self,
+        request: GetNewspaperClippingsPageRequest,
+    ) -> Result<NewspaperClippingsPage, ClippingError> {
+        let sort = NewspaperClippingSort::from_request(&request.sort)
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::InvalidId))?;
+        let (items, total) = self.list(NewspaperClippingListQuery {
+            query: request.query,
+            sort,
+            offset: request.offset,
+            limit: request.limit,
+        })?;
+        Ok(NewspaperClippingsPage {
+            items: items.into_iter().map(Into::into).collect(),
+            total,
+            offset: request.offset,
+            limit: request.limit,
+        })
+    }
+
+    pub fn detail_response(
+        &self,
+        id: &str,
+    ) -> Result<Option<NewspaperClippingDetail>, ClippingError> {
+        let Some(detail) = self.detail(id)? else {
+            return Ok(None);
+        };
+        let storage_status = self
+            .list_root_summaries()?
+            .into_iter()
+            .find(|root| root.root_id == detail.clipping.asset_root_id)
+            .map(|root| root.status)
+            .unwrap_or(ClippingRootStatus::Offline);
+        Ok(Some(NewspaperClippingDetail {
+            image_url: format!(
+                "http://newspaper-media.localhost/clipping/{}?v={}",
+                detail.clipping.id, detail.clipping.asset_version
+            ),
+            id: detail.clipping.id,
+            title: detail.clipping.title,
+            note_markdown: detail.clipping.note_markdown,
+            edition_code: detail.clipping.edition_code_snapshot,
+            edition_name: detail.clipping.edition_name_snapshot,
+            publication_date: detail.clipping.publication_date_snapshot,
+            page_number: detail.clipping.page_number_snapshot,
+            source_available: detail.source_available,
+            asset_state: detail.clipping.asset_state,
+            asset_error_code: detail.clipping.asset_error_code,
+            storage_status,
+            asset_width: detail.clipping.asset_pixel_width,
+            asset_height: detail.clipping.asset_pixel_height,
+            revision: detail.clipping.revision,
+            created_at: detail.clipping.created_at,
+            updated_at: detail.clipping.updated_at,
+        }))
+    }
+
+    pub fn update_note_response(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        title: &str,
+        note_markdown: &str,
+        now: i64,
+    ) -> Result<NewspaperClippingDetail, ClippingError> {
+        self.update_note(id, expected_revision, title, note_markdown, now)?;
+        self.detail_response(id)?
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))
+    }
+
+    pub fn ensure_thumbnail(
+        &self,
+        id: &str,
+    ) -> Result<EnsureNewspaperClippingThumbnailResponse, ClippingError> {
+        if !validate_clipping_id(id) {
+            return Err(ClippingError::new(ClippingErrorCode::InvalidId));
+        }
+        let _permit = self
+            .thumbnail_permit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let clipping = self
+            .read_by_id(id)?
+            .filter(|clipping| clipping.asset_state.is_publicly_visible())
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))?;
+        if clipping.asset_state != ClippingAssetState::Ready {
+            return Err(ClippingError::new(ClippingErrorCode::AssetMissing));
+        }
+        if let Ok((bytes, _)) = self
+            .layout
+            .read_thumbnail_for_protocol(id, clipping.asset_version)
+        {
+            let features = webp::BitstreamFeatures::new(&bytes)
+                .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetValidationFailed))?;
+            return Ok(thumbnail_response(
+                id,
+                clipping.asset_version,
+                "ready",
+                features.width(),
+                features.height(),
+            ));
+        }
+
+        let asset_layout = self.roots.resolve(&clipping.asset_root_id)?;
+        let (canonical, _) = asset_layout.read_validated_canonical_at(
+            id,
+            &clipping.asset_relative_path,
+            clipping.asset_byte_count,
+            clipping.asset_pixel_width,
+            clipping.asset_pixel_height,
+            &clipping.asset_checksum_sha256,
+        )?;
+        let source = image::load_from_memory_with_format(&canonical, image::ImageFormat::WebP)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetValidationFailed))?
+            .to_rgba8();
+        let resized =
+            image::imageops::thumbnail(&source, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+        let width = resized.width();
+        let height = resized.height();
+        let encoded = webp::Encoder::from_rgba(resized.as_raw(), width, height)
+            .encode_lossless()
+            .to_vec();
+        self.layout
+            .write_thumbnail_cache(id, clipping.asset_version, &encoded)?;
+        Ok(thumbnail_response(
+            id,
+            clipping.asset_version,
+            "generated",
+            width,
+            height,
+        ))
+    }
+
     pub fn search(
         &self,
         mut request: SearchNewspaperClippingsRequest,
@@ -1012,6 +1153,25 @@ impl ClippingService {
             }
         }
         summary
+    }
+}
+
+fn thumbnail_response(
+    clipping_id: &str,
+    asset_version: u32,
+    status: &str,
+    width: u32,
+    height: u32,
+) -> EnsureNewspaperClippingThumbnailResponse {
+    let thumbnail_version = format!("{asset_version}-{THUMBNAIL_CACHE_SCHEMA_VERSION}");
+    EnsureNewspaperClippingThumbnailResponse {
+        status: status.to_string(),
+        thumbnail_url: format!(
+            "http://newspaper-media.localhost/clipping-thumbnail/{clipping_id}?v={thumbnail_version}"
+        ),
+        thumbnail_version,
+        width,
+        height,
     }
 }
 
@@ -2119,6 +2279,62 @@ mod tests {
     }
 
     #[test]
+    fn clipping_ui_contract_lists_details_updates_and_generates_only_cached_thumbnail() {
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let created = service
+            .register_staged(staged_snapshot_record(&service, &destination, ID))
+            .unwrap();
+
+        let page = service
+            .list_page(GetNewspaperClippingsPageRequest {
+                query: String::new(),
+                sort: "updated_desc".to_string(),
+                offset: 0,
+                limit: 50,
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, ID);
+        assert!(page.items[0].note_excerpt.is_empty());
+
+        let detail = service.detail_response(ID).unwrap().unwrap();
+        assert_eq!(detail.revision, created.revision);
+        assert!(detail.image_url.ends_with(&format!("/clipping/{ID}?v=1")));
+        assert_eq!(detail.storage_status, ClippingRootStatus::Unchecked);
+
+        let updated = service
+            .update_note_response(ID, created.revision, "  Evidence  ", "中文 note", 101)
+            .unwrap();
+        assert_eq!(updated.title, "Evidence");
+        assert_eq!(updated.note_markdown, "中文 note");
+        assert_eq!(updated.revision, created.revision + 1);
+
+        let thumbnail = service.ensure_thumbnail(ID).unwrap();
+        assert_eq!(thumbnail.status, "generated");
+        assert!(thumbnail.width <= THUMBNAIL_MAX_WIDTH);
+        assert!(thumbnail.height <= THUMBNAIL_MAX_HEIGHT);
+        assert!(service
+            .layout
+            .thumbnail_path(ID, created.asset_version)
+            .unwrap()
+            .is_file());
+        let cached = service.ensure_thumbnail(ID).unwrap();
+        assert_eq!(cached.status, "ready");
+        assert_eq!(cached.thumbnail_version, thumbnail.thumbnail_version);
+
+        let canonical = service
+            .root_layout(&created.asset_root_id)
+            .unwrap()
+            .canonical_path_at(ID, &created.asset_relative_path)
+            .unwrap();
+        assert!(
+            canonical.is_file(),
+            "thumbnail generation must retain canonical media"
+        );
+    }
+
+    #[test]
     fn persistence_gate_clipping_update_rejects_stale_revision() {
         let (_temp, service, _diagnostics) = fixture();
         let created = service
@@ -2726,7 +2942,7 @@ mod tests {
         assert_eq!(updated.updated_at, created.updated_at);
         let after = service.search(search_request("new york")).unwrap();
         assert_ne!(after.revision, before.revision);
-        assert!(after.revision <= (1i64 << 53) - 1);
+        assert!(after.revision < (1i64 << 53));
     }
 
     #[test]

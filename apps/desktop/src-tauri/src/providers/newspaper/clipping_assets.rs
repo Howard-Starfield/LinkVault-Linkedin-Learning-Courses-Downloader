@@ -950,6 +950,64 @@ impl ClippingAssetLayout {
         Ok((bytes, CLIPPING_ASSET_MIME))
     }
 
+    /// Atomically publish one derived thumbnail inside the application cache.
+    /// Canonical clipping bytes are never modified by this cache operation.
+    pub fn write_thumbnail_cache(
+        &self,
+        clipping_id: &str,
+        asset_version: u32,
+        bytes: &[u8],
+    ) -> Result<(u32, u32), ClippingError> {
+        let invalid = || ClippingError::new(ClippingErrorCode::AssetValidationFailed);
+        if bytes.is_empty() || bytes.len() as u64 > THUMBNAIL_MAX_BYTES || !is_webp_container(bytes)
+        {
+            return Err(invalid());
+        }
+        let features = webp::BitstreamFeatures::new(bytes).ok_or_else(invalid)?;
+        if features.has_animation()
+            || features.width() == 0
+            || features.width() > THUMBNAIL_MAX_WIDTH
+            || features.height() == 0
+            || features.height() > THUMBNAIL_MAX_HEIGHT
+        {
+            return Err(invalid());
+        }
+        let decoded = webp::Decoder::new(bytes).decode().ok_or_else(invalid)?;
+        if decoded.width() != features.width() || decoded.height() != features.height() {
+            return Err(invalid());
+        }
+
+        let target = self.thumbnail_path(clipping_id, asset_version)?;
+        if self
+            .read_thumbnail_for_protocol(clipping_id, asset_version)
+            .is_ok()
+        {
+            return Ok((features.width(), features.height()));
+        }
+        if target.symlink_metadata().is_ok() {
+            let contained = self.contained_regular_file(&target)?;
+            fs::remove_file(contained)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        }
+        let part = target.with_extension("webp.part");
+        if part.symlink_metadata().is_ok() {
+            let contained = self.contained_regular_file(&part)?;
+            fs::remove_file(contained)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        fs::rename(&part, &target)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        Ok((features.width(), features.height()))
+    }
+
     /// Serve-side validation for derived thumbnails (FR-MEDIA-002).
     pub fn read_thumbnail_for_protocol(
         &self,

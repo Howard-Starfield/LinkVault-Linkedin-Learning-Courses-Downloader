@@ -723,6 +723,65 @@ pub fn escape_like_pattern(term: &str) -> String {
     escaped
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetNewspaperClippingsPageRequest {
+    pub query: String,
+    pub sort: String,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperClippingsPage {
+    pub items: Vec<NewspaperClippingSummary>,
+    pub total: u32,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperClippingDetail {
+    pub id: String,
+    pub title: String,
+    pub note_markdown: String,
+    pub edition_code: String,
+    pub edition_name: String,
+    pub publication_date: String,
+    pub page_number: String,
+    pub image_url: String,
+    pub source_available: bool,
+    pub asset_state: ClippingAssetState,
+    pub asset_error_code: Option<String>,
+    pub storage_status: ClippingRootStatus,
+    pub asset_width: u32,
+    pub asset_height: u32,
+    pub revision: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateNewspaperClippingRequest {
+    pub clipping_id: String,
+    pub expected_revision: u64,
+    pub title: String,
+    pub note_markdown: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureNewspaperClippingThumbnailResponse {
+    pub status: String,
+    pub thumbnail_url: String,
+    pub thumbnail_version: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
