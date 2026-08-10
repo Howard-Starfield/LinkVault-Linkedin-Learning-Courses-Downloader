@@ -1,8 +1,10 @@
 # Newspaper clipping note durability implementation plan
 
-**Status:** Approved Phase 4C implementation work order. Product defaults are
-approved; implementation still follows the branch/entry gates in this document
-and does not authorize a push, migration of user data, or release by itself.
+**Status:** Implemented locally through Slice E at `17599b8`. Automated
+controller, migration, recovery, lifecycle, browser, performance, Rust, and
+release gates pass. Native Windows close-X/tray Quit/restart UAT remains a
+separate user observation; this document does not authorize a push, migration
+of user data, or release by itself.
 
 **Date:** 2026-08-10
 

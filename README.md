@@ -117,12 +117,30 @@ least one downloaded edition with a readable completed page.
     On disk, the clipping belongs under the same newspaper download destination
     at `Newspaper snapshots/<edition>/`; Settings must not offer an arbitrary
     global snapshot-folder override.
+11. Add a unique title/body suffix and click the window **X** before the footer
+    reaches **Saved**. The window should hide instead of exiting. Choose
+    **Show LinkVault** from the tray, reopen the clipping, and confirm the exact
+    suffix is canonical or appears in the explicit recovery state. There must
+    still be only one main window.
+12. Type continuously, click **X** while the footer says **Saving…**, then show
+    LinkVault from the tray. Confirm the newest text—not an earlier keystroke—is
+    present. Repeat the hide/show cycle once to catch duplicate close handlers.
+13. Add another unique suffix and immediately choose **Quit** from the tray.
+    Relaunch LinkVault and confirm the exact latest text is saved or explicitly
+    offered for recovery. Tray Quit must exit; window X must only hide.
+14. Do not use Task Manager against a real user database to test crash recovery.
+    Forced-termination and injected save/checkpoint failures belong to the
+    isolated automated harness or a disposable test profile.
 
 Focused automated checks for this workflow:
 
 ```powershell
 npm --prefix apps\desktop run verify:clipping-note-editor-markdown
 npm --prefix apps\desktop run verify:clipping-note-editor
+npm --prefix apps\desktop run verify:clipping-note-autosave
+npm --prefix apps\desktop run verify:clipping-note-lifecycle
+npm --prefix apps\desktop run verify:clipping-note-durability-structure
+npm --prefix apps\desktop run verify:clipping-note-durability-browser
 npm --prefix apps\desktop run verify:newspaper-clipping-library
 ```
 
