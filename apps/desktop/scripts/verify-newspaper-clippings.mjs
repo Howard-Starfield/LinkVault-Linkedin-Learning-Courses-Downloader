@@ -64,6 +64,9 @@ const [
   readerBrowserVerificationSource,
   cargoSource,
   baselineHarnessSource,
+  repositorySource,
+  assetsSource,
+  startupSource,
 ] = await Promise.all([
   readFile(path.join(newspaperDirectory, "clipping_crop.rs"), "utf8"),
   readFile(path.join(newspaperDirectory, "clipping_service.rs"), "utf8"),
@@ -81,6 +84,9 @@ const [
   readFile(path.join(desktopDirectory, "scripts", "verify-newspaper-clippings-browser.mjs"), "utf8"),
   readFile(path.join(desktopDirectory, "src-tauri", "Cargo.toml"), "utf8"),
   readFile(path.join(rustDirectory, "app", "newspaper_clipping_crop_baseline.rs"), "utf8"),
+  readFile(path.join(newspaperDirectory, "clipping_repository.rs"), "utf8"),
+  readFile(path.join(newspaperDirectory, "clipping_assets.rs"), "utf8"),
+  readFile(path.join(newspaperDirectory, "clipping_startup.rs"), "utf8"),
 ]);
 
 const productionCrop = productionSource(cropSource);
@@ -98,6 +104,7 @@ for (const [source, file] of [
 
 requireContains(moduleSource, "pub mod clipping_crop;", "newspaper/mod.rs");
 requireContains(moduleSource, "pub mod clipping_service;", "newspaper/mod.rs");
+requireContains(moduleSource, "pub mod clipping_startup;", "newspaper/mod.rs");
 requireContains(
   libSource,
   "pub use app::newspaper_clipping_crop_baseline as crop_baseline;",
@@ -224,6 +231,60 @@ for (const forbidden of ["sourcePath", "assetPath", "relativePath", "outputDir",
 }
 if (librarySource.includes("createNewspaperClipping")) {
   fail("NewspaperLibrary.tsx must not own the create command");
+}
+
+const cropSourceProjection = repositorySource.slice(
+  repositorySource.indexOf("pub struct CropSourceRecord"),
+  repositorySource.indexOf("pub fn load_crop_source"),
+);
+assert.ok(cropSourceProjection.length > 0, "crop source projection is missing");
+assert.ok(!cropSourceProjection.includes("source_url"), "crop source projection must not expose a remote URL");
+const cropSourceQuery = repositorySource.slice(
+  repositorySource.indexOf("pub fn load_crop_source"),
+  repositorySource.indexOf("pub fn load_by_id"),
+);
+assert.ok(!cropSourceQuery.includes("p.source_url"), "crop source query must not select a remote URL");
+
+for (const fragment of [
+  "THUMBNAIL_CACHE_SCHEMA_VERSION: u32 = 2",
+  "THUMBNAIL_MAX_WIDTH: u32 = 1024",
+  "THUMBNAIL_MAX_HEIGHT: u32 = 640",
+  'THUMBNAIL_VERSION_DIR: &str = "v2"',
+  "snapshot_clipping_segment",
+  'format!("Page {page}")',
+  'format!("{label} - {clipping_id}")',
+  "if segment == clipping_id",
+]) {
+  requireContains(assetsSource, fragment, "newspaper/clipping_assets.rs");
+}
+for (const fragment of [
+  "source.width().min(THUMBNAIL_MAX_WIDTH)",
+  "source.height().min(THUMBNAIL_MAX_HEIGHT)",
+]) {
+  requireContains(productionService, fragment, "newspaper/clipping_service.rs");
+}
+
+for (const fragment of [
+  "STARTUP_FOLDER_RECONCILIATION_DELAY",
+  "recover_transactional_state",
+  "schedule_managed_folder_reconciliation",
+  "tokio::time::sleep(STARTUP_FOLDER_RECONCILIATION_DELAY).await",
+  "tauri::async_runtime::spawn_blocking",
+  "service.run_deferred_cleanup",
+]) {
+  requireContains(startupSource, fragment, "newspaper/clipping_startup.rs");
+}
+requireOrder(
+  startupSource,
+  [
+    "tokio::time::sleep(STARTUP_FOLDER_RECONCILIATION_DELAY).await",
+    "tauri::async_runtime::spawn_blocking",
+    "service.run_deferred_cleanup",
+  ],
+  "newspaper/clipping_startup.rs",
+);
+if (libSource.includes("run_deferred_cleanup") || libSource.includes("read_dir")) {
+  fail("lib.rs must delegate startup folder reconciliation without filesystem work");
 }
 for (const fragment of [
   "NewspaperClippingCapability",

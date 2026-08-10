@@ -321,6 +321,10 @@ try {
   await page.getByLabel("Clipping note editor body").waitFor();
 
   const title = page.locator(".clipping-detail__title input");
+  await page.evaluate(() => {
+    window.__CLIPPING_LIBRARY_TEST__.updateCalls.length = 0;
+    window.__CLIPPING_LIBRARY_TEST__.checkpointCalls.length = 0;
+  });
   await title.fill("Transit evidence note");
   await title.press("Enter");
   assert.equal(await page.getByLabel("Clipping note editor body").evaluate((element) => element === document.activeElement), true, "Enter in the top-bar title did not focus the note body");
@@ -464,6 +468,55 @@ try {
   await page.getByRole("button", { name: "Discard recovered changes" }).click();
   await page.getByLabel("Clipping note editor body").waitFor();
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.invalidRecoveryIds.size), 0);
+
+  const taskProbe = "Task alignment probe";
+  const editorBody = page.getByLabel("Clipping note editor body");
+  await editorBody.click();
+  await page.keyboard.press("Control+End");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("/todo");
+  const todoOption = page.getByRole("option", { name: /^To-do list/ });
+  await todoOption.waitFor();
+  await todoOption.click();
+  await todoOption.waitFor({ state: "detached" });
+  await page.keyboard.type(taskProbe);
+  const taskItem = editorBody.locator('ul[data-type="taskList"] > li[data-checked]', { hasText: taskProbe });
+  await taskItem.waitFor({ timeout: 8_000 }).catch(async (error) => {
+    const editorHtml = await editorBody.innerHTML();
+    throw new Error(`slash to-do command did not create a task item; editor HTML: ${editorHtml}`, { cause: error });
+  });
+  const taskGeometry = await taskItem.evaluate((item, expectedText) => {
+    const label = item.querySelector(":scope > label");
+    const paragraph = item.querySelector(":scope > div > p");
+    if (!(label instanceof HTMLElement) || !(paragraph instanceof HTMLParagraphElement)) return null;
+    const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
+    let textNode = walker.nextNode();
+    while (textNode && !textNode.textContent?.includes(expectedText)) textNode = walker.nextNode();
+    if (!textNode) return null;
+    const start = Math.max(0, textNode.textContent.indexOf(expectedText));
+    const range = document.createRange();
+    range.setStart(textNode, start);
+    range.setEnd(textNode, Math.min(textNode.textContent.length, start + 1));
+    const labelRect = label.getBoundingClientRect();
+    const textRect = range.getBoundingClientRect();
+    const paragraphStyle = getComputedStyle(paragraph);
+    return {
+      display: getComputedStyle(item).display,
+      paragraphMarginTop: Number.parseFloat(paragraphStyle.marginTop),
+      labelTop: labelRect.top,
+      labelBottom: labelRect.bottom,
+      textTop: textRect.top,
+      textBottom: textRect.bottom
+    };
+  }, taskProbe);
+  assert.ok(taskGeometry, "task item did not expose its checkbox and first text line");
+  assert.equal(taskGeometry.display, "flex", "task item lost its single-row layout owner");
+  assert.equal(taskGeometry.paragraphMarginTop, 0, "task text inherited the generic paragraph top margin");
+  assert.ok(
+    taskGeometry.labelTop < taskGeometry.textBottom && taskGeometry.labelBottom > taskGeometry.textTop,
+    `task checkbox and first text line do not share a row: ${JSON.stringify(taskGeometry)}`
+  );
+  await page.getByText("Saved", { exact: true }).waitFor();
 
   const durabilityPerformance = await measureClippingNoteDurabilityBrowser(page, title);
   console.table(durabilityPerformance.exitLatency);

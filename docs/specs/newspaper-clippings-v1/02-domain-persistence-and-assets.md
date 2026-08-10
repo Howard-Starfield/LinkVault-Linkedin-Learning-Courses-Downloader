@@ -414,7 +414,7 @@ from the source job's persisted batch destination, never a frontend payload:
    │  └─ quarantine/<timestamp>-<reason>-<name>/
    └─ <sanitized edition name - code>/
       └─ <publication-date>/
-         └─ <clipping-id>/clipping-v1.webp
+         └─ Page <page> - <clipping-id>/clipping-v1.webp
 ```
 
 Derived thumbnails remain under the dedicated app-data cache. Existing v3
@@ -426,8 +426,13 @@ rows are assigned to `legacy-managed-v1`, which resolves the former
 The new canonical relative path is exactly:
 
 ```text
-<sanitized edition name - code>/<publication-date>/<clipping-id>/clipping-v1.webp
+<sanitized edition name - code>/<publication-date>/Page <page> - <clipping-id>/clipping-v1.webp
 ```
+
+The page label is sanitized and bounded for one Windows-safe segment. The full
+UUID remains the collision-proof identity suffix. Readers also accept the
+earlier `<edition>/<date>/<clipping-id>/clipping-v1.webp` shape so existing
+assets require no rename or migration.
 
 React cannot override root, directory, filename, extension, asset version, or
 relative path.
@@ -558,7 +563,7 @@ Through `DatabaseWriter`, insert one row with:
 ```text
 asset_state = creating
 asset_root_id = <registered download-snapshot root ID>
-asset_relative_path = <edition>/<date>/<id>/clipping-v1.webp
+asset_relative_path = <edition>/<date>/Page <page> - <id>/clipping-v1.webp
 asset_version = 1
 revision = 1
 note_markdown = ''
@@ -572,7 +577,7 @@ filesystem. A uniqueness conflict follows the idempotency contract.
 Outside a database transaction, atomically rename:
 
 ```text
-.linkvault/staging/<id>  →  <edition>/<date>/<id>
+.linkvault/staging/<id>  →  <edition>/<date>/Page <page> - <id>
 ```
 
 Before rename, reject an unexpected existing final directory. After rename,
@@ -754,11 +759,11 @@ Thumbnail files are cache, not aggregate state.
 ### Thumbnail output
 
 - Format: lossy WebP is allowed because the thumbnail is derived.
-- Bounding box: 512×320 pixels.
+- Bounding box: 1024×640 pixels.
 - Aspect ratio: preserved.
 - Upscaling: prohibited.
 - Source: canonical clipping asset only.
-- Cache schema version: integer constant starting at 1.
+- Cache schema version: integer constant; the high-density cache is version 2.
 - Filename key includes clipping ID and canonical asset version.
 
 ### Thumbnail ensure flow
@@ -797,7 +802,7 @@ The thumbnail route verifies the clipping and requested composite version,
 derives the deterministic cache path, and serves only a regular contained file.
 Before reading, metadata must report a positive byte count no greater than
 8,388,608 bytes. The exact returned buffer must be a static, decodable WebP
-whose width is 1 through 512 and height is 1 through 320. Animated/multiframe,
+whose width is 1 through 1024 and height is 1 through 640. Animated/multiframe,
 empty, malformed, oversized-byte, oversized-dimension, symlinked, reparse, and
 stale-version files are rejected.
 
@@ -864,8 +869,12 @@ included in release diagnostics but not required on every launch.
   deleted. Malformed names, non-regular entries, symlinks, and reparse points
   are never deletion targets.
 - Quarantine entries are retained for seven days, then eligible for deletion.
-- Cleanup is submitted to a detached blocking task; application setup and the
-  UI/runtime startup thread do not wait for enumeration.
+- Cleanup is scheduled once per process after a five-second startup quiet
+  period, then submitted to a detached blocking task; application setup and
+  the UI/runtime startup thread do not wait for enumeration.
+- Database-driven `creating` and `delete_pending` recovery remains synchronous
+  before clipping state is exposed; the quiet period applies only to managed
+  orphan/cache folder reconciliation.
 - Each launch may completely enumerate the staging, assets, trash, quarantine,
   and clipping-thumbnail managed categories. Actual `ReadDir` items consumed
   are counted and reported honestly; enumeration/inspection is not described
@@ -877,7 +886,8 @@ included in release diagnostics but not required on every launch.
   filename cursor is used because directory order is unspecified and stable
   Rust provides no portable durable `ReadDir` position.
 - Cleanup retains every containment and age rule above and must not scan user
-  newspaper download directories.
+  newspaper download directories or infer clipping identity from files in the
+  visible edition/date tree.
 
 The 500-entry and 5,000-entry managed-directory measurements record wall time
 and approximate/peak process memory for the supported Windows environment.

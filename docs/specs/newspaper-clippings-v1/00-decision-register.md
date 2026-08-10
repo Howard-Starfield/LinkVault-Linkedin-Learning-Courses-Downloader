@@ -234,8 +234,14 @@ never chooses or receives the absolute canonical path.
 of its source job. Its canonical image is stored beneath:
 
 ```text
-<destination>/Newspaper snapshots/<sanitized edition name - code>/<publication-date>/<clipping-id>/clipping-v1.webp
+<destination>/Newspaper snapshots/<sanitized edition name - code>/<publication-date>/Page <page> - <clipping-id>/clipping-v1.webp
 ```
+
+The readable leaf repeats the page label but retains the full clipping UUID,
+so multiple selections from the same edition, date, and page cannot collide.
+Edition and date are not repeated in the leaf because the parent hierarchy is
+already authoritative and Windows path-length headroom is finite. Existing
+UUID-only snapshot leaves remain valid and are not renamed or migrated.
 
 SQLite stores `asset_root_id` and a root-relative asset path. The backend owns
 a root registry and a marker under the reserved `.linkvault` subtree. Staging,
@@ -477,7 +483,7 @@ without changing title or note source data.
 
 **Decision:** List thumbnails are regenerable cache files derived from the
 canonical clipping, generated on demand for visible rows. They preserve aspect
-ratio, do not upscale, and fit within a 512×320 pixel box.
+ratio, do not upscale, and fit within a 1024×640 pixel box.
 
 **Rationale:** Loading full-resolution canonical crops in every visible row can
 create avoidable decode and memory cost. Derived thumbnails can be safely
@@ -485,7 +491,8 @@ removed and rebuilt.
 
 **Constraints:** Thumbnail cache schema version and canonical asset version are
 part of the URL/version key. Thumbnail absence does not make a clipping
-unavailable.
+unavailable. The 1024×640 cache is schema version 2 so pre-density cache files
+cannot be mistaken for current output.
 
 **Affected specifications:** 02, 05, 07.
 
@@ -681,11 +688,13 @@ specified, but it must not replace the managed source crop.
 **Approval:** Approved by the product owner on 2026-08-09 for the Phase 1
 review correction.
 
-**Decision:** V1 deferred cleanup runs only in the detached blocking lifecycle
-task and may completely enumerate each application-managed clipping category.
-It does not claim that directory enumeration or inspection is bounded. Actual
-`ReadDir` items consumed are counted, while filesystem mutation attempts remain
-limited to 32 per managed category per launch.
+**Decision:** V1 deferred cleanup waits for a five-second startup quiet period,
+then runs only in one detached blocking lifecycle task and may completely
+enumerate each application-managed clipping category. Critical database-driven
+recovery of `creating` and `delete_pending` rows remains synchronous. The
+deferred task does not claim that directory enumeration or inspection is
+bounded. Actual `ReadDir` items consumed are counted, while filesystem mutation
+attempts remain limited to 32 per managed category per launch.
 
 The managed categories are staging, canonical assets, trash, quarantine, and
 derived clipping thumbnails. Traversal streams entries without sorting or
@@ -716,8 +725,9 @@ safe classifications only.
 **Test and release-gate impact:** Phase 1 tests must count actual iterator items,
 prove at most 32 mutation attempts per category, prove repeated passes reach
 removable leftovers, and record 500-entry and 5,000-entry wall time plus
-approximate/peak memory evidence. Production composition must prove no UI or
-startup thread waits for enumeration.
+approximate/peak memory evidence. Production composition must prove the quiet
+period precedes the blocking worker and no UI or startup thread waits for
+enumeration.
 
 **Backward compatibility and rollback:** Managed paths and database rows are
 unchanged. Reverting before release restores the prior cleanup implementation;

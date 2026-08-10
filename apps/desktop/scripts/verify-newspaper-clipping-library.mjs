@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (relative) => readFile(path.join(desktop, relative), "utf8");
-const [app, api, controller, clippings, detail, list, search, roots, commands, models, service, lib] = await Promise.all([
+const [app, api, controller, clippings, detail, list, search, roots, commands, models, service, lib, styles] = await Promise.all([
   read("src/App.tsx"),
   read("src/components/newspaper/newspaper-api.ts"),
   read("src/components/newspaper/clipping-note-save-controller.ts"),
@@ -17,7 +17,8 @@ const [app, api, controller, clippings, detail, list, search, roots, commands, m
   read("src-tauri/src/providers/newspaper/commands.rs"),
   read("src-tauri/src/providers/newspaper/clipping_models.rs"),
   read("src-tauri/src/providers/newspaper/clipping_service.rs"),
-  read("src-tauri/src/lib.rs")
+  read("src-tauri/src/lib.rs"),
+  read("src/index.css")
 ]);
 
 for (const fragment of [
@@ -61,6 +62,11 @@ assert.ok(roots.includes("Created automatically from Newspaper download destinat
 assert.ok(!roots.includes("<Input"), "snapshot root Settings added an arbitrary path input");
 assert.ok(service.includes("write_thumbnail_cache"), "thumbnail generation does not use the bounded cache owner");
 assert.ok(lib.includes("linkvault://prepare-exit") && lib.includes("resolve_cooperative_exit"), "tray quit is not cooperative");
+assert.ok(
+  styles.includes('.clipping-note-editor__content ul[data-type="taskList"] > li > div > p:first-child') &&
+    styles.includes("margin-top: 0"),
+  "task-item text can be pushed below its checkbox by the global editor paragraph margin or a stale DOM selector",
+);
 
 async function sourceFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
