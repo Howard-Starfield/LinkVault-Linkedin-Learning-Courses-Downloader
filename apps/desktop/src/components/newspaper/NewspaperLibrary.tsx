@@ -40,7 +40,7 @@ export function NewspaperLibrary({
         ))
       }
     : undefined;
-  const resolvedClippingCapability = clippingCapability ?? browserHarnessCapability;
+  const resolvedClippingCapability = browserHarnessCapability ?? clippingCapability;
   const scrollRef = useRef<HTMLDivElement>(null);
   const requestGenerationRef = useRef(0);
   const loadingOffsetsRef = useRef<Set<number>>(new Set());
