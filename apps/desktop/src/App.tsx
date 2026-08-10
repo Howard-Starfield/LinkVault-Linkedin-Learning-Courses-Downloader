@@ -353,6 +353,10 @@ export default function App() {
   const [activeView, setActiveView] = useState<AppView>("downloads");
   const [pendingClippingId, setPendingClippingId] = useState<string | null>(null);
   const [clippingsViewKey, setClippingsViewKey] = useState(0);
+  const [clippingGallerySummary, setClippingGallerySummary] = useState<{
+    total: number;
+    loading: boolean;
+  } | null>(null);
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [activeSearchQuery, setActiveSearchQuery] = useState("");
   const [isLinkedInExpanded, setIsLinkedInExpanded] = useState(true);
@@ -1976,6 +1980,11 @@ export default function App() {
             <button aria-label="Clear clipping search" onClick={() => void updateGlobalSearch("")} type="button">
               <X aria-hidden="true" />
             </button>
+          ) : activeView === "newspaper-clippings" && clippingGallerySummary ? (
+            <div className="lv-global-search__context">
+              <strong>Saved evidence</strong>
+              <span>{clippingGallerySummary.loading ? "Loading" : `${clippingGallerySummary.total} clipping${clippingGallerySummary.total === 1 ? "" : "s"}`}</span>
+            </div>
           ) : <span>Clippings</span>}
         </div>
         <div className="lv-content">
@@ -2023,6 +2032,8 @@ export default function App() {
           ) : activeView === "newspaper-clippings" ? (
             <NewspaperClippings
               key={clippingsViewKey}
+              onGallerySummaryChange={setClippingGallerySummary}
+              onOpenLibrary={() => void requestNavigation("newspaper-library")}
               onPendingConsumed={() => setPendingClippingId(null)}
               pendingClippingId={pendingClippingId}
               registerFlush={registerClippingFlush}

@@ -10,10 +10,14 @@ export type ClippingFlush = () => Promise<boolean>;
 
 export function NewspaperClippings({
   pendingClippingId,
+  onGallerySummaryChange,
+  onOpenLibrary,
   onPendingConsumed,
   registerFlush
 }: {
   pendingClippingId: string | null;
+  onGallerySummaryChange: (summary: { total: number; loading: boolean } | null) => void;
+  onOpenLibrary: () => void;
   onPendingConsumed: () => void;
   registerFlush: (flush: ClippingFlush | null) => void;
 }) {
@@ -84,7 +88,13 @@ export function NewspaperClippings({
   }, [selectedId]);
 
   if (!selectedId) {
-    return <NewspaperClippingList onSelect={(id) => void select(id)} />;
+    return (
+      <NewspaperClippingList
+        onOpenLibrary={onOpenLibrary}
+        onSelect={(id) => void select(id)}
+        onSummaryChange={onGallerySummaryChange}
+      />
+    );
   }
 
   return (
