@@ -5,6 +5,8 @@
 //! error code and never writes files or rows.
 
 use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// Maximum Unicode scalar values for a trimmed clipping title (D-014).
 pub const TITLE_MAX_CHARS: usize = 200;
@@ -26,6 +28,10 @@ pub const ASSET_MAX_BYTES: u64 = 536_870_912;
 pub const LIST_LIMIT_MAX: u32 = 100;
 /// Default frontend list page size.
 pub const LIST_LIMIT_DEFAULT: u32 = 50;
+pub const SEARCH_PAGE_LIMIT: u32 = 50;
+pub const POSSIBLE_MATCH_LIMIT: usize = 25;
+pub const FUZZY_CANDIDATE_LIMIT: usize = 100;
+pub const SEARCH_SNIPPET_MAX_CHARS: usize = 240;
 /// Canonical clipping asset MIME type (D-008).
 pub const CLIPPING_ASSET_MIME: &str = "image/webp";
 /// Registered page image MIME types accepted as source snapshots.
@@ -70,6 +76,32 @@ pub struct ClippingRoot {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClippingRootStatus {
+    Unchecked,
+    Connected,
+    Offline,
+    MarkerMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClippingRootSummary {
+    pub root_id: String,
+    pub kind: String,
+    pub display_path: String,
+    pub status: ClippingRootStatus,
+    pub last_checked_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReconnectNewspaperSnapshotRootResult {
+    Cancelled,
+    Connected { root: ClippingRootSummary },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClippingSourceKind {
     Original,
@@ -93,12 +125,148 @@ impl ClippingSourceKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClippingAssetState {
     Creating,
     Ready,
     Missing,
     DeletePending,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClippingSummary {
+    pub id: String,
+    pub title: String,
+    pub excerpt: String,
+    pub edition_code: String,
+    pub edition_name: String,
+    pub publication_date: String,
+    pub page_number: String,
+    pub asset_state: ClippingAssetState,
+    pub asset_error_code: Option<String>,
+    pub asset_version: u32,
+    pub asset_pixel_width: u32,
+    pub asset_pixel_height: u32,
+    pub source_available: bool,
+    pub revision: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperClippingSummary {
+    pub id: String,
+    pub title: String,
+    pub note_excerpt: String,
+    pub edition_code: String,
+    pub edition_name: String,
+    pub publication_date: String,
+    pub page_number: String,
+    pub thumbnail_ready: bool,
+    pub thumbnail_url: Option<String>,
+    pub thumbnail_version: Option<String>,
+    pub source_available: bool,
+    pub asset_state: ClippingAssetState,
+    pub asset_error_code: Option<String>,
+    pub asset_width: u32,
+    pub asset_height: u32,
+    pub revision: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<ClippingSummary> for NewspaperClippingSummary {
+    fn from(value: ClippingSummary) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            note_excerpt: value.excerpt,
+            edition_code: value.edition_code,
+            edition_name: value.edition_name,
+            publication_date: value.publication_date,
+            page_number: value.page_number,
+            thumbnail_ready: false,
+            thumbnail_url: None,
+            thumbnail_version: None,
+            source_available: value.source_available,
+            asset_state: value.asset_state,
+            asset_error_code: value.asset_error_code,
+            asset_width: value.asset_pixel_width,
+            asset_height: value.asset_pixel_height,
+            revision: value.revision,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewspaperClippingMatchField {
+    Title,
+    Note,
+    Edition,
+    Date,
+    Page,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperClippingSearchSnippetPart {
+    pub text: String,
+    pub highlighted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperClippingSearchSnippet {
+    pub field: NewspaperClippingMatchField,
+    pub parts: Vec<NewspaperClippingSearchSnippetPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewspaperClippingSearchResult {
+    pub clipping: NewspaperClippingSummary,
+    pub matched_fields: Vec<NewspaperClippingMatchField>,
+    pub snippets: Vec<NewspaperClippingSearchSnippet>,
+    pub possible_match: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchNewspaperClippingsRequest {
+    pub query: String,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchNewspaperClippingsPage {
+    pub items: Vec<NewspaperClippingSearchResult>,
+    pub total: u32,
+    pub offset: u32,
+    pub limit: u32,
+    pub note_search_applied: bool,
+    pub revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchPossibleNewspaperClippingsRequest {
+    pub query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPossibleNewspaperClippingsResponse {
+    pub items: Vec<NewspaperClippingSearchResult>,
+    pub limit: usize,
+    pub revision: i64,
 }
 
 impl ClippingAssetState {
@@ -364,7 +532,17 @@ pub fn normalize_search_query(raw: &str) -> Result<String, ClippingErrorCode> {
     if trimmed.chars().count() > SEARCH_QUERY_MAX_CHARS {
         return Err(ClippingErrorCode::InvalidTitle);
     }
-    Ok(trimmed.to_string())
+    let normalized = normalize_search_text(trimmed);
+    if normalized.chars().count() > SEARCH_QUERY_MAX_CHARS {
+        return Err(ClippingErrorCode::InvalidTitle);
+    }
+    Ok(normalized)
+}
+
+/// Compatibility-normalize and lowercase text for the derived search index.
+/// Canonical clipping title/note bytes are never rewritten.
+pub fn normalize_search_text(value: &str) -> String {
+    value.nfkc().flat_map(char::to_lowercase).collect()
 }
 
 /// Escape `%`, `_`, and the escape character itself before wrapping a search
@@ -485,6 +663,11 @@ mod tests {
         let normalized = normalize_search_query("  \u{4e2d}\u{6587}  ").unwrap();
         assert_eq!(normalized, "\u{4e2d}\u{6587}");
         assert!(normalize_search_query(&"q".repeat(SEARCH_QUERY_MAX_CHARS + 1)).is_err());
+        assert_eq!(
+            normalize_search_query("  ＬｉｎｋＶａｕｌｔ  ").unwrap(),
+            "linkvault"
+        );
+        assert_eq!(normalize_search_text("CAFÉ"), normalize_search_text("café"));
     }
 
     #[test]
@@ -503,5 +686,48 @@ mod tests {
         );
         let error = ClippingError::new(ClippingErrorCode::AssetMissing);
         assert_eq!(error.as_safe_string(), "CLIPPING_ASSET_MISSING");
+    }
+
+    #[test]
+    fn search_and_reconnect_ipc_models_use_the_approved_public_shape() {
+        let public = NewspaperClippingSummary::from(ClippingSummary {
+            id: VALID_ID.to_owned(),
+            title: "Title".to_owned(),
+            excerpt: "Note excerpt".to_owned(),
+            edition_code: "NY".to_owned(),
+            edition_name: "New York".to_owned(),
+            publication_date: "2026-08-09".to_owned(),
+            page_number: "A01".to_owned(),
+            asset_state: ClippingAssetState::Ready,
+            asset_error_code: None,
+            asset_version: 1,
+            asset_pixel_width: 320,
+            asset_pixel_height: 200,
+            source_available: true,
+            revision: 2,
+            created_at: 100,
+            updated_at: 200,
+        });
+        let json = serde_json::to_value(&public).unwrap();
+        assert_eq!(json["noteExcerpt"], "Note excerpt");
+        assert_eq!(json["assetWidth"], 320);
+        assert_eq!(json["assetHeight"], 200);
+        assert_eq!(json["thumbnailReady"], false);
+        assert!(json.get("excerpt").is_none());
+        assert!(json.get("assetPixelWidth").is_none());
+
+        let reconnected = ReconnectNewspaperSnapshotRootResult::Connected {
+            root: ClippingRootSummary {
+                root_id: "clipping-root-test".to_owned(),
+                kind: "download_snapshot".to_owned(),
+                display_path: r"C:\downloads\Newspaper snapshots".to_owned(),
+                status: ClippingRootStatus::Connected,
+                last_checked_at: Some(200),
+            },
+        };
+        let json = serde_json::to_value(reconnected).unwrap();
+        assert_eq!(json["status"], "connected");
+        assert_eq!(json["root"]["rootId"], "clipping-root-test");
+        assert!(json["root"].get("locator").is_none());
     }
 }

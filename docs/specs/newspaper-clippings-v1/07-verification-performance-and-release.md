@@ -964,9 +964,10 @@ unbounded row/image loading or obvious UI stalls.
 
 Search representative English/Chinese Title, Note, Edition, Date, and Page
 values; verify explainable order, factual cumulative tags, safe snippets,
-literal short-query fallback, exact-only Date/Page, lazy confident pages, and no
-more than 25 visibly separated Possible matches. Open a result with a pending
-draft and return to the same query/anchor without data loss.
+the one/two-character Note exclusion helper, exact-only Date/Page, lazy
+confident pages, and no more than 25 visibly separated Possible matches. Open
+a result with a pending draft and return to the same query/anchor without data
+loss.
 
 #### UAT-012: Snapshot location reconnect
 

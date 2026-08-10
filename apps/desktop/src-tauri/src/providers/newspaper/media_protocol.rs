@@ -176,6 +176,12 @@ fn resolve_clipping(
     let (bytes, mime) = match validated {
         Ok(validated) => validated,
         Err(error) => {
+            // `root_layout` may use the deliberately short verified-root
+            // cache. Recheck after an I/O failure so an offline removable
+            // drive does not permanently turn a healthy clipping `missing`.
+            if service.verify_root_fresh_for_integrity(&record.0).is_err() {
+                return Err(MediaError::NotFound);
+            }
             let safe_code = match error.code {
                 ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
                 _ => "CLIPPING_ASSET_MISSING",
