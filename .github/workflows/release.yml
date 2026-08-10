@@ -41,5 +41,6 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: LinkVault ${{ github.ref_name }}
           generateReleaseNotes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
