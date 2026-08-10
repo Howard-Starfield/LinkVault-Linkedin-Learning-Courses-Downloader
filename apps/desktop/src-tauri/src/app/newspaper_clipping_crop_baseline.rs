@@ -127,9 +127,19 @@ fn measure_case(case: BaselineCase) -> Result<CropBaselineCase, String> {
     let diagnostics = DatabaseDiagnostics::default();
     let writer = DatabaseWriter::start(db_path.clone(), diagnostics.clone())
         .map_err(|error| error.to_string())?;
-    let layout = ClippingAssetLayout::new(temp.path().join("newspaper-clippings"));
-    let service =
-        ClippingService::new(db_path, writer.clone(), layout.clone(), diagnostics.clone());
+    let bootstrap_layout = ClippingAssetLayout::new(temp.path().join("newspaper-clippings"));
+    let service = ClippingService::new(
+        db_path,
+        writer.clone(),
+        bootstrap_layout,
+        diagnostics.clone(),
+    );
+    let download_destination = temp.path().join("download-destination");
+    fs::create_dir(&download_destination).map_err(|error| error.to_string())?;
+    let asset_root = service
+        .register_download_destination(&download_destination, 123)
+        .map_err(safe_error)?;
+    let layout = service.root_layout(&asset_root.id).map_err(safe_error)?;
     let source_root = temp.path().join("crop-baseline-source");
     fs::create_dir(&source_root).map_err(|error| error.to_string())?;
     let source_image =
@@ -162,7 +172,7 @@ fn measure_case(case: BaselineCase) -> Result<CropBaselineCase, String> {
     let crop_width = prepared.crop.width;
     let crop_height = prepared.crop.height;
     let output_bytes = prepared.asset_byte_count;
-    let record = staged_record(&request, &source_record, prepared)?;
+    let record = staged_record(&request, &source_record, prepared, &asset_root.id)?;
     let persistence_started = Instant::now();
     let clipping = service.register_staged(record).map_err(safe_error)?;
     let database_elapsed = persistence_started.elapsed();
@@ -286,6 +296,7 @@ fn staged_record(
     request: &CreateNewspaperClippingRequest,
     source: &CropSourceRecord,
     prepared: PreparedClipping,
+    asset_root_id: &str,
 ) -> Result<NewClippingRecord, String> {
     Ok(NewClippingRecord {
         id: request.operation_id.clone(),
@@ -305,8 +316,14 @@ fn staged_record(
         crop_y: prepared.crop.y,
         crop_width: prepared.crop.width,
         crop_height: prepared.crop.height,
-        asset_relative_path: ClippingAssetLayout::canonical_relative_path(&request.operation_id)
-            .map_err(safe_error)?,
+        asset_root_id: asset_root_id.to_string(),
+        asset_relative_path: ClippingAssetLayout::snapshot_relative_path(
+            &source.edition_name,
+            &source.edition_code,
+            &source.publication_date,
+            &request.operation_id,
+        )
+        .map_err(safe_error)?,
         asset_byte_count: prepared.asset_byte_count,
         asset_checksum_sha256: prepared.asset_checksum_sha256,
         title: prepared.title,
