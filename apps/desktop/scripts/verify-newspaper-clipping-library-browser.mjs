@@ -225,7 +225,13 @@ try {
   await page.getByLabel("Clipping note editor body").waitFor();
   const topBack = page.locator(".lv-global-search").getByRole("button", { name: "Back", exact: true });
   await topBack.waitFor();
-  assert.equal(await page.locator(".clipping-note-page__header").getByRole("button").count(), 0, "detail header still owns a duplicate Back control");
+  assert.equal(await page.locator(".clipping-note-page__header").count(), 0, "detail still renders a redundant internal header");
+  assert.equal(await page.getByLabel("Search saved newspaper clippings").count(), 0, "gallery search input remained mounted on the note detail page");
+  assert.equal(await page.locator(".clipping-note-editor__utility-bar").count(), 0, "history controls still interrupt the title-to-editor flow");
+  assert.equal(await page.locator(".clipping-note-editor__footer .clipping-save-status").count(), 1, "save state is not inside the note footer");
+  assert.equal(await page.locator(".clipping-note-editor__footer").getByRole("toolbar", { name: "Editing history", exact: true }).count(), 1, "Undo and Redo are not inside the note footer");
+  assert.equal(await page.locator(".lv-global-search__title-slot .clipping-detail__title input").count(), 1, "editable note title is not beside Back in the top bar");
+  assert.equal(await page.locator(".clipping-detail__writing > .clipping-detail__title").count(), 0, "note title is still duplicated above the editor body");
   if (process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT) {
     await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT });
   }
@@ -238,7 +244,8 @@ try {
 
   const title = page.locator(".clipping-detail__title input");
   await title.fill("Transit evidence note");
-  await page.getByLabel("Clipping note editor body").click();
+  await title.press("Enter");
+  assert.equal(await page.getByLabel("Clipping note editor body").evaluate((element) => element === document.activeElement), true, "Enter in the top-bar title did not focus the note body");
   await page.keyboard.type(" with searchable keyword");
   await page.waitForTimeout(950);
   const initialSaveCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.updateCalls);
@@ -246,6 +253,8 @@ try {
   assert.equal(initialSaveCalls.at(-1).noteMarkdown.includes("searchable keyword"), true);
   await page.getByText("Saved", { exact: true }).waitFor();
 
+  await topBack.click();
+  await page.locator(".clipping-gallery").waitFor();
   const globalSearch = page.getByLabel("Search saved newspaper clippings");
   await globalSearch.fill("transit");
   await page.locator(".clipping-search-results").waitFor();

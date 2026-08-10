@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
 import { AlertTriangle, Check, Clipboard, LoaderCircle, RotateCcw } from "lucide-react";
 import { Button, Input } from "../primitives";
 import {
@@ -112,39 +113,57 @@ export function NewspaperClippingDetail({
               : view.status === "conflict"
                 ? "Changed in another window"
                 : "Saved";
+  const titleSlot = typeof document !== "undefined"
+    ? document.getElementById("clipping-detail-title-slot")
+    : null;
 
   return (
-    <article className="clipping-detail" aria-label="Clipping note detail">
-      <NewspaperClippingSourceCard detail={detail} />
-      <div className="clipping-detail__document">
-        <label className="clipping-detail__title">
-          <span>Title</span>
-          <Input
-            aria-invalid={view.errorCode === "CLIPPING_INVALID_TITLE" || undefined}
-            onBlur={() => void controller.flush()}
-            onChange={(event) => controller.setTitle(event.target.value)}
-            value={view.draftTitle}
-          />
-        </label>
-        <div className="clipping-save-status" data-status={view.status} role="status">
-          {view.status === "saving" ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Check aria-hidden="true" />}
-          <span>{statusCopy}</span>
-          {view.status === "failed" && !view.errorCode?.startsWith("CLIPPING_INVALID") && view.errorCode !== "CLIPPING_NOTE_TOO_LARGE" ? (
-            <Button size="xs" variant="outline" onClick={() => void controller.retry()}>
-              <RotateCcw aria-hidden="true" /> Retry
-            </Button>
-          ) : null}
-        </div>
-        <Suspense fallback={<div className="clipping-editor-loading"><LoaderCircle aria-hidden="true" className="animate-spin" /> Loading note editor…</div>}>
+    <>
+      {titleSlot
+        ? createPortal(
+          <label className="clipping-detail__title">
+            <span className="sr-only">Title</span>
+            <Input
+              aria-label="Clipping note title"
+              aria-invalid={view.errorCode === "CLIPPING_INVALID_TITLE" || undefined}
+              onBlur={() => void controller.flush()}
+              onChange={(event) => controller.setTitle(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                document.querySelector<HTMLElement>('.clipping-note-editor__content')?.focus();
+              }}
+              placeholder="Untitled clipping"
+              value={view.draftTitle}
+            />
+          </label>,
+          titleSlot
+        )
+        : null}
+      <article className="clipping-detail" aria-label="Clipping note detail">
+        <NewspaperClippingSourceCard detail={detail} />
+        <div className="clipping-detail__writing">
+          <Suspense fallback={<div className="clipping-editor-loading"><LoaderCircle aria-hidden="true" className="animate-spin" /> Loading note editor…</div>}>
           <LazyClippingNoteEditor
             key={`${detail.id}-${editorIdentity}`}
             autoFocus
             documentId={`${detail.id}-${editorIdentity}`}
+            footerContent={(
+              <div className="clipping-save-status" data-status={view.status} role="status">
+                {view.status === "saving" ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Check aria-hidden="true" />}
+                <span>{statusCopy}</span>
+                {view.status === "failed" && !view.errorCode?.startsWith("CLIPPING_INVALID") && view.errorCode !== "CLIPPING_NOTE_TOO_LARGE" ? (
+                  <Button size="xs" variant="outline" onClick={() => void controller.retry()}>
+                    <RotateCcw aria-hidden="true" /> Retry
+                  </Button>
+                ) : null}
+              </div>
+            )}
             initialMarkdown={view.draftMarkdown}
             onBlur={() => void controller.flush()}
             onMarkdownChange={(markdown) => controller.setMarkdown(markdown)}
           />
-        </Suspense>
+          </Suspense>
         {view.status === "conflict" ? (
           <section className="clipping-conflict" role="alert">
             <div><AlertTriangle aria-hidden="true" /><strong>This note changed in another window.</strong></div>
@@ -182,7 +201,8 @@ export function NewspaperClippingDetail({
             {copyFallback ? <textarea aria-label="Copy clipping draft manually" readOnly value={view.draftMarkdown} /> : null}
           </section>
         ) : null}
-      </div>
-    </article>
+        </div>
+      </article>
+    </>
   );
 }
