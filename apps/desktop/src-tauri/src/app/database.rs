@@ -20,7 +20,7 @@ use thiserror::Error;
 // Bump this whenever any provider-owned schema changes. Provider migrations run
 // only while advancing this global version, so leaving it unchanged would make
 // existing installations skip new columns that fresh databases already have.
-pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+pub const CURRENT_SCHEMA_VERSION: i32 = 5;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -1547,6 +1547,19 @@ mod tests {
         connection
     }
 
+    fn drop_clipping_search_derived_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS newspaper_clippings_fts_ai;
+                 DROP TRIGGER IF EXISTS newspaper_clippings_fts_ad;
+                 DROP TRIGGER IF EXISTS newspaper_clippings_fts_au;
+                 DROP TABLE IF EXISTS newspaper_clippings_fts;
+                 DROP TABLE IF EXISTS newspaper_clippings_normalized_fts;
+                 DROP TABLE IF EXISTS newspaper_clipping_search_metadata;",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn persistence_gate_new_database_initializes_without_backup() {
         let directory = tempdir().unwrap();
@@ -3002,6 +3015,7 @@ mod tests {
             legacy.pragma_update(None, "foreign_keys", true).unwrap();
             initialize(&legacy).unwrap();
             insert_representative_provider_rows(&legacy);
+            drop_clipping_search_derived_fixture(&legacy);
             legacy
                 .execute_batch(
                     "DROP TABLE newspaper_clippings;
@@ -3179,6 +3193,7 @@ mod tests {
                 None,
             );
             legacy.pragma_update(None, "foreign_keys", false).unwrap();
+            drop_clipping_search_derived_fixture(&legacy);
             legacy
                 .execute_batch(
                     "CREATE TABLE newspaper_clippings_v3_fixture AS
@@ -3204,7 +3219,7 @@ mod tests {
 
         let (connection, initialization) = initialize_database(&db_path).unwrap();
         assert_eq!(initialization.from_version, 3);
-        assert_eq!(initialization.to_version, 4);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
         assert!(initialization.backup_path.unwrap().is_file());
         let migrated: (String, String, String) = connection
             .query_row(
@@ -3226,6 +3241,153 @@ mod tests {
             })
             .unwrap();
         assert_eq!(foreign_key_check, 0);
+    }
+
+    #[test]
+    fn persistence_gate_v4_clippings_receive_verified_fts_migration_backup() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            insert_test_clipping(
+                &legacy,
+                "44444444-4444-4444-8444-444444444444",
+                "ready",
+                None,
+            );
+            drop_clipping_search_derived_fixture(&legacy);
+            legacy.execute_batch("PRAGMA user_version = 4;").unwrap();
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 4);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let backup_path = initialization
+            .backup_path
+            .expect("populated v4 database must receive a verified backup");
+        let backup = Connection::open(backup_path).unwrap();
+        assert_eq!(schema_version(&backup).unwrap(), 4);
+        for table in [
+            "newspaper_clippings_fts",
+            "newspaper_clippings_normalized_fts",
+            "newspaper_clipping_search_metadata",
+        ] {
+            let exists: bool = backup
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = ?1
+                    )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "v4 backup unexpectedly contains {table}");
+        }
+        let backup_note: String = backup
+            .query_row(
+                "SELECT note_markdown FROM newspaper_clippings
+                 WHERE id = '44444444-4444-4444-8444-444444444444'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backup_note, "note body");
+
+        let migrated_match_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_fts
+                 WHERE newspaper_clippings_fts MATCH 'note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_match_count, 1);
+        let normalized_match_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_normalized_fts
+                 WHERE newspaper_clippings_normalized_fts MATCH 'note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized_match_count, 1);
+        assert_eq!(schema_version(&connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        let foreign_key_check: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn persistence_gate_failed_v5_fts_install_keeps_v4_and_retries() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            insert_test_clipping(
+                &legacy,
+                "55555555-5555-4555-8555-555555555555",
+                "ready",
+                None,
+            );
+            drop_clipping_search_derived_fixture(&legacy);
+            legacy
+                .execute_batch(
+                    "CREATE VIEW newspaper_clippings_fts AS
+                         SELECT id AS unexpected FROM newspaper_clippings;
+                     PRAGMA user_version = 4;",
+                )
+                .unwrap();
+        }
+
+        assert!(initialize_database(&db_path).is_err());
+        let failed = Connection::open(&db_path).unwrap();
+        assert_eq!(schema_version(&failed).unwrap(), 4);
+        assert_eq!(
+            failed
+                .query_row("SELECT note_markdown FROM newspaper_clippings", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "note body"
+        );
+        failed
+            .execute("DROP VIEW newspaper_clippings_fts", [])
+            .unwrap();
+        drop(failed);
+
+        let (repaired, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 4);
+        assert_eq!(schema_version(&repaired).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            repaired
+                .query_row(
+                    "SELECT COUNT(*) FROM newspaper_clippings_fts
+                     WHERE newspaper_clippings_fts MATCH 'note'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let backups = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert!(
+            backups >= 2,
+            "failed and retried migrations retain verified backups"
+        );
     }
 
     #[test]

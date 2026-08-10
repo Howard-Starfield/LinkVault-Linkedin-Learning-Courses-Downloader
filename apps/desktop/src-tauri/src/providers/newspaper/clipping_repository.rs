@@ -10,8 +10,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
 use super::clipping_models::{
-    escape_like_pattern, ClippingAssetState, ClippingRoot, ClippingRootKind, ClippingSourceKind,
-    NewspaperClipping, NewspaperClippingListQuery, NewspaperClippingSort,
+    escape_like_pattern, normalize_search_text, ClippingAssetState, ClippingRoot, ClippingRootKind,
+    ClippingSourceKind, ClippingSummary, NewspaperClipping, NewspaperClippingListQuery,
+    NewspaperClippingSort,
 };
 
 /// Registration payload for the `creating` row (CREATE-STATE-002). The
@@ -50,6 +51,13 @@ pub struct NewClippingRoot {
     pub locator: String,
     pub locator_key: String,
     pub now: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconnectRootOutcome {
+    Updated(ClippingRoot),
+    NotFoundOrChanged,
+    LocatorOwnedByOther,
 }
 
 fn map_root_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClippingRoot> {
@@ -118,6 +126,43 @@ pub fn load_all_roots(connection: &Connection) -> Result<Vec<ClippingRoot>> {
         .collect()
 }
 
+/// Replace a disconnected download root's backend locator without exposing
+/// paths to the frontend. The writer thread serializes the duplicate check and
+/// conditional update with every other application-owned database mutation.
+pub fn reconnect_download_root(
+    connection: &Connection,
+    root_id: &str,
+    expected_locator_key: &str,
+    locator: &str,
+    locator_key: &str,
+    now: i64,
+) -> Result<ReconnectRootOutcome> {
+    let owner = connection
+        .query_row(
+            "SELECT id FROM newspaper_clipping_roots
+             WHERE locator_key = ?1 COLLATE NOCASE AND id <> ?2",
+            params![locator_key, root_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if owner.is_some() {
+        return Ok(ReconnectRootOutcome::LocatorOwnedByOther);
+    }
+
+    let changed = connection.execute(
+        "UPDATE newspaper_clipping_roots
+         SET locator = ?1, locator_key = ?2, updated_at = ?3
+         WHERE id = ?4 AND kind = 'download_snapshot'
+           AND locator_key = ?5 COLLATE NOCASE",
+        params![locator, locator_key, now, root_id, expected_locator_key],
+    )?;
+    if changed == 0 {
+        return Ok(ReconnectRootOutcome::NotFoundOrChanged);
+    }
+    let root = load_root_by_id(connection, root_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(ReconnectRootOutcome::Updated(root))
+}
+
 pub fn load_batch_destination_for_job(
     connection: &Connection,
     source_job_id: &str,
@@ -144,40 +189,99 @@ const CLIPPING_COLUMNS: &str = "id, source_job_id, source_page_id,
     asset_error_code, title, note_markdown, revision, created_at, updated_at";
 
 pub fn insert_creating(connection: &Connection, record: &NewClippingRecord) -> Result<()> {
-    connection.execute(
-        &format!(
-            "INSERT INTO newspaper_clippings ({CLIPPING_COLUMNS})
+    connection.execute_batch("SAVEPOINT clipping_insert_search_document")?;
+    let result = (|| {
+        connection.execute(
+            &format!(
+                "INSERT INTO newspaper_clippings ({CLIPPING_COLUMNS})
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, 'image/webp', ?16, ?17, ?20, ?21,
                      1, 'creating', NULL, ?22, '', 1, ?23, ?23)"
-        ),
+            ),
+            params![
+                record.id,
+                record.source_job_id,
+                record.source_page_id,
+                record.source_media_version_snapshot,
+                record.source_kind_snapshot.as_sql(),
+                record.source_mime_type_snapshot,
+                record.source_checksum_snapshot,
+                record.edition_code_snapshot,
+                record.edition_name_snapshot,
+                record.publication_date_snapshot,
+                record.page_number_snapshot,
+                record.source_pixel_width,
+                record.source_pixel_height,
+                record.crop_x,
+                record.crop_y,
+                record.crop_width,
+                record.crop_height,
+                record.asset_root_id,
+                record.asset_relative_path,
+                record.asset_byte_count,
+                record.asset_checksum_sha256,
+                record.title,
+                record.now,
+            ],
+        )?;
+        let rowid = connection.last_insert_rowid();
+        insert_normalized_search_document(
+            connection,
+            rowid,
+            &record.title,
+            "",
+            &record.edition_name_snapshot,
+            &record.edition_code_snapshot,
+        )
+    })();
+    finish_savepoint(connection, "clipping_insert_search_document", result)
+}
+
+fn insert_normalized_search_document(
+    connection: &Connection,
+    rowid: i64,
+    title: &str,
+    note_markdown: &str,
+    edition_name: &str,
+    edition_code: &str,
+) -> Result<()> {
+    let normalized_title = normalize_search_text(title);
+    let normalized_note = normalize_search_text(note_markdown);
+    let normalized_edition_name = normalize_search_text(edition_name);
+    let normalized_edition_code = normalize_search_text(edition_code);
+    connection.execute(
+        "INSERT INTO newspaper_clippings_normalized_fts(
+            rowid, title, note_markdown, edition_name_snapshot, edition_code_snapshot
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            record.id,
-            record.source_job_id,
-            record.source_page_id,
-            record.source_media_version_snapshot,
-            record.source_kind_snapshot.as_sql(),
-            record.source_mime_type_snapshot,
-            record.source_checksum_snapshot,
-            record.edition_code_snapshot,
-            record.edition_name_snapshot,
-            record.publication_date_snapshot,
-            record.page_number_snapshot,
-            record.source_pixel_width,
-            record.source_pixel_height,
-            record.crop_x,
-            record.crop_y,
-            record.crop_width,
-            record.crop_height,
-            record.asset_root_id,
-            record.asset_relative_path,
-            record.asset_byte_count,
-            record.asset_checksum_sha256,
-            record.title,
-            record.now,
+            rowid,
+            &normalized_title,
+            &normalized_note,
+            &normalized_edition_name,
+            &normalized_edition_code,
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO newspaper_clipping_search_metadata(
+            rowid, title, edition_name_snapshot, edition_code_snapshot
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            rowid,
+            normalized_title,
+            normalized_edition_name,
+            normalized_edition_code,
         ],
     )?;
     Ok(())
+}
+
+fn finish_savepoint<T>(connection: &Connection, name: &str, result: Result<T>) -> Result<T> {
+    if result.is_ok() {
+        connection.execute_batch(&format!("RELEASE {name}"))?;
+        return result;
+    }
+    let _ = connection.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+    result
 }
 
 pub fn row_state(connection: &Connection, id: &str) -> Result<Option<ClippingAssetState>> {
@@ -328,7 +432,8 @@ pub fn update_note(
 ) -> Result<NoteUpdateOutcome> {
     let current = connection
         .query_row(
-            "SELECT asset_state, revision, title, note_markdown
+            "SELECT asset_state, revision, title, note_markdown, rowid,
+                    edition_name_snapshot, edition_code_snapshot
              FROM newspaper_clippings WHERE id = ?1",
             params![id],
             |row| {
@@ -337,11 +442,16 @@ pub fn update_note(
                     row.get::<_, u64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((state, revision, stored_title, stored_note)) = current else {
+    let Some((state, revision, stored_title, stored_note, rowid, edition_name, edition_code)) =
+        current
+    else {
         return Ok(NoteUpdateOutcome::NotFound);
     };
     let Some(state) = ClippingAssetState::from_sql(&state) else {
@@ -359,16 +469,42 @@ pub fn update_note(
         let clipping = load_by_id(connection, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         return Ok(NoteUpdateOutcome::Unchanged { clipping });
     }
-    let changed = connection.execute(
-        "UPDATE newspaper_clippings
-         SET title = ?2,
-             note_markdown = ?3,
-             revision = revision + 1,
-             updated_at = ?4
-         WHERE id = ?1
-           AND revision = ?5
-           AND asset_state IN ('ready', 'missing')",
-        params![id, title, note_markdown, now, expected_revision],
+    connection.execute_batch("SAVEPOINT clipping_update_search_document")?;
+    let changed = finish_savepoint(
+        connection,
+        "clipping_update_search_document",
+        (|| {
+            let changed = connection.execute(
+                "UPDATE newspaper_clippings
+                 SET title = ?2,
+                     note_markdown = ?3,
+                     revision = revision + 1,
+                     updated_at = ?4
+                 WHERE id = ?1
+                   AND revision = ?5
+                   AND asset_state IN ('ready', 'missing')",
+                params![id, title, note_markdown, now, expected_revision],
+            )?;
+            if changed == 1 {
+                connection.execute(
+                    "DELETE FROM newspaper_clippings_normalized_fts WHERE rowid = ?1",
+                    params![rowid],
+                )?;
+                connection.execute(
+                    "DELETE FROM newspaper_clipping_search_metadata WHERE rowid = ?1",
+                    params![rowid],
+                )?;
+                insert_normalized_search_document(
+                    connection,
+                    rowid,
+                    title,
+                    note_markdown,
+                    &edition_name,
+                    &edition_code,
+                )?;
+            }
+            Ok(changed)
+        })(),
     )?;
     if changed == 1 {
         let clipping = load_by_id(connection, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
@@ -442,31 +578,40 @@ pub fn mark_delete_pending(
 }
 
 pub fn delete_if_pending(connection: &Connection, id: &str) -> Result<bool> {
-    let changed = connection.execute(
-        "DELETE FROM newspaper_clippings WHERE id = ?1 AND asset_state = 'delete_pending'",
-        params![id],
-    )?;
-    Ok(changed == 1)
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ClippingSummary {
-    pub id: String,
-    pub title: String,
-    pub excerpt: String,
-    pub edition_code: String,
-    pub edition_name: String,
-    pub publication_date: String,
-    pub page_number: String,
-    pub asset_state: ClippingAssetState,
-    pub asset_error_code: Option<String>,
-    pub asset_version: u32,
-    pub asset_pixel_width: u32,
-    pub asset_pixel_height: u32,
-    pub source_available: bool,
-    pub revision: u64,
-    pub created_at: i64,
-    pub updated_at: i64,
+    connection.execute_batch("SAVEPOINT clipping_delete_search_document")?;
+    finish_savepoint(
+        connection,
+        "clipping_delete_search_document",
+        (|| {
+            let rowid = connection
+                .query_row(
+                    "SELECT rowid FROM newspaper_clippings
+                     WHERE id = ?1 AND asset_state = 'delete_pending'",
+                    params![id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(rowid) = rowid else {
+                return Ok(false);
+            };
+            let changed = connection.execute(
+                "DELETE FROM newspaper_clippings
+                 WHERE id = ?1 AND asset_state = 'delete_pending'",
+                params![id],
+            )?;
+            if changed == 1 {
+                connection.execute(
+                    "DELETE FROM newspaper_clippings_normalized_fts WHERE rowid = ?1",
+                    params![rowid],
+                )?;
+                connection.execute(
+                    "DELETE FROM newspaper_clipping_search_metadata WHERE rowid = ?1",
+                    params![rowid],
+                )?;
+            }
+            Ok(changed == 1)
+        })(),
+    )
 }
 
 /// Plain-text excerpt for list rows (FR-READ-001/002). Derived from at most
@@ -748,6 +893,586 @@ pub fn list_clippings(
         });
     }
     Ok((summaries, total))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConfidentSearchHit {
+    pub clipping: ClippingSummary,
+    pub title_match: bool,
+    pub note_match: bool,
+    pub edition_match: bool,
+    pub date_match: bool,
+    pub page_match: bool,
+}
+
+fn fts_literal_query(term: &str, column: Option<&str>) -> String {
+    let literal = term.replace('"', "\"\"");
+    match column {
+        Some(column) => format!("{column} : \"{literal}\""),
+        None => format!("\"{literal}\""),
+    }
+}
+
+/// Opaque, deterministic search-page token. `MAX(updated_at)` alone misses
+/// multiple commits in the same second, so mix aggregate row revisions and
+/// visible lifecycle state into a JavaScript-safe 53-bit value.
+fn clipping_search_revision(connection: &Connection) -> Result<i64> {
+    let values: (i64, i64, i64, i64, i64, i64) = connection.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(revision), 0),
+                COALESCE(SUM(updated_at), 0),
+                COALESCE(SUM(asset_version), 0),
+                COALESCE(SUM(CASE asset_state
+                    WHEN 'creating' THEN 1
+                    WHEN 'ready' THEN 3
+                    WHEN 'missing' THEN 5
+                    WHEN 'delete_pending' THEN 7
+                    ELSE 11 END), 0),
+                COALESCE(SUM(
+                    CASE WHEN source_job_id IS NOT NULL THEN 1 ELSE 0 END
+                    + CASE WHEN source_page_id IS NOT NULL THEN 2 ELSE 0 END
+                ), 0)
+         FROM newspaper_clippings",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for value in [values.0, values.1, values.2, values.3, values.4, values.5] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok((hash & ((1u64 << 53) - 1)) as i64)
+}
+
+/// Dedicated relevance query. It never overloads the ordinary list path and
+/// never selects a complete note; list excerpts are capped at 4,096 bytes.
+pub(crate) fn search_confident_clippings(
+    connection: &Connection,
+    normalized_query: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<ConfidentSearchHit>, u32, i64)> {
+    let chars = normalized_query.chars().count();
+    let note_search_applied = chars >= 3;
+    let pattern = format!("%{}%", escape_like_pattern(normalized_query));
+    let prefix = format!("{}%", escape_like_pattern(normalized_query));
+    let revision = clipping_search_revision(connection)?;
+
+    let common_columns = "c.id, c.title,
+        COALESCE(substr(CAST(c.note_markdown AS BLOB), 1, 4096), X''),
+        c.edition_code_snapshot, c.edition_name_snapshot,
+        c.publication_date_snapshot, c.page_number_snapshot, c.asset_state,
+        c.asset_error_code, c.asset_version, c.asset_pixel_width, c.asset_pixel_height,
+        EXISTS(
+            SELECT 1 FROM newspaper_pages p
+            JOIN newspaper_jobs j ON j.id = p.job_id
+            WHERE p.id = c.source_page_id AND j.id = c.source_job_id
+              AND p.status = 'completed'
+        ),
+        c.revision, c.created_at, c.updated_at,
+        m.title LIKE ?5 ESCAPE '\\',
+        (m.edition_name_snapshot LIKE ?5 ESCAPE '\\'
+            OR m.edition_code_snapshot LIKE ?5 ESCAPE '\\'),
+        EXISTS(SELECT 1 FROM note_hits n WHERE n.rowid = c.rowid),
+        c.publication_date_snapshot LIKE ?5 ESCAPE '\\',
+        c.page_number_snapshot LIKE ?5 ESCAPE '\\'";
+    let long_cte = "WITH text_hits AS (
+            SELECT rowid,
+                   bm25(newspaper_clippings_normalized_fts, 8.0, 4.0, 2.0, 2.0) AS score
+            FROM newspaper_clippings_normalized_fts
+            WHERE newspaper_clippings_normalized_fts MATCH ?1
+        ),
+        note_hits AS (
+            SELECT rowid FROM newspaper_clippings_normalized_fts
+            WHERE newspaper_clippings_normalized_fts MATCH ?2
+        )";
+    let candidate_where = "c.asset_state IN ('ready', 'missing') AND (
+            h.rowid IS NOT NULL
+            OR m.title LIKE ?5 ESCAPE '\\'
+            OR m.edition_name_snapshot LIKE ?5 ESCAPE '\\'
+            OR m.edition_code_snapshot LIKE ?5 ESCAPE '\\'
+            OR c.publication_date_snapshot LIKE ?5 ESCAPE '\\'
+            OR c.page_number_snapshot LIKE ?5 ESCAPE '\\'
+        )";
+
+    #[allow(clippy::type_complexity)]
+    let raw_rows: Vec<(
+        String,
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u32,
+        u32,
+        u32,
+        bool,
+        u64,
+        i64,
+        i64,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    )>;
+    let total: u32;
+    if note_search_applied {
+        let all_fts = fts_literal_query(normalized_query, None);
+        let note_fts = fts_literal_query(normalized_query, Some("note_markdown"));
+        total = connection.query_row(
+            &format!(
+                "{long_cte}
+                 SELECT COUNT(*) FROM newspaper_clippings c
+                 JOIN newspaper_clipping_search_metadata m ON m.rowid = c.rowid
+                 LEFT JOIN text_hits h ON h.rowid = c.rowid
+                 WHERE {candidate_where}"
+            ),
+            params![all_fts, note_fts, normalized_query, prefix, pattern],
+            |row| row.get(0),
+        )?;
+        let sql = format!(
+            "{long_cte}
+             SELECT {common_columns}
+             FROM newspaper_clippings c
+             JOIN newspaper_clipping_search_metadata m ON m.rowid = c.rowid
+             LEFT JOIN text_hits h ON h.rowid = c.rowid
+             WHERE {candidate_where}
+             ORDER BY (m.title = ?3) DESC,
+                      (m.title LIKE ?4 ESCAPE '\\') DESC,
+                      (h.rowid IS NOT NULL
+                        OR m.title LIKE ?5 ESCAPE '\\'
+                        OR m.edition_name_snapshot LIKE ?5 ESCAPE '\\'
+                        OR m.edition_code_snapshot LIKE ?5 ESCAPE '\\') DESC,
+                      COALESCE(h.score, 1.0e30) ASC,
+                      ((c.publication_date_snapshot LIKE ?5 ESCAPE '\\')
+                        + (c.page_number_snapshot LIKE ?5 ESCAPE '\\')) DESC,
+                      c.updated_at DESC, c.id ASC
+             LIMIT ?6 OFFSET ?7"
+        );
+        raw_rows = connection
+            .prepare(&sql)?
+            .query_map(
+                params![
+                    all_fts,
+                    note_fts,
+                    normalized_query,
+                    prefix,
+                    pattern,
+                    limit,
+                    offset
+                ],
+                map_confident_search_row,
+            )?
+            .collect::<Result<Vec<_>>>()?;
+    } else {
+        let short_where = "c.asset_state IN ('ready', 'missing') AND (
+                m.title LIKE ?3 ESCAPE '\\'
+                OR m.edition_name_snapshot LIKE ?3 ESCAPE '\\'
+                OR m.edition_code_snapshot LIKE ?3 ESCAPE '\\'
+                OR c.publication_date_snapshot LIKE ?3 ESCAPE '\\'
+                OR c.page_number_snapshot LIKE ?3 ESCAPE '\\'
+            )";
+        total = connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM newspaper_clippings c
+                 JOIN newspaper_clipping_search_metadata m ON m.rowid = c.rowid
+                 WHERE {short_where}"
+            ),
+            params![normalized_query, prefix, pattern],
+            |row| row.get(0),
+        )?;
+        let short_columns = common_columns.replace("?5", "?3").replace(
+            "EXISTS(SELECT 1 FROM note_hits n WHERE n.rowid = c.rowid)",
+            "0",
+        );
+        let sql = format!(
+            "SELECT {short_columns}
+             FROM newspaper_clippings c
+             JOIN newspaper_clipping_search_metadata m ON m.rowid = c.rowid
+             WHERE {short_where}
+             ORDER BY (m.title = ?1) DESC,
+                      (m.title LIKE ?2 ESCAPE '\\') DESC,
+                      (m.title LIKE ?3 ESCAPE '\\'
+                        OR m.edition_name_snapshot LIKE ?3 ESCAPE '\\'
+                        OR m.edition_code_snapshot LIKE ?3 ESCAPE '\\') DESC,
+                      ((c.publication_date_snapshot LIKE ?3 ESCAPE '\\')
+                        + (c.page_number_snapshot LIKE ?3 ESCAPE '\\')) DESC,
+                      c.updated_at DESC, c.id ASC
+             LIMIT ?4 OFFSET ?5"
+        );
+        raw_rows = connection
+            .prepare(&sql)?
+            .query_map(
+                params![normalized_query, prefix, pattern, limit, offset],
+                map_confident_search_row,
+            )?
+            .collect::<Result<Vec<_>>>()?;
+    }
+
+    let hits = raw_rows
+        .into_iter()
+        .map(confident_hit_from_raw)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((hits, total, revision))
+}
+
+#[allow(clippy::type_complexity)]
+fn map_confident_search_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(
+    String,
+    String,
+    Vec<u8>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    u32,
+    u32,
+    u32,
+    bool,
+    u64,
+    i64,
+    i64,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
+    ))
+}
+
+#[allow(clippy::type_complexity)]
+fn confident_hit_from_raw(
+    raw: (
+        String,
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u32,
+        u32,
+        u32,
+        bool,
+        u64,
+        i64,
+        i64,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    ),
+) -> Result<ConfidentSearchHit> {
+    let (
+        id,
+        title,
+        note_markdown,
+        edition_code,
+        edition_name,
+        publication_date,
+        page_number,
+        state,
+        asset_error_code,
+        asset_version,
+        asset_pixel_width,
+        asset_pixel_height,
+        source_available,
+        revision,
+        created_at,
+        updated_at,
+        title_match,
+        edition_match,
+        note_match,
+        date_match,
+        page_match,
+    ) = raw;
+    let Some(asset_state) = ClippingAssetState::from_sql(&state) else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    Ok(ConfidentSearchHit {
+        clipping: ClippingSummary {
+            id,
+            title,
+            excerpt: excerpt_from_bounded_markdown_bytes(&note_markdown),
+            edition_code,
+            edition_name,
+            publication_date,
+            page_number,
+            asset_state,
+            asset_error_code,
+            asset_version,
+            asset_pixel_width,
+            asset_pixel_height,
+            source_available,
+            revision,
+            created_at,
+            updated_at,
+        },
+        title_match,
+        note_match,
+        edition_match,
+        date_match,
+        page_match,
+    })
+}
+
+pub(crate) fn load_note_search_snippet(
+    connection: &Connection,
+    clipping_id: &str,
+    normalized_query: &str,
+) -> Result<Option<String>> {
+    let query = fts_literal_query(normalized_query, Some("note_markdown"));
+    connection
+        .query_row(
+            "SELECT snippet(newspaper_clippings_fts, 1, char(30), char(31), ' … ', 32)
+             FROM newspaper_clippings_fts
+             WHERE newspaper_clippings_fts MATCH ?1
+               AND rowid = (SELECT rowid FROM newspaper_clippings WHERE id = ?2)",
+            params![query, clipping_id],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+fn fts_fuzzy_query(term: &str, column: Option<&str>) -> Option<String> {
+    let characters: Vec<char> = term.chars().collect();
+    if characters.len() < 3 {
+        return None;
+    }
+    let mut trigrams = std::collections::BTreeSet::new();
+    for window in characters.windows(3) {
+        let term: String = window.iter().collect();
+        let literal = format!("\"{}\"", term.replace('"', "\"\""));
+        trigrams.insert(match column {
+            Some(column) => format!("{column} : {literal}"),
+            None => literal,
+        });
+    }
+    Some(trigrams.into_iter().collect::<Vec<_>>().join(" OR "))
+}
+
+pub(crate) fn confident_search_ids(
+    connection: &Connection,
+    normalized_query: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let pattern = format!("%{}%", escape_like_pattern(normalized_query));
+    let all_fts = fts_literal_query(normalized_query, None);
+    connection
+        .prepare(
+            "WITH text_hits AS (
+                SELECT rowid FROM newspaper_clippings_normalized_fts
+                WHERE newspaper_clippings_normalized_fts MATCH ?1
+             )
+             SELECT c.id FROM newspaper_clippings c
+             JOIN newspaper_clipping_search_metadata m ON m.rowid = c.rowid
+             LEFT JOIN text_hits h ON h.rowid = c.rowid
+             WHERE c.asset_state IN ('ready', 'missing') AND (
+                h.rowid IS NOT NULL
+                OR m.title LIKE ?2 ESCAPE '\\'
+                OR m.edition_name_snapshot LIKE ?2 ESCAPE '\\'
+                OR m.edition_code_snapshot LIKE ?2 ESCAPE '\\'
+                OR c.publication_date_snapshot LIKE ?2 ESCAPE '\\'
+                OR c.page_number_snapshot LIKE ?2 ESCAPE '\\'
+             )",
+        )?
+        .query_map(params![all_fts, pattern], |row| row.get(0))?
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FuzzySearchCandidate {
+    pub clipping: ClippingSummary,
+    pub note_window: String,
+}
+
+pub(crate) fn fuzzy_search_candidates(
+    connection: &Connection,
+    normalized_query: &str,
+    limit: usize,
+) -> Result<(Vec<FuzzySearchCandidate>, i64)> {
+    let Some(query) = fts_fuzzy_query(normalized_query, None) else {
+        return Ok((Vec::new(), 0));
+    };
+    let revision = clipping_search_revision(connection)?;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u32,
+        u32,
+        u32,
+        bool,
+        u64,
+        i64,
+        i64,
+    )> = connection
+        .prepare(
+            "SELECT c.id, c.title,
+                    COALESCE(substr(CAST(c.note_markdown AS BLOB), 1, 4096), X''),
+                    c.edition_code_snapshot, c.edition_name_snapshot,
+                    c.publication_date_snapshot, c.page_number_snapshot, c.asset_state,
+                    c.asset_error_code, c.asset_version, c.asset_pixel_width,
+                    c.asset_pixel_height,
+                    EXISTS(
+                        SELECT 1 FROM newspaper_pages p
+                        JOIN newspaper_jobs j ON j.id = p.job_id
+                        WHERE p.id = c.source_page_id AND j.id = c.source_job_id
+                          AND p.status = 'completed'
+                    ),
+                    c.revision, c.created_at, c.updated_at
+             FROM newspaper_clippings_normalized_fts
+             JOIN newspaper_clippings c
+               ON c.rowid = newspaper_clippings_normalized_fts.rowid
+             WHERE newspaper_clippings_normalized_fts MATCH ?1
+               AND c.asset_state IN ('ready', 'missing')
+             ORDER BY bm25(newspaper_clippings_normalized_fts, 8.0, 4.0, 2.0, 2.0) ASC,
+                      c.updated_at DESC, c.id ASC
+             LIMIT ?2",
+        )?
+        .query_map(params![query, limit], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+                row.get(15)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let mut candidates = Vec::with_capacity(rows.len());
+    for (
+        id,
+        title,
+        note_markdown,
+        edition_code,
+        edition_name,
+        publication_date,
+        page_number,
+        state,
+        asset_error_code,
+        asset_version,
+        asset_pixel_width,
+        asset_pixel_height,
+        source_available,
+        clipping_revision,
+        created_at,
+        updated_at,
+    ) in rows
+    {
+        let Some(asset_state) = ClippingAssetState::from_sql(&state) else {
+            return Err(rusqlite::Error::InvalidQuery);
+        };
+        let excerpt = excerpt_from_bounded_markdown_bytes(&note_markdown);
+        let note_window = load_fuzzy_note_window(connection, &id, normalized_query)?
+            .map(|value| excerpt_from_markdown(&value))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| excerpt.clone());
+        candidates.push(FuzzySearchCandidate {
+            clipping: ClippingSummary {
+                id,
+                title,
+                excerpt,
+                edition_code,
+                edition_name,
+                publication_date,
+                page_number,
+                asset_state,
+                asset_error_code,
+                asset_version,
+                asset_pixel_width,
+                asset_pixel_height,
+                source_available,
+                revision: clipping_revision,
+                created_at,
+                updated_at,
+            },
+            note_window,
+        });
+    }
+    Ok((candidates, revision))
+}
+
+fn load_fuzzy_note_window(
+    connection: &Connection,
+    clipping_id: &str,
+    normalized_query: &str,
+) -> Result<Option<String>> {
+    let Some(query) = fts_fuzzy_query(normalized_query, Some("note_markdown")) else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT snippet(newspaper_clippings_fts, 1, '', '', ' … ', 64)
+             FROM newspaper_clippings_fts
+             WHERE newspaper_clippings_fts MATCH ?1
+               AND rowid = (SELECT rowid FROM newspaper_clippings WHERE id = ?2)",
+            params![query, clipping_id],
+            |row| row.get(0),
+        )
+        .optional()
 }
 
 /// Detail read for one public clipping plus its derived source availability

@@ -18,14 +18,19 @@ use crate::cache::open_runtime;
 
 use super::clipping_assets::ClippingAssetLayout;
 use super::clipping_models::{
-    normalize_search_query, normalize_title, validate_asset_byte_count, validate_clipping_id,
-    validate_edition_code, validate_edition_name, validate_list_limit, validate_note_markdown,
-    validate_page_number, validate_publication_date, validate_sha256_hex, validate_source_mime,
-    ClippingAssetState, ClippingError, ClippingErrorCode, NewspaperClipping,
-    NewspaperClippingListQuery,
+    normalize_search_query, normalize_search_text, normalize_title, validate_asset_byte_count,
+    validate_clipping_id, validate_edition_code, validate_edition_name, validate_list_limit,
+    validate_note_markdown, validate_page_number, validate_publication_date, validate_sha256_hex,
+    validate_source_mime, ClippingAssetState, ClippingError, ClippingErrorCode, ClippingSummary,
+    NewspaperClipping, NewspaperClippingListQuery, NewspaperClippingMatchField,
+    NewspaperClippingSearchResult, NewspaperClippingSearchSnippet,
+    NewspaperClippingSearchSnippetPart, SearchNewspaperClippingsPage,
+    SearchNewspaperClippingsRequest, SearchPossibleNewspaperClippingsRequest,
+    SearchPossibleNewspaperClippingsResponse, FUZZY_CANDIDATE_LIMIT, POSSIBLE_MATCH_LIMIT,
+    SEARCH_PAGE_LIMIT, SEARCH_SNIPPET_MAX_CHARS,
 };
 use super::clipping_recovery;
-use super::clipping_repository::{self as repository, ClippingDetail, ClippingSummary};
+use super::clipping_repository::{self as repository, ClippingDetail};
 use super::clipping_roots::ClippingRootRegistry;
 
 #[derive(Clone)]
@@ -224,6 +229,41 @@ impl ClippingService {
 
     pub(crate) fn root_layout(&self, root_id: &str) -> Result<ClippingAssetLayout, ClippingError> {
         self.roots.resolve(root_id)
+    }
+
+    pub fn list_root_summaries(
+        &self,
+    ) -> Result<Vec<super::clipping_models::ClippingRootSummary>, ClippingError> {
+        self.roots.list_summaries()
+    }
+
+    pub fn check_root(
+        &self,
+        root_id: &str,
+        now: i64,
+    ) -> Result<super::clipping_models::ClippingRootSummary, ClippingError> {
+        self.roots.check(root_id, now)
+    }
+
+    pub fn reconnect_root(
+        &self,
+        root_id: &str,
+        selected_snapshot_directory: &std::path::Path,
+        now: i64,
+    ) -> Result<super::clipping_models::ClippingRootSummary, ClippingError> {
+        self.roots
+            .reconnect(root_id, selected_snapshot_directory, now)
+    }
+
+    pub fn verified_root_open_path(&self, root_id: &str) -> Result<PathBuf, ClippingError> {
+        self.roots.verified_open_path(root_id)
+    }
+
+    pub(crate) fn verify_root_fresh_for_integrity(
+        &self,
+        root_id: &str,
+    ) -> Result<(), ClippingError> {
+        self.roots.verify_fresh_for_integrity(root_id)
     }
 
     #[allow(dead_code)] // Consumed by the Phase 2 crop service after its storage rebase.
@@ -487,6 +527,198 @@ impl ClippingService {
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))
     }
 
+    pub fn search(
+        &self,
+        mut request: SearchNewspaperClippingsRequest,
+    ) -> Result<SearchNewspaperClippingsPage, ClippingError> {
+        if request.limit != SEARCH_PAGE_LIMIT {
+            return Err(ClippingError::new(ClippingErrorCode::InvalidId));
+        }
+        request.query = normalize_search_query(&request.query).map_err(ClippingError::new)?;
+        let note_search_applied = request.query.chars().count() >= 3;
+        if request.query.is_empty() {
+            return Ok(SearchNewspaperClippingsPage {
+                items: Vec::new(),
+                total: 0,
+                offset: request.offset,
+                limit: SEARCH_PAGE_LIMIT,
+                note_search_applied: false,
+                revision: 0,
+            });
+        }
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let (hits, total, revision) = repository::search_confident_clippings(
+            &connection,
+            &request.query,
+            request.offset,
+            SEARCH_PAGE_LIMIT,
+        )
+        .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let mut items = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let mut matched_fields = Vec::with_capacity(5);
+            let mut snippets = Vec::with_capacity(5);
+            if hit.title_match {
+                matched_fields.push(NewspaperClippingMatchField::Title);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Title,
+                    &hit.clipping.title,
+                ));
+            }
+            if hit.note_match {
+                matched_fields.push(NewspaperClippingMatchField::Note);
+                let raw = repository::load_note_search_snippet(
+                    &connection,
+                    &hit.clipping.id,
+                    &request.query,
+                )
+                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+                snippets.push(note_search_snippet(raw.as_deref(), &hit.clipping.excerpt));
+            }
+            if hit.edition_match {
+                matched_fields.push(NewspaperClippingMatchField::Edition);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Edition,
+                    &format!(
+                        "{} ({})",
+                        hit.clipping.edition_name, hit.clipping.edition_code
+                    ),
+                ));
+            }
+            if hit.date_match {
+                matched_fields.push(NewspaperClippingMatchField::Date);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Date,
+                    &hit.clipping.publication_date,
+                ));
+            }
+            if hit.page_match {
+                matched_fields.push(NewspaperClippingMatchField::Page);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Page,
+                    &hit.clipping.page_number,
+                ));
+            }
+            items.push(NewspaperClippingSearchResult {
+                clipping: hit.clipping.into(),
+                matched_fields,
+                snippets,
+                possible_match: false,
+            });
+        }
+        Ok(SearchNewspaperClippingsPage {
+            items,
+            total,
+            offset: request.offset,
+            limit: SEARCH_PAGE_LIMIT,
+            note_search_applied,
+            revision,
+        })
+    }
+
+    pub fn search_possible(
+        &self,
+        mut request: SearchPossibleNewspaperClippingsRequest,
+    ) -> Result<SearchPossibleNewspaperClippingsResponse, ClippingError> {
+        request.query = normalize_search_query(&request.query).map_err(ClippingError::new)?;
+        if request.query.chars().count() < 4 {
+            return Ok(SearchPossibleNewspaperClippingsResponse {
+                items: Vec::new(),
+                limit: POSSIBLE_MATCH_LIMIT,
+                revision: 0,
+            });
+        }
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let confident_ids = repository::confident_search_ids(&connection, &request.query)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let (candidates, revision) =
+            repository::fuzzy_search_candidates(&connection, &request.query, FUZZY_CANDIDATE_LIMIT)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let mut scored = Vec::new();
+        for candidate in candidates {
+            if confident_ids.contains(&candidate.clipping.id) {
+                continue;
+            }
+            let title_distance = bounded_fuzzy_distance(&request.query, &candidate.clipping.title);
+            let note_distance = bounded_fuzzy_distance(&request.query, &candidate.note_window);
+            let edition_value = format!(
+                "{} {}",
+                candidate.clipping.edition_name, candidate.clipping.edition_code
+            );
+            let edition_distance = bounded_fuzzy_distance(&request.query, &edition_value);
+            let mut matched_fields = Vec::with_capacity(3);
+            let mut snippets = Vec::with_capacity(3);
+            if title_distance.is_some() {
+                matched_fields.push(NewspaperClippingMatchField::Title);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Title,
+                    &candidate.clipping.title,
+                ));
+            }
+            if note_distance.is_some() {
+                matched_fields.push(NewspaperClippingMatchField::Note);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Note,
+                    &candidate.note_window,
+                ));
+            }
+            if edition_distance.is_some() {
+                matched_fields.push(NewspaperClippingMatchField::Edition);
+                snippets.push(whole_field_snippet(
+                    NewspaperClippingMatchField::Edition,
+                    &edition_value,
+                ));
+            }
+            let Some(best_distance) = [title_distance, note_distance, edition_distance]
+                .into_iter()
+                .flatten()
+                .min()
+            else {
+                continue;
+            };
+            let field_rank = if title_distance == Some(best_distance) {
+                0u8
+            } else if note_distance == Some(best_distance) {
+                1
+            } else {
+                2
+            };
+            scored.push((
+                best_distance,
+                field_rank,
+                candidate.clipping.updated_at,
+                candidate.clipping.id.clone(),
+                NewspaperClippingSearchResult {
+                    clipping: candidate.clipping.into(),
+                    matched_fields,
+                    snippets,
+                    possible_match: true,
+                },
+            ));
+        }
+        scored.sort_by(
+            |(left_distance, left_field, left_updated, left_id, _),
+             (right_distance, right_field, right_updated, right_id, _)| {
+                left_distance
+                    .cmp(right_distance)
+                    .then_with(|| left_field.cmp(right_field))
+                    .then_with(|| right_updated.cmp(left_updated))
+                    .then_with(|| left_id.cmp(right_id))
+            },
+        );
+        Ok(SearchPossibleNewspaperClippingsResponse {
+            items: scored
+                .into_iter()
+                .take(POSSIBLE_MATCH_LIMIT)
+                .map(|(_, _, _, _, result)| result)
+                .collect(),
+            limit: POSSIBLE_MATCH_LIMIT,
+            revision,
+        })
+    }
+
     pub fn detail(&self, id: &str) -> Result<Option<ClippingDetail>, ClippingError> {
         if !validate_clipping_id(id) {
             return Err(ClippingError::new(ClippingErrorCode::InvalidId));
@@ -542,6 +774,155 @@ impl ClippingService {
         }
         summary
     }
+}
+
+fn whole_field_snippet(
+    field: NewspaperClippingMatchField,
+    value: &str,
+) -> NewspaperClippingSearchSnippet {
+    NewspaperClippingSearchSnippet {
+        field,
+        parts: vec![NewspaperClippingSearchSnippetPart {
+            text: value.chars().take(SEARCH_SNIPPET_MAX_CHARS).collect(),
+            highlighted: true,
+        }],
+    }
+}
+
+fn note_search_snippet(raw: Option<&str>, fallback: &str) -> NewspaperClippingSearchSnippet {
+    let mut parts = Vec::new();
+    let mut highlighted = false;
+    let mut buffer = String::new();
+    let source = raw.unwrap_or(fallback);
+    for character in source.chars() {
+        if character == '\u{1e}' || character == '\u{1f}' {
+            if !buffer.is_empty() {
+                let text = repository::excerpt_from_markdown(&buffer);
+                if !text.is_empty() {
+                    parts.push(NewspaperClippingSearchSnippetPart { text, highlighted });
+                }
+                buffer.clear();
+            }
+            highlighted = character == '\u{1e}';
+            continue;
+        }
+        buffer.push(character);
+    }
+    if !buffer.is_empty() {
+        let text = repository::excerpt_from_markdown(&buffer);
+        if !text.is_empty() {
+            parts.push(NewspaperClippingSearchSnippetPart { text, highlighted });
+        }
+    }
+    if parts.is_empty() {
+        parts.push(NewspaperClippingSearchSnippetPart {
+            text: fallback.chars().take(SEARCH_SNIPPET_MAX_CHARS).collect(),
+            highlighted: false,
+        });
+    }
+    let mut remaining = SEARCH_SNIPPET_MAX_CHARS;
+    for part in &mut parts {
+        let bounded: String = part.text.chars().take(remaining).collect();
+        remaining = remaining.saturating_sub(bounded.chars().count());
+        part.text = bounded;
+    }
+    parts.retain(|part| !part.text.is_empty());
+    NewspaperClippingSearchSnippet {
+        field: NewspaperClippingMatchField::Note,
+        parts,
+    }
+}
+
+fn bounded_fuzzy_distance(query: &str, candidate: &str) -> Option<usize> {
+    let query: Vec<char> = query.chars().collect();
+    if query.len() < 4 {
+        return None;
+    }
+    let candidate: Vec<char> = normalize_search_text(candidate).chars().take(512).collect();
+    if candidate.is_empty() {
+        return None;
+    }
+    let limit = if query.len() <= 5 {
+        1
+    } else if query.len() <= 10 {
+        2
+    } else {
+        3
+    };
+    let mut windows = std::collections::BTreeSet::<(usize, usize)>::new();
+    if candidate.len().abs_diff(query.len()) <= limit {
+        windows.insert((0, candidate.len()));
+    }
+    let mut token_start = None;
+    for (index, character) in candidate
+        .iter()
+        .copied()
+        .chain(std::iter::once(' '))
+        .enumerate()
+    {
+        if character.is_alphanumeric() {
+            token_start.get_or_insert(index);
+        } else if let Some(start) = token_start.take() {
+            let length = index.saturating_sub(start);
+            if length.abs_diff(query.len()) <= limit {
+                windows.insert((start, length));
+            }
+        }
+    }
+    if query.len() >= 3 && candidate.len() >= 3 {
+        'query_trigrams: for query_index in 0..=query.len() - 3 {
+            for candidate_index in 0..=candidate.len() - 3 {
+                if query[query_index..query_index + 3]
+                    == candidate[candidate_index..candidate_index + 3]
+                {
+                    let base = candidate_index.saturating_sub(query_index);
+                    for length in query.len().saturating_sub(limit)..=query.len() + limit {
+                        if base + length <= candidate.len() {
+                            windows.insert((base, length));
+                            if windows.len() >= 64 {
+                                break 'query_trigrams;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    windows
+        .into_iter()
+        .filter_map(|(start, length)| {
+            damerau_levenshtein_with_limit(&query, &candidate[start..start + length], limit)
+        })
+        .min()
+}
+
+fn damerau_levenshtein_with_limit(left: &[char], right: &[char], limit: usize) -> Option<usize> {
+    if left.len().abs_diff(right.len()) > limit {
+        return None;
+    }
+    let infinity = limit + left.len() + right.len() + 1;
+    let mut previous_previous = vec![infinity; right.len() + 1];
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![infinity; right.len() + 1];
+    for i in 1..=left.len() {
+        current.fill(infinity);
+        current[0] = i;
+        let start = i.saturating_sub(limit).max(1);
+        let end = (i + limit).min(right.len());
+        for j in start..=end {
+            let substitution = previous[j - 1] + usize::from(left[i - 1] != right[j - 1]);
+            let insertion = current[j - 1] + 1;
+            let deletion = previous[j] + 1;
+            let mut distance = substitution.min(insertion).min(deletion);
+            if i > 1 && j > 1 && left[i - 1] == right[j - 2] && left[i - 2] == right[j - 1] {
+                distance = distance.min(previous_previous[j - 2] + 1);
+            }
+            current[j] = distance;
+        }
+        std::mem::swap(&mut previous_previous, &mut previous);
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[right.len()] <= limit).then_some(previous[right.len()])
 }
 
 #[cfg(test)]
@@ -902,6 +1283,603 @@ mod tests {
         assert!(!rows[0].source_available);
     }
 
+    fn create_search_fixture(
+        service: &ClippingService,
+        id: &str,
+        title: &str,
+        note: &str,
+        now: i64,
+    ) {
+        let mut record = staged_record(service, id);
+        record.now = now;
+        let created = service.register_staged_legacy_fixture(record).unwrap();
+        service
+            .update_note(id, created.revision, title, note, now + 1)
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_search_fixture_with_snapshots(
+        service: &ClippingService,
+        id: &str,
+        title: &str,
+        note: &str,
+        edition_code: &str,
+        edition_name: &str,
+        publication_date: &str,
+        page_number: &str,
+        now: i64,
+    ) {
+        let mut record = staged_record(service, id);
+        record.title = title.to_owned();
+        record.edition_code_snapshot = edition_code.to_owned();
+        record.edition_name_snapshot = edition_name.to_owned();
+        record.publication_date_snapshot = publication_date.to_owned();
+        record.page_number_snapshot = page_number.to_owned();
+        record.now = now;
+        let created = service.register_staged_legacy_fixture(record).unwrap();
+        if !note.is_empty() {
+            service
+                .update_note(id, created.revision, title, note, now + 1)
+                .unwrap();
+        }
+    }
+
+    fn seed_ready_search_rows(service: &ClippingService, count: usize) {
+        let mut template = staged_record(service, ID);
+        service.layout.discard_staging(ID);
+        let connection = open_runtime(&service.db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for index in 0..count {
+            let id = format!("b0000000-0000-4000-8000-{index:012}");
+            template.id = id.clone();
+            template.asset_relative_path =
+                ClippingAssetLayout::canonical_relative_path(&id).unwrap();
+            template.title = format!("Scale keyword {index:03}");
+            template.now = 10_000 + index as i64;
+            repository::insert_creating(&connection, &template).unwrap();
+            assert!(repository::mark_ready_from_creating(&connection, &id, template.now).unwrap());
+        }
+        connection.execute_batch("COMMIT").unwrap();
+    }
+
+    fn search_request(query: &str) -> SearchNewspaperClippingsRequest {
+        SearchNewspaperClippingsRequest {
+            query: query.to_owned(),
+            offset: 0,
+            limit: SEARCH_PAGE_LIMIT,
+        }
+    }
+
+    #[test]
+    fn clipping_search_ranks_exact_prefix_then_note_and_excludes_short_note_queries() {
+        let (_temp, service, _diagnostics) = fixture();
+        let exact_id = "11111111-1111-4111-8111-111111111111";
+        let prefix_id = "22222222-2222-4222-8222-222222222222";
+        let note_id = "33333333-3333-4333-8333-333333333333";
+        create_search_fixture(&service, exact_id, "Needle", "", 100);
+        create_search_fixture(&service, prefix_id, "Needle prefix", "", 200);
+        create_search_fixture(
+            &service,
+            note_id,
+            "Unrelated title",
+            "A safe **needle** note body",
+            300,
+        );
+
+        let page = service.search(search_request("needle")).unwrap();
+        assert_eq!(page.total, 3);
+        assert!(page.note_search_applied);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.clipping.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![exact_id, prefix_id, note_id]
+        );
+        assert_eq!(
+            page.items[2].matched_fields,
+            vec![NewspaperClippingMatchField::Note]
+        );
+        assert!(page.items[2].snippets[0]
+            .parts
+            .iter()
+            .any(|part| part.highlighted && part.text.contains("needle")));
+
+        let short = service.search(search_request("dl")).unwrap();
+        assert!(!short.note_search_applied);
+        assert_eq!(short.total, 2);
+        assert!(short.items.iter().all(|item| !item
+            .matched_fields
+            .contains(&NewspaperClippingMatchField::Note)));
+    }
+
+    #[test]
+    fn clipping_search_golden_ranking_is_weighted_stable_and_unicode_aware() {
+        let (_temp, service, _diagnostics) = fixture();
+        let exact_id = "10000000-0000-4000-8000-000000000001";
+        let prefix_id = "10000000-0000-4000-8000-000000000002";
+        let title_id = "10000000-0000-4000-8000-000000000003";
+        let note_id = "10000000-0000-4000-8000-000000000004";
+        let edition_a_id = "10000000-0000-4000-8000-000000000005";
+        let edition_b_id = "10000000-0000-4000-8000-000000000006";
+        create_search_fixture(&service, exact_id, "Needle", "", 100);
+        create_search_fixture(&service, prefix_id, "Needle bulletin", "", 100);
+        create_search_fixture(&service, title_id, "Daily needle bulletin", "", 100);
+        create_search_fixture(
+            &service,
+            note_id,
+            "Daily report",
+            "Daily needle bulletin",
+            100,
+        );
+        create_search_fixture_with_snapshots(
+            &service,
+            edition_a_id,
+            "Daily report",
+            "",
+            "NA",
+            "Needle Gazette",
+            "2026-08-08",
+            "A01",
+            100,
+        );
+        create_search_fixture_with_snapshots(
+            &service,
+            edition_b_id,
+            "Daily report",
+            "",
+            "NB",
+            "Needle Gazette",
+            "2026-08-08",
+            "A01",
+            100,
+        );
+
+        let page = service.search(search_request("needle")).unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.clipping.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                exact_id,
+                prefix_id,
+                title_id,
+                note_id,
+                edition_a_id,
+                edition_b_id,
+            ]
+        );
+
+        let chinese_title_id = "20000000-0000-4000-8000-000000000001";
+        let chinese_note_id = "20000000-0000-4000-8000-000000000002";
+        create_search_fixture(&service, chinese_title_id, "今日中文摘要", "", 200);
+        create_search_fixture(
+            &service,
+            chinese_note_id,
+            "今日报道",
+            "这是一份中文摘要",
+            200,
+        );
+        let chinese = service.search(search_request("中文摘要")).unwrap();
+        assert_eq!(
+            chinese
+                .items
+                .iter()
+                .map(|item| item.clipping.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![chinese_title_id, chinese_note_id]
+        );
+    }
+
+    #[test]
+    fn clipping_search_returns_cumulative_fields_and_bounded_plain_text_parts() {
+        let (_temp, service, _diagnostics) = fixture();
+        let id = "30000000-0000-4000-8000-000000000001";
+        create_search_fixture_with_snapshots(
+            &service,
+            id,
+            "2026 clipping",
+            "**2026** [reference](https://example.invalid/secret) <script>inert</script>",
+            "Y2026",
+            "Chronicle 2026",
+            "2026-08-08",
+            "P2026",
+            100,
+        );
+
+        let page = service.search(search_request("2026")).unwrap();
+        assert_eq!(page.total, 1);
+        let result = &page.items[0];
+        assert_eq!(
+            result.matched_fields,
+            vec![
+                NewspaperClippingMatchField::Title,
+                NewspaperClippingMatchField::Note,
+                NewspaperClippingMatchField::Edition,
+                NewspaperClippingMatchField::Date,
+                NewspaperClippingMatchField::Page,
+            ]
+        );
+        let note = result
+            .snippets
+            .iter()
+            .find(|snippet| snippet.field == NewspaperClippingMatchField::Note)
+            .unwrap();
+        assert!(note.parts.iter().any(|part| part.highlighted));
+        assert!(
+            note.parts
+                .iter()
+                .map(|part| part.text.chars().count())
+                .sum::<usize>()
+                <= SEARCH_SNIPPET_MAX_CHARS
+        );
+        assert!(note
+            .parts
+            .iter()
+            .all(|part| !part.text.contains("https://example.invalid/secret")));
+        assert!(note
+            .parts
+            .iter()
+            .all(|part| !part.text.contains('\u{1e}') && !part.text.contains('\u{1f}')));
+    }
+
+    #[test]
+    fn clipping_search_normalizes_width_and_treats_like_and_fts_syntax_literally() {
+        let (_temp, service, _diagnostics) = fixture();
+        let width_id = "44444444-4444-4444-8444-444444444444";
+        let literal_id = "55555555-5555-4555-8555-555555555555";
+        create_search_fixture(&service, width_id, "ＬｉｎｋＶａｕｌｔ digest", "", 100);
+        create_search_fixture(
+            &service,
+            literal_id,
+            "100% AND _ \"quoted\" path\\name O'Brien OR NOT",
+            "operator OR NOT is plain content",
+            200,
+        );
+
+        let normalized = service.search(search_request("linkvault")).unwrap();
+        assert_eq!(normalized.total, 1);
+        assert_eq!(normalized.items[0].clipping.id, width_id);
+        assert_eq!(
+            normalized.items[0].matched_fields,
+            vec![NewspaperClippingMatchField::Title]
+        );
+
+        for literal in ["%", "_", "AND", "\"quoted\"", "\\", "O'Brien", "OR NOT"] {
+            let page = service.search(search_request(literal)).unwrap();
+            assert!(page.items.iter().any(|item| item.clipping.id == literal_id));
+        }
+    }
+
+    #[test]
+    fn clipping_search_never_fabricates_a_highlight_for_normalized_only_note_hits() {
+        let (_temp, service, _diagnostics) = fixture();
+        let id = "50000000-0000-4000-8000-000000000001";
+        let note = format!("{}ＬｉｎｋＶａｕｌｔ", "prefix ".repeat(1_000));
+        create_search_fixture(&service, id, "Unrelated", &note, 100);
+
+        let page = service.search(search_request("linkvault")).unwrap();
+        assert_eq!(page.total, 1);
+        let result = &page.items[0];
+        assert_eq!(
+            result.matched_fields,
+            vec![NewspaperClippingMatchField::Note]
+        );
+        let snippet = result
+            .snippets
+            .iter()
+            .find(|snippet| snippet.field == NewspaperClippingMatchField::Note)
+            .unwrap();
+        assert!(snippet.parts.iter().all(|part| !part.highlighted));
+        assert!(
+            snippet
+                .parts
+                .iter()
+                .map(|part| part.text.chars().count())
+                .sum::<usize>()
+                <= SEARCH_SNIPPET_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn clipping_possible_matches_are_separate_bounded_and_never_fuzz_date_or_page() {
+        let (_temp, service, _diagnostics) = fixture();
+        let fuzzy_title_id = "66666666-6666-4666-8666-666666666666";
+        let confident_id = "77777777-7777-4777-8777-777777777777";
+        let fuzzy_note_id = "88888888-8888-4888-8888-888888888888";
+        let chinese_id = "99999999-9999-4999-8999-999999999999";
+        create_search_fixture(&service, fuzzy_title_id, "Needle", "", 100);
+        create_search_fixture(&service, confident_id, "Needel", "", 200);
+        create_search_fixture(
+            &service,
+            fuzzy_note_id,
+            "Unrelated",
+            "A planetary research note",
+            300,
+        );
+        create_search_fixture(&service, chinese_id, "今日中文摘要", "", 400);
+
+        let short = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "nee".to_owned(),
+            })
+            .unwrap();
+        assert!(short.items.is_empty());
+        assert_eq!(short.limit, POSSIBLE_MATCH_LIMIT);
+
+        let title = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "needel".to_owned(),
+            })
+            .unwrap();
+        assert!(title.items.iter().any(|item| {
+            item.clipping.id == fuzzy_title_id
+                && item.possible_match
+                && item
+                    .matched_fields
+                    .contains(&NewspaperClippingMatchField::Title)
+        }));
+        assert!(!title
+            .items
+            .iter()
+            .any(|item| item.clipping.id == confident_id));
+
+        let note = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "planetery".to_owned(),
+            })
+            .unwrap();
+        assert!(note.items.iter().any(|item| {
+            item.clipping.id == fuzzy_note_id
+                && item.matched_fields == vec![NewspaperClippingMatchField::Note]
+        }));
+
+        let chinese = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "今日中文提要".to_owned(),
+            })
+            .unwrap();
+        assert!(chinese.items.iter().any(|item| {
+            item.clipping.id == chinese_id
+                && item
+                    .matched_fields
+                    .contains(&NewspaperClippingMatchField::Title)
+        }));
+
+        let date = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "2027-08-08".to_owned(),
+            })
+            .unwrap();
+        assert!(date
+            .items
+            .iter()
+            .all(|item| !item.matched_fields.iter().any(|field| matches!(
+                field,
+                NewspaperClippingMatchField::Date | NewspaperClippingMatchField::Page
+            ))));
+    }
+
+    #[test]
+    fn clipping_fuzzy_distance_handles_transposition_and_unicode_substitution() {
+        assert_eq!(bounded_fuzzy_distance("needel", "needle"), Some(1));
+        assert_eq!(bounded_fuzzy_distance("新闻摘要", "新闻精要"), Some(1));
+        assert_eq!(bounded_fuzzy_distance("needel", "entirely unrelated"), None);
+    }
+
+    #[test]
+    fn clipping_search_index_failure_rolls_back_canonical_note_update() {
+        let (_temp, service, _diagnostics) = fixture();
+        let created = service
+            .register_staged_legacy_fixture(staged_record(&service, ID))
+            .unwrap();
+        let connection = open_runtime(&service.db_path).unwrap();
+        connection
+            .execute("DROP TABLE newspaper_clippings_normalized_fts", [])
+            .unwrap();
+        drop(connection);
+
+        let error = service
+            .update_note(ID, created.revision, "Must roll back", "lost update", 200)
+            .unwrap_err();
+        assert_eq!(error.code, ClippingErrorCode::DatabaseWriteFailed);
+        let unchanged = service.detail(ID).unwrap().unwrap().clipping;
+        assert_eq!(unchanged.title, created.title);
+        assert_eq!(unchanged.note_markdown, created.note_markdown);
+        assert_eq!(unchanged.revision, created.revision);
+
+        let connection = open_runtime(&service.db_path).unwrap();
+        super::super::storage::repair_clipping_search_index(&connection).unwrap();
+        drop(connection);
+        let retried = service
+            .update_note(ID, created.revision, "Recovered", "indexed", 201)
+            .unwrap();
+        assert_eq!(retried.title, "Recovered");
+        assert_eq!(service.search(search_request("indexed")).unwrap().total, 1);
+    }
+
+    #[test]
+    fn clipping_search_revision_changes_for_same_timestamp_note_commits() {
+        let (_temp, service, _diagnostics) = fixture();
+        let created = service
+            .register_staged_legacy_fixture(staged_record(&service, ID))
+            .unwrap();
+        let before = service.search(search_request("new york")).unwrap();
+        let updated = service
+            .update_note(
+                ID,
+                created.revision,
+                "New York updated",
+                "new york note",
+                created.updated_at,
+            )
+            .unwrap();
+        assert_eq!(updated.updated_at, created.updated_at);
+        let after = service.search(search_request("new york")).unwrap();
+        assert_ne!(after.revision, before.revision);
+        assert!(after.revision <= (1i64 << 53) - 1);
+    }
+
+    #[test]
+    fn clipping_possible_match_uses_only_a_bounded_window_from_a_maximum_note() {
+        let (_temp, service, _diagnostics) = fixture();
+        let id = "40000000-0000-4000-8000-000000000001";
+        let suffix = " planetary research";
+        let note = format!(
+            "{}{}",
+            "x".repeat(super::super::clipping_models::NOTE_MAX_UTF8_BYTES - suffix.len()),
+            suffix
+        );
+        assert_eq!(
+            note.len(),
+            super::super::clipping_models::NOTE_MAX_UTF8_BYTES
+        );
+        create_search_fixture(&service, id, "Unrelated", &note, 100);
+
+        let search_started = Instant::now();
+        let possible = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "planetery".to_owned(),
+            })
+            .unwrap();
+        let search_elapsed = search_started.elapsed();
+        let result = possible
+            .items
+            .iter()
+            .find(|item| item.clipping.id == id)
+            .unwrap();
+        let note_snippet = result
+            .snippets
+            .iter()
+            .find(|snippet| snippet.field == NewspaperClippingMatchField::Note)
+            .unwrap();
+        assert!(
+            note_snippet
+                .parts
+                .iter()
+                .map(|part| part.text.chars().count())
+                .sum::<usize>()
+                <= SEARCH_SNIPPET_MAX_CHARS
+        );
+        assert!(result.clipping.note_excerpt.len() <= 160);
+        eprintln!(
+            "clipping_possible_profile note_bytes={} candidate_cap={} returned={} elapsed_ms={:.3}",
+            note.len(),
+            FUZZY_CANDIDATE_LIMIT,
+            possible.items.len(),
+            search_elapsed.as_secs_f64() * 1_000.0
+        );
+    }
+
+    #[test]
+    fn clipping_search_profiles_zero_one_and_five_hundred_rows_without_page_overlap() {
+        let (_temp, service, _diagnostics) = fixture();
+        assert_eq!(service.search(search_request("scale")).unwrap().total, 0);
+        let seed_started = Instant::now();
+        seed_ready_search_rows(&service, 500);
+        let seed_elapsed = seed_started.elapsed();
+
+        let first_started = Instant::now();
+        let first = service.search(search_request("scale")).unwrap();
+        let first_elapsed = first_started.elapsed();
+        let last_started = Instant::now();
+        let last = service
+            .search(SearchNewspaperClippingsRequest {
+                query: "scale".to_owned(),
+                offset: 450,
+                limit: SEARCH_PAGE_LIMIT,
+            })
+            .unwrap();
+        let last_elapsed = last_started.elapsed();
+        assert_eq!(first.total, 500);
+        assert_eq!(first.items.len(), 50);
+        assert_eq!(last.items.len(), 50);
+        let first_ids: HashSet<_> = first
+            .items
+            .iter()
+            .map(|item| item.clipping.id.as_str())
+            .collect();
+        assert!(last
+            .items
+            .iter()
+            .all(|item| !first_ids.contains(item.clipping.id.as_str())));
+        let one = service
+            .search(SearchNewspaperClippingsRequest {
+                query: "scale".to_owned(),
+                offset: 499,
+                limit: SEARCH_PAGE_LIMIT,
+            })
+            .unwrap();
+        assert_eq!(one.items.len(), 1);
+        eprintln!(
+            "clipping_search_profile rows=500 seed_ms={:.3} first_page_ms={:.3} deep_page_ms={:.3}",
+            seed_elapsed.as_secs_f64() * 1_000.0,
+            first_elapsed.as_secs_f64() * 1_000.0,
+            last_elapsed.as_secs_f64() * 1_000.0
+        );
+    }
+
+    #[test]
+    fn clipping_search_pages_fifty_and_caps_possible_matches_at_twenty_five() {
+        let (_temp, service, _diagnostics) = fixture();
+        for index in 0..51 {
+            let id = format!("90000000-0000-4000-8000-{index:012}");
+            create_search_fixture(
+                &service,
+                &id,
+                &format!("Batch keyword {index:02}"),
+                "",
+                100 + index,
+            );
+        }
+        let first = service.search(search_request("batch")).unwrap();
+        let second = service
+            .search(SearchNewspaperClippingsRequest {
+                query: "batch".to_owned(),
+                offset: 50,
+                limit: SEARCH_PAGE_LIMIT,
+            })
+            .unwrap();
+        assert_eq!(first.total, 51);
+        assert_eq!(first.items.len(), 50);
+        assert_eq!(second.items.len(), 1);
+        let first_ids: HashSet<_> = first
+            .items
+            .iter()
+            .map(|item| item.clipping.id.as_str())
+            .collect();
+        assert!(!first_ids.contains(second.items[0].clipping.id.as_str()));
+
+        for index in 0..30 {
+            let id = format!("a0000000-0000-4000-8000-{index:012}");
+            create_search_fixture(
+                &service,
+                &id,
+                &format!("Newspaper result {index:02}"),
+                "",
+                1_000 + index,
+            );
+        }
+        let possible = service
+            .search_possible(SearchPossibleNewspaperClippingsRequest {
+                query: "newspapr".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(possible.items.len(), POSSIBLE_MATCH_LIMIT);
+        assert!(possible.items.iter().all(|item| item.possible_match));
+        assert_eq!(
+            possible
+                .items
+                .iter()
+                .map(|item| item.clipping.id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            POSSIBLE_MATCH_LIMIT
+        );
+    }
+
     #[test]
     fn persistence_gate_clipping_delete_removes_only_aggregate_asset() {
         let (temp, service, _diagnostics) = fixture();
@@ -922,6 +1900,7 @@ mod tests {
         std::fs::write(&other_thumbnail, encode_test_webp(4, 4)).unwrap();
         service.delete(ID, created.revision).unwrap();
         assert!(service.detail(ID).unwrap().is_none());
+        assert_eq!(service.search(search_request("new york")).unwrap().total, 0);
         assert!(!service.layout.canonical_path(ID).unwrap().exists());
         assert!(!service.layout.thumbnail_path(ID, 1).unwrap().exists());
         assert!(!service.layout.thumbnail_path(ID, 2).unwrap().exists());

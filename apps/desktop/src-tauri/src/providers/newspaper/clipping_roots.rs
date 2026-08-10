@@ -5,10 +5,12 @@
 //! a disconnected drive or a later path reuse cannot silently redirect a
 //! clipping to unrelated storage.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::app::database_diagnostics::DatabaseProvider;
 use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
@@ -16,14 +18,18 @@ use crate::cache::open_runtime;
 use serde::{Deserialize, Serialize};
 
 use super::clipping_assets::ClippingAssetLayout;
-use super::clipping_models::{ClippingError, ClippingErrorCode, ClippingRoot, ClippingRootKind};
-use super::clipping_repository::{self as repository, NewClippingRoot};
+use super::clipping_models::{
+    ClippingError, ClippingErrorCode, ClippingRoot, ClippingRootKind, ClippingRootStatus,
+    ClippingRootSummary,
+};
+use super::clipping_repository::{self as repository, NewClippingRoot, ReconnectRootOutcome};
 use super::naming;
 use super::storage::{LEGACY_CLIPPING_ROOT_ID, LEGACY_CLIPPING_ROOT_LOCATOR};
 
 pub const SNAPSHOT_DIRECTORY_NAME: &str = "Newspaper snapshots";
 pub const INTERNAL_DIRECTORY_NAME: &str = ".linkvault";
 pub const ROOT_MARKER_FILE_NAME: &str = "clipping-root-v1.json";
+const VERIFIED_ROOT_CACHE_TTL: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct ClippingRootRegistry {
@@ -31,6 +37,37 @@ pub struct ClippingRootRegistry {
     writer: DatabaseWriter,
     legacy_layout: ClippingAssetLayout,
     registration_lock: Arc<Mutex<()>>,
+    probes: Arc<RootProbeCoordinator>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRootProbe {
+    status: ClippingRootStatus,
+    checked_at: i64,
+}
+
+#[derive(Clone)]
+struct CachedVerifiedRoot {
+    path: PathBuf,
+    valid_until: Instant,
+}
+
+#[derive(Default)]
+struct RootProbeState {
+    cache: HashMap<String, CachedRootProbe>,
+    verified: HashMap<String, CachedVerifiedRoot>,
+    in_flight: HashSet<String>,
+}
+
+#[derive(Default)]
+struct RootProbeCoordinator {
+    state: Mutex<RootProbeState>,
+    completed: Condvar,
+    /// Filesystem probes are deliberately serialized. They are user-triggered,
+    /// can block on offline drives, and must never fan out without a bound.
+    probe_permit: Mutex<()>,
+    probe_count: std::sync::atomic::AtomicUsize,
+    probe_delay: Mutex<Option<Duration>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +88,7 @@ impl ClippingRootRegistry {
             writer,
             legacy_layout,
             registration_lock: Arc::new(Mutex::new(())),
+            probes: Arc::new(RootProbeCoordinator::default()),
         }
     }
 
@@ -63,6 +101,277 @@ impl ClippingRootRegistry {
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
         repository::load_all_roots(&connection)
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))
+    }
+
+    /// Return persisted roots immediately. This never touches the filesystem;
+    /// callers see `unchecked` until a user-triggered check has completed.
+    pub fn list_summaries(&self) -> Result<Vec<ClippingRootSummary>, ClippingError> {
+        let roots = self.list()?;
+        let probes = self
+            .probes
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(roots
+            .iter()
+            .map(|root| self.summary(root, probes.cache.get(&root.id).copied()))
+            .collect())
+    }
+
+    /// Recheck one root. Concurrent checks for the same ID join the existing
+    /// probe and receive its result instead of touching the drive again.
+    pub fn check(&self, root_id: &str, now: i64) -> Result<ClippingRootSummary, ClippingError> {
+        let root = self.load_root(root_id)?;
+        let mut joined_existing = false;
+        loop {
+            let mut state = self
+                .probes
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.in_flight.contains(root_id) {
+                joined_existing = true;
+                state = self
+                    .probes
+                    .completed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                drop(state);
+                continue;
+            }
+            if joined_existing {
+                if let Some(cached) = state.cache.get(root_id).copied() {
+                    return Ok(self.summary(&root, Some(cached)));
+                }
+            }
+            state.in_flight.insert(root_id.to_owned());
+            break;
+        }
+
+        let (status, verified_path) = {
+            let _permit = self
+                .probes
+                .probe_permit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.probes
+                .probe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(delay) = *self
+                .probes
+                .probe_delay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                std::thread::sleep(delay);
+            }
+            self.probe_root(&root)
+        };
+        let cached = CachedRootProbe {
+            status,
+            checked_at: now,
+        };
+        let mut state = self
+            .probes
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.cache.insert(root.id.clone(), cached);
+        if let Some(path) = verified_path {
+            state.verified.insert(
+                root.id.clone(),
+                CachedVerifiedRoot {
+                    path,
+                    valid_until: Instant::now() + VERIFIED_ROOT_CACHE_TTL,
+                },
+            );
+        } else {
+            state.verified.remove(&root.id);
+        }
+        state.in_flight.remove(root_id);
+        self.probes.completed.notify_all();
+        Ok(self.summary(&root, Some(cached)))
+    }
+
+    /// Rebind an existing root to the exact selected snapshot directory. The
+    /// directory and its marker must already exist; reconnect never scans,
+    /// creates, repairs, or moves user files.
+    pub fn reconnect(
+        &self,
+        root_id: &str,
+        selected_snapshot_directory: &Path,
+        now: i64,
+    ) -> Result<ClippingRootSummary, ClippingError> {
+        let _registration_guard = self
+            .registration_lock
+            .lock()
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+        let current = self.load_root(root_id)?;
+        if current.kind != ClippingRootKind::DownloadSnapshot {
+            return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+        }
+        let selected = existing_safe_directory(selected_snapshot_directory)?;
+        if selected.file_name().and_then(|name| name.to_str()) != Some(SNAPSHOT_DIRECTORY_NAME) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+        }
+        verify_marker(&selected, root_id)?;
+        let locator = selected.to_string_lossy().into_owned();
+        let new_locator_key = locator_key(&selected);
+        let expected_locator_key = current.locator_key.clone();
+        let root_id_owned = root_id.to_owned();
+        let outcome = self.writer.execute(
+            DatabaseWriteContext {
+                operation: "clipping_reconnect_download_root",
+                provider: DatabaseProvider::Newspaper,
+                workflow_id: None,
+            },
+            move |connection| {
+                repository::reconnect_download_root(
+                    connection,
+                    &root_id_owned,
+                    &expected_locator_key,
+                    &locator,
+                    &new_locator_key,
+                    now,
+                )
+                .map_err(Into::into)
+            },
+        );
+        let updated = match outcome {
+            Ok(ReconnectRootOutcome::Updated(root)) => root,
+            Ok(ReconnectRootOutcome::NotFoundOrChanged)
+            | Ok(ReconnectRootOutcome::LocatorOwnedByOther) => {
+                return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+            }
+            Err(_) => return Err(ClippingError::new(ClippingErrorCode::DatabaseWriteFailed)),
+        };
+        let cached = CachedRootProbe {
+            status: ClippingRootStatus::Connected,
+            checked_at: now,
+        };
+        let mut state = self
+            .probes
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.cache.insert(updated.id.clone(), cached);
+        state.verified.insert(
+            updated.id.clone(),
+            CachedVerifiedRoot {
+                path: selected,
+                valid_until: Instant::now() + VERIFIED_ROOT_CACHE_TTL,
+            },
+        );
+        Ok(self.summary(&updated, Some(cached)))
+    }
+
+    /// Verify immediately before an OS-open action and return the backend-only
+    /// path. Commands must never serialize this path to React.
+    pub fn verified_open_path(&self, root_id: &str) -> Result<PathBuf, ClippingError> {
+        let root = self.load_root(root_id)?;
+        Ok(self.resolve_root_fresh(&root)?.root().to_path_buf())
+    }
+
+    /// Bypass the short media cache after a read failure so an unplugged or
+    /// moved snapshot root is not mistaken for a corrupt clipping asset.
+    pub(crate) fn verify_fresh_for_integrity(&self, root_id: &str) -> Result<(), ClippingError> {
+        let root = self.load_root(root_id)?;
+        self.resolve_root_fresh(&root).map(|_| ())
+    }
+
+    fn load_root(&self, root_id: &str) -> Result<ClippingRoot, ClippingError> {
+        if root_id != LEGACY_CLIPPING_ROOT_ID && !validate_root_id(root_id) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+        }
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        repository::load_root_by_id(&connection, root_id)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))
+    }
+
+    fn summary(&self, root: &ClippingRoot, probe: Option<CachedRootProbe>) -> ClippingRootSummary {
+        let display_path = match root.kind {
+            ClippingRootKind::LegacyManaged => user_display_path(self.legacy_layout.root()),
+            ClippingRootKind::DownloadSnapshot => user_display_locator(&root.locator),
+        };
+        ClippingRootSummary {
+            root_id: root.id.clone(),
+            kind: root.kind.as_sql().to_owned(),
+            display_path,
+            status: probe
+                .map(|probe| probe.status)
+                .unwrap_or(ClippingRootStatus::Unchecked),
+            last_checked_at: probe.map(|probe| probe.checked_at),
+        }
+    }
+
+    fn probe_root(&self, root: &ClippingRoot) -> (ClippingRootStatus, Option<PathBuf>) {
+        match root.kind {
+            ClippingRootKind::LegacyManaged => {
+                match fs::symlink_metadata(self.legacy_layout.root()) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        (ClippingRootStatus::Offline, None)
+                    }
+                    Ok(metadata)
+                        if !is_symlink_or_reparse(&metadata) && metadata.file_type().is_dir() =>
+                    {
+                        (
+                            ClippingRootStatus::Connected,
+                            Some(self.legacy_layout.root().to_path_buf()),
+                        )
+                    }
+                    _ => (ClippingRootStatus::MarkerMismatch, None),
+                }
+            }
+            ClippingRootKind::DownloadSnapshot => {
+                let locator = Path::new(&root.locator);
+                match fs::symlink_metadata(locator) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        (ClippingRootStatus::Offline, None)
+                    }
+                    Err(_) => (ClippingRootStatus::Offline, None),
+                    Ok(metadata)
+                        if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() =>
+                    {
+                        (ClippingRootStatus::MarkerMismatch, None)
+                    }
+                    Ok(_) => match locator.canonicalize() {
+                        Ok(path)
+                            if locator_key(&path) == root.locator_key
+                                && verify_marker(&path, &root.id).is_ok() =>
+                        {
+                            (ClippingRootStatus::Connected, Some(path))
+                        }
+                        _ => (ClippingRootStatus::MarkerMismatch, None),
+                    },
+                }
+            }
+        }
+    }
+
+    fn resolve_root_fresh(
+        &self,
+        root: &ClippingRoot,
+    ) -> Result<ClippingAssetLayout, ClippingError> {
+        match root.kind {
+            ClippingRootKind::LegacyManaged => {
+                if root.id != LEGACY_CLIPPING_ROOT_ID
+                    || root.locator != LEGACY_CLIPPING_ROOT_LOCATOR
+                {
+                    return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+                }
+                Ok(self.legacy_layout.clone())
+            }
+            ClippingRootKind::DownloadSnapshot => {
+                let path = existing_safe_directory(Path::new(&root.locator))?;
+                if locator_key(&path) != root.locator_key {
+                    return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+                }
+                verify_marker(&path, &root.id)?;
+                Ok(ClippingAssetLayout::new_existing(path))
+            }
+        }
     }
 
     /// Register `<destination>/Newspaper snapshots` for future clipping
@@ -184,29 +493,40 @@ impl ClippingRootRegistry {
     /// a missing directory or marker, which keeps offline drives distinct from
     /// newly attached storage that happens to reuse the same path.
     pub fn resolve(&self, root_id: &str) -> Result<ClippingAssetLayout, ClippingError> {
-        let connection = open_runtime(&self.db_path)
-            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
-        let root = repository::load_root_by_id(&connection, root_id)
-            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?
-            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
-        match root.kind {
-            ClippingRootKind::LegacyManaged => {
-                if root.id != LEGACY_CLIPPING_ROOT_ID
-                    || root.locator != LEGACY_CLIPPING_ROOT_LOCATOR
+        let root = self.load_root(root_id)?;
+        if root.kind == ClippingRootKind::DownloadSnapshot {
+            let cached = self
+                .probes
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .verified
+                .get(root_id)
+                .cloned();
+            if let Some(cached) = cached {
+                if cached.valid_until > Instant::now()
+                    && locator_key(&cached.path) == root.locator_key
                 {
-                    return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+                    return Ok(ClippingAssetLayout::new_existing(cached.path));
                 }
-                Ok(self.legacy_layout.clone())
-            }
-            ClippingRootKind::DownloadSnapshot => {
-                let path = existing_safe_directory(Path::new(&root.locator))?;
-                if locator_key(&path) != root.locator_key {
-                    return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
-                }
-                verify_marker(&path, &root.id)?;
-                Ok(ClippingAssetLayout::new_existing(path))
             }
         }
+        let layout = self.resolve_root_fresh(&root)?;
+        if root.kind == ClippingRootKind::DownloadSnapshot {
+            self.probes
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .verified
+                .insert(
+                    root.id,
+                    CachedVerifiedRoot {
+                        path: layout.root().to_path_buf(),
+                        valid_until: Instant::now() + VERIFIED_ROOT_CACHE_TTL,
+                    },
+                );
+        }
+        Ok(layout)
     }
 
     pub fn resolve_for_creation(
@@ -222,7 +542,7 @@ impl ClippingRootRegistry {
             return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
         }
         drop(connection);
-        self.resolve(root_id)
+        self.resolve_root_fresh(&root)
     }
 }
 
@@ -310,6 +630,18 @@ fn verify_marker(root: &Path, expected_id: &str) -> Result<(), ClippingError> {
 
 fn locator_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn user_display_path(path: &Path) -> String {
+    user_display_locator(&path.to_string_lossy())
+}
+
+fn user_display_locator(locator: &str) -> String {
+    locator
+        .strip_prefix(r"\\?\UNC\")
+        .map(|path| format!(r"\\{path}"))
+        .or_else(|| locator.strip_prefix(r"\\?\").map(str::to_owned))
+        .unwrap_or_else(|| locator.to_owned())
 }
 
 fn existing_safe_directory(path: &Path) -> Result<PathBuf, ClippingError> {
@@ -449,6 +781,328 @@ mod tests {
         assert_eq!(
             registry.resolve(&root.id).unwrap_err().code,
             ClippingErrorCode::AssetRootUnavailable
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipping_root_summaries_are_non_blocking_until_explicitly_checked() {
+        let (_temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        fs::remove_dir_all(&root.locator).unwrap();
+
+        let summaries = registry.list_summaries().unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.root_id == root.id)
+            .unwrap();
+        assert_eq!(summary.status, ClippingRootStatus::Unchecked);
+        assert_eq!(summary.last_checked_at, None);
+
+        let checked = registry.check(&root.id, 200).unwrap();
+        assert_eq!(checked.status, ClippingRootStatus::Offline);
+        assert_eq!(checked.last_checked_at, Some(200));
+        assert!(!Path::new(&root.locator).exists());
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipping_root_operations_reject_unbounded_or_malformed_ids_before_lookup() {
+        let (_temp, registry, writer, _destination) = fixture();
+        for invalid in ["../Newspaper snapshots", &"x".repeat(10_000)] {
+            assert_eq!(
+                registry.check(invalid, 100).unwrap_err().code,
+                ClippingErrorCode::AssetRootUnavailable
+            );
+            assert_eq!(
+                registry.verified_open_path(invalid).unwrap_err().code,
+                ClippingErrorCode::AssetRootUnavailable
+            );
+        }
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn concurrent_clipping_root_checks_share_one_bounded_probe() {
+        let (_temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        *registry
+            .probes
+            .probe_delay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Duration::from_millis(100));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let callers: Vec<_> = (0..8)
+            .map(|index| {
+                let registry = registry.clone();
+                let root_id = root.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.check(&root_id, 200 + index).unwrap()
+                })
+            })
+            .collect();
+        let summaries: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect();
+        assert!(summaries
+            .iter()
+            .all(|summary| summary.status == ClippingRootStatus::Connected));
+        assert!(summaries
+            .iter()
+            .all(|summary| summary.last_checked_at == summaries[0].last_checked_at));
+        assert_eq!(
+            registry
+                .probes
+                .probe_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipping_root_check_distinguishes_connected_and_marker_mismatch() {
+        let (_temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        assert_eq!(
+            registry.check(&root.id, 200).unwrap().status,
+            ClippingRootStatus::Connected
+        );
+        fs::write(
+            marker_path(Path::new(&root.locator)),
+            br#"{"schema_version":1,"root_id":"clipping-root-wrong"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.check(&root.id, 300).unwrap().status,
+            ClippingRootStatus::MarkerMismatch
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipping_root_reconnect_requires_exact_existing_marker_bound_directory() {
+        let (temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        let moved_parent = temp.path().join("replacement-drive");
+        fs::create_dir(&moved_parent).unwrap();
+        let moved_root = moved_parent.join(SNAPSHOT_DIRECTORY_NAME);
+        fs::rename(&root.locator, &moved_root).unwrap();
+        assert_eq!(
+            registry.check(&root.id, 150).unwrap().status,
+            ClippingRootStatus::Offline
+        );
+
+        let wrong_level = moved_root.join("edition");
+        fs::create_dir(&wrong_level).unwrap();
+        assert_eq!(
+            registry
+                .reconnect(&root.id, &wrong_level, 190)
+                .unwrap_err()
+                .code,
+            ClippingErrorCode::AssetRootUnavailable
+        );
+
+        let empty_parent = temp.path().join("empty-drive");
+        fs::create_dir(&empty_parent).unwrap();
+        let empty_root = empty_parent.join(SNAPSHOT_DIRECTORY_NAME);
+        fs::create_dir(&empty_root).unwrap();
+        assert_eq!(
+            registry
+                .reconnect(&root.id, &empty_root, 191)
+                .unwrap_err()
+                .code,
+            ClippingErrorCode::AssetRootUnavailable
+        );
+        fs::create_dir(empty_root.join(INTERNAL_DIRECTORY_NAME)).unwrap();
+        fs::write(
+            marker_path(&empty_root),
+            serde_json::to_vec(&RootMarker {
+                schema_version: 1,
+                root_id: "wrong-root-id".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .reconnect(&root.id, &empty_root, 192)
+                .unwrap_err()
+                .code,
+            ClippingErrorCode::AssetRootUnavailable
+        );
+
+        let reconnected = registry.reconnect(&root.id, &moved_root, 200).unwrap();
+        assert_eq!(reconnected.status, ClippingRootStatus::Connected);
+        assert_eq!(reconnected.display_path, moved_root.to_string_lossy());
+        assert_eq!(
+            registry.resolve(&root.id).unwrap().root(),
+            moved_root.canonicalize().unwrap()
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipping_root_reconnect_writer_failure_preserves_old_locator() {
+        let (temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        let moved_parent = temp.path().join("replacement-drive");
+        fs::create_dir(&moved_parent).unwrap();
+        let moved_root = moved_parent.join(SNAPSHOT_DIRECTORY_NAME);
+        fs::rename(&root.locator, &moved_root).unwrap();
+        writer.shutdown().unwrap();
+
+        assert_eq!(
+            registry
+                .reconnect(&root.id, &moved_root, 200)
+                .unwrap_err()
+                .code,
+            ClippingErrorCode::DatabaseWriteFailed
+        );
+        let stored = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == root.id)
+            .unwrap();
+        assert_eq!(stored.locator, root.locator);
+        assert_eq!(stored.updated_at, root.updated_at);
+    }
+
+    #[test]
+    fn clipping_root_reconnect_same_path_is_idempotent() {
+        let (_temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        let reconnected = registry
+            .reconnect(&root.id, Path::new(&root.locator), 200)
+            .unwrap();
+        assert_eq!(reconnected.status, ClippingRootStatus::Connected);
+        let stored = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == root.id)
+            .unwrap();
+        assert_eq!(stored.locator, root.locator);
+        assert_eq!(stored.locator_key, root.locator_key);
+        assert_eq!(stored.updated_at, 200);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clipping_root_reconnect_rejects_duplicate_locator_without_touching_sentinel() {
+        let (temp, registry, writer, first_destination) = fixture();
+        let second_destination = temp.path().join("second-downloads");
+        fs::create_dir(&second_destination).unwrap();
+        let first = registry
+            .register_download_destination(&first_destination, 100)
+            .unwrap();
+        let second = registry
+            .register_download_destination(&second_destination, 110)
+            .unwrap();
+        let second_path = PathBuf::from(&second.locator);
+        fs::write(
+            marker_path(&second_path),
+            serde_json::to_vec(&RootMarker {
+                schema_version: 1,
+                root_id: first.id.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let sentinel = temp.path().join("outside-sentinel.bin");
+        let sentinel_bytes = b"must remain byte-identical";
+        fs::write(&sentinel, sentinel_bytes).unwrap();
+
+        assert_eq!(
+            registry
+                .reconnect(&first.id, &second_path, 200)
+                .unwrap_err()
+                .code,
+            ClippingErrorCode::AssetRootUnavailable
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), sentinel_bytes);
+        let roots = registry.list().unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .find(|root| root.id == first.id)
+                .unwrap()
+                .locator,
+            first.locator
+        );
+        assert_eq!(
+            roots
+                .iter()
+                .find(|root| root.id == second.id)
+                .unwrap()
+                .locator,
+            second.locator
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clipping_root_reconnect_rejects_junction_before_touching_target() {
+        let (temp, registry, writer, destination) = fixture();
+        let root = registry
+            .register_download_destination(&destination, 100)
+            .unwrap();
+        let target_parent = temp.path().join("junction-target");
+        let link_parent = temp.path().join("junction-link");
+        fs::create_dir(&target_parent).unwrap();
+        fs::create_dir(&link_parent).unwrap();
+        let target = target_parent.join(SNAPSHOT_DIRECTORY_NAME);
+        fs::rename(&root.locator, &target).unwrap();
+        let sentinel = target.join("sentinel.bin");
+        let sentinel_bytes = b"junction target must remain unchanged";
+        fs::write(&sentinel, sentinel_bytes).unwrap();
+        let link = link_parent.join(SNAPSHOT_DIRECTORY_NAME);
+        let output = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction fixture must be available"
+        );
+
+        assert_eq!(
+            registry.reconnect(&root.id, &link, 200).unwrap_err().code,
+            ClippingErrorCode::AssetRootUnavailable
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), sentinel_bytes);
+        assert_eq!(
+            registry
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == root.id)
+                .unwrap()
+                .locator,
+            root.locator
         );
         writer.shutdown().unwrap();
     }
