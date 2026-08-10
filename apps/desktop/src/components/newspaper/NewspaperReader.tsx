@@ -639,9 +639,12 @@ export function NewspaperReader({
           announcement: `Clipping saved from ${response.editionName}, ${response.publicationDate}, page ${response.pageNumber}.`
         });
         toast.success("Clipping saved", {
-          description: `${response.editionName} · ${response.publicationDate} · ${response.pageNumber}`
+          description: `${response.editionName} · ${response.publicationDate} · ${response.pageNumber}`,
+          action: clippingCapability?.onCreated ? {
+            label: "Open note",
+            onClick: () => clippingCapability.onCreated?.(response.clippingId)
+          } : undefined
         });
-        clippingCapability?.onCreated?.(response.clippingId);
       } catch (error) {
         const failure = clippingFailure(error);
         if (failure?.code === "SOURCE_MEDIA_STALE") {
