@@ -358,6 +358,7 @@ try {
   assert.equal(await title.inputValue(), "Local conflict draft");
   await page.getByRole("button", { name: "Keep my changes" }).click();
   await page.getByText("Saved", { exact: true }).waitFor();
+  await page.waitForFunction(() => window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.size === 0);
 
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.conflictNext = true; });
   await title.fill("Second local conflict draft");
@@ -365,6 +366,7 @@ try {
   await page.getByText("This note changed in another window.").waitFor();
   await page.getByRole("button", { name: "Keep my changes" }).click();
   await page.getByText("Saved", { exact: true }).waitFor();
+  await page.waitForFunction(() => window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.size === 0);
 
   await page.getByRole("button", { name: "Open settings" }).click();
   await page.getByText("D:\\Newspapers\\Newspaper snapshots").waitFor();
@@ -383,6 +385,11 @@ try {
   await title.fill("Draft that initially fails");
   await page.waitForTimeout(950);
   await page.getByText("Recovered draft saved locally.").waitFor();
+  await page.waitForFunction(
+    (expected) => [...window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.values()].at(0)?.title === expected,
+    "Draft that initially fails",
+    { timeout: 3_000 }
+  );
   assert.equal(await page.evaluate(() => [...window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.values()].at(0).title), "Draft that initially fails");
   await page.getByRole("button", { name: "Download editions" }).click();
   await page.locator(".newspaper-download").waitFor();
