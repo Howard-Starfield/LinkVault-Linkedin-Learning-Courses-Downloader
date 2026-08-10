@@ -95,12 +95,10 @@ export class ClippingNoteCheckpointController {
   }
 
   getSnapshot = () => this.view;
-
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   };
-
   setDraft(baseRevision: number, title: string, markdown: string) {
     if (this.disposed) return;
     if (
@@ -127,16 +125,16 @@ export class ClippingNoteCheckpointController {
       this.scheduleCheckpoint();
     }
   }
-
   retry() {
     if (this.view.status !== "failed") return Promise.resolve(false);
     return this.startCheckpoint();
   }
-
-  async ensureDurable() {
+  async ensureDurable(writerSequence?: number) {
+    if (writerSequence !== undefined && (writerSequence < 0 || writerSequence > this.view.writerSequence)) return false;
     while (!this.disposed) {
       this.clearTimers();
-      if (this.view.writerSequence <= this.view.durableSequence) return true;
+      const targetSequence = writerSequence ?? this.view.writerSequence;
+      if (targetSequence <= this.view.durableSequence) return true;
       if (this.view.status === "conflict" || this.view.status === "failed") return false;
       const running = this.inFlight
         ?? (this.view.status === "dirty" ? this.startCheckpoint() : null);
@@ -144,7 +142,34 @@ export class ClippingNoteCheckpointController {
     }
     return false;
   }
-
+  restoreDurable(baseRevision: number, title: string, markdown: string, writerSequence: number) {
+    if (this.disposed || this.view.writerSequence !== 0 || writerSequence < 1) return false;
+    this.clearTimers();
+    this.setView({
+      ...this.view,
+      baseRevision,
+      draftTitle: title,
+      draftMarkdown: markdown,
+      writerSequence,
+      durableSequence: writerSequence,
+      status: "durable",
+      errorCode: null
+    });
+    return true;
+  }
+  resetCanonical(baseRevision: number, title: string, markdown: string) {
+    if (this.disposed) return;
+    this.clearTimers();
+    this.setView({
+      ...this.view,
+      baseRevision,
+      draftTitle: title,
+      draftMarkdown: markdown,
+      durableSequence: this.view.writerSequence,
+      status: "idle",
+      errorCode: null
+    });
+  }
   acknowledgeCanonicalSave(writerSessionId: string, writerSequence: number, canonicalRevision: number) {
     if (this.disposed || writerSessionId !== this.view.writerSessionId) return false;
     if (writerSequence < 0 || writerSequence > this.view.writerSequence) return false;
@@ -160,7 +185,6 @@ export class ClippingNoteCheckpointController {
     if (!latestIsCanonical) this.scheduleCheckpoint();
     return true;
   }
-
   dispose() {
     this.disposed = true;
     this.clearTimers();
