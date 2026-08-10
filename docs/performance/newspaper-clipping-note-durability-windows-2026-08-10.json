@@ -143,5 +143,24 @@
     "writesPerSecond": 2523
   },
   "conclusion": "The approved 500 ms trailing/2 s maximum recovery checkpoint and 800 ms trailing/5 s maximum canonical schedules remain accepted. The real writer stayed single-lane, upserted one draft row, bounded WAL high-water below 5 MB, and showed near-limit p95 below 7 ms on this host. No threshold was relaxed after measurement.",
-  "nativeUat": "Pending user observation for native window X hide/show, tray Quit/relaunch, queued-latest text, and optional Chinese IME. Browser proof does not certify those operating-system interactions."
+  "nativeUat": {
+    "status": "passed_observed_close_and_tray_scenarios",
+    "observedBy": "product owner",
+    "environment": "native Tauri development window on Windows 11 Enterprise 24H2",
+    "observedAt": "2026-08-10",
+    "passed": [
+      "window X before Saved hid the main window and tray Show retained exact latest text",
+      "window X while Saving retained queued-latest text",
+      "repeated hide and Show did not create a duplicate main window",
+      "tray Quit exited the native process and relaunch retained or explicitly recovered the latest note"
+    ],
+    "notClaimed": [
+      "native injected canonical or checkpoint failure",
+      "native revision-conflict fault injection",
+      "forced-process crash recovery outside a disposable test profile",
+      "native Chinese IME composition in this UAT run",
+      "screen-reader UAT, which is not a product blocker"
+    ],
+    "boundary": "Browser and service automation cover failure, conflict, and recovery contracts but are not mislabeled as native operating-system interaction proof."
+  }
 }

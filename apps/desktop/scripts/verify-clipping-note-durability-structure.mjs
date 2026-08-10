@@ -109,6 +109,7 @@ assert.equal(performanceReport.source.browserMatrixCommit, "17599b8", "durabilit
 assert.equal(performanceReport.tenMinuteEquivalent.checkpointWrites, 300, "durability report does not contain the approved ten-minute workload");
 assert.equal(performanceReport.tenMinuteEquivalent.failedWrites, 0, "durability report records failed checkpoint writes");
 assert.equal(performanceReport.tenMinuteEquivalent.finalDraftRows, 1, "durability report no longer proves one-row upsert behavior");
-assert.equal(performanceReport.nativeUat.startsWith("Pending"), true, "browser evidence was mislabeled as native UAT");
+assert.equal(performanceReport.nativeUat.status, "passed_observed_close_and_tray_scenarios", "native close/tray UAT status is missing");
+assert.ok(performanceReport.nativeUat.notClaimed.includes("forced-process crash recovery outside a disposable test profile"), "native UAT overclaims crash recovery");
 
 console.log("Clipping note durability ownership, size, native authority, SQL, and gate contracts passed.");
