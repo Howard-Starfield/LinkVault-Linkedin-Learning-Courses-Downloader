@@ -350,19 +350,31 @@ try {
   assert.equal(await page.locator(".clipping-detail").count(), 0, "clearing search bypassed the clipping gallery");
   await page.locator(".clipping-gallery__card").first().click();
   await page.locator(".clipping-detail").waitFor();
+  await page.getByText("Saved", { exact: true }).waitFor();
+  await page.waitForFunction(() => window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.size === 0);
 
+  const firstConflictCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.updateCalls.length);
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.conflictNext = true; });
   await title.fill("Local conflict draft");
-  await page.waitForTimeout(950);
+  await page.waitForFunction(() => document.querySelector(".clipping-detail__title input")?.value === "Local conflict draft");
+  await page.waitForFunction(
+    (previous) => !window.__CLIPPING_LIBRARY_TEST__.conflictNext && window.__CLIPPING_LIBRARY_TEST__.updateCalls.length > previous,
+    firstConflictCalls
+  );
   await page.getByText("This note changed in another window.").waitFor();
   assert.equal(await title.inputValue(), "Local conflict draft");
   await page.getByRole("button", { name: "Keep my changes" }).click();
   await page.getByText("Saved", { exact: true }).waitFor();
   await page.waitForFunction(() => window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.size === 0);
 
+  const secondConflictCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.updateCalls.length);
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.conflictNext = true; });
   await title.fill("Second local conflict draft");
-  await page.waitForTimeout(950);
+  await page.waitForFunction(() => document.querySelector(".clipping-detail__title input")?.value === "Second local conflict draft");
+  await page.waitForFunction(
+    (previous) => !window.__CLIPPING_LIBRARY_TEST__.conflictNext && window.__CLIPPING_LIBRARY_TEST__.updateCalls.length > previous,
+    secondConflictCalls
+  );
   await page.getByText("This note changed in another window.").waitFor();
   await page.getByRole("button", { name: "Keep my changes" }).click();
   await page.getByText("Saved", { exact: true }).waitFor();
