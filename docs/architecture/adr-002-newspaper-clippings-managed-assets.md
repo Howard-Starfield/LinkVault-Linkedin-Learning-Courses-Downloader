@@ -114,7 +114,9 @@ deferred.
 
 ### Note presentation
 
-- The clipping image is rendered as a fixed source card above the note editor.
+- The clipping image is rendered as a fixed, read-only document header above
+  the note title and editor. Presentation may be visually integrated with the
+  writing surface rather than boxed as a separate card.
 - It is not inserted as an editable image node inside the Markdown document.
 - The editor is a frontend adapter that emits plain Markdown.
 - The Rust backend stores and validates Markdown but does not own WYSIWYG
@@ -201,8 +203,8 @@ explicitly exclude `Newspaper snapshots`.
 
 Rejected. The user could accidentally remove or reorder the source evidence,
 provenance would become editor-specific, and future editor replacement would
-be coupled to attachment ownership. A fixed source card and separate Markdown
-body preserve both provenance and editor portability.
+be coupled to attachment ownership. A fixed, read-only document header and
+separate Markdown body preserve both provenance and editor portability.
 
 ### Introduce a general notes platform now
 

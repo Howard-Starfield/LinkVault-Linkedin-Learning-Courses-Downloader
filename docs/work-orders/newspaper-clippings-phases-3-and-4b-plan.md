@@ -1,8 +1,9 @@
 # Newspaper Clippings core workflow implementation plan
 
-**Status:** Authorized and in progress — live owner/conflict audit refreshed
-2026-08-09. Storage/root registration and ranked search/reconnect are complete
-as local stacked commits; Phase 2 is being adapted before Reader UI begins.
+**Status:** Core workflow implemented locally through Phase 4B. Phase 4B code is
+closed at `12a65a1` after the 2026-08-10 owner, browser, persistence, native,
+visual, performance, and release audit. Review/merge remains pending; approved
+Phase 4C durability work is next on a separate boundary.
 
 **Date:** 2026-08-09
 
@@ -13,17 +14,25 @@ clipping, and types a note in the approved Tiptap editor with safe autosave.
 The same clipping can later be found from the application top bar without
 enumerating the nested snapshot folders.
 
+**Durability follow-up:** The bounded close/exit/recovery design, module size
+budgets, performance budgets, and required gates are specified in
+`docs/work-orders/newspaper-clipping-note-durability-plan.md`. Implement that
+work as separately reviewable slices; do not add its state machines to
+`App.tsx`, `ClippingNoteEditor.tsx`, `clipping_service.rs`, or the canonical
+clipping repository.
+
 ### Execution ledger
 
 | Slice | Local state | Next gate |
 |---|---|---|
 | Snapshot root registry and reconnect backend | Complete at `95b6059` | Preserve during Phase 2 adaptation |
 | Ranked clipping search and reconnect IPC | Complete at `43e0ae5` | Production top-bar/search-results UI in Phase 4B |
-| Phase 2 native crop | Replayed and adapted on `codex/newspaper-clippings-phase2-adapted` | Multi-root crop tests, clean gates, fresh baseline |
-| Phase 3 Reader selection | Authorized, not started | Branch only after adapted Phase 2 commit |
-| Phase 4B Clippings/Tiptap/search UI | Authorized, not started | Branch only after Phase 3 commit |
+| Phase 2 native crop | Complete on the stacked integration branch | Preserve crop tests and baseline |
+| Phase 3 Reader selection | Complete on the stacked integration branch | Preserve reader browser/DPI/virtualization contracts |
+| Phase 4B Clippings/Tiptap/search UI | Complete locally at `12a65a1` | Review/merge pending; preserve full Phase 4B gates |
+| Phase 4C note durability/native lifecycle | Approved in D-034; not started | Branch from the audited Phase 4B/docs base; keep separate review boundary |
 
-The local branches may be stacked to reach UAT, but Phase 3 and Phase 4B remain
+The local branches may be stacked to reach UAT, but Phases 3, 4B, and 4C remain
 separate commit/review boundaries. No branch is pushed or merged automatically.
 
 ## 1. Decisions frozen for implementation
@@ -46,10 +55,11 @@ separate commit/review boundaries. No branch is pushed or merged automatically.
   source/job data. React never chooses or receives a raw filesystem path.
 - Saving creates exactly one clipping aggregate containing one immutable image
   and one initially empty Markdown note.
-- The clipping image is a fixed source card above the note editor. It is not an
-  editable node in the note body.
-- The editor is the exact Tiptap 3.29.2 trio approved by D-024 and is imported
-  only by the LinkVault-owned `ClippingNoteEditor` adapter.
+- The clipping image is a fixed read-only document header above the editor.
+  The editable note title sits beside `Back` in the detail top bar. Neither is
+  an editable node in the note body.
+- The editor uses the exact Tiptap 3.29.2 packages approved by D-024 and all
+  Tiptap imports remain in the LinkVault-owned `ClippingNoteEditor` adapter.
 - SQLite stores title and plain Markdown. Tiptap/ProseMirror JSON is never
   persisted.
 - Keyword search uses SQLite clipping metadata and note Markdown. Folder depth,
@@ -477,8 +487,8 @@ Stop after Phase 3 review readiness. Do not start Phase 4B in the same branch.
 Production-enable the complete save-and-review path:
 
 - third World Journal sidebar child named **Clippings**;
-- paged/virtualized clipping list;
-- selected clipping detail with fixed source image card;
+- paged/virtualized responsive clipping gallery;
+- separate full-page clipping detail with a fixed, read-only image header;
 - title and Tiptap Markdown editor;
 - 800 ms autosave, flush boundaries, failures, and revision conflicts;
 - Reader success-toast **Open note** navigation;
@@ -627,17 +637,19 @@ Settings snapshot-root requirements:
   when applicable.
 - **Reconnect** uses the native directory picker and the stable root ID. React
   never sends a replacement path to an ordinary command or rewrites clipping
-  rows. A successful reconnect refreshes visible source cards and search detail
+  rows. A successful reconnect refreshes visible clipping headers and search detail
   without moving canonical files.
 
 Detail requirements:
 
 - Abort/ignore stale detail responses by clipping ID and request generation.
-- Render one fixed source card above title/editor using the versioned media URL.
+- Render one fixed, read-only clipping header above the editor using the
+  versioned media URL and one continuous full-page writing column. Portal the
+  editable title beside `Back`; do not duplicate it in the writing column.
 - Handle ready, verified missing/corrupt, and temporarily unavailable snapshot
   root states without deleting the note. Reconnecting a drive must make a
   transiently unavailable image readable again without rewriting note data.
-- The ordinary source card cannot be removed or edited through Tiptap.
+- The clipping header cannot be removed or edited through Tiptap.
 - Expanded image viewing, if retained, is a bounded detail-only overlay and not
   a new persistent canvas architecture.
 
@@ -649,7 +661,16 @@ Detail requirements:
 - Never call `setContent` for ordinary parent acknowledgements/rerenders.
 - Flush the prior draft before switching clipping IDs.
 - Preserve composition guards and one committed ready callback.
-- Keep raw HTML, MDX, images, tables, code, task-list markers, unsafe links, and
+- Provide a Markdown-safe `/` menu for paragraph, Heading 1-4, task list,
+  bulleted list, numbered list, blockquote, and horizontal rule at a block
+  start or after whitespace. Rank aliases and close fuzzy matches while making
+  execution require an explicit click or Enter. Mount it above the application
+  shell. Provide a pointer-release selection toolbar
+  for Bold, Italic, Strikethrough, and Link, anchored to the beginning of the
+  selection and bounded by the viewport.
+- Keep the top-bar title compact; render save state and Undo/Redo together in
+  the bottom-right note footer.
+- Keep raw HTML, MDX, images, tables, code, unsafe links, and
   file/image paste outside the V1 persisted subset.
 
 ### 5.6 Autosave controller
@@ -731,7 +752,7 @@ Automated proof must include:
 - visible-only thumbnails and 8/50/500 list performance;
 - keyword search over title/note/provenance, including English, Chinese,
   literal wildcard characters, deep matches, and stale-query rejection;
-- source card ready, verified missing/corrupt, and transiently offline-root
+- clipping header ready, verified missing/corrupt, and transiently offline-root
   behavior;
 - title and Markdown validation boundaries;
 - 800 ms debounce, one in-flight save, queued-latest acknowledgement, retry,
@@ -789,7 +810,7 @@ intermediate failures. Generated dist/browser output is removed before commit.
 ### 5.10 Suggested Phase 4B commit slices
 
 1. Safe list/detail/update/thumbnail DTOs, commands, and service tests.
-2. App navigation, Clippings list, visible-only thumbnails, and source card.
+2. App navigation, Clippings gallery, visible-only thumbnails, and clipping header.
 3. Lazy Tiptap detail integration and pure autosave controller.
 4. Conflict/navigation guards, Reader Open note enablement, browser/performance
    gates, native IME evidence, and documentation.
@@ -835,7 +856,7 @@ Stop and request review if implementation would:
 - discard a failed/conflicting draft;
 - combine Phase 3 and Phase 4B in one implementation PR;
 - begin Phase 5 deletion/source-navigation/reset work;
-- change dependencies beyond the approved Tiptap trio or change the release
+- change dependencies beyond the approved Tiptap package set or change the release
   version.
 
 ## 8. Planning handoff

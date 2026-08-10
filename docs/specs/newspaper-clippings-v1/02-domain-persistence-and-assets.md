@@ -2,9 +2,11 @@
 
 **Status:** Approved
 
-**Primary implementation phase:** Phase 1
+**Primary implementation phases:** Phase 1 foundation and Phase 4C durability
+migration
 
-**Related decisions:** D-004 through D-012, D-014 through D-022, D-027, D-028
+**Related decisions:** D-004 through D-012, D-014 through D-022, D-027, D-028,
+D-032 through D-034
 
 ## 1. Purpose
 
@@ -275,6 +277,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS newspaper_clippings_fts USING fts5(
 - Search joins back to `newspaper_clippings` and exposes only `ready` or
   `missing` rows. Index corruption or absence cannot delete or rewrite a note.
 
+### Recovery-checkpoint table (schema v6)
+
+D-034 adds one local, recovery-only row per clipping:
+
+```sql
+CREATE TABLE newspaper_clipping_note_drafts (
+    clipping_id TEXT PRIMARY KEY
+        REFERENCES newspaper_clippings(id) ON DELETE CASCADE,
+    base_revision INTEGER NOT NULL CHECK (base_revision >= 1),
+    writer_session_id TEXT NOT NULL,
+    writer_sequence INTEGER NOT NULL CHECK (writer_sequence >= 1),
+    draft_title TEXT NOT NULL,
+    draft_markdown TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+```
+
+This table is not canonical note storage and has no FTS trigger. A same-session
+checkpoint replaces only a lower sequence. A different session must first load
+and classify the existing recovery row and may not overwrite it silently.
+Backend validation allows at most 4 KiB of UTF-8 title bytes and 4 MiB of UTF-8
+Markdown bytes. Draft bytes never appear in path fields, logs, diagnostics,
+search results, list excerpts, or canonical `updated_at`.
+
 ## 5. Schema-version and migration contract
 
 Phase 1 introduced the clipping table at schema version 3. D-032 advances the
@@ -282,8 +308,10 @@ application to schema version 4, adds the root registry and `asset_root_id`, and
 rebuilds populated v3 clipping tables after the existing verified backup.
 D-019 then advances the application to schema version 5, creates the external-
 content FTS table and synchronization triggers, and issues an FTS `rebuild`
-only after the canonical clipping rows are present. The verified backup occurs
-before either pending migration when upgrading an older database.
+only after the canonical clipping rows are present. D-034 advances the
+application to schema version 6 and adds the recovery-checkpoint table after the
+same verified backup boundary. The verified backup occurs before any pending
+migration when upgrading an older database.
 
 ### FR-MIGRATION-001
 
@@ -318,6 +346,14 @@ parity before writing `PRAGMA user_version = 5`. A failed create, trigger, or
 rebuild rolls back and preserves the verified backup. Repair may drop and
 rebuild only the derived FTS objects while leaving clipping rows untouched.
 
+### FR-MIGRATION-007
+
+Schema-v6 installation creates and verifies the exact recovery table,
+constraints, and `ON DELETE CASCADE` foreign key before writing
+`PRAGMA user_version = 6`. It does not add an FTS trigger, mutate canonical
+clipping rows, or create recovery rows during migration. Failure rolls back
+with `user_version` below 6 and preserves the verified backup.
+
 ### Migration evidence
 
 Tests must prove:
@@ -334,6 +370,8 @@ Tests must prove:
 - Re-running initialization is idempotent.
 - A failed migration leaves `user_version` below the target and preserves the
   verified backup.
+- Fresh, populated-v5, already-v6, failed-v6, and future-version fixtures prove
+  the recovery table contract and preserve representative provider data.
 
 ## 6. Validation and storage limits
 
@@ -355,6 +393,8 @@ Backend validation is authoritative.
 | List offset | Non-negative integer |
 | List limit | 1–100; frontend default 50 |
 | Search query | Trimmed; maximum 200 Unicode scalar values |
+| Recovery title | 0-4,096 UTF-8 bytes; recovery only; no NUL |
+| Recovery Markdown | 0-4,194,304 UTF-8 bytes; recovery only; no NUL |
 
 The frontend may prevalidate for user feedback, but invalid backend input returns
 a typed error and never writes files or rows.
@@ -626,6 +666,15 @@ immutable through the note update command.
 
 No-op updates whose normalized title and Markdown equal the stored values return
 the current record without incrementing revision.
+
+### FR-UPDATE-006: Atomic checkpoint acknowledgement
+
+When a canonical update includes an acknowledged writer session and sequence,
+the existing note savepoint deletes only that clipping's matching-session
+checkpoint whose sequence is less than or equal to the submitted sequence. A
+revision conflict, validation failure, SQL failure, or stale session/sequence
+leaves the checkpoint intact. A no-op canonical update may clear it only after
+proving the submitted title and Markdown equal the canonical bytes.
 
 ## 11. Read and list contract
 

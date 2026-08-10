@@ -5,8 +5,8 @@
 **Primary implementation phase:** Phase 6, with mandatory checkpoints in every
 prior phase
 
-**Related decisions:** All V1 decisions, especially D-004 through D-008, D-032,
-D-015 through D-028
+**Related decisions:** All V1 decisions, especially D-004 through D-008,
+D-015 through D-028, and D-032 through D-034
 
 ## 1. Purpose
 
@@ -36,6 +36,8 @@ Recommended new scripts:
 ```text
 apps/desktop/scripts/verify-newspaper-clippings.mjs
 apps/desktop/scripts/verify-newspaper-clippings-browser.mjs
+apps/desktop/scripts/verify-clipping-note-durability-structure.mjs
+apps/desktop/scripts/verify-clipping-note-durability-browser.mjs
 ```
 
 Recommended package scripts:
@@ -45,7 +47,11 @@ Recommended package scripts:
   "verify:newspaper-clippings":
     "node --experimental-strip-types ./scripts/verify-newspaper-clippings.mjs",
   "verify:newspaper-clippings-browser":
-    "node ./scripts/verify-newspaper-clippings-browser.mjs"
+    "node ./scripts/verify-newspaper-clippings-browser.mjs",
+  "verify:clipping-note-durability-structure":
+    "node ./scripts/verify-clipping-note-durability-structure.mjs",
+  "verify:clipping-note-durability-browser":
+    "node ./scripts/verify-clipping-note-durability-browser.mjs"
 }
 ```
 
@@ -92,6 +98,9 @@ npm.cmd --prefix apps\desktop run verify:newspaper-performance
 npm.cmd --prefix apps\desktop run verify:newspaper-performance-browser
 npm.cmd --prefix apps\desktop run verify:newspaper-clippings
 npm.cmd --prefix apps\desktop run verify:newspaper-clippings-browser
+npm.cmd --prefix apps\desktop run verify:clipping-note-autosave
+npm.cmd --prefix apps\desktop run verify:clipping-note-durability-structure
+npm.cmd --prefix apps\desktop run verify:clipping-note-durability-browser
 ```
 
 ### Rust gates
@@ -590,6 +599,8 @@ clipping_autosave_
 ### Autosave
 
 - Exact 800 ms debounce.
+- Canonical 5-second maximum wait during continuous typing.
+- Recovery checkpoint at 500 ms quiet / 2-second maximum wait.
 - No Tauri write per keystroke.
 - Title-only, note-only, combined changes.
 - Edit during in-flight save.
@@ -598,7 +609,14 @@ clipping_autosave_
 - Flush on every specified boundary.
 - Navigation block and explicit discard.
 - Window blur.
-- Cooperative close.
+- Window X prevents close, flushes/checkpoints, and hides only on success.
+- Tray Quit/application/updater exit flushes/checkpoints and exits only on
+  success.
+- Failed, uncheckpointed/stale-conflict, stale-token, missing-owner, and
+  timed-out lifecycle requests remain open and preserve the draft; a
+  canonical conflict exits only with the exact newest checkpoint durable.
+- Canonical save clears only the matching acknowledged checkpoint atomically.
+- Crash/restart recovery is revision-, writer-session-, and sequence-aware.
 - Maximum-size validation.
 
 ### Revision conflicts
@@ -821,6 +839,11 @@ Required measurements at 8/50/500 clippings:
 - First editable readiness.
 - Typing/IME main-thread long-task evidence.
 - Autosave request duration.
+- Checkpoint p50/p95/max latency and submitted/coalesced write counts.
+- Close/quit handshake p50/p95/max for clean, dirty, in-flight, and checkpoint
+  fallback states.
+- SQLite WAL growth during 10 minutes of near-limit continuous typing and after
+  the idle checkpoint interval.
 - List scroll dropped-frame/long-task evidence where tooling permits.
 - Process memory before/after detail and after closing.
 
@@ -869,7 +892,7 @@ Add deterministic visual fixtures for:
 
 - World Journal sidebar with Clippings inactive/active.
 - Clippings empty state.
-- 8-row populated master-detail view.
+- Populated four-column default gallery and responsive column variants.
 - Ranked search takeover with cumulative match tags.
 - Confident-results tail followed by a separated Possible matches section.
 - Snapshot locations in connected/offline/marker-mismatch/checking states.
@@ -1048,6 +1071,19 @@ Adds:
 - Visual fixtures and native DPI/IME checks.
 - Production enablement only after gates pass.
 
+### Phase 4C
+
+Adds:
+
+- Schema-v6 recovery checkpoint migration/repository/service suite.
+- Pure autosave/checkpoint controller and sequence/conflict matrix.
+- Native close-X, tray Quit, application/updater exit, timeout, stale-token,
+  writer-shutdown-order, and crash/restart tests.
+- Durability ownership/line-budget structural gate.
+- Browser integration plus installed Windows lifecycle/crash-recovery UAT.
+- Release measurements for write counts, checkpoint/exit latency, memory, and
+  SQLite/WAL growth.
+
 ### Phase 5
 
 Adds:
@@ -1072,6 +1108,10 @@ Release is blocked by any of:
   media/Markdown link execution.
 - Creation/deletion crash state cannot recover deterministically.
 - Revision conflict silently loses a draft.
+- A native close/exit path can destroy the editor or shut down the database
+  writer before acknowledged durability.
+- A stale session/sequence can overwrite or clear a newer recovery checkpoint.
+- Recovery draft bytes enter canonical FTS, logs, diagnostics, or list excerpts.
 - Chinese IME cannot compose reliably in title/editor.
 - Reader exceeds its mounted-page bound.
 - List loads canonical images/full Markdown for all rows.
@@ -1116,8 +1156,9 @@ preserved and reported, not rewritten by older code.
 Final release notes/help must state, without overstating capability:
 
 - Crop drawing requires a pointer; surrounding actions are keyboard accessible.
-- Forced process termination/power loss inside the 800 ms note debounce window
-  can lose the most recent unsubmitted draft.
+- A forced process termination or power loss may lose normally no more than the
+  500 ms quiet checkpoint window and no more than 2 seconds during continuous
+  typing. This is bounded recovery, not a zero-loss hard-crash guarantee.
 - Missing canonical assets are not silently recopied from potentially changed
   source pages.
 - Deleted source editions are not heuristically relinked after redownload.
