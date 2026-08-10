@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { Button } from "../primitives";
 import { preserveStableClippingThumbnail } from "./clipping-thumbnail-state";
 import {
   ensureNewspaperClippingThumbnail,
@@ -26,7 +27,23 @@ function clippingAspectRatio(item: NewspaperClippingSummary | undefined) {
   return Math.min(2.4, Math.max(0.72, item.assetWidth / item.assetHeight));
 }
 
-export function NewspaperClippingList({ onSelect }: { onSelect: (id: string) => void }) {
+function ClippingSkeletonShelf({ loading = false }: { loading?: boolean }) {
+  return (
+    <div aria-hidden="true" className={`clipping-gallery__skeletons${loading ? " is-loading" : ""}`}>
+      {Array.from({ length: 4 }, (_, index) => <span key={index} />)}
+    </div>
+  );
+}
+
+export function NewspaperClippingList({
+  onOpenLibrary,
+  onSelect,
+  onSummaryChange
+}: {
+  onOpenLibrary: () => void;
+  onSelect: (id: string) => void;
+  onSummaryChange: (summary: { total: number; loading: boolean } | null) => void;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const generationRef = useRef(0);
   const loadingRef = useRef(new Set<string>());
@@ -87,6 +104,12 @@ export function NewspaperClippingList({ onSelect }: { onSelect: (id: string) => 
   }, [items, loadPage]);
 
   useEffect(refresh, [refresh]);
+
+  useEffect(() => {
+    onSummaryChange({ total, loading: initialLoading });
+  }, [initialLoading, onSummaryChange, total]);
+
+  useEffect(() => () => onSummaryChange(null), [onSummaryChange]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -167,18 +190,25 @@ export function NewspaperClippingList({ onSelect }: { onSelect: (id: string) => 
 
   return (
     <section className="clipping-gallery" aria-label="Saved clippings">
-      <header className="clipping-gallery__header">
-        <div>
-          <span>Saved evidence</span>
-          <h2>Clippings</h2>
-          <p>Open a clipping to view its source and write a note.</p>
-        </div>
-        <strong>{total} clipping{total === 1 ? "" : "s"}</strong>
-      </header>
       <div className="clipping-gallery__scroll" ref={scrollRef} data-testid="newspaper-clipping-list-scroll">
         {error ? <div className="clipping-gallery__message" role="alert">Could not load clippings. {error}</div> : null}
-        {!error && initialLoading ? <div className="clipping-gallery__message">Loading clippings…</div> : null}
-        {!error && !initialLoading && total === 0 ? <div className="clipping-gallery__message">Crop an area in Newspaper library to create your first note.</div> : null}
+        {!error && initialLoading ? (
+          <div className="clipping-gallery__loading" role="status">
+            <span className="sr-only">Loading clippings…</span>
+            <ClippingSkeletonShelf loading />
+          </div>
+        ) : null}
+        {!error && !initialLoading && total === 0 ? (
+          <div className="clipping-gallery__empty">
+            <ClippingSkeletonShelf />
+            <div>
+              <span>Start here</span>
+              <h2>No clippings yet</h2>
+              <p>Clips you save from Newspaper library appear here with their notes.</p>
+              <Button onClick={onOpenLibrary} size="sm" variant="primary">Open Newspaper library</Button>
+            </div>
+          </div>
+        ) : null}
         <div className="clipping-gallery__virtual" style={{ height: `${virtualizer.getTotalSize()}px` }}>
           {virtualRows.map((row) => {
             const start = row.index * columnCount;

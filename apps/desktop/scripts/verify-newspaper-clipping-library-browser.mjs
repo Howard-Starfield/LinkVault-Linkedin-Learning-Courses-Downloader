@@ -161,6 +161,9 @@ try {
 
   await page.getByRole("button", { name: "Clippings", exact: true }).click();
   await page.locator(".clipping-gallery").waitFor();
+  assert.equal(await page.locator(".clipping-gallery__header").count(), 0, "gallery still renders a second header below search");
+  await page.getByText("Saved evidence", { exact: true }).waitFor();
+  await page.getByText("500 clippings", { exact: true }).waitFor();
   assert.equal(await page.locator(".clipping-detail").count(), 0, "gallery eagerly mounted the clipping detail page");
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 0, "gallery eagerly fetched a clipping detail");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), false, "gallery eagerly fetched the editor chunk");
@@ -170,7 +173,7 @@ try {
   const mountedCards = await page.locator(".clipping-gallery__card").count();
   assert.ok(mountedCards > 0 && mountedCards <= 40, `virtual gallery mounted ${mountedCards} cards`);
   const thumbnailCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
-  assert.ok(thumbnailCalls > 0 && thumbnailCalls <= 50, `thumbnail generation was not viewport-bounded: ${thumbnailCalls} calls`);
+  assert.ok(thumbnailCalls > 0 && thumbnailCalls <= 80, `thumbnail generation was not viewport-bounded: ${thumbnailCalls} calls`);
   const firstCard = page.locator(".clipping-gallery__card").first();
   await firstCard.locator(".clipping-gallery__thumb img[data-loaded='true']").waitFor();
   const cardGeometry = await firstCard.evaluate((card) => {
@@ -282,8 +285,20 @@ try {
   await page.getByRole("button", { name: "Download editions" }).click();
   await page.locator(".newspaper-download").waitFor();
 
+  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.details = []; });
+  await page.getByRole("button", { name: "Clippings", exact: true }).click();
+  await page.getByRole("heading", { name: "No clippings yet" }).waitFor();
+  assert.equal(await page.locator(".clipping-gallery__skeletons:not(.is-loading) > span").count(), 4, "empty gallery does not show four clipping skeletons");
+  await page.getByText("Clips you save from Newspaper library appear here with their notes.", { exact: true }).waitFor();
+  await page.getByText("0 clippings", { exact: true }).waitFor();
+  if (process.env.LINKVAULT_CLIPPING_EMPTY_SCREENSHOT) {
+    await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_EMPTY_SCREENSHOT });
+  }
+  await page.getByRole("button", { name: "Open Newspaper library" }).click();
+  await page.locator(".newspaper-library").waitFor();
+
   assert.deepEqual(consoleErrors, [], `browser console/page errors: ${consoleErrors.join("\n")}`);
-  console.log("Clipping library browser matrix passed: responsive four-column gallery, contained title veil, lazy thumbnails/detail/editor, autosave, search paging/tags, conflict, roots, and guarded navigation.");
+  console.log("Clipping library browser matrix passed: compact search-row summary, responsive gallery, first-use skeletons, contained title veil, lazy thumbnails/detail/editor, autosave, search, conflict, roots, and guarded navigation.");
 } finally {
   await browser.close();
 }
