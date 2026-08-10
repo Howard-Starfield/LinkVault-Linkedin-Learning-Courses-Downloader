@@ -40,6 +40,70 @@ function createFakeTimers() {
   };
 }
 
+async function settleScheduledWork() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+async function continuousTypingCounts(durationMs) {
+  const fakeTimers = createFakeTimers();
+  const canonicalCalls = [];
+  const checkpointCalls = [];
+  const canonical = new ClippingNoteSaveController(
+    initial,
+    async (request) => {
+      canonicalCalls.push(request);
+      return { ...request, revision: request.expectedRevision + 1 };
+    },
+    code,
+    800,
+    () => null,
+    5_000,
+    fakeTimers.scheduler
+  );
+  const checkpoint = new ClippingNoteCheckpointController(
+    "clip-1",
+    "frequency-session",
+    5,
+    "Initial",
+    "",
+    async (request) => {
+      checkpointCalls.push(request);
+      return {
+        documentId: request.documentId,
+        writerSessionId: request.writerSessionId,
+        writerSequence: request.writerSequence
+      };
+    },
+    code,
+    500,
+    2_000,
+    () => null,
+    fakeTimers.scheduler
+  );
+  for (let elapsed = 0; elapsed < durationMs; elapsed += 100) {
+    const markdown = `continuous-${elapsed}`;
+    canonical.setMarkdown(markdown);
+    checkpoint.setDraft(5, "Initial", markdown);
+    fakeTimers.advance(100);
+    await settleScheduledWork();
+  }
+  const typingCounts = {
+    canonical: canonicalCalls.length,
+    checkpoint: checkpointCalls.length
+  };
+  fakeTimers.advance(800);
+  await settleScheduledWork();
+  const idleCounts = {
+    canonical: canonicalCalls.length,
+    checkpoint: checkpointCalls.length
+  };
+  canonical.dispose();
+  checkpoint.dispose();
+  return { typingCounts, idleCounts };
+}
+
 {
   const cached = {
     id: "clip-1",
@@ -100,6 +164,31 @@ function createFakeTimers() {
   assert.equal(calls.length, 1, "maximum wait did not bound continuous typing");
   assert.equal(calls[0].title, "Latest continuous draft");
   controller.dispose();
+}
+
+for (const [durationMs, checkpointMaximum, canonicalMaximum] of [
+  [10_000, 5, 2],
+  [600_000, 300, 120]
+]) {
+  const { typingCounts, idleCounts } = await continuousTypingCounts(durationMs);
+  assert.ok(
+    typingCounts.checkpoint <= checkpointMaximum,
+    `${durationMs}ms typing exceeded ${checkpointMaximum} checkpoint submissions`
+  );
+  assert.ok(
+    typingCounts.canonical <= canonicalMaximum,
+    `${durationMs}ms typing exceeded ${canonicalMaximum} canonical submissions`
+  );
+  assert.ok(
+    idleCounts.checkpoint <= typingCounts.checkpoint + 1,
+    `${durationMs}ms typing scheduled more than one final checkpoint`
+  );
+  assert.ok(
+    idleCounts.canonical <= typingCounts.canonical + 1,
+    `${durationMs}ms typing scheduled more than one final canonical save`
+  );
+  assert.equal(typingCounts.checkpoint, checkpointMaximum, "max-wait checkpoint cadence drifted");
+  assert.equal(typingCounts.canonical, canonicalMaximum, "max-wait canonical cadence drifted");
 }
 
 {
@@ -399,4 +488,4 @@ function createFakeTimers() {
   controller.dispose();
 }
 
-console.log("Clipping note canonical autosave, checkpoint coalescing, stable thumbnails, flush, retry, queued-latest, validation, and conflict contracts passed.");
+console.log("Clipping note canonical autosave, 10-second/10-minute frequency, checkpoint coalescing, stable thumbnails, flush, retry, queued-latest, validation, and conflict contracts passed.");

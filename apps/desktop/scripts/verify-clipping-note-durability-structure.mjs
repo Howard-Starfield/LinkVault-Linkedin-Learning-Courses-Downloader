@@ -17,9 +17,11 @@ const budgets = new Map([
   ["src/components/newspaper/NewspaperClippings.tsx", 140],
   ["src/components/newspaper/ClippingNoteEditor.tsx", 500],
   ["src/components/newspaper/clipping-note-slash-command.tsx", 300],
+  ["scripts/clipping-note-durability-browser-performance.mjs", 140],
   ["src-tauri/src/app/cooperative_exit.rs", 320],
   ["src-tauri/src/app/database_migrations/mod.rs", 120],
   ["src-tauri/src/app/database_migrations/newspaper_clipping_drafts.rs", 300],
+  ["src-tauri/src/app/newspaper_clipping_note_durability_baseline.rs", 360],
   ["src-tauri/src/providers/newspaper/clipping_draft_models.rs", 180],
   ["src-tauri/src/providers/newspaper/clipping_draft_repository.rs", 340],
   ["src-tauri/src/providers/newspaper/clipping_draft_service.rs", 360],
@@ -82,6 +84,7 @@ for (const file of await filesUnder(path.join(desktop, "src-tauri/src"))) {
   assert.ok(
     normalized.endsWith("database_migrations/newspaper_clipping_drafts.rs")
       || normalized.endsWith("newspaper/clipping_draft_repository.rs")
+      || normalized.endsWith("app/newspaper_clipping_note_durability_baseline.rs")
       || normalized.endsWith("clipping_service/tests/tests.rs"),
     `recovery draft SQL escaped its owned migration/repository seams: ${normalized}`
   );
@@ -93,5 +96,12 @@ for (const required of [
   "verify:clipping-note-durability-structure",
   "verify:clipping-note-durability-browser"
 ]) assert.ok(packageJson.scripts[required], `package script ${required} is missing`);
+
+const cargoManifest = await source("src-tauri/Cargo.toml");
+const durabilityBaseline = loaded.get("src-tauri/src/app/newspaper_clipping_note_durability_baseline.rs");
+assert.ok(cargoManifest.includes("durability-baseline = []"), "release durability baseline feature is missing");
+assert.ok(cargoManifest.includes('required-features = ["durability-baseline"]'), "durability example is not feature-gated");
+assert.ok(durabilityBaseline.includes("TEN_MINUTE_MAX_WAIT_WRITES: usize = 300"), "ten-minute write bound is not measured");
+assert.ok(!durabilityBaseline.includes("thread::sleep"), "durability collector uses time-based sleeps");
 
 console.log("Clipping note durability ownership, size, native authority, SQL, and gate contracts passed.");
