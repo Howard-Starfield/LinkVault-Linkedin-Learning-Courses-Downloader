@@ -40,7 +40,7 @@ pub const SUPPORTED_SOURCE_MIME_TYPES: [&str; 3] = ["image/jpeg", "image/png", "
 /// Frontend crop coordinates normalized against the rendered source image.
 /// The native crop pipeline validates and converts these values before any
 /// source file read (specification 03 sections 2, 3, and 15).
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedCropRect {
     pub x: f64,
@@ -769,6 +769,10 @@ pub struct NewspaperClippingDetail {
     pub page_number: String,
     pub image_url: String,
     pub source_available: bool,
+    pub source_job_id: Option<String>,
+    pub source_page_id: Option<String>,
+    pub source_media_version_snapshot: i64,
+    pub normalized_rect: NormalizedCropRect,
     pub asset_state: ClippingAssetState,
     pub asset_error_code: Option<String>,
     pub storage_status: ClippingRootStatus,
@@ -777,6 +781,20 @@ pub struct NewspaperClippingDetail {
     pub revision: u64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteNewspaperClippingRequest {
+    pub clipping_id: String,
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNewspaperClippingResponse {
+    pub clipping_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

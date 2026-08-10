@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use super::{
     job_repository,
@@ -60,6 +60,57 @@ pub(super) fn validate_query(
         return Err("INVALID_LIBRARY_QUERY".to_string());
     }
     Ok(())
+}
+
+/// Exact navigation lookup. This intentionally does not depend on the
+/// library's current query, virtualized page, or row index.
+pub(super) fn query_item(db_path: &Path, job_id: &str) -> Result<NewspaperLibraryItem, String> {
+    if job_id.is_empty() || job_id.len() > 128 {
+        return Err("NEWSPAPER_NAVIGATION_TARGET_INVALID".to_string());
+    }
+    let connection =
+        crate::cache::open_runtime(db_path).map_err(|_| "DATABASE_UNAVAILABLE".to_string())?;
+    connection
+        .query_row(
+            "SELECT j.id, j.edition_code, e.name_zh, j.publication_date, j.status,
+                    j.output_dir, j.page_count, j.completed_count, j.warning, j.updated_at,
+                    p.last_page_id, p.last_page_index, p.furthest_page_index,
+                    (SELECT COUNT(*) FROM newspaper_read_pages viewed WHERE viewed.job_id = j.id),
+                    p.updated_at
+             FROM newspaper_jobs j
+             JOIN newspaper_editions e ON e.code = j.edition_code
+                AND e.publication_date = j.edition_publication_date
+             LEFT JOIN newspaper_reading_progress p ON p.job_id = j.id
+             WHERE j.id = ?1
+               AND j.status IN ('completed', 'partial')
+               AND j.dismissed = 0",
+            params![job_id],
+            |row| {
+                Ok(NewspaperLibraryItem {
+                    job_id: row.get(0)?,
+                    edition_code: row.get(1)?,
+                    edition_name: row.get(2)?,
+                    publication_date: row.get(3)?,
+                    status: row.get(4)?,
+                    output_dir: row.get(5)?,
+                    page_count: row.get(6)?,
+                    completed_count: row.get(7)?,
+                    warning: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    thumbnail_ready: false,
+                    thumbnail_url: None,
+                    thumbnail_version: None,
+                    last_page_id: row.get(10)?,
+                    last_page_index: row.get(11)?,
+                    furthest_page_index: row.get(12)?,
+                    read_page_count: row.get(13)?,
+                    reading_updated_at: row.get(14)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|_| "DATABASE_UNAVAILABLE".to_string())?
+        .ok_or_else(|| "NEWSPAPER_SOURCE_JOB_NOT_FOUND".to_string())
 }
 
 pub(super) fn query_page(

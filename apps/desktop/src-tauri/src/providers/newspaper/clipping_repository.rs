@@ -432,12 +432,24 @@ pub fn load_public_by_id(connection: &Connection, id: &str) -> Result<Option<New
         .optional()
 }
 
-pub fn mark_ready_from_creating(connection: &Connection, id: &str, now: i64) -> Result<bool> {
+pub fn mark_ready_after_validation(
+    connection: &Connection,
+    id: &str,
+    expected_state: ClippingAssetState,
+    now: i64,
+) -> Result<bool> {
+    if !matches!(
+        expected_state,
+        ClippingAssetState::Creating | ClippingAssetState::Missing
+    ) {
+        return Ok(false);
+    }
     let changed = connection.execute(
         "UPDATE newspaper_clippings
-         SET asset_state = 'ready', asset_error_code = NULL, updated_at = ?2
-         WHERE id = ?1 AND asset_state = 'creating'",
-        params![id, now],
+         SET asset_state = 'ready', asset_error_code = NULL,
+             updated_at = CASE WHEN ?2 = 'creating' THEN ?3 ELSE updated_at END
+         WHERE id = ?1 AND asset_state = ?2",
+        params![id, expected_state.as_sql(), now],
     )?;
     Ok(changed == 1)
 }

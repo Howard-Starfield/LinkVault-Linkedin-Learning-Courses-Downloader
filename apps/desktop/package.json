@@ -16,6 +16,7 @@
     "verify:clipping-note-durability-browser": "node ./scripts/verify-clipping-note-durability-browser.mjs",
     "verify:newspaper-clipping-library-browser": "node ./scripts/verify-newspaper-clipping-library-browser.mjs",
     "verify:newspaper-clipping-library": "node ./scripts/verify-newspaper-clipping-library.mjs",
+    "verify:newspaper-clipping-lifecycle": "node ./scripts/verify-newspaper-clipping-lifecycle.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
     "verify:architecture": "node ./scripts/verify-architecture.mjs",

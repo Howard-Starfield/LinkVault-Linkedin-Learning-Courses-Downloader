@@ -1,13 +1,18 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, Check, Clipboard, LoaderCircle, RotateCcw } from "lucide-react";
+import { toast } from "sonner";
+import { AlertTriangle, Check, Clipboard, LoaderCircle, MoreHorizontal, RotateCcw } from "lucide-react";
 import { Button, Input } from "../primitives";
 import {
   getNewspaperClipping,
+  recoverNewspaperClippingAsset,
   type NewspaperClippingDetail as ClippingDetail
 } from "./newspaper-api";
 import { NewspaperClippingSourceCard } from "./NewspaperClippingSourceCard";
+import { NewspaperClippingDeleteDialog } from "./NewspaperClippingDeleteDialog";
+import { clippingSaveStatusCopy } from "./clipping-note-status";
 import { useClippingNoteDurability } from "./useClippingNoteDurability";
+import { useNewspaperClippingDelete } from "./useNewspaperClippingDelete";
 
 const LazyClippingNoteEditor = lazy(() => import("./ClippingNoteEditor").then((module) => ({
   default: module.ClippingNoteEditor
@@ -15,10 +20,18 @@ const LazyClippingNoteEditor = lazy(() => import("./ClippingNoteEditor").then((m
 
 export function NewspaperClippingDetail({
   detail,
+  focusEditor,
+  focusSource,
+  onDeleted,
+  onOpenSource,
   onSaved,
   registerFlush
 }: {
   detail: ClippingDetail;
+  focusEditor: boolean;
+  focusSource: boolean;
+  onDeleted: (clippingId: string) => void;
+  onOpenSource: (detail: ClippingDetail) => void;
   onSaved: (detail: ClippingDetail) => void;
   registerFlush: (flush: (() => Promise<boolean>) | null) => void;
 }) {
@@ -30,6 +43,7 @@ export function NewspaperClippingDetail({
   const [conflictLoadAttempt, setConflictLoadAttempt] = useState(0);
   const [editorIdentity, setEditorIdentity] = useState(0);
   const [copyFallback, setCopyFallback] = useState(false);
+  const [recoveringAsset, setRecoveringAsset] = useState(false);
 
   useEffect(() => {
     if (view?.status !== "conflict" || latestConflict) return;
@@ -51,30 +65,52 @@ export function NewspaperClippingDetail({
     };
   }, [conflictLoadAttempt, detail.id, latestConflict, view?.status]);
 
+  useEffect(() => {
+    if (!focusSource) return;
+    document.querySelector<HTMLButtonElement>("[aria-label='Open source newspaper page']")?.focus();
+  }, [durability.ready, focusSource]);
+
   const effectiveError = view?.errorCode ?? durability.checkpointView?.errorCode;
-  const statusCopy = effectiveError === "CLIPPING_INVALID_TITLE"
-    ? "Title must be 1–200 characters."
-    : effectiveError === "CLIPPING_NOTE_TOO_LARGE"
-      ? "Note exceeds the 2 MiB limit."
-      : effectiveError === "CLIPPING_INVALID_MARKDOWN"
-        ? "Note contains an invalid null character."
-        : view?.status === "saving"
-          ? "Saving…"
-          : view?.status === "dirty"
-            ? "Unsaved changes"
-            : view?.status === "failed" && durability.checkpointView?.status === "durable"
-              ? "Recovered draft saved locally."
-              : view?.status === "failed"
-                ? "Save failed. Your draft is still here."
-                : view?.status === "conflict"
-                  ? "Changed in another window"
-                  : "Saved";
+  const statusCopy = clippingSaveStatusCopy(
+    view?.status,
+    effectiveError,
+    durability.checkpointView?.status
+  );
+
+  const retryAsset = async () => {
+    setRecoveringAsset(true);
+    try {
+      const recovered = await recoverNewspaperClippingAsset(detail.id);
+      onSaved(recovered);
+      toast.success("Clipping image verified");
+      return true;
+    } catch {
+      toast.error("The clipping image could not be recovered", {
+        description: "The note is still saved. LinkVault did not search other folders or recrop the page."
+      });
+      return false;
+    } finally {
+      setRecoveringAsset(false);
+    }
+  };
+  const deletion = useNewspaperClippingDelete({
+    clippingId: detail.id,
+    expectedRevision: view?.persistedRevision ?? detail.revision,
+    flush: durability.flush,
+    onDeleted,
+    onSaved
+  });
 
   if (!durability.ready || !view) {
     const invalid = durability.recovery?.status === "invalid";
     return (
       <article className="clipping-detail" aria-label="Clipping note detail">
-        <NewspaperClippingSourceCard detail={detail} />
+        <NewspaperClippingSourceCard
+          detail={detail}
+          onOpenSource={onOpenSource}
+          onRetryAsset={retryAsset}
+          recovering={recoveringAsset}
+        />
         <div className="clipping-detail-state" role={invalid || durability.initializationError ? "alert" : "status"}>
           {invalid ? (
             <>
@@ -103,9 +139,10 @@ export function NewspaperClippingDetail({
   return (
     <>
       {titleSlot ? createPortal(
-        <label className="clipping-detail__title">
-          <span className="sr-only">Title</span>
-          <Input
+        <div className="clipping-detail__title-row">
+          <label className="clipping-detail__title">
+            <span className="sr-only">Title</span>
+            <Input
             aria-label="Clipping note title"
             aria-invalid={effectiveError === "CLIPPING_INVALID_TITLE" || undefined}
             onBlur={() => void durability.flush()}
@@ -117,12 +154,24 @@ export function NewspaperClippingDetail({
             }}
             placeholder="Untitled clipping"
             value={view.draftTitle}
-          />
-        </label>,
+            />
+          </label>
+          <Button
+            aria-label="Delete clipping"
+            onClick={() => void deletion.request()}
+            size="xs"
+            variant="ghost"
+          ><MoreHorizontal aria-hidden="true" /></Button>
+        </div>,
         titleSlot
       ) : null}
       <article className="clipping-detail" aria-label="Clipping note detail">
-        <NewspaperClippingSourceCard detail={detail} />
+        <NewspaperClippingSourceCard
+          detail={detail}
+          onOpenSource={onOpenSource}
+          onRetryAsset={retryAsset}
+          recovering={recoveringAsset}
+        />
         <div className="clipping-detail__writing">
           {durability.recovery?.status === "matching" ? (
             <div className="clipping-recovery-notice" role="status">
@@ -132,7 +181,7 @@ export function NewspaperClippingDetail({
           <Suspense fallback={<div className="clipping-editor-loading"><LoaderCircle aria-hidden="true" className="animate-spin" /> Loading note editor…</div>}>
             <LazyClippingNoteEditor
               key={`${detail.id}-${editorIdentity}`}
-              autoFocus
+              autoFocus={focusEditor}
               documentId={`${detail.id}-${editorIdentity}`}
               footerContent={(
                 <div className="clipping-save-status" data-status={view.status} role="status">
@@ -198,6 +247,13 @@ export function NewspaperClippingDetail({
           ) : null}
         </div>
       </article>
+      <NewspaperClippingDeleteDialog
+        deleting={deletion.deleting}
+        error={deletion.error}
+        onCancel={deletion.cancel}
+        onConfirm={() => void deletion.confirm()}
+        open={deletion.open}
+      />
     </>
   );
 }

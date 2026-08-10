@@ -21,6 +21,10 @@ try {
       pageNumber: `A${index % 40 + 1}`,
       imageUrl: svg(`Clipping ${index + 1}`),
       sourceAvailable: true,
+      sourceJobId: `source-job-${index + 1}`,
+      sourcePageId: `source-page-${index + 1}`,
+      sourceMediaVersionSnapshot: 7,
+      normalizedRect: { x: 0.2, y: 0.62, width: 0.35, height: 0.18 },
       assetState: "ready",
       assetErrorCode: null,
       storageStatus: "connected",
@@ -57,6 +61,9 @@ try {
       detailCalls: [],
       thumbnailCalls: [],
       updateCalls: [],
+      deleteCalls: [],
+      recoveryCalls: [],
+      progressCalls: [],
       checkpointCalls: [],
       checkpointFail: false,
       recoveryDrafts: new Map(),
@@ -68,6 +75,36 @@ try {
       updateDelayMs: 30
     };
     window.__NEWSPAPER_CLIPPINGS_API__ = {
+      async getLibraryItem(jobId) {
+        const detail = window.__CLIPPING_LIBRARY_TEST__.details.find((item) => item.sourceJobId === jobId);
+        if (!detail) throw "NEWSPAPER_SOURCE_JOB_NOT_FOUND";
+        return {
+          jobId,
+          editionCode: detail.editionCode,
+          editionName: detail.editionName,
+          publicationDate: detail.publicationDate,
+          status: "completed",
+          outputDir: "D:\\Newspapers\\edition",
+          pageCount: 3,
+          completedCount: 3,
+          updatedAt: detail.updatedAt,
+          thumbnailReady: false,
+          readPageCount: 0
+        };
+      },
+      async getReaderManifest(jobId) {
+        const detail = window.__CLIPPING_LIBRARY_TEST__.details.find((item) => item.sourceJobId === jobId);
+        if (!detail) throw "NEWSPAPER_SOURCE_JOB_NOT_FOUND";
+        return [
+          { id: `${detail.sourcePageId}-other-1`, jobId, canonicalIndex: 0, pageNumber: "A01", status: "completed", mediaUrl: svg("Other page 1"), mediaVersion: 7, pixelWidth: 1200, pixelHeight: 700 },
+          { id: `${detail.sourcePageId}-other-2`, jobId, canonicalIndex: 1, pageNumber: "A02", status: "completed", mediaUrl: svg("Other page 2"), mediaVersion: 7, pixelWidth: 1200, pixelHeight: 700 },
+          { id: detail.sourcePageId, jobId, canonicalIndex: 2, pageNumber: detail.pageNumber, status: "completed", mediaUrl: svg("Exact source page"), mediaVersion: 7, pixelWidth: 1200, pixelHeight: 700 }
+        ];
+      },
+      async saveReadingProgress(jobId, pageId) {
+        window.__CLIPPING_LIBRARY_TEST__.progressCalls.push({ jobId, pageId });
+        return { jobId, lastPageId: pageId, lastPageIndex: 2, furthestPageIndex: 2, readPageCount: 1, updatedAt: Date.now() };
+      },
       async checkpoint(request) {
         const test = window.__CLIPPING_LIBRARY_TEST__;
         test.checkpointCalls.push(structuredClone(request));
@@ -170,6 +207,24 @@ try {
           && draft.writerSequence <= request.checkpoint.writerSequence) {
           test.recoveryDrafts.delete(request.clippingId);
         }
+        return structuredClone(detail);
+      },
+      async delete(request) {
+        const test = window.__CLIPPING_LIBRARY_TEST__;
+        test.deleteCalls.push(structuredClone(request));
+        const index = test.details.findIndex((item) => item.id === request.clippingId);
+        if (index < 0) throw "CLIPPING_NOT_FOUND";
+        if (test.details[index].revision !== request.expectedRevision) throw "CLIPPING_REVISION_CONFLICT";
+        test.details.splice(index, 1);
+        return { clippingId: request.clippingId, deleted: true };
+      },
+      async recoverAsset(clippingId) {
+        const test = window.__CLIPPING_LIBRARY_TEST__;
+        test.recoveryCalls.push(clippingId);
+        const detail = test.details.find((item) => item.id === clippingId);
+        if (!detail) throw "CLIPPING_NOT_FOUND";
+        detail.assetState = "ready";
+        detail.assetErrorCode = null;
         return structuredClone(detail);
       },
       async ensureThumbnail(id) {
@@ -292,7 +347,8 @@ try {
   await page.setViewportSize({ width: 1900, height: 960 });
   await page.waitForFunction(() => document.querySelector(".clipping-gallery__row")?.children.length === 5);
   assert.equal(await page.locator(".clipping-gallery__row").first().locator(".clipping-gallery__card").count(), 5, "wide gallery did not add a clipping column");
-  await page.waitForFunction((previous) => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length > previous, callsAtDefaultWidth);
+  const callsAtWideWidth = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
+  assert.ok(callsAtWideWidth >= callsAtDefaultWidth && callsAtWideWidth <= 80, `responsive resize escaped viewport-bounded thumbnails: ${callsAtWideWidth} calls`);
   await page.setViewportSize({ width: 1600, height: 960 });
   await page.waitForFunction(() => document.querySelector(".clipping-gallery__row")?.children.length === 4);
   if (process.env.LINKVAULT_CLIPPING_SCREENSHOT) {
@@ -301,6 +357,7 @@ try {
   await firstCard.click();
   await page.locator(".clipping-detail").waitFor();
   await page.getByLabel("Clipping note editor body").waitFor();
+  assert.equal(await page.getByLabel("Clipping note editor body").evaluate((element) => element === document.activeElement), false, "ordinary gallery selection stole editor focus");
   const topBack = page.locator(".lv-global-search").getByRole("button", { name: "Back", exact: true });
   await topBack.waitFor();
   assert.equal(await page.locator(".clipping-note-page__header").count(), 0, "detail still renders a redundant internal header");
@@ -310,11 +367,36 @@ try {
   assert.equal(await page.locator(".clipping-note-editor__footer").getByRole("toolbar", { name: "Editing history", exact: true }).count(), 1, "Undo and Redo are not inside the note footer");
   assert.equal(await page.locator(".lv-global-search__title-slot .clipping-detail__title input").count(), 1, "editable note title is not beside Back in the top bar");
   assert.equal(await page.locator(".clipping-detail__writing > .clipping-detail__title").count(), 0, "note title is still duplicated above the editor body");
+  await page.locator(".clipping-source-card > img").evaluate((image) => image.dispatchEvent(new Event("error")));
+  await page.getByRole("button", { name: "Retry image check" }).click();
+  await page.locator(".clipping-source-card > img").waitFor();
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.recoveryCalls.length), 1, "successful exact-asset retry did not remount the verified clipping image");
   if (process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT) {
     await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT });
   }
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 1, "thumbnail selection did not fetch exactly one clipping detail");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), true, "detail did not lazy-load the editor chunk");
+  await page.getByRole("button", { name: "Open source newspaper page" }).click();
+  await page.locator(".newspaper-reader").waitFor();
+  await page.getByRole("button", { name: "Back to clipping" }).waitFor();
+  await page.waitForFunction(() => document.querySelector("[aria-label='Select newspaper page']")?.value === "2");
+  assert.equal(await page.getByLabel("Select newspaper page").inputValue(), "2", "source navigation used a page index instead of the exact page ID");
+  const sourceHighlight = page.locator("[data-testid='newspaper-source-highlight']");
+  await sourceHighlight.waitFor();
+  const highlightStyle = await sourceHighlight.evaluate((element) => ({
+    left: element.style.left,
+    top: element.style.top,
+    width: element.style.width,
+    height: element.style.height,
+    pointerEvents: getComputedStyle(element).pointerEvents
+  }));
+  assert.deepEqual(highlightStyle, { left: "20%", top: "62%", width: "35%", height: "18%", pointerEvents: "none" });
+  await page.waitForTimeout(3_150);
+  assert.equal(await sourceHighlight.count(), 0, "source highlight did not expire after its three-second display window");
+  await page.getByRole("button", { name: "Back to clipping" }).click();
+  await page.getByLabel("Clipping note editor body").waitFor();
+  assert.equal(await page.getByRole("button", { name: "Open source newspaper page" }).evaluate((element) => element === document.activeElement), true, "source return did not restore focus to Open source");
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 2, "Back to clipping did not reload the exact clipping ID once");
   await topBack.click();
   await page.locator(".clipping-gallery").waitFor();
   await page.locator(".clipping-gallery__card").first().click();
@@ -328,10 +410,10 @@ try {
   await title.fill("Transit evidence note");
   await title.press("Enter");
   assert.equal(await page.getByLabel("Clipping note editor body").evaluate((element) => element === document.activeElement), true, "Enter in the top-bar title did not focus the note body");
-  await page.keyboard.type(" with searchable keyword");
+  await page.keyboard.insertText(" with searchable keyword");
   await page.waitForTimeout(950);
   const initialSaveCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.updateCalls);
-  assert.ok(initialSaveCalls.length >= 2 && initialSaveCalls.length <= 3, `title/body editing issued ${initialSaveCalls.length} canonical saves`);
+  assert.ok(initialSaveCalls.length >= 2 && initialSaveCalls.length <= 3, `title/body editing issued ${initialSaveCalls.length} canonical saves: ${JSON.stringify(initialSaveCalls)}`);
   const initialCheckpointCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.checkpointCalls.length);
   assert.ok(initialCheckpointCalls > 0 && initialCheckpointCalls <= 5, `title/body editing issued ${initialCheckpointCalls} recovery checkpoints`);
   assert.equal(initialSaveCalls.at(-1).noteMarkdown.includes("searchable keyword"), true);
@@ -349,6 +431,15 @@ try {
   await page.waitForFunction(() => window.__CLIPPING_LIBRARY_TEST__.searchCalls.some((call) => call.offset === 50));
   const searchOffsets = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.searchCalls.map((call) => call.offset));
   assert.ok(searchOffsets.includes(50), "search scrolling did not lazy-load the next 50 results");
+  await page.locator(".clipping-search-row").first().click();
+  await page.locator(".clipping-detail").waitFor();
+  await page.getByRole("button", { name: "Open source newspaper page" }).click();
+  await page.getByRole("button", { name: "Back to clipping" }).waitFor();
+  await page.getByRole("button", { name: "Back to clipping" }).click();
+  await page.locator(".clipping-detail").waitFor();
+  await topBack.click();
+  await page.locator(".clipping-search-results").waitFor();
+  assert.equal(await globalSearch.inputValue(), "transit", "source round trip discarded the clipping search query");
   await page.getByLabel("Clear clipping search").click();
   await page.locator(".clipping-gallery").waitFor();
   assert.equal(await page.locator(".clipping-detail").count(), 0, "clearing search bypassed the clipping gallery");
@@ -525,6 +616,21 @@ try {
   await page.getByRole("button", { name: "Download editions" }).click();
   await page.locator(".newspaper-download").waitFor();
   assert.equal(await page.locator(".lv-global-search").count(), 0, "clipping search row remained on Download editions");
+
+  await page.getByRole("button", { name: "Clippings", exact: true }).click();
+  await page.locator(".clipping-gallery__card").first().click();
+  await page.getByLabel("Clipping note editor body").waitFor();
+  await page.getByRole("button", { name: "Delete clipping" }).click();
+  await page.getByRole("dialog", { name: "Delete this clipping?" }).waitFor();
+  await page.getByText("The original newspaper page is not deleted.", { exact: false }).waitFor();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await page.locator(".clipping-detail").count(), 1, "cancelling deletion removed the clipping detail");
+  await page.getByRole("button", { name: "Delete clipping" }).click();
+  await page.getByRole("dialog", { name: "Delete this clipping?" }).getByRole("button", { name: "Delete clipping" }).click();
+  await page.locator(".clipping-detail").waitFor();
+  await page.waitForFunction(() => document.querySelector(".clipping-detail__title input")?.value === "Transit archive clipping 2");
+  assert.equal(await title.inputValue(), "Transit archive clipping 2", "confirmed deletion did not select the next cached clipping");
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.deleteCalls.length), 1, "confirmed deletion did not issue one revision-guarded request");
 
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.details = []; });
   await page.getByRole("button", { name: "Clippings", exact: true }).click();

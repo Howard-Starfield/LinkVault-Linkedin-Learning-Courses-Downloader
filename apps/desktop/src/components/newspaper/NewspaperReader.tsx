@@ -54,6 +54,9 @@ import {
   NewspaperClippingConfirmationControls,
   NewspaperClippingSelectionOverlay
 } from "./NewspaperClippingSelectionOverlay";
+import { NewspaperSourceHighlight } from "./NewspaperSourceHighlight";
+import type { NewspaperReaderSourceTarget } from "./newspaper-navigation";
+import { useNewspaperSourceHighlight } from "./useNewspaperSourceHighlight";
 import { threePageRange } from "./newspaper-virtualization";
 
 const PAGE_GAP = 2;
@@ -121,6 +124,7 @@ export function NewspaperReader({
   pageTone,
   onPageToneChange,
   clippingCapability,
+  sourceTarget,
   onClose
 }: {
   item: NewspaperLibraryItem;
@@ -129,6 +133,7 @@ export function NewspaperReader({
   pageTone: NewspaperPageTone;
   onPageToneChange: (tone: NewspaperPageTone) => void;
   clippingCapability?: NewspaperClippingCapability;
+  sourceTarget?: NewspaperReaderSourceTarget | null;
   onClose: (progress?: NewspaperReadingProgress) => void;
 }) {
   const baselineZoom = clampNewspaperReaderZoom(defaultZoom);
@@ -158,6 +163,12 @@ export function NewspaperReader({
   const [failedImages, setFailedImages] = useState<Set<string>>(() => new Set());
   const [isClickZoomed, setIsClickZoomed] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
+  const [sourceMediaChanged, setSourceMediaChanged] = useState(false);
+  const {
+    clear: clearSourceHighlight,
+    show: showSourceHighlight,
+    visiblePageId: sourceHighlightPageId
+  } = useNewspaperSourceHighlight(sourceTarget);
 
   activeIndexRef.current = activeIndex;
   clippingInteractionRef.current = clippingInteraction;
@@ -169,11 +180,28 @@ export function NewspaperReader({
       .then((manifest) => {
         if (stale) return;
         setPages(manifest);
+        const targetIndex = sourceTarget
+          ? manifest.findIndex((page) => page.id === sourceTarget.pageId && page.status === "completed")
+          : -1;
+        if (sourceTarget && targetIndex < 0) {
+          toast.error("Original page is unavailable", {
+            description: "Your clipping and note are still saved."
+          });
+          void onClose();
+          return;
+        }
         const savedIndex = item.lastPageId
           ? manifest.findIndex((page) => page.id === item.lastPageId && page.status === "completed")
           : -1;
         const firstCompleted = manifest.findIndex((page) => page.status === "completed");
-        const nextIndex = savedIndex >= 0 ? savedIndex : Math.max(0, firstCompleted);
+        const nextIndex = targetIndex >= 0
+          ? targetIndex
+          : savedIndex >= 0 ? savedIndex : Math.max(0, firstCompleted);
+        const targetPage = targetIndex >= 0 ? manifest[targetIndex] : null;
+        setSourceMediaChanged(Boolean(
+          targetPage && sourceTarget
+          && targetPage.mediaVersion !== sourceTarget.sourceMediaVersionSnapshot
+        ));
         setActiveIndex(nextIndex);
         activeIndexRef.current = nextIndex;
       })
@@ -186,7 +214,7 @@ export function NewspaperReader({
     return () => {
       stale = true;
     };
-  }, [item.jobId, item.lastPageId]);
+  }, [item.jobId, item.lastPageId, onClose, sourceTarget]);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -220,6 +248,7 @@ export function NewspaperReader({
     rangeExtractor,
     onChange: (instance) => {
       if (zoomingRef.current) return;
+      if (sourceTarget && !initialScrollDoneRef.current) return;
       const measurements = instance.measurementsCache;
       if (measurements.length === 0) return;
       const center = (instance.scrollOffset ?? 0) + (instance.scrollRect?.height ?? 0) / 2;
@@ -330,9 +359,10 @@ export function NewspaperReader({
       return;
     }
     clearPanGesture();
+    clearSourceHighlight();
     dispatchClipping({ type: "ENTER" });
     scrollRef.current?.focus({ preventScroll: true });
-  }, [clearPanGesture, clippingCapability?.enabled, pages]);
+  }, [clearPanGesture, clearSourceHighlight, clippingCapability?.enabled, pages]);
 
   useEffect(() => {
     const handleBlur = () => {
@@ -345,6 +375,7 @@ export function NewspaperReader({
       if (event.defaultPrevented) return;
       const interaction = clippingInteractionRef.current;
       if (event.key === "Escape") {
+        clearSourceHighlight();
         event.preventDefault();
         if (interaction.type === "clip-saving") return;
         if (interaction.type !== "browse") {
@@ -392,7 +423,7 @@ export function NewspaperReader({
       window.removeEventListener("blur", handleBlur);
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [cancelClipping, clippingCapability?.enabled, enterClipMode, flushProgress, onClose, pages.length, virtualizer]);
+  }, [cancelClipping, clearSourceHighlight, clippingCapability?.enabled, enterClipMode, flushProgress, onClose, pages.length, virtualizer]);
 
   useEffect(() => () => {
     releaseClippingPointer();
@@ -400,6 +431,7 @@ export function NewspaperReader({
   }, [releaseClippingPointer]);
 
   const changeZoom = (nextZoom: number, anchor?: ZoomAnchor) => {
+    clearSourceHighlight();
     const bounded = clampNewspaperReaderZoom(nextZoom);
     const element = scrollRef.current;
     const targetIndex = anchor?.pageIndex ?? activeIndexRef.current;
@@ -465,6 +497,7 @@ export function NewspaperReader({
   };
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    clearSourceHighlight();
     if (!event.isPrimary || event.button !== 0 || zoomingRef.current) return;
     const target = event.target;
     if (!(target instanceof Element)) return;
@@ -775,6 +808,31 @@ export function NewspaperReader({
     () => virtualItems.filter((virtualItem) => pages[virtualItem.index]?.mediaUrl).length,
     [pages, virtualItems]
   );
+  const revealSourceHighlight = useCallback((image: HTMLImageElement, pageId: string) => {
+    if (!sourceTarget || pageId !== sourceTarget.pageId) return;
+    window.requestAnimationFrame(() => {
+      const scroller = scrollRef.current;
+      if (!scroller) return;
+      const imageRect = image.getBoundingClientRect();
+      const scrollerRect = scroller.getBoundingClientRect();
+      const highlightCenter = sourceTarget.highlight.y + sourceTarget.highlight.height / 2;
+      scroller.scrollTo({
+        top: Math.max(0, scroller.scrollTop + imageRect.top - scrollerRect.top
+          + imageRect.height * highlightCenter - scroller.clientHeight / 2),
+        behavior: "auto"
+      });
+      window.requestAnimationFrame(() => showSourceHighlight(pageId));
+    });
+  }, [showSourceHighlight, sourceTarget]);
+  useEffect(() => {
+    if (loading || !sourceTarget) return;
+    const image = scrollRef.current?.querySelector<HTMLImageElement>(
+      `[data-page-id="${CSS.escape(sourceTarget.pageId)}"] [data-testid="newspaper-reader-page-image"]`
+    );
+    if (image?.complete && image.naturalWidth > 0) {
+      revealSourceHighlight(image, sourceTarget.pageId);
+    }
+  }, [loading, revealSourceHighlight, sourceTarget]);
 
   return createPortal(
     <section
@@ -795,7 +853,7 @@ export function NewspaperReader({
             disabled={clippingLocksGeometry}
             onClick={() => void flushProgress().then(onClose)}
           >
-            <ArrowLeft /> Back to library
+            <ArrowLeft /> {sourceTarget ? "Back to clipping" : "Back to library"}
           </Button>
           <div>
             <strong>{item.editionName}</strong>
@@ -895,11 +953,20 @@ export function NewspaperReader({
           </div>
         </div>
       </header>
+      {sourceMediaChanged ? (
+        <div className="newspaper-source-version-notice" role="status">
+          This page image has changed since the clipping was saved.
+        </div>
+      ) : null}
+      {sourceHighlightPageId ? (
+        <span className="sr-only" role="status">Saved clipping location highlighted</span>
+      ) : null}
       <div
         ref={scrollRef}
         className="newspaper-reader-canvas"
         data-testid="newspaper-reader-scroll"
         tabIndex={-1}
+        onWheel={clearSourceHighlight}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -953,8 +1020,12 @@ export function NewspaperReader({
                       height={page.pixelHeight ?? 4384}
                       data-testid="newspaper-reader-page-image"
                       data-click-zoomed={isClickZoomed ? "true" : undefined}
+                      onLoad={(event) => revealSourceHighlight(event.currentTarget, page.id)}
                       onError={() => setFailedImages((current) => new Set(current).add(page.id))}
                     />
+                    {sourceTarget?.pageId === page.id && sourceHighlightPageId === page.id ? (
+                      <NewspaperSourceHighlight rect={sourceTarget.highlight} />
+                    ) : null}
                     {clippingForPage && clippingForPage.rect.width > 0 && clippingForPage.rect.height > 0 ? (
                       <NewspaperClippingSelectionOverlay
                         rect={clippingForPage.rect}

@@ -1,9 +1,23 @@
-import { ImageOff } from "lucide-react";
+import { ExternalLink, ImageOff, LoaderCircle, RotateCcw } from "lucide-react";
 import { useState } from "react";
+import { Button } from "../primitives";
 import type { NewspaperClippingDetail } from "./newspaper-api";
 
-export function NewspaperClippingSourceCard({ detail }: { detail: NewspaperClippingDetail }) {
+export function NewspaperClippingSourceCard({
+  detail,
+  onOpenSource,
+  onRetryAsset,
+  recovering
+}: {
+  detail: NewspaperClippingDetail;
+  onOpenSource: (detail: NewspaperClippingDetail) => void;
+  onRetryAsset: () => Promise<boolean>;
+  recovering: boolean;
+}) {
   const [imageFailed, setImageFailed] = useState(false);
+  const retryAsset = async () => {
+    if (await onRetryAsset()) setImageFailed(false);
+  };
   const unavailable = detail.assetState !== "ready"
     || detail.storageStatus === "offline"
     || detail.storageStatus === "marker_mismatch"
@@ -22,6 +36,12 @@ export function NewspaperClippingSourceCard({ detail }: { detail: NewspaperClipp
         <div className="clipping-source-card__unavailable" role="status">
           <ImageOff aria-hidden="true" />
           <span>{message}</span>
+          {detail.assetState === "missing" || imageFailed ? (
+            <Button disabled={recovering} onClick={() => void retryAsset()} size="xs" variant="outline">
+              {recovering ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}
+              Retry image check
+            </Button>
+          ) : null}
         </div>
       ) : (
         <img
@@ -32,11 +52,28 @@ export function NewspaperClippingSourceCard({ detail }: { detail: NewspaperClipp
         />
       )}
       <figcaption>
-        <strong>{detail.editionName}</strong>
-        <span aria-hidden="true">·</span>
-        <span>{detail.publicationDate}</span>
-        <span aria-hidden="true">·</span>
-        <span>Page {detail.pageNumber}</span>
+        <div>
+          <strong>{detail.editionName}</strong>
+          <span aria-hidden="true">·</span>
+          <span>{detail.publicationDate}</span>
+          <span aria-hidden="true">·</span>
+          <span>Page {detail.pageNumber}</span>
+        </div>
+        {detail.sourceAvailable ? (
+          <Button
+            aria-label="Open source newspaper page"
+            onClick={() => onOpenSource(detail)}
+            size="xs"
+            variant="ghost"
+          >
+            <ExternalLink aria-hidden="true" /> Open source
+          </Button>
+        ) : (
+          <p className="clipping-source-card__source-unavailable">
+            Original edition is no longer in the newspaper library.<br />
+            Your clipping and note are still saved.
+          </p>
+        )}
       </figcaption>
     </figure>
   );

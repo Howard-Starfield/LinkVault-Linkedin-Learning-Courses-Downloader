@@ -34,7 +34,7 @@ use super::clipping_models::{
     NewspaperClippingDetail, NewspaperClippingListQuery, NewspaperClippingMatchField,
     NewspaperClippingSearchResult, NewspaperClippingSearchSnippet,
     NewspaperClippingSearchSnippetPart, NewspaperClippingSort, NewspaperClippingsPage,
-    SearchNewspaperClippingsPage, SearchNewspaperClippingsRequest,
+    NormalizedCropRect, SearchNewspaperClippingsPage, SearchNewspaperClippingsRequest,
     SearchPossibleNewspaperClippingsRequest, SearchPossibleNewspaperClippingsResponse,
     FUZZY_CANDIDATE_LIMIT, POSSIBLE_MATCH_LIMIT, SEARCH_PAGE_LIMIT, SEARCH_SNIPPET_MAX_CHARS,
 };
@@ -334,6 +334,22 @@ impl ClippingService {
         }
     }
 
+    fn mark_ready_after_validation(
+        &self,
+        id: &str,
+        expected_state: ClippingAssetState,
+        now: i64,
+        operation: &'static str,
+    ) -> Result<bool, ClippingError> {
+        let owned_id = id.to_string();
+        self.writer
+            .execute(Self::context(operation), move |db| {
+                repository::mark_ready_after_validation(db, &owned_id, expected_state, now)
+                    .map_err(Into::into)
+            })
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))
+    }
+
     fn read_by_id(&self, id: &str) -> Result<Option<NewspaperClipping>, ClippingError> {
         let connection = open_runtime(&self.db_path)
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
@@ -577,13 +593,12 @@ impl ClippingService {
                 record.crop_height,
                 &record.asset_checksum_sha256,
             )?;
-            let id = record.id.clone();
-            let marked = self
-                .writer
-                .execute(Self::context("clipping_mark_ready"), move |db| {
-                    repository::mark_ready_from_creating(db, &id, record.now).map_err(Into::into)
-                })
-                .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))?;
+            let marked = self.mark_ready_after_validation(
+                &record.id,
+                ClippingAssetState::Creating,
+                record.now,
+                "clipping_mark_ready",
+            )?;
             if !marked {
                 return Err(ClippingError::new(ClippingErrorCode::OperationConflict));
             }
@@ -780,6 +795,47 @@ impl ClippingService {
         }
     }
 
+    /// Bounded user-triggered validation of the row's exact canonical asset.
+    /// It never searches other folders and never recrops from a source page.
+    pub fn recover_asset(&self, id: &str) -> Result<NewspaperClippingDetail, ClippingError> {
+        if !validate_clipping_id(id) {
+            return Err(ClippingError::new(ClippingErrorCode::InvalidId));
+        }
+        let clipping = self
+            .read_by_id(id)?
+            .filter(|row| row.asset_state.is_publicly_visible())
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))?;
+        let asset_layout = self.roots.resolve(&clipping.asset_root_id)?;
+        asset_layout.read_validated_canonical_at(
+            id,
+            &clipping.asset_relative_path,
+            clipping.asset_byte_count,
+            clipping.asset_pixel_width,
+            clipping.asset_pixel_height,
+            &clipping.asset_checksum_sha256,
+        )?;
+        if clipping.asset_state == ClippingAssetState::Missing {
+            let marked = self.mark_ready_after_validation(
+                id,
+                ClippingAssetState::Missing,
+                0,
+                "clipping_revalidate_canonical",
+            )?;
+            if !marked {
+                let current = self
+                    .detail_response(id)?
+                    .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))?;
+                return if current.asset_state == ClippingAssetState::Ready {
+                    Ok(current)
+                } else {
+                    Err(ClippingError::new(ClippingErrorCode::OperationConflict))
+                };
+            }
+        }
+        self.detail_response(id)?
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))
+    }
+
     pub fn list(
         &self,
         mut query: NewspaperClippingListQuery,
@@ -819,12 +875,25 @@ impl ClippingService {
         let Some(detail) = self.detail(id)? else {
             return Ok(None);
         };
+        if detail.clipping.source_pixel_width == 0 || detail.clipping.source_pixel_height == 0 {
+            return Err(ClippingError::new(ClippingErrorCode::DatabaseReadFailed));
+        }
         let storage_status = self
             .list_root_summaries()?
             .into_iter()
             .find(|root| root.root_id == detail.clipping.asset_root_id)
             .map(|root| root.status)
             .unwrap_or(ClippingRootStatus::Offline);
+        let normalized_rect = NormalizedCropRect {
+            x: f64::from(detail.clipping.crop_x) / f64::from(detail.clipping.source_pixel_width),
+            y: f64::from(detail.clipping.crop_y) / f64::from(detail.clipping.source_pixel_height),
+            width: f64::from(detail.clipping.crop_width)
+                / f64::from(detail.clipping.source_pixel_width),
+            height: f64::from(detail.clipping.crop_height)
+                / f64::from(detail.clipping.source_pixel_height),
+        };
+        clipping_crop::validate_normalized_rect(normalized_rect)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
         Ok(Some(NewspaperClippingDetail {
             image_url: format!(
                 "http://newspaper-media.localhost/clipping/{}?v={}",
@@ -838,6 +907,10 @@ impl ClippingService {
             publication_date: detail.clipping.publication_date_snapshot,
             page_number: detail.clipping.page_number_snapshot,
             source_available: detail.source_available,
+            source_job_id: detail.clipping.source_job_id.clone(),
+            source_page_id: detail.clipping.source_page_id.clone(),
+            source_media_version_snapshot: detail.clipping.source_media_version_snapshot,
+            normalized_rect,
             asset_state: detail.clipping.asset_state,
             asset_error_code: detail.clipping.asset_error_code,
             storage_status,
@@ -2440,6 +2513,18 @@ mod tests {
         assert_eq!(detail.revision, created.revision);
         assert!(detail.image_url.ends_with(&format!("/clipping/{ID}?v=1")));
         assert_eq!(detail.storage_status, ClippingRootStatus::Unchecked);
+        assert_eq!(detail.source_job_id, None);
+        assert_eq!(detail.source_page_id, None);
+        assert_eq!(detail.source_media_version_snapshot, 1);
+        assert_eq!(
+            detail.normalized_rect,
+            NormalizedCropRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }
+        );
 
         let updated = service
             .update_note_response(ID, created.revision, "  Evidence  ", "中文 note", None, 101)
@@ -2472,6 +2557,86 @@ mod tests {
         assert!(
             canonical.is_file(),
             "thumbnail generation must retain canonical media"
+        );
+    }
+
+    #[test]
+    fn clipping_targeted_asset_recovery_revalidates_only_the_exact_canonical() {
+        let (_temp, service, _diagnostics) = fixture();
+        let created = service
+            .register_staged_legacy_fixture(staged_record(&service, ID))
+            .unwrap();
+        let owned_id = ID.to_string();
+        service
+            .writer
+            .execute(ClippingService::context("test_mark_missing"), move |db| {
+                assert!(repository::mark_missing_from_ready(
+                    db,
+                    &owned_id,
+                    ClippingErrorCode::AssetMissing.as_str(),
+                    101,
+                )?);
+                Ok(())
+            })
+            .unwrap();
+
+        let recovered = service.recover_asset(ID).unwrap();
+        assert_eq!(recovered.asset_state, ClippingAssetState::Ready);
+        assert_eq!(recovered.revision, created.revision);
+        assert_eq!(
+            service.read_by_id(ID).unwrap().unwrap().asset_version,
+            created.asset_version
+        );
+
+        let canonical = service.layout.canonical_path(ID).unwrap();
+        std::fs::remove_file(&canonical).unwrap();
+        let owned_id = ID.to_string();
+        service
+            .writer
+            .execute(
+                ClippingService::context("test_mark_missing_again"),
+                move |db| {
+                    assert!(repository::mark_missing_from_ready(
+                        db,
+                        &owned_id,
+                        ClippingErrorCode::AssetMissing.as_str(),
+                        102,
+                    )?);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            service.recover_asset(ID).unwrap_err().code,
+            ClippingErrorCode::AssetMissing
+        );
+        assert_eq!(
+            service.detail_response(ID).unwrap().unwrap().asset_state,
+            ClippingAssetState::Missing
+        );
+    }
+
+    #[test]
+    fn clipping_detail_rejects_corrupt_normalized_geometry() {
+        let (_temp, service, _diagnostics) = fixture();
+        service
+            .register_staged_legacy_fixture(staged_record(&service, ID))
+            .unwrap();
+        let connection = rusqlite::Connection::open(&service.db_path).unwrap();
+        connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE newspaper_clippings SET crop_x = source_pixel_width WHERE id = ?1",
+                [ID],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            service.detail_response(ID).unwrap_err().code,
+            ClippingErrorCode::DatabaseReadFailed
         );
     }
 
@@ -2748,7 +2913,13 @@ mod tests {
             template.title = format!("Scale keyword {index:03}");
             template.now = 10_000 + index as i64;
             repository::insert_creating(&connection, &template).unwrap();
-            assert!(repository::mark_ready_from_creating(&connection, &id, template.now).unwrap());
+            assert!(repository::mark_ready_after_validation(
+                &connection,
+                &id,
+                ClippingAssetState::Creating,
+                template.now,
+            )
+            .unwrap());
         }
         connection.execute_batch("COMMIT").unwrap();
     }
