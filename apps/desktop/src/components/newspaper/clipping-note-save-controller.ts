@@ -1,3 +1,13 @@
+export type ClippingNoteTimerScheduler = {
+  schedule: (callback: () => void, delayMs: number) => unknown;
+  cancel: (handle: unknown) => void;
+};
+
+const systemClippingNoteTimerScheduler: ClippingNoteTimerScheduler = {
+  schedule: (callback, delayMs) => setTimeout(callback, delayMs),
+  cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>)
+};
+
 export type ClippingNoteDocument = {
   documentId: string;
   title: string;
@@ -29,26 +39,33 @@ type Listener = (view: ClippingNoteSaveView) => void;
 
 export class ClippingNoteSaveController {
   private view: ClippingNoteSaveView;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private debounceTimer: unknown | null = null;
+  private maxWaitTimer: unknown | null = null;
   private inFlight: Promise<boolean> | null = null;
   private listeners = new Set<Listener>();
   private disposed = false;
   private readonly save: ClippingNoteSave;
   private readonly errorCode: (error: unknown) => string;
   private readonly debounceMs: number;
+  private readonly maxWaitMs: number;
   private readonly validate: (draft: { title: string; markdown: string }) => string | null;
+  private readonly timers: ClippingNoteTimerScheduler;
 
   constructor(
     initial: ClippingNoteDocument,
     save: ClippingNoteSave,
     errorCode: (error: unknown) => string,
     debounceMs = 800,
-    validate: (draft: { title: string; markdown: string }) => string | null = () => null
+    validate: (draft: { title: string; markdown: string }) => string | null = () => null,
+    maxWaitMs = 5_000,
+    timers: ClippingNoteTimerScheduler = systemClippingNoteTimerScheduler
   ) {
     this.save = save;
     this.errorCode = errorCode;
     this.debounceMs = debounceMs;
+    this.maxWaitMs = maxWaitMs;
     this.validate = validate;
+    this.timers = timers;
     this.view = {
       documentId: initial.documentId,
       persistedTitle: initial.title,
@@ -77,7 +94,11 @@ export class ClippingNoteSaveController {
   }
 
   private setDraft(title: string, markdown: string) {
-    if (this.disposed || this.view.status === "conflict") return;
+    if (this.disposed) return;
+    if (this.view.status === "conflict") {
+      this.setView({ ...this.view, draftTitle: title, draftMarkdown: markdown });
+      return;
+    }
     const clean = title === this.view.persistedTitle && markdown === this.view.persistedMarkdown;
     const validationError = clean ? null : this.validate({ title, markdown });
     this.setView({
@@ -87,9 +108,10 @@ export class ClippingNoteSaveController {
       status: clean ? "clean" : validationError ? "failed" : this.view.status === "saving" ? "saving" : "dirty",
       errorCode: validationError
     });
-    this.clearTimer();
+    this.clearDebounceTimer();
+    if (clean || validationError) this.clearMaxWaitTimer();
     if (!clean && !validationError && this.view.status !== "saving") {
-      this.timer = setTimeout(() => void this.startSave(), this.debounceMs);
+      this.scheduleDirtySave();
     }
   }
 
@@ -99,18 +121,14 @@ export class ClippingNoteSaveController {
   }
 
   async flush() {
-    this.clearTimer();
-    if (this.view.status === "clean") return true;
-    if (this.view.status === "conflict" || this.view.status === "failed") return false;
-    if (this.inFlight) {
-      const saved = await this.inFlight;
-      const afterSave = this.getSnapshot().status as ClippingNoteSaveStatus;
-      if (!saved || afterSave === "conflict" || afterSave === "failed") return false;
+    while (!this.disposed) {
+      this.clearTimers();
+      if (this.view.status === "clean") return true;
+      if (this.view.status === "conflict" || this.view.status === "failed") return false;
+      const running = this.inFlight ?? (this.view.status === "dirty" ? this.startSave() : null);
+      if (!running || !(await running)) return false;
     }
-    if (this.view.status === "dirty") {
-      return this.startSave();
-    }
-    return (this.getSnapshot().status as ClippingNoteSaveStatus) === "clean";
+    return false;
   }
 
   keepMyChanges(latest: ClippingNoteDocument) {
@@ -127,7 +145,7 @@ export class ClippingNoteSaveController {
 
   dispose() {
     this.disposed = true;
-    this.clearTimer();
+    this.clearTimers();
     this.listeners.clear();
   }
 
@@ -150,7 +168,7 @@ export class ClippingNoteSaveController {
       return Promise.resolve(false);
     }
 
-    this.clearTimer();
+    this.clearTimers();
     const submitted = {
       documentId: this.view.documentId,
       expectedRevision: this.view.persistedRevision,
@@ -192,7 +210,7 @@ export class ClippingNoteSaveController {
       .finally(() => {
         this.inFlight = null;
         if (!this.disposed && this.view.status === "dirty") {
-          this.timer = setTimeout(() => void this.startSave(), this.debounceMs);
+          this.scheduleDirtySave();
         }
       });
     this.inFlight = running;
@@ -200,7 +218,7 @@ export class ClippingNoteSaveController {
   }
 
   private adoptPersisted(document: ClippingNoteDocument, replaceDraft: boolean) {
-    this.clearTimer();
+    this.clearTimers();
     this.setView({
       ...this.view,
       persistedTitle: document.title,
@@ -213,11 +231,38 @@ export class ClippingNoteSaveController {
     });
   }
 
-  private clearTimer() {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
+  private scheduleDirtySave() {
+    this.clearDebounceTimer();
+    this.debounceTimer = this.timers.schedule(() => {
+      this.debounceTimer = null;
+      void this.startSave();
+    }, this.debounceMs);
+    if (this.maxWaitTimer === null) {
+      this.maxWaitTimer = this.timers.schedule(() => {
+        this.maxWaitTimer = null;
+        this.clearDebounceTimer();
+        void this.startSave();
+      }, this.maxWaitMs);
     }
+  }
+
+  private clearDebounceTimer() {
+    if (this.debounceTimer !== null) {
+      this.timers.cancel(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+  }
+
+  private clearMaxWaitTimer() {
+    if (this.maxWaitTimer !== null) {
+      this.timers.cancel(this.maxWaitTimer);
+      this.maxWaitTimer = null;
+    }
+  }
+
+  private clearTimers() {
+    this.clearDebounceTimer();
+    this.clearMaxWaitTimer();
   }
 
   private setView(view: ClippingNoteSaveView) {
