@@ -352,6 +352,7 @@ export default function App() {
   const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<AppView>("downloads");
   const [pendingClippingId, setPendingClippingId] = useState<string | null>(null);
+  const [clippingsViewKey, setClippingsViewKey] = useState(0);
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [activeSearchQuery, setActiveSearchQuery] = useState("");
   const [isLinkedInExpanded, setIsLinkedInExpanded] = useState(true);
@@ -411,6 +412,12 @@ export default function App() {
     setActiveSearchQuery("");
     setGlobalSearchQuery("");
     setIsNewspaperExpanded(true);
+  }, [requestNavigation]);
+
+  const openClippingsGallery = useCallback(async () => {
+    if (!(await requestNavigation("newspaper-clippings"))) return;
+    setPendingClippingId(null);
+    setClippingsViewKey((current) => current + 1);
   }, [requestNavigation]);
 
   async function updateGlobalSearch(nextRaw: string) {
@@ -1860,7 +1867,7 @@ export default function App() {
                 className="lv-nav-child"
                 active={activeView === "newspaper-clippings"}
                 icon={<StickyNote aria-hidden="true" />}
-                onClick={() => void requestNavigation("newspaper-clippings")}
+                onClick={() => void openClippingsGallery()}
               >
                 Clippings
               </SidebarItem>
@@ -2015,6 +2022,7 @@ export default function App() {
             <NewspaperView mode="library" onOpenClipping={(id) => void openClipping(id)} />
           ) : activeView === "newspaper-clippings" ? (
             <NewspaperClippings
+              key={clippingsViewKey}
               onPendingConsumed={() => setPendingClippingId(null)}
               pendingClippingId={pendingClippingId}
               registerFlush={registerClippingFlush}
