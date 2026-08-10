@@ -1,10 +1,11 @@
 # Newspaper clipping note durability implementation plan
 
-**Status:** Implemented locally through Slice E at `17599b8`. Automated
-controller, migration, recovery, lifecycle, browser, performance, Rust, and
-release gates pass. Native Windows close-X/tray Quit/restart UAT remains a
-separate user observation; this document does not authorize a push, migration
-of user data, or release by itself.
+**Status:** Implemented locally through Slice E. Automated controller,
+migration, recovery, lifecycle, browser, performance, Rust, and release gates
+pass. Product-owner native dev UAT passed the ordinary close-X/tray Show/tray
+Quit/restart scenarios on 2026-08-10. Disposable-profile native fault injection
+remains separate Phase 6 evidence; this document does not authorize a push,
+migration of user data, or release by itself.
 
 **Date:** 2026-08-10
 
@@ -646,6 +647,21 @@ window, record:
 
 Do not use Task Manager termination against an uncommitted user database. The
 crash-recovery UAT must use an isolated test database/profile.
+
+### Recorded native dev observation — 2026-08-10
+
+The product owner reported passing scenarios 1, 2, 3, and 8 in the native
+Tauri development window: close-X before `Saved`, close-X while `Saving…`, tray
+Show with exact queued-latest text, repeated hide/show without a duplicate
+window, and tray Quit followed by relaunch with the latest note retained or
+explicitly recovered. Process inspection after Quit confirmed that the native
+`linkvault.exe` ended; only the development Vite listener remained.
+
+This observation does not claim native fault injection for scenarios 4–6 or a
+Chinese IME run for scenario 7. Browser/service automation covers the
+corresponding failure, conflict, and recovery contracts, while destructive
+native crash testing remains restricted to a disposable test profile. A screen
+reader run is not a product blocker under the approved editor decision.
 
 ## 12. Required gates
 
