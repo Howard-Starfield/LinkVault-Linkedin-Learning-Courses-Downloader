@@ -6,6 +6,7 @@
 
 pub mod database;
 pub mod database_diagnostics;
+pub mod database_migrations;
 pub mod database_writer;
 #[cfg(feature = "crop-baseline")]
 pub mod newspaper_clipping_crop_baseline;

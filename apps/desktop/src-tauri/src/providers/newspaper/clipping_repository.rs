@@ -9,6 +9,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
+use super::clipping_draft_repository::{self as draft_repository, DraftCheckpointAck};
 use super::clipping_models::{
     escape_like_pattern, normalize_search_text, ClippingAssetState, ClippingRoot, ClippingRootKind,
     ClippingSourceKind, ClippingSummary, NewspaperClipping, NewspaperClippingListQuery,
@@ -492,6 +493,7 @@ pub fn update_note(
     title: &str,
     note_markdown: &str,
     now: i64,
+    checkpoint: Option<&DraftCheckpointAck>,
 ) -> Result<NoteUpdateOutcome> {
     let current = connection
         .query_row(
@@ -529,6 +531,19 @@ pub fn update_note(
         });
     }
     if stored_title == title && stored_note == note_markdown {
+        if let Some(checkpoint) = checkpoint {
+            connection.execute_batch("SAVEPOINT clipping_update_search_document")?;
+            finish_savepoint(
+                connection,
+                "clipping_update_search_document",
+                draft_repository::clear_acknowledged(
+                    connection,
+                    id,
+                    checkpoint,
+                    Some((title, note_markdown)),
+                ),
+            )?;
+        }
         let clipping = load_by_id(connection, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         return Ok(NoteUpdateOutcome::Unchanged { clipping });
     }
@@ -565,6 +580,9 @@ pub fn update_note(
                     &edition_name,
                     &edition_code,
                 )?;
+                if let Some(checkpoint) = checkpoint {
+                    draft_repository::clear_acknowledged(connection, id, checkpoint, None)?;
+                }
             }
             Ok(changed)
         })(),

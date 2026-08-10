@@ -266,6 +266,7 @@ Rules:
 | `app/cooperative_exit.rs` | Exit-attempt state, request token, deduplication, timeout, confirmation, blocked result | 240 / 320 lines |
 | `app/database_migrations/mod.rs` | Bounded migration dispatch seam | 80 / 120 lines |
 | `app/database_migrations/newspaper_clipping_drafts.rs` | Schema-v6 DDL and verifier for recovery drafts | 220 / 300 lines |
+| `providers/newspaper/clipping_draft_models.rs` | Path-free checkpoint/recovery transport DTOs only | 120 / 180 lines |
 | `providers/newspaper/clipping_draft_repository.rs` | Recovery SQL only; no Tauri or UI types | 240 / 340 lines |
 | `providers/newspaper/clipping_draft_service.rs` | Validation envelope, writer submission, recovery classification, canonical-clear inputs | 260 / 360 lines |
 | `providers/newspaper/commands.rs` | Thin checkpoint/load/discard commands | Maximum net addition 80 lines |
