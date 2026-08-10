@@ -169,6 +169,7 @@ apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_<version>_x64-setup.
 ## Publish An Update
 
 The release workflow runs when you push a version tag like `vX.Y.Z`. It builds the Windows installer, creates a GitHub release, and uploads `latest.json` for the in-app updater.
+Tags with a prerelease suffix, such as `vX.Y.Z-rc.1`, are published as GitHub prereleases and do not replace the stable `latest` release.
 
 1. Bump the version in `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, and `apps/desktop/src-tauri/tauri.conf.json`.
 2. Run:
