@@ -60,6 +60,7 @@ import { NewspaperView } from "./components/newspaper/NewspaperView";
 import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
 import { NewspaperSnapshotRootsSettings } from "./components/newspaper/NewspaperSnapshotRootsSettings";
+import { useClippingNoteExitBridge } from "./components/newspaper/useClippingNoteExitBridge";
 import {
   NEWSPAPER_PAGE_TONES,
   NEWSPAPER_READER_ZOOM_MAX,
@@ -394,6 +395,7 @@ export default function App() {
   const registerClippingFlush = useCallback((flush: ClippingFlush | null) => {
     clippingFlushRef.current = flush;
   }, []);
+  useClippingNoteExitBridge(isTauriRuntime(), clippingFlushRef);
 
   const requestNavigation = useCallback((nextView: AppView) => {
     let allowed = false;
@@ -504,30 +506,6 @@ export default function App() {
     return () => {
       disposed = true;
       window.clearInterval(intervalId);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let disposed = false;
-    const cleanups: Array<() => void> = [];
-    void listen<{ token: number }>("linkvault://quit-requested", async ({ payload }) => {
-      if (disposed) return;
-      const flush = clippingFlushRef.current;
-      if (flush && !(await flush())) {
-        toast.error("Quit paused", {
-          description: "Your clipping draft is still unsaved. Retry the save or resolve the conflict, then choose Quit again."
-        });
-        return;
-      }
-      await invoke("confirm_cooperative_quit", { token: payload.token });
-    }).then((cleanup) => cleanups.push(cleanup));
-    void listen("linkvault://quit-blocked", () => {
-      if (!disposed) toast.info("LinkVault stayed open to protect an unsaved clipping note.");
-    }).then((cleanup) => cleanups.push(cleanup));
-    return () => {
-      disposed = true;
-      cleanups.forEach((cleanup) => cleanup());
     };
   }, []);
 

@@ -4,6 +4,7 @@
 //! content provider. Workflow execution will live in `crate::workflow`, while
 //! provider discovery and download behavior lives in `crate::providers`.
 
+pub mod cooperative_exit;
 pub mod database;
 pub mod database_diagnostics;
 pub mod database_migrations;

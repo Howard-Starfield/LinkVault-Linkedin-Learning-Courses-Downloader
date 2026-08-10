@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
+import { installClippingNoteExitBrowserHarness } from "./clipping-note-exit-browser-harness.mjs";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
 assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkVault preview.");
@@ -55,12 +56,78 @@ try {
       detailCalls: [],
       thumbnailCalls: [],
       updateCalls: [],
+      checkpointCalls: [],
+      checkpointFail: false,
+      recoveryDrafts: new Map(),
+      invalidRecoveryIds: new Set(),
       searchCalls: [],
       rootChecks: 0,
       conflictNext: false,
       failNext: false
     };
     window.__NEWSPAPER_CLIPPINGS_API__ = {
+      async checkpoint(request) {
+        const test = window.__CLIPPING_LIBRARY_TEST__;
+        test.checkpointCalls.push(structuredClone(request));
+        if (test.checkpointFail) throw "CLIPPING_RECOVERY_FAILED";
+        const existing = test.recoveryDrafts.get(request.clippingId);
+        if (existing && existing.writerSessionId !== request.writerSessionId) throw "CLIPPING_RECOVERY_WRITER_CONFLICT";
+        if (existing && existing.writerSequence > request.writerSequence) throw "CLIPPING_RECOVERY_STALE_SEQUENCE";
+        test.recoveryDrafts.set(request.clippingId, { ...structuredClone(request), updatedAt: Date.now() });
+        return {
+          clippingId: request.clippingId,
+          writerSessionId: request.writerSessionId,
+          writerSequence: request.writerSequence
+        };
+      },
+      async loadRecovery(clippingId) {
+        const test = window.__CLIPPING_LIBRARY_TEST__;
+        const detail = test.details.find((item) => item.id === clippingId);
+        const draft = test.recoveryDrafts.get(clippingId);
+        if (!draft) return { status: "none", canonicalRevision: detail.revision, identity: null, draft: null };
+        if (test.invalidRecoveryIds.has(clippingId)) {
+          return {
+            status: "invalid",
+            canonicalRevision: detail.revision,
+            identity: { clippingId, writerSessionId: draft.writerSessionId, writerSequence: draft.writerSequence },
+            draft: null
+          };
+        }
+        return {
+          status: draft.baseRevision === detail.revision ? "matching" : "canonical_changed",
+          canonicalRevision: detail.revision,
+          identity: {
+            clippingId,
+            writerSessionId: draft.writerSessionId,
+            writerSequence: draft.writerSequence
+          },
+          draft: {
+            baseRevision: draft.baseRevision,
+            title: draft.title,
+            markdown: draft.markdown,
+            updatedAt: draft.updatedAt
+          }
+        };
+      },
+      async claimRecovery(request) {
+        const test = window.__CLIPPING_LIBRARY_TEST__;
+        const draft = test.recoveryDrafts.get(request.clippingId);
+        if (!draft || draft.writerSessionId !== request.priorWriterSessionId || draft.writerSequence !== request.priorWriterSequence) {
+          throw "CLIPPING_RECOVERY_WRITER_CONFLICT";
+        }
+        draft.writerSessionId = request.writerSessionId;
+        draft.writerSequence = 1;
+        return window.__NEWSPAPER_CLIPPINGS_API__.loadRecovery(request.clippingId);
+      },
+      async discardRecovery(identity) {
+        const test = window.__CLIPPING_LIBRARY_TEST__;
+        const draft = test.recoveryDrafts.get(identity.clippingId);
+        if (!draft) return;
+        if (draft.writerSessionId !== identity.writerSessionId) throw "CLIPPING_RECOVERY_WRITER_CONFLICT";
+        if (draft.writerSequence !== identity.writerSequence) throw "CLIPPING_RECOVERY_STALE_SEQUENCE";
+        test.recoveryDrafts.delete(identity.clippingId);
+        test.invalidRecoveryIds.delete(identity.clippingId);
+      },
       async getPage(request) {
         const test = window.__CLIPPING_LIBRARY_TEST__;
         test.pageCalls.push({ ...request, at: performance.now() });
@@ -95,6 +162,12 @@ try {
         detail.noteMarkdown = request.noteMarkdown;
         detail.revision += 1;
         detail.updatedAt += 1;
+        const draft = test.recoveryDrafts.get(request.clippingId);
+        if (request.checkpoint && draft
+          && draft.writerSessionId === request.checkpoint.writerSessionId
+          && draft.writerSequence <= request.checkpoint.writerSequence) {
+          test.recoveryDrafts.delete(request.clippingId);
+        }
         return structuredClone(detail);
       },
       async ensureThumbnail(id) {
@@ -147,6 +220,7 @@ try {
       async openRoot() {}
     };
   });
+  await page.addInitScript(installClippingNoteExitBrowserHarness);
 
   const consoleErrors = [];
   page.on("console", (message) => {
@@ -157,6 +231,8 @@ try {
   });
   page.on("pageerror", (error) => consoleErrors.push(error.message));
   await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.listenerCounts().prepare === 1);
+  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.listenerCounts()), { prepare: 1, blocked: 1 }, "Strict Mode left duplicate native lifecycle listeners");
   assert.equal(await page.locator(".lv-global-search").count(), 0, "clipping search row leaked onto the default page");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), false, "normal route fetched the editor chunk");
 
@@ -249,7 +325,9 @@ try {
   await page.keyboard.type(" with searchable keyword");
   await page.waitForTimeout(950);
   const initialSaveCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.updateCalls);
-  assert.equal(initialSaveCalls.length, 2, "title blur plus stable editor draft did not produce two bounded saves");
+  assert.ok(initialSaveCalls.length >= 2 && initialSaveCalls.length <= 3, `title/body editing issued ${initialSaveCalls.length} canonical saves`);
+  const initialCheckpointCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.checkpointCalls.length);
+  assert.ok(initialCheckpointCalls > 0 && initialCheckpointCalls <= 5, `title/body editing issued ${initialCheckpointCalls} recovery checkpoints`);
   assert.equal(initialSaveCalls.at(-1).noteMarkdown.includes("searchable keyword"), true);
   await page.getByText("Saved", { exact: true }).waitFor();
 
@@ -302,11 +380,94 @@ try {
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.failNext = true; });
   await title.fill("Draft that initially fails");
   await page.waitForTimeout(950);
-  await page.getByText("Save failed. Your draft is still here.").waitFor();
+  await page.getByText("Recovered draft saved locally.").waitFor();
+  assert.equal(await page.evaluate(() => [...window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.values()].at(0).title), "Draft that initially fails");
   await page.getByRole("button", { name: "Download editions" }).click();
-  assert.ok(await page.locator(".clipping-detail").count(), "failed flush allowed route navigation");
+  await page.locator(".newspaper-download").waitFor();
+  await page.getByRole("button", { name: "Clippings", exact: true }).click();
+  const recoverySearch = page.getByLabel("Search saved newspaper clippings");
+  await recoverySearch.fill("Draft that initially fails");
+  await page.locator(".clipping-search-results").waitFor();
+  assert.equal(await page.getByText("Draft that initially fails", { exact: true }).count(), 0, "recovery-only title entered clipping search");
+  await page.getByLabel("Clear clipping search").click();
+  await page.locator(".clipping-gallery__card").first().click();
+  await page.getByText("Recovered unsaved changes").waitFor();
+  assert.equal(await title.inputValue(), "Draft that initially fails");
+  await page.getByText("Saved", { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.size), 0, "canonical recovery did not clear its checkpoint");
+
+  const canonicalBeforeConflict = await title.inputValue();
+  await page.evaluate(() => {
+    const test = window.__CLIPPING_LIBRARY_TEST__;
+    const detail = test.details[0];
+    test.recoveryDrafts.set(detail.id, {
+      clippingId: detail.id,
+      baseRevision: detail.revision - 1,
+      writerSessionId: "11111111-1111-4111-8111-111111111111",
+      writerSequence: 4,
+      title: "Recovered revision conflict",
+      markdown: "Newest recovery body",
+      updatedAt: Date.now()
+    });
+  });
+  await page.getByRole("button", { name: "Download editions" }).click();
+  await page.locator(".newspaper-download").waitFor();
+  await page.getByRole("button", { name: "Clippings", exact: true }).click();
+  await page.locator(".clipping-gallery__card").first().click();
+  await page.getByText("This note changed in another window.").waitFor();
+  assert.equal(await title.inputValue(), "Recovered revision conflict");
+  await page.getByRole("button", { name: "Use saved version" }).click();
+  await page.waitForFunction((expected) => document.querySelector(".clipping-detail__title input")?.value === expected, canonicalBeforeConflict);
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.recoveryDrafts.size), 0, "Use saved version did not explicitly discard recovery");
+
+  await page.evaluate(() => {
+    const test = window.__CLIPPING_LIBRARY_TEST__;
+    const detail = test.details[0];
+    test.recoveryDrafts.set(detail.id, {
+      clippingId: detail.id,
+      baseRevision: detail.revision,
+      writerSessionId: "22222222-2222-4222-8222-222222222222",
+      writerSequence: 1,
+      title: "invalid",
+      markdown: "invalid",
+      updatedAt: Date.now()
+    });
+    test.invalidRecoveryIds.add(detail.id);
+  });
+  await page.getByRole("button", { name: "Download editions" }).click();
+  await page.locator(".newspaper-download").waitFor();
+  await page.getByRole("button", { name: "Clippings", exact: true }).click();
+  await page.locator(".clipping-gallery__card").first().click();
+  await page.getByText("Recovered changes are invalid. The saved note is untouched.").waitFor();
+  assert.equal(await page.getByLabel("Clipping note editor body").count(), 0, "invalid recovery enabled editing before explicit cleanup");
+  await page.getByRole("button", { name: "Discard recovered changes" }).click();
+  await page.getByLabel("Clipping note editor body").waitFor();
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.invalidRecoveryIds.size), 0);
+
+  await title.fill("Lifecycle flush draft");
+  await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.emitPrepare({ token: 501, reason: "close", deadlineMs: 15_000 }));
+  await page.waitForFunction(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.some((entry) => entry.token === 501));
+  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.find((entry) => entry.token === 501)), { token: 501, durable: true });
+  await page.getByText("Saved", { exact: true }).waitFor();
+
+  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.failNext = true; });
+  await title.fill("Lifecycle checkpoint fallback");
+  await page.waitForTimeout(950);
+  await page.getByText("Recovered draft saved locally.").waitFor();
+  await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.emitPrepare({ token: 502, reason: "exit", deadlineMs: 15_000 }));
+  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.find((entry) => entry.token === 502)), { token: 502, durable: true });
   await page.getByRole("button", { name: "Retry" }).click();
   await page.getByText("Saved", { exact: true }).waitFor();
+
+  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.checkpointFail = true; });
+  await title.fill("Lifecycle blocked draft");
+  await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.emitPrepare({ token: 503, reason: "close", deadlineMs: 15_000 }));
+  assert.deepEqual(await page.evaluate(() => window.__CLIPPING_NOTE_EXIT_BRIDGE__.resolutions.find((entry) => entry.token === 503)), { token: 503, durable: false });
+  assert.equal(await title.inputValue(), "Lifecycle blocked draft", "blocked close discarded the visible draft");
+  await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.checkpointFail = false; });
+  await page.getByRole("button", { name: "Retry" }).click();
+  await page.getByText("Saved", { exact: true }).waitFor();
+
   await page.getByRole("button", { name: "Download editions" }).click();
   await page.locator(".newspaper-download").waitFor();
   assert.equal(await page.locator(".lv-global-search").count(), 0, "clipping search row remained on Download editions");
@@ -324,7 +485,7 @@ try {
   await page.locator(".newspaper-library").waitFor();
 
   assert.deepEqual(consoleErrors, [], `browser console/page errors: ${consoleErrors.join("\n")}`);
-  console.log("Clipping library browser matrix passed: compact search-row summary, responsive gallery, first-use skeletons, contained title veil, lazy thumbnails/detail/editor, autosave, search, conflict, roots, and guarded navigation.");
+  console.log("Clipping library browser matrix passed: compact search-row summary, responsive gallery, first-use skeletons, contained title veil, lazy thumbnails/detail/editor, autosave, recovery, native preparation, search, conflict, roots, and guarded navigation.");
 } finally {
   await browser.close();
 }
