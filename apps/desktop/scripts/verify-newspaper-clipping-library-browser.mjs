@@ -162,7 +162,7 @@ try {
   await page.getByRole("button", { name: "Clippings", exact: true }).click();
   await page.locator(".clipping-gallery").waitFor();
   assert.equal(await page.locator(".clipping-gallery__header").count(), 0, "gallery still renders a second header below search");
-  await page.getByText("Saved evidence", { exact: true }).waitFor();
+  await page.getByText("Clippings", { exact: true }).last().waitFor();
   await page.getByText("500 clippings", { exact: true }).waitFor();
   assert.equal(await page.locator(".clipping-detail").count(), 0, "gallery eagerly mounted the clipping detail page");
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 0, "gallery eagerly fetched a clipping detail");
@@ -197,6 +197,15 @@ try {
   assert.ok(cardGeometry.titleHeight < 60, "title gradient covers too much of the clipping");
   assert.ok(Math.abs(cardGeometry.thumbnailBottom - cardGeometry.titleBottom) <= 1, "title gradient bleeds beyond the thumbnail bottom edge");
   assert.equal((await firstCard.innerText()).trim(), "Transit archive clipping 1", "gallery card must show only its single title");
+  await firstCard.hover();
+  await page.waitForTimeout(220);
+  const hoverTransforms = await firstCard.evaluate((card) => {
+    const image = new DOMMatrixReadOnly(getComputedStyle(card.querySelector(".clipping-gallery__thumb img")).transform);
+    const thumbnail = new DOMMatrixReadOnly(getComputedStyle(card.querySelector(".clipping-gallery__thumb")).transform);
+    return { imageScaleX: image.a, imageScaleY: image.d, thumbnailX: thumbnail.e, thumbnailY: thumbnail.f };
+  });
+  assert.ok(Math.abs(hoverTransforms.imageScaleX - 1.05) < 0.01 && Math.abs(hoverTransforms.imageScaleY - 1.05) < 0.01, "hover does not enlarge the clipping image by 5%");
+  assert.ok(Math.abs(hoverTransforms.thumbnailX) < 0.01 && Math.abs(hoverTransforms.thumbnailY) < 0.01, "hover still moves the clipping card");
   const callsAtDefaultWidth = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
   await page.setViewportSize({ width: 700, height: 960 });
   await page.waitForFunction(() => document.querySelector(".clipping-gallery__row")?.children.length === 2);

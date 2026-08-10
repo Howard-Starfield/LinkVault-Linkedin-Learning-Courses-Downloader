@@ -1982,7 +1982,7 @@ export default function App() {
             </button>
           ) : activeView === "newspaper-clippings" && clippingGallerySummary ? (
             <div className="lv-global-search__context">
-              <strong>Saved evidence</strong>
+              <strong>Clippings</strong>
               <span>{clippingGallerySummary.loading ? "Loading" : `${clippingGallerySummary.total} clipping${clippingGallerySummary.total === 1 ? "" : "s"}`}</span>
             </div>
           ) : <span>Clippings</span>}

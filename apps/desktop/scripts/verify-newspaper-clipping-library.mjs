@@ -23,7 +23,7 @@ const [app, api, controller, clippings, detail, list, search, roots, commands, m
 for (const fragment of [
   '"newspaper-clippings"', "Search titles, notes, editions, dates, or pages",
   "requestNavigation", "registerClippingFlush", "NewspaperSnapshotRootsSettings",
-  "clippingGallerySummary", "Saved evidence"
+  "clippingGallerySummary", "Clippings"
 ]) assert.ok(app.includes(fragment), `App is missing ${fragment}`);
 
 for (const command of [
