@@ -1439,7 +1439,11 @@ mod tests {
             Some(sha256_hex(&std::fs::read(&source_path).unwrap()).as_str())
         );
 
-        let bytes = std::fs::read(service.layout.canonical_path(CROP_ID).unwrap()).unwrap();
+        let asset_layout = service.root_layout(&clipping.asset_root_id).unwrap();
+        let canonical_path = asset_layout
+            .canonical_path_at(CROP_ID, &clipping.asset_relative_path)
+            .unwrap();
+        let bytes = std::fs::read(&canonical_path).unwrap();
         let decoded = webp::Decoder::new(&bytes).decode().unwrap();
         let expected = source_image.crop_imm(16, 16, 32, 32).to_rgba8().into_raw();
         assert_eq!(decoded.width(), 32);
@@ -1449,11 +1453,115 @@ mod tests {
         let retried = service.create_newspaper_clipping(request, 124).unwrap();
         assert_eq!(retried, response);
         assert_eq!(
-            std::fs::read_dir(service.layout.assets_dir().unwrap())
+            std::fs::read_dir(canonical_path.parent().unwrap().parent().unwrap())
                 .unwrap()
                 .count(),
             1,
             "an idempotent retry must not create another canonical directory"
+        );
+    }
+
+    #[test]
+    fn clipping_crop_keeps_each_source_jobs_original_download_snapshot_root() {
+        let (temp, service, _diagnostics) = fixture();
+        let first_destination = temp.path().join("first-download-destination");
+        let second_destination = temp.path().join("second-download-destination");
+        std::fs::create_dir(&first_destination).unwrap();
+        std::fs::create_dir(&second_destination).unwrap();
+        let source_image = crop_fixture_image(64, 64);
+        let first_source = write_crop_source(&first_destination, "first-page.png", &source_image);
+        let second_source =
+            write_crop_source(&second_destination, "second-page.png", &source_image);
+        insert_crop_source(
+            &service,
+            &first_destination,
+            Some(&first_source),
+            None,
+            64,
+            64,
+            1,
+        );
+
+        let first_id = "11111111-1111-4111-8111-111111111111";
+        service
+            .create_newspaper_clipping(crop_request(first_id), 123)
+            .unwrap();
+        let first = service.detail(first_id).unwrap().unwrap().clipping;
+        let first_layout = service.root_layout(&first.asset_root_id).unwrap();
+        let first_path = first_layout
+            .canonical_path_at(first_id, &first.asset_relative_path)
+            .unwrap();
+        assert!(first_path.is_file());
+        assert_eq!(
+            first_layout.root(),
+            first_destination
+                .join("Newspaper snapshots")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(first_path.starts_with(first_layout.root()));
+
+        let connection = rusqlite::Connection::open(&service.db_path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_batches
+                 (id, status, destination, delay_minutes, optimize_images,
+                  optimization_profile, keep_original_jpg, created_at, updated_at)
+                 VALUES ('crop-batch-2', 'completed', ?1, 0, 0, 'webp_high', 1, 2, 2)",
+                params![second_destination.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_jobs
+                 (id, batch_id, edition_code, edition_publication_date, publication_date,
+                  status, output_dir, page_count, completed_count, created_at, updated_at)
+                 VALUES ('crop-job-2', 'crop-batch-2', 'CROPTEST', '', '2026-08-10',
+                         'completed', ?1, 1, 1, 2, 2)",
+                params![second_destination.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO newspaper_pages
+                 (id, job_id, page_number, source_url, original_path, optimized_path, status,
+                  original_bytes, final_bytes, checksum, pixel_width, pixel_height,
+                  media_version, created_at, updated_at)
+                 VALUES ('crop_page_02', 'crop-job-2', 'B02', 'test://crop-page-2', ?1, NULL,
+                         'completed', 1, 1, 'crop-source-checksum-2', 64, 64, 1, 2, 2)",
+                params![second_source.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let second_id = "22222222-2222-4222-8222-222222222222";
+        let mut second_request = crop_request(second_id);
+        second_request.page_id = "crop_page_02".to_owned();
+        service
+            .create_newspaper_clipping(second_request, 124)
+            .unwrap();
+        let second = service.detail(second_id).unwrap().unwrap().clipping;
+        let second_layout = service.root_layout(&second.asset_root_id).unwrap();
+        let second_path = second_layout
+            .canonical_path_at(second_id, &second.asset_relative_path)
+            .unwrap();
+
+        assert_ne!(first.asset_root_id, second.asset_root_id);
+        assert!(second_path.is_file());
+        assert_eq!(
+            second_layout.root(),
+            second_destination
+                .join("Newspaper snapshots")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(second_path.starts_with(second_layout.root()));
+        assert!(
+            first_path.is_file(),
+            "registering a later destination moved the first crop"
         );
     }
 
@@ -1720,8 +1828,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(responses[0], responses[1]);
         assert_eq!(responses[0].clipping_id, CROP_ID);
+        let clipping = service.detail(CROP_ID).unwrap().unwrap().clipping;
+        let asset_layout = service.root_layout(&clipping.asset_root_id).unwrap();
+        let canonical_path = asset_layout
+            .canonical_path_at(CROP_ID, &clipping.asset_relative_path)
+            .unwrap();
+        assert!(canonical_path.is_file());
         assert_eq!(
-            std::fs::read_dir(service.layout.assets_dir().unwrap())
+            std::fs::read_dir(canonical_path.parent().unwrap().parent().unwrap())
                 .unwrap()
                 .count(),
             1
@@ -1887,9 +2001,14 @@ mod tests {
 
     #[test]
     fn clipping_crop_discards_untracked_corrupt_staging_before_creating_row() {
-        let (_temp, service, _diagnostics) = fixture();
-        let record = staged_record(&service, CROP_ID);
-        let staging_path = service.layout.staging_complete_path(CROP_ID).unwrap();
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let record = staged_snapshot_record(&service, &destination, CROP_ID);
+        let asset_layout = service.root_layout(&record.asset_root_id).unwrap();
+        let staging_path = asset_layout.staging_complete_path(CROP_ID).unwrap();
+        let canonical_path = asset_layout
+            .canonical_path_at(CROP_ID, &record.asset_relative_path)
+            .unwrap();
         std::fs::write(&staging_path, b"not a webp asset").unwrap();
 
         assert_eq!(
@@ -1898,7 +2017,7 @@ mod tests {
         );
         assert!(!staging_path.exists());
         assert!(!staging_path.parent().unwrap().exists());
-        assert!(!service.layout.canonical_path(CROP_ID).unwrap().exists());
+        assert!(!canonical_path.exists());
 
         let connection = rusqlite::Connection::open(&service.db_path).unwrap();
         assert_eq!(repository::row_state(&connection, CROP_ID).unwrap(), None);
@@ -1924,9 +2043,14 @@ mod tests {
 
     #[test]
     fn clipping_crop_discards_untracked_staging_when_creating_insert_is_rejected() {
-        let (_temp, service, _diagnostics) = fixture();
-        let record = staged_record(&service, CROP_ID);
-        let staging_path = service.layout.staging_complete_path(CROP_ID).unwrap();
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let record = staged_snapshot_record(&service, &destination, CROP_ID);
+        let asset_layout = service.root_layout(&record.asset_root_id).unwrap();
+        let staging_path = asset_layout.staging_complete_path(CROP_ID).unwrap();
+        let canonical_path = asset_layout
+            .canonical_path_at(CROP_ID, &record.asset_relative_path)
+            .unwrap();
         service.writer.shutdown().unwrap();
 
         assert_eq!(
@@ -1935,7 +2059,7 @@ mod tests {
         );
         assert!(!staging_path.exists());
         assert!(!staging_path.parent().unwrap().exists());
-        assert!(!service.layout.canonical_path(CROP_ID).unwrap().exists());
+        assert!(!canonical_path.exists());
 
         let connection = rusqlite::Connection::open(&service.db_path).unwrap();
         assert_eq!(repository::row_state(&connection, CROP_ID).unwrap(), None);
