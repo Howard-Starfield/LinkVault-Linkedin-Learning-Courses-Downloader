@@ -13,7 +13,7 @@ import {
   type NewspaperLibraryItem,
   type NewspaperLibraryStatus
 } from "./newspaper-api";
-import { NewspaperReader } from "./NewspaperReader";
+import { NewspaperReader, type NewspaperClippingCapability } from "./NewspaperReader";
 import {
   NEWSPAPER_READER_PREFERENCES_EVENT,
   readNewspaperReaderPreferences,
@@ -24,7 +24,23 @@ import { visibleVirtualIndexes } from "./newspaper-virtualization";
 
 const PAGE_SIZE = 50;
 const ROW_HEIGHT = 112;
-export function NewspaperLibrary() {
+export function NewspaperLibrary({
+  clippingCapability
+}: {
+  clippingCapability?: NewspaperClippingCapability;
+} = {}) {
+  const browserHarnessCapability = typeof window !== "undefined"
+    && window.location.hostname === "127.0.0.1"
+    && (window as Window & { __NEWSPAPER_CLIPPING_HARNESS__?: boolean }).__NEWSPAPER_CLIPPING_HARNESS__
+    ? {
+        enabled: true,
+        onCreated: (clippingId: string) => window.dispatchEvent(new CustomEvent(
+          "linkvault:newspaper-clipping-created",
+          { detail: { clippingId } }
+        ))
+      }
+    : undefined;
+  const resolvedClippingCapability = clippingCapability ?? browserHarnessCapability;
   const scrollRef = useRef<HTMLDivElement>(null);
   const requestGenerationRef = useRef(0);
   const loadingOffsetsRef = useRef<Set<number>>(new Set());
@@ -199,6 +215,7 @@ export function NewspaperLibrary() {
         defaultZoom={readerPreferences.defaultZoom}
         clickZoom={readerPreferences.clickZoom}
         pageTone={readerPreferences.pageTone}
+        clippingCapability={resolvedClippingCapability}
         onPageToneChange={(pageTone) => {
           const next = { ...readerPreferences, pageTone };
           setReaderPreferences(next);

@@ -57,6 +57,11 @@ const [
   apiSource,
   readerSource,
   librarySource,
+  newspaperViewSource,
+  geometrySource,
+  interactionSource,
+  overlaySource,
+  readerBrowserVerificationSource,
   cargoSource,
   baselineHarnessSource,
 ] = await Promise.all([
@@ -69,6 +74,11 @@ const [
   readFile(path.join(desktopDirectory, "src", "components", "newspaper", "newspaper-api.ts"), "utf8"),
   readFile(path.join(desktopDirectory, "src", "components", "newspaper", "NewspaperReader.tsx"), "utf8"),
   readFile(path.join(desktopDirectory, "src", "components", "newspaper", "NewspaperLibrary.tsx"), "utf8"),
+  readFile(path.join(desktopDirectory, "src", "components", "newspaper", "NewspaperView.tsx"), "utf8"),
+  readFile(path.join(desktopDirectory, "src", "components", "newspaper", "newspaper-clipping-geometry.ts"), "utf8"),
+  readFile(path.join(desktopDirectory, "src", "components", "newspaper", "newspaper-clipping-state.ts"), "utf8"),
+  readFile(path.join(desktopDirectory, "src", "components", "newspaper", "NewspaperClippingSelectionOverlay.tsx"), "utf8"),
+  readFile(path.join(desktopDirectory, "scripts", "verify-newspaper-clippings-browser.mjs"), "utf8"),
   readFile(path.join(desktopDirectory, "src-tauri", "Cargo.toml"), "utf8"),
   readFile(path.join(rustDirectory, "app", "newspaper_clipping_crop_baseline.rs"), "utf8"),
 ]);
@@ -173,9 +183,11 @@ requireOrder(
     "validate_create_request(&request)",
     "let _permit = self",
     "let source_record = self",
+    "register_source_job_root",
+    "resolve_for_creation",
     "clipping_crop::stage_crop",
     "clipping_crop::validate_source_recheck",
-    "self.layout.discard_staging(&request.operation_id)",
+    "asset_layout.discard_staging(&request.operation_id)",
     "self.register_staged(record)",
   ],
   "newspaper/clipping_service.rs",
@@ -210,13 +222,64 @@ for (const forbidden of ["sourcePath", "assetPath", "relativePath", "outputDir",
     fail(`newspaper-api.ts clipping contract leaks a filesystem path field (${forbidden})`);
   }
 }
-for (const [source, file] of [
-  [readerSource, "NewspaperReader.tsx"],
-  [librarySource, "NewspaperLibrary.tsx"],
+if (librarySource.includes("createNewspaperClipping")) {
+  fail("NewspaperLibrary.tsx must not own the create command");
+}
+for (const fragment of [
+  "NewspaperClippingCapability",
+  "newspaperClippingReducer",
+  "clippingSaveRef.current",
+  "crypto.randomUUID()",
+  "createNewspaperClipping",
+  "SOURCE_MEDIA_STALE",
+  "requiresRedraw",
+  "ResizeObserver",
+  "data-clipping-mode",
+  "NewspaperClippingConfirmationControls",
 ]) {
-  if (source.includes("createNewspaperClipping")) {
-    fail(`${file} must remain untouched by the backend-only Phase 2 command`);
+  requireContains(readerSource, fragment, "NewspaperReader.tsx Phase 3 crop owner");
+}
+for (const forbidden of ["drawImage(", "toDataURL(", "html2canvas", 'getContext("2d")']) {
+  if (readerSource.includes(forbidden) || overlaySource.includes(forbidden)) {
+    fail(`Phase 3 Reader must not introduce a screenshot/full-page canvas path (${forbidden})`);
   }
+}
+for (const fragment of [
+  "normalizedCropRectFromClientPoints",
+  "estimateSourceCropSize",
+  "clientRectSizesMateriallyDiffer",
+]) {
+  requireContains(geometrySource, fragment, "newspaper-clipping-geometry.ts");
+}
+for (const fragment of [
+  'type: "clip-selecting"',
+  'type: "clip-drawing"',
+  'type: "clip-confirming"',
+  'type: "clip-saving"',
+  "requiresRedraw",
+]) {
+  requireContains(interactionSource, fragment, "newspaper-clipping-state.ts");
+}
+for (const fragment of [
+  "NewspaperClippingSelectionOverlay",
+  "NewspaperClippingConfirmationControls",
+  'data-testid="newspaper-clipping-save"',
+  'data-testid="newspaper-clipping-redraw"',
+  'data-testid="newspaper-clipping-cancel"',
+]) {
+  requireContains(overlaySource, fragment, "NewspaperClippingSelectionOverlay.tsx");
+}
+requireContains(librarySource, "__NEWSPAPER_CLIPPING_HARNESS__", "NewspaperLibrary.tsx isolated browser harness");
+requireContains(librarySource, 'window.location.hostname === "127.0.0.1"', "NewspaperLibrary.tsx local-only harness guard");
+requireContains(newspaperViewSource, "return <NewspaperLibrary />;", "NewspaperView.tsx production capability gate");
+for (const fragment of [
+  "Duplicate Save invoked create more than once",
+  "Retry generated a new operation ID",
+  "click redraw before saving again",
+  "Window blur retained a drawing lock",
+  "Viewport resize changed frozen normalized geometry",
+]) {
+  requireContains(readerBrowserVerificationSource, fragment, "verify-newspaper-clippings-browser.mjs");
 }
 
 const performanceEntries = (await readdir(performanceDirectory, { withFileTypes: true }))

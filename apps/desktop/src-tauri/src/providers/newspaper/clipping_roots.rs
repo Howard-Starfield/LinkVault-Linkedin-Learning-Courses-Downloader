@@ -67,7 +67,8 @@ struct RootProbeCoordinator {
     /// can block on offline drives, and must never fan out without a bound.
     probe_permit: Mutex<()>,
     probe_count: std::sync::atomic::AtomicUsize,
-    probe_delay: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    joined_probe_count: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,6 +131,10 @@ impl ClippingRootRegistry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.in_flight.contains(root_id) {
+                #[cfg(test)]
+                self.probes
+                    .joined_probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 joined_existing = true;
                 state = self
                     .probes
@@ -157,14 +162,6 @@ impl ClippingRootRegistry {
             self.probes
                 .probe_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(delay) = *self
-                .probes
-                .probe_delay
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-            {
-                std::thread::sleep(delay);
-            }
             self.probe_root(&root)
         };
         let cached = CachedRootProbe {
@@ -830,27 +827,52 @@ mod tests {
         let root = registry
             .register_download_destination(&destination, 100)
             .unwrap();
-        *registry
+        let probe_permit = registry
             .probes
-            .probe_delay
+            .probe_permit
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Duration::from_millis(100));
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        let callers: Vec<_> = (0..8)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let leader_registry = registry.clone();
+        let leader_root_id = root.id.clone();
+        let leader =
+            std::thread::spawn(move || leader_registry.check(&leader_root_id, 200).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !registry
+            .probes
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight
+            .contains(&root.id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "leader did not claim the root probe"
+            );
+            std::thread::yield_now();
+        }
+        let callers: Vec<_> = (1..8)
             .map(|index| {
                 let registry = registry.clone();
                 let root_id = root.id.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    registry.check(&root_id, 200 + index).unwrap()
-                })
+                std::thread::spawn(move || registry.check(&root_id, 200 + index).unwrap())
             })
             .collect();
-        let summaries: Vec<_> = callers
-            .into_iter()
-            .map(|caller| caller.join().unwrap())
-            .collect();
+        while registry
+            .probes
+            .joined_probe_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 7
+        {
+            assert!(
+                Instant::now() < deadline,
+                "followers did not join the root probe"
+            );
+            std::thread::yield_now();
+        }
+        drop(probe_permit);
+        let mut summaries = vec![leader.join().unwrap()];
+        summaries.extend(callers.into_iter().map(|caller| caller.join().unwrap()));
         assert!(summaries
             .iter()
             .all(|summary| summary.status == ClippingRootStatus::Connected));
