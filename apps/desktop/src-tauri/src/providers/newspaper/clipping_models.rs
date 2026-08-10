@@ -228,6 +228,7 @@ pub struct NewspaperClippingSummary {
     pub source_available: bool,
     pub asset_state: ClippingAssetState,
     pub asset_error_code: Option<String>,
+    pub asset_version: u32,
     pub asset_width: u32,
     pub asset_height: u32,
     pub revision: u64,
@@ -251,6 +252,7 @@ impl From<ClippingSummary> for NewspaperClippingSummary {
             source_available: value.source_available,
             asset_state: value.asset_state,
             asset_error_code: value.asset_error_code,
+            asset_version: value.asset_version,
             asset_width: value.asset_pixel_width,
             asset_height: value.asset_pixel_height,
             revision: value.revision,
@@ -934,6 +936,7 @@ mod tests {
         assert_eq!(json["assetWidth"], 320);
         assert_eq!(json["assetHeight"], 200);
         assert_eq!(json["thumbnailReady"], false);
+        assert_eq!(json["assetVersion"], 1);
         assert!(json.get("excerpt").is_none());
         assert!(json.get("assetPixelWidth").is_none());
 

@@ -506,24 +506,17 @@ pub async fn update_newspaper_clipping(
 
 #[tauri::command]
 pub async fn ensure_newspaper_clipping_thumbnail(
-    app: tauri::AppHandle,
     state: State<'_, ClippingService>,
     clipping_id: String,
 ) -> Result<EnsureNewspaperClippingThumbnailResponse, String> {
-    let event_id = clipping_id.clone();
     let service = state.inner().clone();
-    let response = tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         service
             .ensure_thumbnail(&clipping_id)
             .map_err(|error| error.as_safe_string())
     })
     .await
-    .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())??;
-    let _ = app.emit(
-        "newspaper://clipping-invalidated",
-        serde_json::json!({ "clippingId": event_id, "thumbnailVersion": response.thumbnail_version }),
-    );
-    Ok(response)
+    .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?
 }
 
 #[tauri::command]

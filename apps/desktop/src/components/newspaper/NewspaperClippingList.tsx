@@ -1,5 +1,4 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { FileText, ImageOff, LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -8,9 +7,10 @@ import {
   isTauriRuntime,
   type NewspaperClippingSummary
 } from "./newspaper-api";
+import { preserveStableClippingThumbnail } from "./clipping-thumbnail-state";
 
 const PAGE_SIZE = 50;
-const ROW_HEIGHT = 108;
+const ROW_HEIGHT = 220;
 
 export function NewspaperClippingList({
   selectedId,
@@ -23,6 +23,7 @@ export function NewspaperClippingList({
   const generationRef = useRef(0);
   const loadingRef = useRef(new Set<string>());
   const thumbnailRef = useRef(new Set<string>());
+  const thumbnailErrorRef = useRef(new Set<string>());
   const selectedIdRef = useRef(selectedId);
   const onSelectRef = useRef(onSelect);
   selectedIdRef.current = selectedId;
@@ -47,9 +48,12 @@ export function NewspaperClippingList({
       setTotal(page.total);
       setItems((current) => {
         const next = reset ? new Array<NewspaperClippingSummary | undefined>(page.total) : [...current];
+        const previousById = new Map(
+          current.flatMap((item) => item ? [[item.id, item] as const] : [])
+        );
         next.length = page.total;
         page.items.forEach((item, index) => {
-          next[page.offset + index] = item;
+          next[page.offset + index] = preserveStableClippingThumbnail(item, previousById.get(item.id));
         });
         return next;
       });
@@ -122,7 +126,12 @@ export function NewspaperClippingList({
     let disposed = false;
     for (const row of virtualItems) {
       const item = items[row.index];
-      if (!item || item.thumbnailReady || thumbnailRef.current.has(item.id)) continue;
+      if (
+        !item
+        || item.thumbnailReady
+        || thumbnailRef.current.has(item.id)
+        || thumbnailErrorRef.current.has(item.id)
+      ) continue;
       thumbnailRef.current.add(item.id);
       void ensureNewspaperClippingThumbnail(item.id)
         .then((thumbnail) => {
@@ -134,6 +143,13 @@ export function NewspaperClippingList({
                 thumbnailUrl: thumbnail.thumbnailUrl,
                 thumbnailVersion: thumbnail.thumbnailVersion
               }
+            : candidate));
+        })
+        .catch(() => {
+          thumbnailErrorRef.current.add(item.id);
+          if (disposed) return;
+          setItems((current) => current.map((candidate) => candidate?.id === item.id
+            ? { ...candidate, thumbnailReady: false, thumbnailUrl: null, thumbnailVersion: null }
             : candidate));
         })
         .finally(() => thumbnailRef.current.delete(item.id));
@@ -165,15 +181,30 @@ export function NewspaperClippingList({
                 type="button"
               >
                 <span className="clipping-list__thumb">
-                  {!item ? <LoaderCircle aria-hidden="true" className="animate-spin" />
-                    : item.thumbnailReady && item.thumbnailUrl ? <img alt="" src={item.thumbnailUrl} />
-                      : item.assetState === "missing" ? <ImageOff aria-hidden="true" /> : <FileText aria-hidden="true" />}
+                  {item?.thumbnailReady && item.thumbnailUrl ? (
+                    <img
+                      alt=""
+                      decoding="async"
+                      onError={() => {
+                        thumbnailErrorRef.current.add(item.id);
+                        setItems((current) => current.map((candidate) => candidate?.id === item.id
+                          ? { ...candidate, thumbnailReady: false, thumbnailUrl: null, thumbnailVersion: null }
+                          : candidate));
+                      }}
+                      onLoad={(event) => { event.currentTarget.dataset.loaded = "true"; }}
+                      src={item.thumbnailUrl}
+                    />
+                  ) : (
+                    <span
+                      aria-label={item?.assetState === "missing" || (item && thumbnailErrorRef.current.has(item.id))
+                        ? "Clipping preview unavailable"
+                        : "Preparing clipping preview"}
+                      className="clipping-list__thumb-placeholder"
+                      role="img"
+                    />
+                  )}
                 </span>
-                {item ? <span className="clipping-list__copy">
-                  <strong>{item.title}</strong>
-                  <span>{item.editionName} · {item.publicationDate} · p. {item.pageNumber}</span>
-                  <small>{item.noteExcerpt || "No note yet"}</small>
-                </span> : null}
+                {item ? <span className="clipping-list__title"><strong>{item.title}</strong></span> : null}
               </button>
             );
           })}

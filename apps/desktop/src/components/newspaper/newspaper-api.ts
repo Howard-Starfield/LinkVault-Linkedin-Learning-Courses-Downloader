@@ -126,6 +126,7 @@ export type NewspaperClippingSummary = {
   sourceAvailable: boolean;
   assetState: ClippingAssetState;
   assetErrorCode?: string | null;
+  assetVersion: number;
   assetWidth: number;
   assetHeight: number;
   revision: number;
