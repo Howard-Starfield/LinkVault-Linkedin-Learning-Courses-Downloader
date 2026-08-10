@@ -271,7 +271,7 @@ for (const fragment of [
 }
 requireContains(librarySource, "__NEWSPAPER_CLIPPING_HARNESS__", "NewspaperLibrary.tsx isolated browser harness");
 requireContains(librarySource, 'window.location.hostname === "127.0.0.1"', "NewspaperLibrary.tsx local-only harness guard");
-requireContains(newspaperViewSource, "return <NewspaperLibrary />;", "NewspaperView.tsx production capability gate");
+requireContains(newspaperViewSource, "clippingCapability={{ enabled: true, onCreated: onOpenClipping }}", "NewspaperView.tsx production clipping capability");
 for (const fragment of [
   "Duplicate Save invoked create more than once",
   "Retry generated a new operation ID",

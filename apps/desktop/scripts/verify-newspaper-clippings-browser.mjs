@@ -308,9 +308,12 @@ try {
     before,
     "Saving a clipping changed reader scroll position"
   );
-  const captured = await page.evaluate(() => window.__NEWSPAPER_CLIPPING_TEST__);
+  let captured = await page.evaluate(() => window.__NEWSPAPER_CLIPPING_TEST__);
   assert.equal(captured.createRequests.length, 1, "Duplicate Save invoked create more than once");
-  assert.equal(captured.createdIds.length, 1, "Create callback was not delivered exactly once");
+  assert.equal(captured.createdIds.length, 0, "Reader navigated before the user chose Open note");
+  await page.getByRole("button", { name: "Open note" }).click();
+  captured = await page.evaluate(() => window.__NEWSPAPER_CLIPPING_TEST__);
+  assert.equal(captured.createdIds.length, 1, "Open note callback was not delivered exactly once");
   assert.equal(captured.createRequests[0].pageId, "fixture-page-0");
   assert.equal(captured.createRequests[0].expectedMediaVersion, 3);
   assert.match(captured.createRequests[0].operationId, /^[0-9a-f-]{36}$/);

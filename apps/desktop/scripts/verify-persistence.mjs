@@ -34,7 +34,7 @@ async function collectRustFiles(directory) {
 }
 
 function productionSource(source) {
-  const testBoundary = source.indexOf("#[cfg(test)]");
+  const testBoundary = source.search(/\r?\n#\[cfg\(test\)\]\r?\nmod tests\b/);
   return testBoundary === -1 ? source : source.slice(0, testBoundary);
 }
 
