@@ -10,11 +10,19 @@ The applicable license text is preserved in `coursera-dl.LICENSE`.
 Dependency-specific notices and source information are also available from the
 committed npm and Cargo lockfiles.
 
+## Unicode normalization
+
+The Newspaper Clippings search index uses `unicode-normalization` 0.1.25 from
+[unicode-rs/unicode-normalization](https://github.com/unicode-rs/unicode-normalization).
+It is distributed under the MIT License or the Apache License, Version 2.0, at
+the user's option.
+
 ## Tiptap editor packages
 
-The isolated Newspaper Clippings Phase 4A editor adapter includes
-`@tiptap/react`, `@tiptap/starter-kit`, and `@tiptap/markdown`, each at version
-3.29.2. Their source is available from
+The Newspaper Clippings editor adapter includes `@tiptap/core`,
+`@tiptap/react`, `@tiptap/starter-kit`, `@tiptap/markdown`,
+`@tiptap/suggestion`, and `@tiptap/extension-list`, each at version 3.29.2.
+Their source is available from
 [ueberdosis/tiptap](https://github.com/ueberdosis/tiptap). These packages are
 licensed under the MIT License:
 

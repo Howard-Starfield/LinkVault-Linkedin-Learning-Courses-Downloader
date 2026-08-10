@@ -2,9 +2,11 @@
 
 **Status:** Approved
 
-**Primary implementation phase:** Phase 1
+**Primary implementation phases:** Phase 1 foundation and Phase 4C durability
+migration
 
-**Related decisions:** D-004 through D-012, D-014 through D-022, D-027, D-028
+**Related decisions:** D-004 through D-012, D-014 through D-022, D-027, D-028,
+D-032 through D-034
 
 ## 1. Purpose
 
@@ -81,6 +83,7 @@ pub struct NewspaperClipping {
     pub crop_width: u32,
     pub crop_height: u32,
 
+    pub asset_root_id: String,
     pub asset_relative_path: String,
     pub asset_mime_type: String,
     pub asset_pixel_width: u32,
@@ -138,6 +141,15 @@ Column names and constraints are binding unless an approved migration review
 records a necessary SQLite compatibility adjustment.
 
 ```sql
+CREATE TABLE IF NOT EXISTS newspaper_clipping_roots (
+    id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('legacy_managed', 'download_snapshot')),
+    locator TEXT NOT NULL,
+    locator_key TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS newspaper_clippings (
     id TEXT PRIMARY KEY NOT NULL,
 
@@ -168,6 +180,7 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     crop_height INTEGER NOT NULL
         CHECK (crop_height > 0),
 
+    asset_root_id TEXT NOT NULL,
     asset_relative_path TEXT NOT NULL,
     asset_mime_type TEXT NOT NULL
         CHECK (asset_mime_type = 'image/webp'),
@@ -198,6 +211,9 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     FOREIGN KEY (source_page_id)
         REFERENCES newspaper_pages(id)
         ON DELETE SET NULL,
+    FOREIGN KEY (asset_root_id)
+        REFERENCES newspaper_clipping_roots(id)
+        ON DELETE RESTRICT,
 
     CHECK (crop_x + crop_width <= source_pixel_width),
     CHECK (crop_y + crop_height <= source_pixel_height),
@@ -232,6 +248,19 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_source_page
 
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
     ON newspaper_clippings(asset_state, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_root
+    ON newspaper_clippings(asset_root_id, asset_state, updated_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS newspaper_clippings_fts USING fts5(
+    title,
+    note_markdown,
+    edition_name_snapshot,
+    edition_code_snapshot,
+    content='newspaper_clippings',
+    content_rowid='rowid',
+    tokenize='trigram'
+);
 ```
 
 ### Schema rationale
@@ -242,15 +271,47 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
 - `asset_state` makes cross-filesystem/database operations recoverable.
 - No editor JSON, OCR text, AI output, tags, arbitrary attachments, or remote
   identifiers are added.
-- No full-text index is added in V1.
+- `newspaper_clippings_fts` is a derived search accelerator, never title/note
+  source of truth. Insert/update/delete triggers keep its external-content rows
+  synchronized in the same SQLite transaction as the clipping row.
+- Search joins back to `newspaper_clippings` and exposes only `ready` or
+  `missing` rows. Index corruption or absence cannot delete or rewrite a note.
+
+### Recovery-checkpoint table (schema v6)
+
+D-034 adds one local, recovery-only row per clipping:
+
+```sql
+CREATE TABLE newspaper_clipping_note_drafts (
+    clipping_id TEXT PRIMARY KEY
+        REFERENCES newspaper_clippings(id) ON DELETE CASCADE,
+    base_revision INTEGER NOT NULL CHECK (base_revision >= 1),
+    writer_session_id TEXT NOT NULL,
+    writer_sequence INTEGER NOT NULL CHECK (writer_sequence >= 1),
+    draft_title TEXT NOT NULL,
+    draft_markdown TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+```
+
+This table is not canonical note storage and has no FTS trigger. A same-session
+checkpoint replaces only a lower sequence. A different session must first load
+and classify the existing recovery row and may not overwrite it silently.
+Backend validation allows at most 4 KiB of UTF-8 title bytes and 4 MiB of UTF-8
+Markdown bytes. Draft bytes never appear in path fields, logs, diagnostics,
+search results, list excerpts, or canonical `updated_at`.
 
 ## 5. Schema-version and migration contract
 
-At specification time, the application supports schema version `2`. The Phase
-1 implementation is expected to advance the then-current supported version by
-exactly one. If another approved migration lands first, the coding agent must
-rebase, inspect the new current version, and update the clipping migration
-without overwriting or skipping it.
+Phase 1 introduced the clipping table at schema version 3. D-032 advances the
+application to schema version 4, adds the root registry and `asset_root_id`, and
+rebuilds populated v3 clipping tables after the existing verified backup.
+D-019 then advances the application to schema version 5, creates the external-
+content FTS table and synchronization triggers, and issues an FTS `rebuild`
+only after the canonical clipping rows are present. D-034 advances the
+application to schema version 6 and adds the recovery-checkpoint table after the
+same verified backup boundary. The verified backup occurs before any pending
+migration when upgrading an older database.
 
 ### FR-MIGRATION-001
 
@@ -277,6 +338,22 @@ creation or mutation.
 A database newer than the supported version remains rejected before backup or
 schema mutation.
 
+### FR-MIGRATION-006
+
+Schema-v5 installation verifies `ENABLE_FTS5`, creates all external-content
+triggers, rebuilds the index from existing rows, and proves row-count/content
+parity before writing `PRAGMA user_version = 5`. A failed create, trigger, or
+rebuild rolls back and preserves the verified backup. Repair may drop and
+rebuild only the derived FTS objects while leaving clipping rows untouched.
+
+### FR-MIGRATION-007
+
+Schema-v6 installation creates and verifies the exact recovery table,
+constraints, and `ON DELETE CASCADE` foreign key before writing
+`PRAGMA user_version = 6`. It does not add an FTS trigger, mutate canonical
+clipping rows, or create recovery rows during migration. Failure rolls back
+with `user_version` below 6 and preserves the verified backup.
+
 ### Migration evidence
 
 Tests must prove:
@@ -285,11 +362,16 @@ Tests must prove:
   progress, and settings rows survive migration.
 - The backup passes integrity check and contains representative pre-migration
   data.
-- The new table has both `ON DELETE SET NULL` foreign keys.
+- The clipping table has both `ON DELETE SET NULL` source foreign keys and the
+  `ON DELETE RESTRICT` root foreign key.
+- Populated v3 clipping rows retain notes/assets and are backfilled to the
+  stable `legacy-managed-v1` root.
 - `PRAGMA foreign_key_check` is empty after migration.
 - Re-running initialization is idempotent.
 - A failed migration leaves `user_version` below the target and preserves the
   verified backup.
+- Fresh, populated-v5, already-v6, failed-v6, and future-version fixtures prove
+  the recovery table contract and preserve representative provider data.
 
 ## 6. Validation and storage limits
 
@@ -311,46 +393,46 @@ Backend validation is authoritative.
 | List offset | Non-negative integer |
 | List limit | 1–100; frontend default 50 |
 | Search query | Trimmed; maximum 200 Unicode scalar values |
+| Recovery title | 0-4,096 UTF-8 bytes; recovery only; no NUL |
+| Recovery Markdown | 0-4,194,304 UTF-8 bytes; recovery only; no NUL |
 
 The frontend may prevalidate for user feedback, but invalid backend input returns
 a typed error and never writes files or rows.
 
 ## 7. Managed root and path contract
 
-The app storage module adds a resolver conceptually equivalent to:
-
-```rust
-pub fn resolve_newspaper_clippings_root() -> Result<PathBuf, StoragePathError>;
-```
-
-Resolved layout:
+Schema v4 adds `newspaper_clipping_roots`. A `download_snapshot` root resolves
+from the source job's persisted batch destination, never a frontend payload:
 
 ```text
-<LinkVaultData>/
-└─ newspaper-clippings/
-   ├─ assets/
-   │  └─ <clipping-id>/
-   │     └─ clipping-v1.webp
-   ├─ thumbnails/
-   │  └─ v1/
-   │     └─ <clipping-id>-asset-<asset-version>.webp
-   ├─ staging/
-   │  └─ <clipping-id>/
-   │     └─ clipping-v1.webp.part
-   ├─ trash/
-   │  └─ <clipping-id>-<deletion-nonce>/
-   │     └─ clipping-v1.webp
-   └─ quarantine/
-      └─ <timestamp>-<reason>-<name>/
+<destination>/
+└─ Newspaper snapshots/
+   ├─ .linkvault/
+   │  ├─ clipping-root-v1.json
+   │  ├─ staging/<clipping-id>/clipping-v1.webp.part
+   │  ├─ trash/<clipping-id>-<deletion-nonce>/clipping-v1.webp
+   │  └─ quarantine/<timestamp>-<reason>-<name>/
+   └─ <sanitized edition name - code>/
+      └─ <publication-date>/
+         └─ Page <page> - <clipping-id>/clipping-v1.webp
 ```
+
+Derived thumbnails remain under the dedicated app-data cache. Existing v3
+rows are assigned to `legacy-managed-v1`, which resolves the former
+`LinkVaultData/newspaper-clippings` layout for read/recovery only.
 
 ### FR-ASSET-001: Backend-derived paths
 
-The canonical relative path is exactly:
+The new canonical relative path is exactly:
 
 ```text
-assets/<clipping-id>/clipping-v1.webp
+<sanitized edition name - code>/<publication-date>/Page <page> - <clipping-id>/clipping-v1.webp
 ```
+
+The page label is sanitized and bounded for one Windows-safe segment. The full
+UUID remains the collision-proof identity suffix. Readers also accept the
+earlier `<edition>/<date>/<clipping-id>/clipping-v1.webp` shape so existing
+assets require no rename or migration.
 
 React cannot override root, directory, filename, extension, asset version, or
 relative path.
@@ -359,20 +441,59 @@ relative path.
 
 Every managed read/write/delete operation:
 
-1. Resolves the application clipping root.
+1. Resolves the row's registered clipping root and verifies its marker.
 2. Rejects absolute or parent-component relative paths.
 3. Creates parent directories itself.
 4. Uses `symlink_metadata` and rejects symlinks.
 5. Canonicalizes existing targets and verifies containment before reading.
 6. Never follows a user-created symlink out of the managed root.
+7. Never recreates a registered root during read, recovery, or cleanup.
+8. Never scans for or automatically rebinds a moved root; any future explicit
+   reconnect flow must verify the root marker before updating its locator.
 
 ### FR-ASSET-003: File permissions and replacement
 
 - Files are written with create-new semantics in staging.
 - An existing canonical directory for a new clipping ID is treated as a
   collision/recovery condition, not overwritten.
-- Asset promotion uses a same-volume atomic rename from staging into `assets`.
+- Asset promotion uses a same-volume atomic rename from reserved staging into
+  the edition/date/clipping directory.
 - No canonical file is modified in place in V1.
+
+### FR-ROOT-RECONNECT-001: Settings list
+
+The root service lists registry identity, kind, and backend-derived display
+path from SQLite, plus any process-memory cached probe outcome. It does not add
+stale availability columns to the root registry or synchronously probe every
+filesystem path while listing. A root without a cached outcome begins as
+`unchecked`; Settings renders it as `checking` while requesting a probe.
+Availability probes run off the UI-sensitive thread, are coalesced per root,
+and are concurrency bounded so a disconnected removable or network destination
+cannot freeze Settings.
+
+### FR-ROOT-RECONNECT-002: Check again
+
+`Check again` accepts only a root ID. The backend resolves the stored locator,
+rejects reparse/symlink substitution, and verifies the exact marker. It returns
+`connected`, `offline`, or `marker_mismatch`; it does not create directories,
+rewrite markers, scan other locations, or mutate the locator.
+
+### FR-ROOT-RECONNECT-003: Reconnect
+
+`Reconnect…` uses a backend-owned native folder-selection flow (or an opaque
+selection token with equivalent ownership). React never submits an arbitrary
+path to the repository. The selected directory must be the existing
+`Newspaper snapshots` root and present the requested root ID in its marker.
+After canonicalization and uniqueness checks, one serialized writer transaction
+updates `locator`, `locator_key`, and `updated_at`. A failure leaves the old
+locator and all notes/assets unchanged.
+
+### FR-ROOT-RECONNECT-004: Offline behavior
+
+Offline or mismatched roots do not block title/note search, editing, or list
+metadata. Canonical images and thumbnails show the existing unavailable state.
+Visible thumbnail requests coalesce the root probe so one result page cannot
+perform one blocking offline-path check per row.
 
 ## 8. Idempotency contract
 
@@ -424,13 +545,13 @@ Outside a database write transaction:
 
 1. Validate operation ID and request.
 2. Resolve and snapshot the source record.
-3. Decode, crop, and encode to
-   `staging/<id>/clipping-v1.webp.part`.
+3. Register/commit the verified root, then decode, crop, and encode to
+   `.linkvault/staging/<id>/clipping-v1.webp.part`.
 4. Flush/close the file.
 5. Decode final bytes and validate dimensions.
 6. Compute final byte count and SHA-256.
 7. Rename `.webp.part` to a complete staging filename
-   `staging/<id>/clipping-v1.webp`.
+   `.linkvault/staging/<id>/clipping-v1.webp`.
 
 No SQLite row exists yet. A failure removes the current operation’s staging
 directory when safe.
@@ -441,7 +562,8 @@ Through `DatabaseWriter`, insert one row with:
 
 ```text
 asset_state = creating
-asset_relative_path = assets/<id>/clipping-v1.webp
+asset_root_id = <registered download-snapshot root ID>
+asset_relative_path = <edition>/<date>/Page <page> - <id>/clipping-v1.webp
 asset_version = 1
 revision = 1
 note_markdown = ''
@@ -455,7 +577,7 @@ filesystem. A uniqueness conflict follows the idempotency contract.
 Outside a database transaction, atomically rename:
 
 ```text
-staging/<id>  →  assets/<id>
+.linkvault/staging/<id>  →  <edition>/<date>/Page <page> - <id>
 ```
 
 Before rename, reject an unexpected existing final directory. After rename,
@@ -550,6 +672,15 @@ immutable through the note update command.
 No-op updates whose normalized title and Markdown equal the stored values return
 the current record without incrementing revision.
 
+### FR-UPDATE-006: Atomic checkpoint acknowledgement
+
+When a canonical update includes an acknowledged writer session and sequence,
+the existing note savepoint deletes only that clipping's matching-session
+checkpoint whose sequence is less than or equal to the submitted sequence. A
+revision conflict, validation failure, SQL failure, or stale session/sequence
+leaves the checkpoint intact. A no-op canonical update may clear it only after
+proving the submitted title and Markdown equal the canonical bytes.
+
 ## 11. Read and list contract
 
 ### Repository detail read
@@ -628,11 +759,11 @@ Thumbnail files are cache, not aggregate state.
 ### Thumbnail output
 
 - Format: lossy WebP is allowed because the thumbnail is derived.
-- Bounding box: 512×320 pixels.
+- Bounding box: 1024×640 pixels.
 - Aspect ratio: preserved.
 - Upscaling: prohibited.
 - Source: canonical clipping asset only.
-- Cache schema version: integer constant starting at 1.
+- Cache schema version: integer constant; the high-density cache is version 2.
 - Filename key includes clipping ID and canonical asset version.
 
 ### Thumbnail ensure flow
@@ -671,7 +802,7 @@ The thumbnail route verifies the clipping and requested composite version,
 derives the deterministic cache path, and serves only a regular contained file.
 Before reading, metadata must report a positive byte count no greater than
 8,388,608 bytes. The exact returned buffer must be a static, decodable WebP
-whose width is 1 through 512 and height is 1 through 320. Animated/multiframe,
+whose width is 1 through 1024 and height is 1 through 640. Animated/multiframe,
 empty, malformed, oversized-byte, oversized-dimension, symlinked, reparse, and
 stale-version files are rejected.
 
@@ -738,8 +869,12 @@ included in release diagnostics but not required on every launch.
   deleted. Malformed names, non-regular entries, symlinks, and reparse points
   are never deletion targets.
 - Quarantine entries are retained for seven days, then eligible for deletion.
-- Cleanup is submitted to a detached blocking task; application setup and the
-  UI/runtime startup thread do not wait for enumeration.
+- Cleanup is scheduled once per process after a five-second startup quiet
+  period, then submitted to a detached blocking task; application setup and
+  the UI/runtime startup thread do not wait for enumeration.
+- Database-driven `creating` and `delete_pending` recovery remains synchronous
+  before clipping state is exposed; the quiet period applies only to managed
+  orphan/cache folder reconciliation.
 - Each launch may completely enumerate the staging, assets, trash, quarantine,
   and clipping-thumbnail managed categories. Actual `ReadDir` items consumed
   are counted and reported honestly; enumeration/inspection is not described
@@ -751,7 +886,8 @@ included in release diagnostics but not required on every launch.
   filename cursor is used because directory order is unspecified and stable
   Rust provides no portable durable `ReadDir` position.
 - Cleanup retains every containment and age rule above and must not scan user
-  newspaper download directories.
+  newspaper download directories or infer clipping identity from files in the
+  visible edition/date tree.
 
 The 500-entry and 5,000-entry managed-directory measurements record wall time
 and approximate/peak process memory for the supported Windows environment.
@@ -834,7 +970,8 @@ Source availability is derived, not persisted as a mutable boolean.
 The existing reset operation must be reviewed and amended so that:
 
 - `newspaper_clippings` is excluded from delete statements.
-- `newspaper-clippings` managed root is not removed.
+- `newspaper_clipping_roots`, the legacy managed root, and registered snapshot
+  roots are not removed.
 - Clipping thumbnails remain or may be lazily regenerated; they are not part of
   the existing newspaper front-page thumbnail root.
 - Source `SET NULL` actions complete under foreign keys.
@@ -880,6 +1017,10 @@ CLIPPING_ASSET_CHECKSUM_MISMATCH
 CLIPPING_DATABASE_WRITE_FAILED
 CLIPPING_DATABASE_READ_FAILED
 CLIPPING_RECOVERY_FAILED
+CLIPPING_RECOVERY_INVALID
+CLIPPING_RECOVERY_TOO_LARGE
+CLIPPING_RECOVERY_STALE_SEQUENCE
+CLIPPING_RECOVERY_WRITER_CONFLICT
 CLIPPING_DELETE_FAILED
 ```
 

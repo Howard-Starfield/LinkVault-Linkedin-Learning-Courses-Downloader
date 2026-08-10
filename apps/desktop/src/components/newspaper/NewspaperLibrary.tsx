@@ -7,13 +7,15 @@ import { toast } from "sonner";
 import { Button, Input, Select, StatusBadge } from "../primitives";
 import {
   ensureThumbnail,
+  getLibraryItem,
   getLibraryPage,
   isTauriRuntime,
   type NewspaperEditionKind,
   type NewspaperLibraryItem,
   type NewspaperLibraryStatus
 } from "./newspaper-api";
-import { NewspaperReader } from "./NewspaperReader";
+import type { NewspaperReaderSourceTarget } from "./newspaper-navigation";
+import { NewspaperReader, type NewspaperClippingCapability } from "./NewspaperReader";
 import {
   NEWSPAPER_READER_PREFERENCES_EVENT,
   readNewspaperReaderPreferences,
@@ -24,7 +26,29 @@ import { visibleVirtualIndexes } from "./newspaper-virtualization";
 
 const PAGE_SIZE = 50;
 const ROW_HEIGHT = 112;
-export function NewspaperLibrary() {
+export function NewspaperLibrary({
+  clippingCapability,
+  readerTarget,
+  onReaderTargetConsumed,
+  onReturnClipping
+}: {
+  clippingCapability?: NewspaperClippingCapability;
+  readerTarget?: NewspaperReaderSourceTarget | null;
+  onReaderTargetConsumed?: (generation: number) => void;
+  onReturnClipping?: (clippingId: string) => void;
+} = {}) {
+  const browserHarnessCapability = typeof window !== "undefined"
+    && window.location.hostname === "127.0.0.1"
+    && (window as Window & { __NEWSPAPER_CLIPPING_HARNESS__?: boolean }).__NEWSPAPER_CLIPPING_HARNESS__
+    ? {
+        enabled: true,
+        onCreated: (clippingId: string) => window.dispatchEvent(new CustomEvent(
+          "linkvault:newspaper-clipping-created",
+          { detail: { clippingId } }
+        ))
+      }
+    : undefined;
+  const resolvedClippingCapability = browserHarnessCapability ?? clippingCapability;
   const scrollRef = useRef<HTMLDivElement>(null);
   const requestGenerationRef = useRef(0);
   const loadingOffsetsRef = useRef<Set<number>>(new Set());
@@ -38,7 +62,30 @@ export function NewspaperLibrary() {
   const [items, setItems] = useState<Array<NewspaperLibraryItem | undefined>>([]);
   const [total, setTotal] = useState(0);
   const [readerItem, setReaderItem] = useState<NewspaperLibraryItem | null>(null);
+  const [activeReaderTarget, setActiveReaderTarget] = useState<NewspaperReaderSourceTarget | null>(null);
   const [thumbnailRetryTick, setThumbnailRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!readerTarget) return;
+    const generation = readerTarget.generation;
+    let stale = false;
+    void getLibraryItem(readerTarget.jobId).then((item) => {
+      if (stale) return;
+      savedScrollTopRef.current = scrollRef.current?.scrollTop ?? 0;
+      setActiveReaderTarget(readerTarget);
+      setReaderItem(item);
+      onReaderTargetConsumed?.(generation);
+    }, () => {
+      if (stale) return;
+      toast.error("Original edition is unavailable", {
+        description: "Your clipping and note are still saved."
+      });
+      onReaderTargetConsumed?.(generation);
+    });
+    return () => {
+      stale = true;
+    };
+  }, [onReaderTargetConsumed, readerTarget]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 200);
@@ -199,6 +246,8 @@ export function NewspaperLibrary() {
         defaultZoom={readerPreferences.defaultZoom}
         clickZoom={readerPreferences.clickZoom}
         pageTone={readerPreferences.pageTone}
+        clippingCapability={resolvedClippingCapability}
+        sourceTarget={activeReaderTarget}
         onPageToneChange={(pageTone) => {
           const next = { ...readerPreferences, pageTone };
           setReaderPreferences(next);
@@ -219,7 +268,13 @@ export function NewspaperLibrary() {
                 : candidate
             )));
           }
+          const returnClippingId = activeReaderTarget?.returnClippingId;
           setReaderItem(null);
+          setActiveReaderTarget(null);
+          if (returnClippingId) {
+            onReturnClipping?.(returnClippingId);
+            return;
+          }
           requestAnimationFrame(() => {
             if (scrollRef.current) scrollRef.current.scrollTop = savedScrollTopRef.current;
           });

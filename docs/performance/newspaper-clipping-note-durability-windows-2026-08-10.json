@@ -1,0 +1,166 @@
+{
+  "capturedAt": "2026-08-10",
+  "scope": "Phase 4C clipping-note checkpoint, renderer exit preparation, active-editor heap, bundle, and persistence regression baseline. Browser-mocked preparation is not native Windows close or tray UAT.",
+  "profile": "release",
+  "source": {
+    "nativeCollectorCommit": "879dab1",
+    "browserMatrixCommit": "17599b8",
+    "branch": "codex/newspaper-clippings-phase4c-durability"
+  },
+  "environment": {
+    "os": "Microsoft Windows 11 Enterprise 24H2",
+    "osVersion": "10.0.26100",
+    "architecture": "64-bit",
+    "rustc": "1.94.1 x86_64-pc-windows-msvc LLVM 21.1.8",
+    "node": "24.14.0",
+    "npm": "11.9.0"
+  },
+  "commands": {
+    "nativeCollector": "cargo run --release --manifest-path apps/desktop/src-tauri/Cargo.toml --example newspaper_clipping_note_durability_baseline --features durability-baseline",
+    "rendererMatrix": "npm.cmd --prefix apps/desktop run verify:clipping-note-durability-browser",
+    "schedulerMatrix": "npm.cmd --prefix apps/desktop run verify:clipping-note-autosave",
+    "releaseGate": "npm.cmd --prefix apps/desktop run verify:release"
+  },
+  "schedulerWriteCounts": [
+    {
+      "continuousTypingSeconds": 10,
+      "inputIntervalMs": 100,
+      "checkpointSubmissions": 5,
+      "canonicalSubmissions": 2
+    },
+    {
+      "continuousTypingSeconds": 600,
+      "inputIntervalMs": 100,
+      "checkpointSubmissions": 300,
+      "canonicalSubmissions": 120
+    }
+  ],
+  "checkpointLatency": [
+    {
+      "payloadBytes": 1024,
+      "samples": 25,
+      "p50Ms": 0.441,
+      "p95Ms": 0.56,
+      "maxMs": 1.219
+    },
+    {
+      "payloadBytes": 102400,
+      "samples": 25,
+      "p50Ms": 0.586,
+      "p95Ms": 0.712,
+      "maxMs": 0.803
+    },
+    {
+      "payloadBytes": 2097152,
+      "samples": 25,
+      "p50Ms": 6.036,
+      "p95Ms": 6.841,
+      "maxMs": 7.288
+    }
+  ],
+  "tenMinuteEquivalent": {
+    "checkpointWrites": 300,
+    "payloadBytes": 2097024,
+    "elapsedMs": 1895.533,
+    "acceptedWrites": 300,
+    "completedWrites": 300,
+    "failedWrites": 0,
+    "maxQueueDepth": 1,
+    "initialDatabaseBytes": 2539520,
+    "initialWalBytes": 0,
+    "peakDatabaseBytes": 4534272,
+    "peakWalBytes": 4663872,
+    "postIdleDatabaseBytes": 4534272,
+    "postIdleWalBytes": 0,
+    "workingSetBeforeBytes": 6893568,
+    "peakWorkingSetBytes": 11177984,
+    "postIdleWorkingSetBytes": 8749056,
+    "finalDraftRows": 1,
+    "finalWriterSequence": 375
+  },
+  "rendererExitPreparation": [
+    {
+      "scenario": "clean",
+      "samples": 20,
+      "p50Ms": 0.0,
+      "p95Ms": 0.1,
+      "maxMs": 0.2
+    },
+    {
+      "scenario": "dirty",
+      "samples": 20,
+      "p50Ms": 31.1,
+      "p95Ms": 32.0,
+      "maxMs": 32.0
+    },
+    {
+      "scenario": "in-flight",
+      "samples": 20,
+      "p50Ms": 107.4,
+      "p95Ms": 123.2,
+      "maxMs": 123.3
+    },
+    {
+      "scenario": "checkpoint-fallback",
+      "samples": 20,
+      "p50Ms": 31.0,
+      "p95Ms": 32.1,
+      "maxMs": 32.1
+    }
+  ],
+  "activeEditorHeap": [
+    {
+      "clippingCount": 8,
+      "usedBytes": 8531332,
+      "totalBytes": 9469952
+    },
+    {
+      "clippingCount": 50,
+      "usedBytes": 8558548,
+      "totalBytes": 9469952
+    },
+    {
+      "clippingCount": 500,
+      "usedBytes": 8858064,
+      "totalBytes": 9732096
+    }
+  ],
+  "bundles": {
+    "mainBeforeRawKb": 478.87,
+    "mainBeforeGzipKb": 137.32,
+    "mainAfterRawKb": 479.73,
+    "mainAfterGzipKb": 137.65,
+    "lazyEditorRawKb": 527.64,
+    "lazyEditorGzipKb": 165.5,
+    "lazyEditorChanged": false
+  },
+  "persistenceReleaseBaseline": {
+    "acceptedWrites": 800,
+    "completedWrites": 800,
+    "failedWrites": 0,
+    "contentionElapsedMs": 317,
+    "snapshotReadElapsedMs": 1,
+    "writesPerSecond": 2523
+  },
+  "conclusion": "The approved 500 ms trailing/2 s maximum recovery checkpoint and 800 ms trailing/5 s maximum canonical schedules remain accepted. The real writer stayed single-lane, upserted one draft row, bounded WAL high-water below 5 MB, and showed near-limit p95 below 7 ms on this host. No threshold was relaxed after measurement.",
+  "nativeUat": {
+    "status": "passed_observed_close_and_tray_scenarios",
+    "observedBy": "product owner",
+    "environment": "native Tauri development window on Windows 11 Enterprise 24H2",
+    "observedAt": "2026-08-10",
+    "passed": [
+      "window X before Saved hid the main window and tray Show retained exact latest text",
+      "window X while Saving retained queued-latest text",
+      "repeated hide and Show did not create a duplicate main window",
+      "tray Quit exited the native process and relaunch retained or explicitly recovered the latest note"
+    ],
+    "notClaimed": [
+      "native injected canonical or checkpoint failure",
+      "native revision-conflict fault injection",
+      "forced-process crash recovery outside a disposable test profile",
+      "native Chinese IME composition in this UAT run",
+      "screen-reader UAT, which is not a product blocker"
+    ],
+    "boundary": "Browser and service automation cover failure, conflict, and recovery contracts but are not mislabeled as native operating-system interaction proof."
+  }
+}

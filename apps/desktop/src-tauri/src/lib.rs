@@ -1,9 +1,13 @@
 #![deny(unused)]
 
 mod app;
+#[cfg(feature = "crop-baseline")]
+pub use app::newspaper_clipping_crop_baseline as crop_baseline;
+#[cfg(feature = "durability-baseline")]
+pub use app::newspaper_clipping_note_durability_baseline as durability_baseline;
 mod providers;
 pub mod workflow;
-
+use app::cooperative_exit::{CooperativeExit, ExitReason, WaitOutcome};
 use app::updates as app_updates;
 pub use app::{database as cache, security, storage};
 pub use providers::linkedin::{
@@ -14,7 +18,71 @@ use providers::linkedin::{commands, linkedin};
 pub use providers::{coursera, newspaper};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+
+#[tauri::command]
+fn resolve_cooperative_exit(
+    state: tauri::State<'_, CooperativeExit>,
+    token: u64,
+    durable: bool,
+) -> bool {
+    state.resolve(token, durable)
+}
+
+fn restore_main_window(app: &tauri::AppHandle, reason: ExitReason) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit(
+        "linkvault://exit-blocked",
+        serde_json::json!({ "reason": reason }),
+    );
+}
+
+fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
+    const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let coordinator = app.state::<CooperativeExit>().inner().clone();
+    let request = coordinator.request(reason);
+    if !request.started {
+        return;
+    }
+    if app
+        .emit(
+            "linkvault://prepare-exit",
+            serde_json::json!({
+                "token": request.token,
+                "reason": reason,
+                "deadlineMs": EXIT_TIMEOUT.as_millis()
+            }),
+        )
+        .is_err()
+    {
+        coordinator.resolve(request.token, false);
+    }
+    let handle = app.clone();
+    std::thread::spawn(
+        move || match coordinator.wait(request.token, EXIT_TIMEOUT) {
+            WaitOutcome::Durable(ExitReason::Close) => {
+                let hidden = handle
+                    .get_webview_window("main")
+                    .is_some_and(|window| window.hide().is_ok());
+                if !hidden {
+                    restore_main_window(&handle, ExitReason::Close);
+                }
+            }
+            WaitOutcome::Durable(ExitReason::Exit) => {
+                coordinator.authorize_exit();
+                handle.exit(0);
+            }
+            WaitOutcome::Blocked(reason) | WaitOutcome::TimedOut(reason) => {
+                restore_main_window(&handle, reason);
+            }
+            WaitOutcome::Stale => {}
+        },
+    );
+}
 
 pub fn run() {
     let app = tauri::Builder::default()
@@ -60,6 +128,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_updates::check_for_app_update,
             app_updates::install_app_update,
+            resolve_cooperative_exit,
             commands::bootstrap_state,
             commands::cancel_active_download,
             commands::clear_failed_download_jobs,
@@ -103,6 +172,7 @@ pub fn run() {
             newspaper::commands::list_newspaper_catalog,
             newspaper::commands::refresh_newspaper_catalog,
             newspaper::commands::create_newspaper_batch,
+            newspaper::commands::create_newspaper_clipping,
             newspaper::commands::create_newspaper_schedule,
             newspaper::commands::toggle_newspaper_schedule,
             newspaper::commands::delete_newspaper_schedule,
@@ -118,10 +188,27 @@ pub fn run() {
             newspaper::commands::remove_newspaper_job,
             newspaper::commands::list_newspaper_library,
             newspaper::commands::get_newspaper_library_page,
+            newspaper::commands::get_newspaper_library_item,
             newspaper::commands::get_newspaper_activity_snapshot,
             newspaper::commands::get_newspaper_reader_manifest,
             newspaper::commands::save_newspaper_reading_progress,
             newspaper::commands::ensure_newspaper_thumbnail,
+            newspaper::commands::get_newspaper_clippings_page,
+            newspaper::commands::get_newspaper_clipping,
+            newspaper::commands::update_newspaper_clipping,
+            newspaper::commands::delete_newspaper_clipping,
+            newspaper::commands::recover_newspaper_clipping_asset,
+            newspaper::commands::checkpoint_newspaper_clipping_note,
+            newspaper::commands::load_newspaper_clipping_note_recovery,
+            newspaper::commands::claim_newspaper_clipping_note_recovery,
+            newspaper::commands::discard_newspaper_clipping_note_recovery,
+            newspaper::commands::ensure_newspaper_clipping_thumbnail,
+            newspaper::commands::search_newspaper_clippings,
+            newspaper::commands::search_possible_newspaper_clippings,
+            newspaper::commands::list_newspaper_snapshot_roots,
+            newspaper::commands::check_newspaper_snapshot_root,
+            newspaper::commands::reconnect_newspaper_snapshot_root,
+            newspaper::commands::open_newspaper_snapshot_root,
             newspaper::commands::open_newspaper_download_folder,
             newspaper::commands::import_existing_newspaper_archive,
             newspaper::commands::repair_newspaper_library,
@@ -177,16 +264,11 @@ pub fn run() {
                 diagnostics.clone(),
             );
             let _recovery_summary =
-                clipping_service.recover_startup(&diagnostics, commands::now_unix_timestamp());
-            // Row-level clipping recovery failures remain in their durable
-            // retryable states and are reported through safe diagnostics. A
-            // single clipping must not prevent unrelated providers or the
-            // application shell from starting.
-            let cleanup_service = clipping_service.clone();
-            let cleanup_diagnostics = diagnostics.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                cleanup_service.run_deferred_cleanup(&cleanup_diagnostics)
-            });
+                newspaper::clipping_startup::recover_and_schedule_reconciliation(
+                    &clipping_service,
+                    &diagnostics,
+                    commands::now_unix_timestamp(),
+                );
             app.manage(diagnostics);
             app.manage(writer);
             app.manage(clipping_service);
@@ -198,14 +280,10 @@ pub fn run() {
             app.manage(newspaper::commands::NewspaperState::new(db_path));
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
+            app.manage(CooperativeExit::default());
 
-            // Taskbar + tray icon: the All-in-One Downloader icon, embedded
-            // at compile time so the binary has no runtime file dependency.
-            // Applied to every window so the taskbar shows the right icon,
-            // and to the system tray so the app stays reachable from the
-            // notification area. The tray carries a right-click menu with
-            // Show / Quit so the user can reopen or exit the app when the
-            // main window is closed.
+            // Embed the taskbar/tray icon so the binary has no runtime file
+            // dependency. The tray keeps Show / Quit available after close.
             let icon_bytes = include_bytes!("../icons/icon-taskbar.png");
             if let Ok(decoded) = image::load_from_memory(icon_bytes) {
                 let rgba = decoded.to_rgba8();
@@ -235,7 +313,9 @@ pub fn run() {
                                 let _ = window.set_focus();
                             }
                         }
-                        "quit" => app.exit(0),
+                        "quit" => {
+                            request_cooperative_exit(app, ExitReason::Exit);
+                        }
                         _ => {}
                     })
                     .build(app)?;
@@ -243,17 +323,34 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                request_cooperative_exit(window.app_handle(), ExitReason::Close);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building LinkVault");
 
-    app.run(|handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) {
+    app.run(|handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let coordinator = handle.state::<CooperativeExit>();
+            if !coordinator.consume_exit_authorization() {
+                api.prevent_exit();
+                request_cooperative_exit(handle, ExitReason::Exit);
+            }
+        }
+        tauri::RunEvent::Exit => {
+            handle
+                .state::<newspaper::clipping_service::ClippingService>()
+                .shutdown_crop_service();
             let _ = handle
                 .state::<app::database_writer::DatabaseWriter>()
                 .shutdown();
         }
+        _ => {}
     });
 }

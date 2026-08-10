@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 use thiserror::Error;
 
 use super::catalog;
+use super::clipping_models::normalize_search_text;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS newspaper_editions (
@@ -208,8 +209,23 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_thumbnail_source
 /// Column names and constraints follow the approved specification; the table
 /// is installed by the application database lifecycle whenever the global
 /// schema version advances past version 2.
-const CLIPPING_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS newspaper_clippings (
+pub const LEGACY_CLIPPING_ROOT_ID: &str = "legacy-managed-v1";
+pub const LEGACY_CLIPPING_ROOT_LOCATOR: &str = "app-data:newspaper-clippings";
+
+const CLIPPING_ROOT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS newspaper_clipping_roots (
+    id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL
+        CHECK (kind IN ('legacy_managed', 'download_snapshot')),
+    locator TEXT NOT NULL,
+    locator_key TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+
+const CLIPPING_TABLE_SCHEMA: &str = r#"
+CREATE TABLE newspaper_clippings (
     id TEXT PRIMARY KEY NOT NULL,
 
     source_job_id TEXT,
@@ -239,6 +255,7 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     crop_height INTEGER NOT NULL
         CHECK (crop_height > 0),
 
+    asset_root_id TEXT NOT NULL,
     asset_relative_path TEXT NOT NULL,
     asset_mime_type TEXT NOT NULL
         CHECK (asset_mime_type = 'image/webp'),
@@ -269,6 +286,9 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
     FOREIGN KEY (source_page_id)
         REFERENCES newspaper_pages(id)
         ON DELETE SET NULL,
+    FOREIGN KEY (asset_root_id)
+        REFERENCES newspaper_clipping_roots(id)
+        ON DELETE RESTRICT,
 
     CHECK (crop_x + crop_width <= source_pixel_width),
     CHECK (crop_y + crop_height <= source_pixel_height),
@@ -280,7 +300,9 @@ CREATE TABLE IF NOT EXISTS newspaper_clippings (
         (asset_state != 'missing')
     )
 );
+"#;
 
+const CLIPPING_INDEX_SCHEMA: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_updated
     ON newspaper_clippings(updated_at DESC, id DESC);
 
@@ -303,10 +325,418 @@ CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_source_page
 
 CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_state
     ON newspaper_clippings(asset_state, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_newspaper_clippings_asset_root
+    ON newspaper_clippings(asset_root_id, asset_state, updated_at);
 "#;
 
+const CLIPPING_SEARCH_SCHEMA: &str = r#"
+CREATE VIRTUAL TABLE newspaper_clippings_fts USING fts5(
+    title,
+    note_markdown,
+    edition_name_snapshot,
+    edition_code_snapshot,
+    content='newspaper_clippings',
+    content_rowid='rowid',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER newspaper_clippings_fts_ai
+AFTER INSERT ON newspaper_clippings BEGIN
+    INSERT INTO newspaper_clippings_fts(
+        rowid, title, note_markdown, edition_name_snapshot, edition_code_snapshot
+    ) VALUES (
+        new.rowid, new.title, new.note_markdown,
+        new.edition_name_snapshot, new.edition_code_snapshot
+    );
+END;
+
+CREATE TRIGGER newspaper_clippings_fts_ad
+AFTER DELETE ON newspaper_clippings BEGIN
+    INSERT INTO newspaper_clippings_fts(
+        newspaper_clippings_fts, rowid, title, note_markdown,
+        edition_name_snapshot, edition_code_snapshot
+    ) VALUES (
+        'delete', old.rowid, old.title, old.note_markdown,
+        old.edition_name_snapshot, old.edition_code_snapshot
+    );
+END;
+
+CREATE TRIGGER newspaper_clippings_fts_au
+AFTER UPDATE OF title, note_markdown, edition_name_snapshot, edition_code_snapshot
+ON newspaper_clippings BEGIN
+    INSERT INTO newspaper_clippings_fts(
+        newspaper_clippings_fts, rowid, title, note_markdown,
+        edition_name_snapshot, edition_code_snapshot
+    ) VALUES (
+        'delete', old.rowid, old.title, old.note_markdown,
+        old.edition_name_snapshot, old.edition_code_snapshot
+    );
+    INSERT INTO newspaper_clippings_fts(
+        rowid, title, note_markdown, edition_name_snapshot, edition_code_snapshot
+    ) VALUES (
+        new.rowid, new.title, new.note_markdown,
+        new.edition_name_snapshot, new.edition_code_snapshot
+    );
+END;
+"#;
+
+const CLIPPING_NORMALIZED_SEARCH_SCHEMA: &str = r#"
+CREATE TABLE newspaper_clipping_search_metadata (
+    rowid INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    edition_name_snapshot TEXT NOT NULL,
+    edition_code_snapshot TEXT NOT NULL
+);
+
+CREATE INDEX idx_newspaper_clipping_search_metadata_title
+    ON newspaper_clipping_search_metadata(title, rowid);
+
+CREATE VIRTUAL TABLE newspaper_clippings_normalized_fts USING fts5(
+    title,
+    note_markdown,
+    edition_name_snapshot,
+    edition_code_snapshot,
+    content='',
+    contentless_delete=1,
+    tokenize='trigram'
+);
+"#;
+
+const CLIPPING_SEARCH_TRIGGERS: [&str; 3] = [
+    "newspaper_clippings_fts_ai",
+    "newspaper_clippings_fts_ad",
+    "newspaper_clippings_fts_au",
+];
+
 pub fn install_clipping_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(CLIPPING_SCHEMA)
+    connection.execute_batch(CLIPPING_ROOT_SCHEMA)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO newspaper_clipping_roots
+            (id, kind, locator, locator_key, created_at, updated_at)
+         VALUES (?1, 'legacy_managed', ?2, ?2, 0, 0)",
+        params![LEGACY_CLIPPING_ROOT_ID, LEGACY_CLIPPING_ROOT_LOCATOR],
+    )?;
+
+    let clipping_table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'newspaper_clippings'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !clipping_table_exists {
+        connection.execute_batch(CLIPPING_TABLE_SCHEMA)?;
+    } else if !table_has_column(connection, "newspaper_clippings", "asset_root_id")? {
+        migrate_clippings_to_root_registry(connection)?;
+    }
+    connection.execute_batch(CLIPPING_INDEX_SCHEMA)?;
+    install_clipping_search_schema(connection)
+}
+
+fn verify_fts5_available(connection: &Connection) -> Result<()> {
+    let enabled: bool = connection.query_row(
+        "SELECT sqlite_compileoption_used('ENABLE_FTS5')",
+        [],
+        |row| row.get(0),
+    )?;
+    if enabled {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidQuery)
+    }
+}
+
+fn clipping_search_table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = ?1
+        )",
+        params![table],
+        |row| row.get(0),
+    )
+}
+
+fn validate_clipping_search_schema(connection: &Connection) -> Result<()> {
+    let table_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'newspaper_clippings_fts'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized = table_sql.to_ascii_lowercase();
+    if !normalized.contains("using fts5")
+        || !normalized.contains("content='newspaper_clippings'")
+        || !normalized.contains("tokenize='trigram'")
+        || !normalized.contains("title")
+        || !normalized.contains("note_markdown")
+        || !normalized.contains("edition_name_snapshot")
+        || !normalized.contains("edition_code_snapshot")
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let normalized_table_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'newspaper_clippings_normalized_fts'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized_table_sql = normalized_table_sql.to_ascii_lowercase();
+    if !normalized_table_sql.contains("using fts5")
+        || !normalized_table_sql.contains("content=''")
+        || !normalized_table_sql.contains("contentless_delete=1")
+        || !normalized_table_sql.contains("tokenize='trigram'")
+        || !normalized_table_sql.contains("title")
+        || !normalized_table_sql.contains("note_markdown")
+        || !normalized_table_sql.contains("edition_name_snapshot")
+        || !normalized_table_sql.contains("edition_code_snapshot")
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let metadata_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'newspaper_clipping_search_metadata'",
+        [],
+        |row| row.get(0),
+    )?;
+    let metadata_sql = metadata_sql.to_ascii_lowercase();
+    if !metadata_sql.contains("rowid integer primary key")
+        || !metadata_sql.contains("title text not null")
+        || !metadata_sql.contains("edition_name_snapshot text not null")
+        || !metadata_sql.contains("edition_code_snapshot text not null")
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let metadata_index_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_newspaper_clipping_search_metadata_title'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !metadata_index_exists {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    for trigger in CLIPPING_SEARCH_TRIGGERS {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1
+            )",
+            params![trigger],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    verify_clipping_search_index(connection)
+}
+
+fn verify_clipping_search_index(connection: &Connection) -> Result<()> {
+    let canonical_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM newspaper_clippings", [], |row| {
+            row.get(0)
+        })?;
+    let content_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM newspaper_clippings_fts", [], |row| {
+            row.get(0)
+        })?;
+    if canonical_count != content_count {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let normalized_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM newspaper_clippings_normalized_fts",
+        [],
+        |row| row.get(0),
+    )?;
+    if canonical_count != normalized_count {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let metadata_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM newspaper_clipping_search_metadata",
+        [],
+        |row| row.get(0),
+    )?;
+    if canonical_count != metadata_count {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    connection.execute(
+        "INSERT INTO newspaper_clippings_fts(newspaper_clippings_fts, rank)
+         VALUES('integrity-check', 1)",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO newspaper_clippings_normalized_fts(
+            newspaper_clippings_normalized_fts
+         ) VALUES('integrity-check')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn create_and_rebuild_clipping_search_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(CLIPPING_SEARCH_SCHEMA)?;
+    connection.execute_batch(CLIPPING_NORMALIZED_SEARCH_SCHEMA)?;
+    connection.execute(
+        "INSERT INTO newspaper_clippings_fts(newspaper_clippings_fts) VALUES('rebuild')",
+        [],
+    )?;
+    rebuild_normalized_clipping_search_index(connection)?;
+    validate_clipping_search_schema(connection)
+}
+
+fn rebuild_normalized_clipping_search_index(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM newspaper_clippings_normalized_fts", [])?;
+    connection.execute("DELETE FROM newspaper_clipping_search_metadata", [])?;
+    let mut read = connection.prepare(
+        "SELECT rowid, title, note_markdown, edition_name_snapshot, edition_code_snapshot
+         FROM newspaper_clippings ORDER BY rowid",
+    )?;
+    let mut rows = read.query([])?;
+    let mut insert = connection.prepare(
+        "INSERT INTO newspaper_clippings_normalized_fts(
+            rowid, title, note_markdown, edition_name_snapshot, edition_code_snapshot
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut insert_metadata = connection.prepare(
+        "INSERT INTO newspaper_clipping_search_metadata(
+            rowid, title, edition_name_snapshot, edition_code_snapshot
+         ) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    while let Some(row) = rows.next()? {
+        let rowid = row.get::<_, i64>(0)?;
+        let title = normalize_search_text(&row.get::<_, String>(1)?);
+        let note = normalize_search_text(&row.get::<_, String>(2)?);
+        let edition_name = normalize_search_text(&row.get::<_, String>(3)?);
+        let edition_code = normalize_search_text(&row.get::<_, String>(4)?);
+        insert.execute(params![rowid, &title, &note, &edition_name, &edition_code])?;
+        insert_metadata.execute(params![rowid, &title, &edition_name, &edition_code])?;
+    }
+    Ok(())
+}
+
+fn drop_clipping_search_schema(connection: &Connection) -> Result<()> {
+    for trigger in CLIPPING_SEARCH_TRIGGERS {
+        connection.execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), [])?;
+    }
+    connection.execute("DROP TABLE IF EXISTS newspaper_clippings_fts", [])?;
+    connection.execute(
+        "DROP TABLE IF EXISTS newspaper_clippings_normalized_fts",
+        [],
+    )?;
+    connection.execute(
+        "DROP TABLE IF EXISTS newspaper_clipping_search_metadata",
+        [],
+    )?;
+    Ok(())
+}
+
+fn install_clipping_search_schema(connection: &Connection) -> Result<()> {
+    verify_fts5_available(connection)?;
+    let complete = clipping_search_table_exists(connection, "newspaper_clippings_fts")?
+        && clipping_search_table_exists(connection, "newspaper_clippings_normalized_fts")?
+        && clipping_search_table_exists(connection, "newspaper_clipping_search_metadata")?;
+    if complete && validate_clipping_search_schema(connection).is_ok() {
+        return Ok(());
+    }
+    connection.execute_batch("SAVEPOINT newspaper_clippings_search_v5")?;
+    let result = (|| {
+        drop_clipping_search_schema(connection)?;
+        create_and_rebuild_clipping_search_schema(connection)
+    })();
+    if result.is_ok() {
+        connection.execute_batch("RELEASE newspaper_clippings_search_v5")?;
+        return Ok(());
+    }
+    let _ = connection.execute_batch(
+        "ROLLBACK TO newspaper_clippings_search_v5;
+         RELEASE newspaper_clippings_search_v5;",
+    );
+    result
+}
+
+/// Rebuild only the derived clipping-search objects. Canonical clipping rows,
+/// title/note bytes, revisions, and assets are never mutated by this repair.
+pub fn repair_clipping_search_index(connection: &Connection) -> Result<()> {
+    verify_fts5_available(connection)?;
+    connection.execute_batch("SAVEPOINT newspaper_clippings_search_repair")?;
+    let result = (|| {
+        drop_clipping_search_schema(connection)?;
+        create_and_rebuild_clipping_search_schema(connection)
+    })();
+    if result.is_ok() {
+        connection.execute_batch("RELEASE newspaper_clippings_search_repair")?;
+        return Ok(());
+    }
+    let _ = connection.execute_batch(
+        "ROLLBACK TO newspaper_clippings_search_repair;
+         RELEASE newspaper_clippings_search_repair;",
+    );
+    result
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
+fn migrate_clippings_to_root_registry(connection: &Connection) -> Result<()> {
+    let foreign_keys_enabled: bool =
+        connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    if foreign_keys_enabled {
+        connection.pragma_update(None, "foreign_keys", false)?;
+    }
+    connection.pragma_update(None, "legacy_alter_table", true)?;
+
+    let migration = (|| {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE newspaper_clippings RENAME TO newspaper_clippings_v3;",
+        )?;
+        connection.execute_batch(CLIPPING_TABLE_SCHEMA)?;
+        connection.execute(
+            "INSERT INTO newspaper_clippings (
+                id, source_job_id, source_page_id, source_media_version_snapshot,
+                source_kind_snapshot, source_mime_type_snapshot, source_checksum_snapshot,
+                edition_code_snapshot, edition_name_snapshot, publication_date_snapshot,
+                page_number_snapshot, source_pixel_width, source_pixel_height,
+                crop_x, crop_y, crop_width, crop_height, asset_root_id,
+                asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+                asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
+                asset_error_code, title, note_markdown, revision, created_at, updated_at
+             )
+             SELECT id, source_job_id, source_page_id, source_media_version_snapshot,
+                source_kind_snapshot, source_mime_type_snapshot, source_checksum_snapshot,
+                edition_code_snapshot, edition_name_snapshot, publication_date_snapshot,
+                page_number_snapshot, source_pixel_width, source_pixel_height,
+                crop_x, crop_y, crop_width, crop_height, ?1,
+                asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+                asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
+                asset_error_code, title, note_markdown, revision, created_at, updated_at
+             FROM newspaper_clippings_v3",
+            params![LEGACY_CLIPPING_ROOT_ID],
+        )?;
+        connection.execute_batch(
+            "DROP TABLE newspaper_clippings_v3;
+             COMMIT;",
+        )
+    })();
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    connection.pragma_update(None, "legacy_alter_table", false)?;
+    if foreign_keys_enabled {
+        connection.pragma_update(None, "foreign_keys", true)?;
+    }
+    migration
 }
 
 pub fn initialize(connection: &Connection) -> Result<()> {
@@ -426,12 +856,7 @@ fn migrate_add_column(
     column: &str,
     statement: &str,
 ) -> Result<()> {
-    let exists = connection
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == column);
+    let exists = table_has_column(connection, table, column)?;
     if !exists {
         connection.execute(statement, [])?;
     }
@@ -901,6 +1326,45 @@ mod tests {
         connection
     }
 
+    fn insert_search_fixture(
+        connection: &Connection,
+        id: &str,
+        title: &str,
+        note: &str,
+        edition_name: &str,
+        edition_code: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO newspaper_clippings (
+                    id, source_job_id, source_page_id, source_media_version_snapshot,
+                    source_kind_snapshot, source_mime_type_snapshot, source_checksum_snapshot,
+                    edition_code_snapshot, edition_name_snapshot, publication_date_snapshot,
+                    page_number_snapshot, source_pixel_width, source_pixel_height,
+                    crop_x, crop_y, crop_width, crop_height, asset_root_id,
+                    asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+                    asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
+                    asset_error_code, title, note_markdown, revision, created_at, updated_at
+                 ) VALUES (
+                    ?1, NULL, NULL, 1, 'optimized', 'image/webp', NULL,
+                    ?5, ?4, '2026-08-09', 'A01', 100, 100,
+                    0, 0, 10, 10, ?6, ?7, 'image/webp', 10, 10,
+                    1, ?8, 1, 'ready', NULL, ?2, ?3, 1, 10, 10
+                 )",
+                params![
+                    id,
+                    title,
+                    note,
+                    edition_name,
+                    edition_code,
+                    LEGACY_CLIPPING_ROOT_ID,
+                    format!("assets/{id}/clipping-v1.webp"),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn schema_keeps_newspaper_tables_provider_prefixed() {
         let connection = initialized();
@@ -916,7 +1380,19 @@ mod tests {
             names,
             vec![
                 "newspaper_batches",
+                "newspaper_clipping_roots",
+                "newspaper_clipping_search_metadata",
                 "newspaper_clippings",
+                "newspaper_clippings_fts",
+                "newspaper_clippings_fts_config",
+                "newspaper_clippings_fts_data",
+                "newspaper_clippings_fts_docsize",
+                "newspaper_clippings_fts_idx",
+                "newspaper_clippings_normalized_fts",
+                "newspaper_clippings_normalized_fts_config",
+                "newspaper_clippings_normalized_fts_data",
+                "newspaper_clippings_normalized_fts_docsize",
+                "newspaper_clippings_normalized_fts_idx",
                 "newspaper_editions",
                 "newspaper_events",
                 "newspaper_jobs",
@@ -929,6 +1405,168 @@ mod tests {
                 "newspaper_thumbnail_cache",
             ]
         );
+    }
+
+    #[test]
+    fn clipping_search_schema_has_fts5_trigram_and_synchronized_triggers() {
+        let connection = initialized();
+        assert!(connection
+            .query_row(
+                "SELECT sqlite_compileoption_used('ENABLE_FTS5')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        insert_search_fixture(
+            &connection,
+            "11111111-1111-4111-8111-111111111111",
+            "Alpha newspaper story",
+            "yellow 中文筆記",
+            "New York",
+            "NY",
+        );
+        let matches = |term: &str| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM newspaper_clippings_fts
+                     WHERE newspaper_clippings_fts MATCH ?1",
+                    params![term],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(matches("Alpha"), 1);
+        assert_eq!(matches("中文筆"), 1);
+
+        connection
+            .execute(
+                "UPDATE newspaper_clippings
+                 SET title = 'Beta newspaper story', note_markdown = 'purple search note'
+                 WHERE id = '11111111-1111-4111-8111-111111111111'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(matches("Alpha"), 0);
+        assert_eq!(matches("Beta"), 1);
+        assert_eq!(matches("purple"), 1);
+
+        connection
+            .execute(
+                "DELETE FROM newspaper_clippings
+                 WHERE id = '11111111-1111-4111-8111-111111111111'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(matches("Beta"), 0);
+        verify_clipping_search_index(&connection).unwrap();
+    }
+
+    #[test]
+    fn clipping_search_repair_rebuilds_only_derived_objects() {
+        let connection = initialized();
+        let id = "22222222-2222-4222-8222-222222222222";
+        insert_search_fixture(
+            &connection,
+            id,
+            "Repairable title",
+            "canonical note bytes",
+            "San Francisco",
+            "SF",
+        );
+        let before: (String, String, i64) = connection
+            .query_row(
+                "SELECT title, note_markdown, revision FROM newspaper_clippings WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER newspaper_clippings_fts_ai;
+                 DROP TRIGGER newspaper_clippings_fts_ad;
+                 DROP TRIGGER newspaper_clippings_fts_au;
+                 DROP TABLE newspaper_clippings_fts;",
+            )
+            .unwrap();
+
+        repair_clipping_search_index(&connection).unwrap();
+        validate_clipping_search_schema(&connection).unwrap();
+        let after: (String, String, i64) = connection
+            .query_row(
+                "SELECT title, note_markdown, revision FROM newspaper_clippings WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let matches: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_fts
+                 WHERE newspaper_clippings_fts MATCH 'Repairable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matches, 1);
+        let normalized_matches: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_normalized_fts
+                 WHERE newspaper_clippings_normalized_fts MATCH 'repairable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized_matches, 1);
+    }
+
+    #[test]
+    fn clipping_search_install_self_heals_a_complete_but_invalid_derived_set() {
+        let connection = initialized();
+        let id = "33333333-3333-4333-8333-333333333333";
+        insert_search_fixture(
+            &connection,
+            id,
+            "Canonical self heal title",
+            "canonical self heal note",
+            "New York",
+            "NY",
+        );
+        let before: (String, String, i64) = connection
+            .query_row(
+                "SELECT title, note_markdown, revision FROM newspaper_clippings WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER newspaper_clippings_fts_ai;
+                 DROP TRIGGER newspaper_clippings_fts_ad;
+                 DROP TRIGGER newspaper_clippings_fts_au;
+                 DROP TABLE newspaper_clippings_fts;
+                 CREATE TABLE newspaper_clippings_fts(unexpected TEXT);",
+            )
+            .unwrap();
+
+        install_clipping_schema(&connection).unwrap();
+        validate_clipping_search_schema(&connection).unwrap();
+        let after: (String, String, i64) = connection
+            .query_row(
+                "SELECT title, note_markdown, revision FROM newspaper_clippings WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let matches: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_normalized_fts
+                 WHERE newspaper_clippings_normalized_fts MATCH 'self heal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matches, 1);
     }
 
     #[test]

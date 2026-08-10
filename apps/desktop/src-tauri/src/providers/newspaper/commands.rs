@@ -8,9 +8,27 @@ use std::{
 
 use chrono::Utc;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 use super::{
-    archive_service, batch_service, catalog_service, job_service, library_events, library_service,
+    archive_service, batch_service, catalog_service,
+    clipping_draft_service::{
+        CheckpointClippingNoteRequest, ClaimClippingNoteRecoveryRequest, ClippingNoteCheckpointAck,
+        ClippingNoteRecoveryResponse, DiscardClippingNoteRecoveryRequest,
+        LoadClippingNoteRecoveryRequest,
+    },
+    clipping_models::{
+        ClippingErrorCode, ClippingRootSummary, CreateNewspaperClippingFailure,
+        CreateNewspaperClippingRequest, CreateNewspaperClippingResponse,
+        DeleteNewspaperClippingRequest, DeleteNewspaperClippingResponse,
+        EnsureNewspaperClippingThumbnailResponse, GetNewspaperClippingsPageRequest,
+        NewspaperClippingDetail, NewspaperClippingsPage, ReconnectNewspaperSnapshotRootResult,
+        SearchNewspaperClippingsPage, SearchNewspaperClippingsRequest,
+        SearchPossibleNewspaperClippingsRequest, SearchPossibleNewspaperClippingsResponse,
+        UpdateNewspaperClippingRequest,
+    },
+    clipping_service::ClippingService,
+    job_service, library_events, library_service,
     models::{
         CreateNewspaperBatchRequest, CreateNewspaperBatchResponse, CreateNewspaperScheduleRequest,
         NewspaperActivitySnapshot, NewspaperBootstrap, NewspaperEdition, NewspaperJob,
@@ -60,6 +78,39 @@ pub fn create_newspaper_batch(
     request: CreateNewspaperBatchRequest,
 ) -> Result<CreateNewspaperBatchResponse, String> {
     batch_service::create(state.db_path(), request)
+}
+
+/// Thin Phase 2 adapter: all source resolution, filesystem work, staging,
+/// idempotency, and persistence ownership remain in `ClippingService`.
+#[tauri::command]
+pub async fn create_newspaper_clipping(
+    app: tauri::AppHandle,
+    service: State<'_, ClippingService>,
+    request: CreateNewspaperClippingRequest,
+) -> Result<CreateNewspaperClippingResponse, CreateNewspaperClippingFailure> {
+    let operation_id = request.operation_id.clone();
+    let service = service.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        service.create_newspaper_clipping(request, Utc::now().timestamp())
+    })
+    .await
+    {
+        Ok(Ok(response)) => {
+            let _ = app.emit(
+                "newspaper://clipping-invalidated",
+                serde_json::json!({ "clippingId": response.clipping_id, "revision": response.revision }),
+            );
+            Ok(response)
+        }
+        Ok(Err(error)) => Err(CreateNewspaperClippingFailure::from_code(
+            operation_id,
+            error.code,
+        )),
+        Err(_) => Err(CreateNewspaperClippingFailure::from_code(
+            operation_id,
+            ClippingErrorCode::ServiceUnavailable,
+        )),
+    }
 }
 
 #[tauri::command]
@@ -285,6 +336,10 @@ pub fn reset_newspaper_database(
             "thumbnailWarning": thumbnail_wipe_warning,
         }),
     );
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "reason": "source_changed" }),
+    );
     Ok(counts)
 }
 
@@ -298,6 +353,7 @@ pub fn reorder_newspaper_jobs(
 
 #[tauri::command]
 pub fn remove_newspaper_job(
+    app: tauri::AppHandle,
     state: State<'_, NewspaperState>,
     job_id: String,
 ) -> Result<(), String> {
@@ -305,6 +361,10 @@ pub fn remove_newspaper_job(
     if matches!(status.as_str(), "active" | "optimizing") {
         state.cancelled.store(true, Ordering::SeqCst);
     }
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "reason": "source_changed", "jobId": job_id }),
+    );
     Ok(())
 }
 
@@ -335,6 +395,17 @@ pub async fn get_newspaper_library_page(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_newspaper_library_item(
+    state: State<'_, NewspaperState>,
+    job_id: String,
+) -> Result<super::models::NewspaperLibraryItem, String> {
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || library_service::query_item(&db_path, &job_id))
+        .await
+        .map_err(|_| "DATABASE_UNAVAILABLE".to_string())?
 }
 
 #[tauri::command]
@@ -379,6 +450,316 @@ pub async fn ensure_newspaper_thumbnail(
     job_id: String,
 ) -> Result<EnsureThumbnailResult, String> {
     state.ensure(job_id).await
+}
+
+#[tauri::command]
+pub async fn search_newspaper_clippings(
+    state: State<'_, ClippingService>,
+    request: SearchNewspaperClippingsRequest,
+) -> Result<SearchNewspaperClippingsPage, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .search(request)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_READ_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn get_newspaper_clippings_page(
+    state: State<'_, ClippingService>,
+    request: GetNewspaperClippingsPageRequest,
+) -> Result<NewspaperClippingsPage, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .list_page(request)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_READ_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn get_newspaper_clipping(
+    state: State<'_, ClippingService>,
+    clipping_id: String,
+) -> Result<NewspaperClippingDetail, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .detail_response(&clipping_id)
+            .and_then(|detail| {
+                detail.ok_or_else(|| {
+                    super::clipping_models::ClippingError::new(ClippingErrorCode::NotFound)
+                })
+            })
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_READ_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn update_newspaper_clipping(
+    app: tauri::AppHandle,
+    state: State<'_, ClippingService>,
+    request: UpdateNewspaperClippingRequest,
+) -> Result<NewspaperClippingDetail, String> {
+    let clipping_id = request.clipping_id.clone();
+    let checkpoint = request
+        .checkpoint
+        .map(|identity| identity.validated())
+        .transpose()
+        .map_err(|error| error.as_safe_string())?;
+    let service = state.inner().clone();
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        service
+            .update_note_response(
+                &request.clipping_id,
+                request.expected_revision,
+                &request.title,
+                &request.note_markdown,
+                checkpoint,
+                Utc::now().timestamp(),
+            )
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_WRITE_FAILED".to_string())??;
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "clippingId": clipping_id, "revision": detail.revision }),
+    );
+    Ok(detail)
+}
+
+#[tauri::command]
+pub async fn delete_newspaper_clipping(
+    app: tauri::AppHandle,
+    state: State<'_, ClippingService>,
+    request: DeleteNewspaperClippingRequest,
+) -> Result<DeleteNewspaperClippingResponse, String> {
+    let clipping_id = request.clipping_id.clone();
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .delete(&request.clipping_id, request.expected_revision)
+            .map_err(|error| match error.code {
+                ClippingErrorCode::RevisionConflict => {
+                    "CLIPPING_DELETE_REVISION_CONFLICT".to_string()
+                }
+                _ => error.as_safe_string(),
+            })
+    })
+    .await
+    .map_err(|_| "CLIPPING_DELETE_FAILED".to_string())??;
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "clippingId": clipping_id, "reason": "deleted" }),
+    );
+    Ok(DeleteNewspaperClippingResponse {
+        clipping_id,
+        deleted: true,
+    })
+}
+
+#[tauri::command]
+pub async fn recover_newspaper_clipping_asset(
+    app: tauri::AppHandle,
+    state: State<'_, ClippingService>,
+    clipping_id: String,
+) -> Result<NewspaperClippingDetail, String> {
+    let event_id = clipping_id.clone();
+    let service = state.inner().clone();
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        service
+            .recover_asset(&clipping_id)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_ASSET_RECOVERY_FAILED".to_string())??;
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "clippingId": event_id, "reason": "asset_recovered" }),
+    );
+    Ok(detail)
+}
+
+#[tauri::command]
+pub async fn checkpoint_newspaper_clipping_note(
+    state: State<'_, ClippingService>,
+    request: CheckpointClippingNoteRequest,
+) -> Result<ClippingNoteCheckpointAck, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .draft_service()
+            .checkpoint(request, Utc::now().timestamp())
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_WRITE_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn load_newspaper_clipping_note_recovery(
+    state: State<'_, ClippingService>,
+    request: LoadClippingNoteRecoveryRequest,
+) -> Result<ClippingNoteRecoveryResponse, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .draft_service()
+            .load(&request)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_READ_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn claim_newspaper_clipping_note_recovery(
+    state: State<'_, ClippingService>,
+    request: ClaimClippingNoteRecoveryRequest,
+) -> Result<ClippingNoteRecoveryResponse, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .draft_service()
+            .claim(request)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_WRITE_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn discard_newspaper_clipping_note_recovery(
+    state: State<'_, ClippingService>,
+    request: DiscardClippingNoteRecoveryRequest,
+) -> Result<(), String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .draft_service()
+            .discard(request)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_WRITE_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub async fn ensure_newspaper_clipping_thumbnail(
+    state: State<'_, ClippingService>,
+    clipping_id: String,
+) -> Result<EnsureNewspaperClippingThumbnailResponse, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .ensure_thumbnail(&clipping_id)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?
+}
+
+#[tauri::command]
+pub async fn search_possible_newspaper_clippings(
+    state: State<'_, ClippingService>,
+    request: SearchPossibleNewspaperClippingsRequest,
+) -> Result<SearchPossibleNewspaperClippingsResponse, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .search_possible(request)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_DATABASE_READ_FAILED".to_string())?
+}
+
+#[tauri::command]
+pub fn list_newspaper_snapshot_roots(
+    state: State<'_, ClippingService>,
+) -> Result<Vec<ClippingRootSummary>, String> {
+    state
+        .list_root_summaries()
+        .map_err(|error| error.as_safe_string())
+}
+
+#[tauri::command]
+pub async fn check_newspaper_snapshot_root(
+    state: State<'_, ClippingService>,
+    root_id: String,
+) -> Result<ClippingRootSummary, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .check_root(&root_id, Utc::now().timestamp())
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?
+}
+
+#[tauri::command]
+pub async fn reconnect_newspaper_snapshot_root(
+    app: tauri::AppHandle,
+    state: State<'_, ClippingService>,
+    root_id: String,
+) -> Result<ReconnectNewspaperSnapshotRootResult, String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(selection) = app
+            .dialog()
+            .file()
+            .set_title("Reconnect Newspaper snapshots folder")
+            .blocking_pick_folder()
+        else {
+            return Ok(ReconnectNewspaperSnapshotRootResult::Cancelled);
+        };
+        let selected = selection
+            .into_path()
+            .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?;
+        service
+            .reconnect_root(&root_id, &selected, Utc::now().timestamp())
+            .map(|root| ReconnectNewspaperSnapshotRootResult::Connected { root })
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?
+}
+
+#[tauri::command]
+pub async fn open_newspaper_snapshot_root(
+    state: State<'_, ClippingService>,
+    root_id: String,
+) -> Result<(), String> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = service
+            .verified_root_open_path(&root_id)
+            .map_err(|error| error.as_safe_string())?;
+        #[cfg(windows)]
+        {
+            std::process::Command::new("explorer")
+                .arg(path)
+                .spawn()
+                .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err("CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())
+        }
+    })
+    .await
+    .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?
 }
 
 #[tauri::command]

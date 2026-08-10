@@ -1,8 +1,21 @@
-import { EditorContent, useEditor } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
+import { type Editor } from "@tiptap/core";
+import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
+import { EditorContent, useEditor } from "@tiptap/react";
+import { BubbleMenu } from "@tiptap/react/menus";
+import StarterKit from "@tiptap/starter-kit";
+import {
+  Bold,
+  Italic,
+  Link2,
+  Redo2,
+  Strikethrough,
+  Undo2,
+  type LucideIcon
+} from "lucide-react";
 import {
   forwardRef,
+  type ReactNode,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -14,6 +27,7 @@ import {
   isSafeClippingNoteLink,
   normalizeClippingNoteMarkdown
 } from "./clipping-note-editor-markdown";
+import { createClippingNoteSlashCommandExtension } from "./clipping-note-slash-command";
 
 export type ClippingNoteEditorProps = {
   documentId: string;
@@ -23,6 +37,7 @@ export type ClippingNoteEditorProps = {
   onMarkdownChange: (markdown: string) => void;
   onBlur: () => void;
   onReady?: () => void;
+  footerContent?: ReactNode;
 };
 
 export type ClippingNoteEditorHandle = {
@@ -30,36 +45,40 @@ export type ClippingNoteEditorHandle = {
   getMarkdown: () => string;
 };
 
-type HeadingLevel = 0 | 1 | 2 | 3 | 4;
-
-function selectedHeadingLevel(editor: NonNullable<ReturnType<typeof useEditor>>): HeadingLevel {
-  for (const level of [1, 2, 3, 4] as const) {
-    if (editor.isActive("heading", { level })) return level;
-  }
-  return 0;
+function selectionStartVirtualElement(editor: Editor) {
+  const { from, to } = editor.state.selection;
+  if (from === to) return null;
+  const coordinates = editor.view.coordsAtPos(from);
+  const rect = new DOMRect(coordinates.left, coordinates.top, 1, coordinates.bottom - coordinates.top);
+  return {
+    contextElement: editor.view.dom,
+    getBoundingClientRect: () => rect,
+    getClientRects: () => [rect]
+  };
 }
 
 /**
- * Phase 4A's retained candidate: Tiptap 3.29.2 constrained to the V1
- * Markdown subset. It deliberately has no Tauri or autosave dependency.
+ * Tiptap 3.29.2 constrained to the V1 Markdown subset. The adapter owns all
+ * editor menus and deliberately has no Tauri or autosave dependency.
  */
 export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingNoteEditorProps>(
   function ClippingNoteEditor(
-    { documentId, initialMarkdown, readOnly = false, autoFocus = false, onMarkdownChange, onBlur, onReady },
+    { documentId, initialMarkdown, readOnly = false, autoFocus = false, onMarkdownChange, onBlur, onReady, footerContent },
     forwardedRef
   ) {
     const normalizedInitialMarkdown = useMemo(
       () => normalizeClippingNoteMarkdown(initialMarkdown),
       [documentId]
     );
+    const slashCommandExtension = useMemo(() => createClippingNoteSlashCommandExtension(), [documentId]);
     const activeDocumentIdRef = useRef(documentId);
     const composingRef = useRef(false);
+    const selectionMenuArmedRef = useRef(false);
     const pendingCompositionMarkdownRef = useRef<{ documentId: string; markdown: string } | null>(null);
     const lastEmittedMarkdownRef = useRef(normalizedInitialMarkdown);
     const onMarkdownChangeRef = useRef(onMarkdownChange);
     const onBlurRef = useRef(onBlur);
     const onReadyRef = useRef(onReady);
-    const linkButtonRef = useRef<HTMLButtonElement | null>(null);
     const linkInputRef = useRef<HTMLInputElement | null>(null);
     const [linkDialogOpen, setLinkDialogOpen] = useState(false);
     const [linkValue, setLinkValue] = useState("");
@@ -76,14 +95,13 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
     useEffect(() => {
       setLinkDialogOpen(false);
       setLinkError("");
+      selectionMenuArmedRef.current = false;
     }, [documentId]);
 
-    // Reset wrapper-owned composition state during render as well as through
-    // the keyed Tiptap instance. An old composition event must never flush
-    // into a newly selected clipping between commit and effect cleanup.
     if (activeDocumentIdRef.current !== documentId) {
       activeDocumentIdRef.current = documentId;
       composingRef.current = false;
+      selectionMenuArmedRef.current = false;
       pendingCompositionMarkdownRef.current = null;
       lastEmittedMarkdownRef.current = normalizedInitialMarkdown;
     }
@@ -103,7 +121,6 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
           codeBlock: false,
           dropcursor: false,
           gapcursor: false,
-          horizontalRule: false,
           trailingNode: false,
           underline: false,
           link: {
@@ -115,17 +132,17 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
             isAllowedUri: (url) => isSafeClippingNoteLink(url)
           }
         }),
+        TaskList,
+        TaskItem.configure({ nested: true }),
         Markdown.configure({
           indentation: { style: "space", size: 2 },
           markedOptions: { breaks: false, gfm: true }
-        })
+        }),
+        slashCommandExtension
       ],
       content: normalizedInitialMarkdown,
       contentType: "markdown",
       editable: !readOnly,
-      // Defer construction until the committed effect phase. This prevents
-      // React Strict Mode's development-only discarded render from creating a
-      // ghost editor instance and duplicate ready notifications.
       immediatelyRender: false,
       shouldRerenderOnTransaction: false,
       editorProps: {
@@ -137,9 +154,7 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
         }
       },
       onBlur: () => onBlurRef.current(),
-      onCreate: () => {
-        queueMicrotask(() => onReadyRef.current?.());
-      },
+      onCreate: () => queueMicrotask(() => onReadyRef.current?.()),
       onUpdate: ({ editor: updatedEditor }) => {
         const markdown = normalizeClippingNoteMarkdown(updatedEditor.getMarkdown());
         if (composingRef.current) {
@@ -157,7 +172,7 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
 
     useEffect(() => {
       if (!editor || !autoFocus) return;
-      const frame = requestAnimationFrame(() => editor.commands.focus("end"));
+      const frame = requestAnimationFrame(() => { if (document.activeElement === document.body) editor.commands.focus("end"); });
       return () => cancelAnimationFrame(frame);
     }, [autoFocus, editor]);
 
@@ -196,17 +211,15 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
             ? pendingCompositionMarkdownRef.current.markdown
             : null);
         pendingCompositionMarkdownRef.current = null;
-        if (markdown !== null && markdown !== undefined) {
-          emitMarkdownOnce(eventDocumentId, markdown);
-        }
+        if (markdown !== null && markdown !== undefined) emitMarkdownOnce(eventDocumentId, markdown);
       });
     }, [editor, emitMarkdownOnce]);
 
     const closeLinkDialog = useCallback(() => {
       setLinkDialogOpen(false);
       setLinkError("");
-      requestAnimationFrame(() => linkButtonRef.current?.focus());
-    }, []);
+      requestAnimationFrame(() => editor?.commands.focus());
+    }, [editor]);
 
     const submitLink = useCallback(() => {
       const url = linkValue.trim();
@@ -218,6 +231,31 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
       closeLinkDialog();
     }, [closeLinkDialog, editor, linkValue]);
 
+    const openLinkDialog = useCallback(() => {
+      setLinkError("");
+      setLinkValue(editor?.getAttributes("link").href ?? "");
+      setLinkDialogOpen(true);
+    }, [editor]);
+
+    const hideSelectionToolbar = useCallback(() => {
+      selectionMenuArmedRef.current = false;
+      editor?.commands.setMeta("clippingSelectionToolbar", "hide");
+    }, [editor]);
+
+    const showSelectionToolbarAfterInput = useCallback(() => {
+      if (!editor || composingRef.current || readOnly) return;
+      requestAnimationFrame(() => {
+        if (editor.state.selection.empty) return;
+        selectionMenuArmedRef.current = true;
+        editor.commands.setMeta("clippingSelectionToolbar", "show");
+        requestAnimationFrame(() => {
+          if (!editor.isDestroyed && !editor.state.selection.empty) {
+            editor.commands.setMeta("clippingSelectionToolbar", "updatePosition");
+          }
+        });
+      });
+    }, [editor, readOnly]);
+
     const handlePasteCapture = useCallback((event: React.ClipboardEvent<HTMLDivElement>) => {
       const transfer = event.clipboardData;
       const containsFile = Array.from(transfer.items).some((item) => item.kind === "file") || transfer.files.length > 0;
@@ -226,16 +264,10 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
         setPasteNotice("Images aren't supported inside clipping notes.");
         return;
       }
-
-      // Rich HTML is deliberately flattened to plain text before it reaches
-      // ProseMirror, so arbitrary pasted markup cannot create a node/mark that
-      // lies outside the Markdown subset.
       if (transfer.types.includes("text/html")) {
         event.preventDefault();
         const plainText = transfer.getData("text/plain");
-        if (plainText && editor) {
-          editor.view.dispatch(editor.state.tr.insertText(plainText));
-        }
+        if (plainText && editor) editor.view.dispatch(editor.state.tr.insertText(plainText));
       }
     }, [editor]);
 
@@ -246,8 +278,7 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
         return;
       }
       if (event.key !== "Tab") return;
-      const dialog = event.currentTarget;
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+      const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
         'input:not([disabled]), button:not([disabled])'
       ));
       if (focusable.length === 0) return;
@@ -262,8 +293,25 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
       }
     }, [closeLinkDialog]);
 
+    const selectionToolbarOptions = useMemo(() => ({
+      strategy: "fixed" as const,
+      placement: "top-start" as const,
+      offset: 8,
+      flip: true,
+      shift: { padding: 8 }
+    }), []);
+    const selectionToolbarReference = useCallback(
+      () => editor ? selectionStartVirtualElement(editor) : null,
+      [editor]
+    );
+    const selectionToolbarContainer = useCallback(() => document.body, []);
+    const shouldShowSelectionToolbar = useCallback(({ from, to }: { from: number; to: number }) => (
+      selectionMenuArmedRef.current
+      && !composingRef.current
+      && from !== to
+      && Boolean(editor?.isEditable)
+    ), [editor]);
     const controlsDisabled = !editor || readOnly;
-    const headingLevel = editor ? selectedHeadingLevel(editor) : 0;
 
     return (
       <div
@@ -274,75 +322,51 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
         onCompositionEndCapture={() => flushCompletedComposition(documentId)}
         onCompositionStartCapture={() => {
           composingRef.current = true;
+          hideSelectionToolbar();
+        }}
+        onKeyUpCapture={(event) => {
+          const extendedSelection = event.shiftKey
+            && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key);
+          const selectedAll = (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "a";
+          if (extendedSelection || selectedAll) {
+            showSelectionToolbarAfterInput();
+          }
         }}
         onPasteCapture={handlePasteCapture}
+        onPointerDownCapture={(event) => {
+          if ((event.target as Element).closest("[data-selection-toolbar='true']")) return;
+          hideSelectionToolbar();
+        }}
+        onPointerUpCapture={(event) => {
+          if (event.button === 0) showSelectionToolbarAfterInput();
+        }}
       >
-        <div aria-label="Clipping note formatting" className="clipping-note-editor__toolbar" role="toolbar">
-          <button
-            aria-label="Undo"
-            disabled={controlsDisabled || !editor.can().undo()}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => editor?.chain().focus().undo().run()}
-            title="Undo"
-            type="button"
+        {editor && !readOnly ? (
+          <BubbleMenu
+            appendTo={selectionToolbarContainer}
+            editor={editor}
+            getReferencedVirtualElement={selectionToolbarReference}
+            options={selectionToolbarOptions}
+            pluginKey="clippingSelectionToolbar"
+            shouldShow={shouldShowSelectionToolbar}
+            updateDelay={0}
           >
-            Undo
-          </button>
-          <button
-            aria-label="Redo"
-            disabled={controlsDisabled || !editor.can().redo()}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => editor?.chain().focus().redo().run()}
-            title="Redo"
-            type="button"
-          >
-            Redo
-          </button>
-          <label className="clipping-note-editor__heading-label">
-            <span className="sr-only">Heading</span>
-            <select
-              aria-label="Heading"
-              disabled={controlsDisabled}
-              onChange={(event) => {
-                const level = Number(event.target.value) as HeadingLevel;
-                if (!editor) return;
-                if (level === 0) editor.chain().focus().setParagraph().run();
-                else editor.chain().focus().toggleHeading({ level }).run();
-              }}
-              value={headingLevel}
+            <div
+              aria-label="Selected text formatting"
+              className="clipping-note-editor__selection-toolbar"
+              data-selection-toolbar="true"
+              role="toolbar"
             >
-              <option value={0}>Paragraph</option>
-              <option value={1}>Heading 1</option>
-              <option value={2}>Heading 2</option>
-              <option value={3}>Heading 3</option>
-              <option value={4}>Heading 4</option>
-            </select>
-          </label>
-          <ToolbarButton active={editor?.isActive("bold") ?? false} disabled={controlsDisabled} label="Bold" onClick={() => editor?.chain().focus().toggleBold().run()} />
-          <ToolbarButton active={editor?.isActive("italic") ?? false} disabled={controlsDisabled} label="Italic" onClick={() => editor?.chain().focus().toggleItalic().run()} />
-          <ToolbarButton active={editor?.isActive("strike") ?? false} disabled={controlsDisabled} label="Strikethrough" onClick={() => editor?.chain().focus().toggleStrike().run()} />
-          <ToolbarButton active={editor?.isActive("bulletList") ?? false} disabled={controlsDisabled} label="Bulleted list" onClick={() => editor?.chain().focus().toggleBulletList().run()} />
-          <ToolbarButton active={editor?.isActive("orderedList") ?? false} disabled={controlsDisabled} label="Numbered list" onClick={() => editor?.chain().focus().toggleOrderedList().run()} />
-          <ToolbarButton active={editor?.isActive("blockquote") ?? false} disabled={controlsDisabled} label="Blockquote" onClick={() => editor?.chain().focus().toggleBlockquote().run()} />
-          <button
-            aria-expanded={linkDialogOpen}
-            aria-label="Link"
-            disabled={controlsDisabled}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => {
-              setLinkError("");
-              setLinkValue(editor?.getAttributes("link").href ?? "");
-              setLinkDialogOpen(true);
-            }}
-            ref={linkButtonRef}
-            title="Link"
-            type="button"
-          >
-            Link
-          </button>
-        </div>
+              <IconToolbarButton active={editor.isActive("bold")} icon={Bold} label="Bold" onClick={() => editor.chain().focus().toggleBold().run()} />
+              <IconToolbarButton active={editor.isActive("italic")} icon={Italic} label="Italic" onClick={() => editor.chain().focus().toggleItalic().run()} />
+              <IconToolbarButton active={editor.isActive("strike")} icon={Strikethrough} label="Strikethrough" onClick={() => editor.chain().focus().toggleStrike().run()} />
+              <span aria-hidden="true" className="clipping-note-editor__toolbar-rule" />
+              <IconToolbarButton active={editor.isActive("link")} icon={Link2} label="Link" onClick={openLinkDialog} />
+            </div>
+          </BubbleMenu>
+        ) : null}
 
-        {linkDialogOpen && (
+        {linkDialogOpen ? (
           <div
             aria-label="Insert link"
             aria-modal="true"
@@ -366,40 +390,64 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
                 value={linkValue}
               />
             </label>
-            {linkError && <p id="clipping-note-editor-link-error" role="alert">{linkError}</p>}
+            {linkError ? <p id="clipping-note-editor-link-error" role="alert">{linkError}</p> : null}
             <div className="clipping-note-editor__link-actions">
               <button onClick={submitLink} type="button">Apply link</button>
               <button onClick={closeLinkDialog} type="button">Cancel</button>
             </div>
           </div>
-        )}
+        ) : null}
 
-        {pasteNotice && <p className="clipping-note-editor__notice" role="status">{pasteNotice}</p>}
+        {pasteNotice ? <p className="clipping-note-editor__notice" role="status">{pasteNotice}</p> : null}
         <EditorContent editor={editor} />
+        <footer className="clipping-note-editor__footer">
+          <span>{!readOnly ? <>Type <kbd>/</kbd> for commands</> : "Read only"}</span>
+          <div className="clipping-note-editor__footer-actions">
+            {footerContent}
+            <div aria-label="Editing history" className="clipping-note-editor__history" role="toolbar">
+              <IconToolbarButton
+                disabled={controlsDisabled || !editor?.can().undo()}
+                icon={Undo2}
+                label="Undo"
+                onClick={() => editor?.chain().focus().undo().run()}
+              />
+              <IconToolbarButton
+                disabled={controlsDisabled || !editor?.can().redo()}
+                icon={Redo2}
+                label="Redo"
+                onClick={() => editor?.chain().focus().redo().run()}
+              />
+            </div>
+          </div>
+        </footer>
       </div>
     );
   }
 );
 
-type ToolbarButtonProps = {
-  active: boolean;
-  disabled: boolean;
+type IconToolbarButtonProps = {
+  active?: boolean;
+  disabled?: boolean;
+  icon: LucideIcon;
   label: string;
   onClick: () => void;
 };
 
-function ToolbarButton({ active, disabled, label, onClick }: ToolbarButtonProps) {
+function IconToolbarButton({ active = false, disabled = false, icon: Icon, label, onClick }: IconToolbarButtonProps) {
   return (
     <button
       aria-label={label}
       aria-pressed={active}
       disabled={disabled}
-      onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
       title={label}
       type="button"
     >
-      {label}
+      <Icon aria-hidden="true" />
     </button>
   );
 }

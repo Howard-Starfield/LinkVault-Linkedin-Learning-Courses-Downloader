@@ -4,7 +4,8 @@
 
 **Primary implementation phase:** Phase 5
 
-**Related decisions:** D-001, D-013, D-016 through D-018, D-021, D-027, D-028
+**Related decisions:** D-001, D-013, D-016 through D-018, D-021, D-027,
+D-028, D-034
 
 ## 1. Purpose
 
@@ -99,6 +100,20 @@ provider, or another clipping, the autosave controller completes the flush or
 explicit discard contract from specification 05. App state does not switch
 views first and attempt saving afterward.
 
+### FR-NAV-006A: Native window lifecycle
+
+Window X is not app navigation and must not destroy the main WebView. Native
+code prevents close, requests the exact durability handshake from specification
+05, and hides the existing main window only after success. Tray **Show** restores
+and focuses that same window. Tray **Quit**, ordinary process exit, and updater
+exit use the same preparation but terminate after success.
+
+On failure, uncheckpointed/stale conflict, missing/stale acknowledgement, or
+timeout, the application remains open and restores/focuses the main window with
+actionable state. A canonical conflict may proceed only after the exact newest
+visible draft is checkpointed for explicit recovery. Neither React unmount nor
+a timeout authorizes discard or process exit.
+
 ## 4. Reader-created clipping → Open note
 
 ### FLOW-NAV-001
@@ -126,7 +141,7 @@ After successful reader save:
    boundary.
 5. `activeView` becomes `newspaper-clippings`.
 6. The Clippings view loads the exact ID independently of current search/sort.
-7. The source card and editor load.
+7. The read-only clipping header and editor load.
 8. The first editable paragraph receives focus after the editor is ready.
 
 ### FR-NAV-007
@@ -146,11 +161,39 @@ It must not clear the user’s search silently.
 If the clipping creation response is successful but detail load temporarily
 fails, keep the clipping ID and offer Retry. Do not create another clipping.
 
+### FR-NAV-009: Search takeover and return
+
+Typing into the Clippings toolbar changes only the provider-owned presentation
+mode. It does not create a global application route, browser-history entry, or
+implicit detail selection. The active detail/editor state remains owned by the
+Clippings view while the ranked result surface is active.
+
+Activating a result is a real clipping-to-clipping navigation boundary:
+
+1. Flush or explicitly resolve the current draft.
+2. Preserve query, result generation, loaded confident-page count, whether the
+   Possible matches section was loaded, scroll anchor, and focused result ID.
+3. Load the exact selected clipping by ID, independent of result offset.
+4. On **Back to search results**, restore that state without rerunning a stale
+   request over the top of newer invalidation state.
+
+Escape in a non-empty focused search clears it and restores the prior ordinary
+Clippings layout. Escape inside Tiptap or another editor-owned control retains
+the editor keyboard hierarchy and never clears search globally.
+
+### FR-NAV-010: Search invalidation
+
+Clipping create/update/delete invalidation increments the search generation.
+Already rendered IDs are deduplicated. If ranking-affecting content changed,
+the next fetch restarts from the first confident page while restoring the
+nearest surviving result anchor. An invalidation never appends a page produced
+for an older query or ranking generation.
+
 ## 5. Clipping → Open source
 
 ### FLOW-NAV-002
 
-1. User chooses **Open source** on the fixed source card.
+1. User chooses **Open source** on the fixed clipping header.
 2. Pending title/note changes flush successfully or navigation is blocked.
 3. The detail’s non-null source job/page IDs are used.
 4. The frontend invokes a direct item lookup if needed:
@@ -361,7 +404,9 @@ Inside the existing reset transaction:
 Outside the transaction:
 
 - Clear the existing front-page newspaper thumbnail cache as before.
-- Do not clear `LinkVaultData/newspaper-clippings`.
+- Do not clear the clipping root registry, legacy
+  `LinkVaultData/newspaper-clippings`, or any registered
+  `<destination>/Newspaper snapshots` tree.
 - Do not clear clipping thumbnail cache.
 - Emit clipping invalidation reason `source_changed`.
 
@@ -461,7 +506,7 @@ dialog and pressing Enter must not accidentally confirm.
 While deletion runs:
 
 - Disable delete and navigation actions for that clipping.
-- Keep source card/note visible with `Deleting…`.
+- Keep the clipping header/note visible with `Deleting…`.
 - Do not remove the list row optimistically before backend success.
 
 ### FR-DELETE-005: Success

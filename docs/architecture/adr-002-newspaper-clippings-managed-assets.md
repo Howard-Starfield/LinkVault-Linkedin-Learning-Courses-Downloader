@@ -4,6 +4,8 @@
 
 **Date:** 2026-08-07
 
+**Storage amendments:** 2026-08-09 (D-032, D-033)
+
 **Decision owners:** Howard Deng and LinkVault engineering
 
 **Related architecture:** [ADR-001: Unified workflow modular monolith](adr-001-unified-workflow-modular-monolith.md)
@@ -88,10 +90,21 @@ deferred.
 
 ### Asset storage
 
-- Canonical clipping bytes live beneath an application-owned root inside
-  `LinkVaultData`, not inside the user-selected newspaper download directory.
-- The database stores an application-controlled relative path, never an
-  arbitrary frontend path.
+- New canonical clipping bytes live beneath the source batch's persisted
+  download destination at `Newspaper snapshots/<edition>/<date>/<clipping-id>/`.
+- SQLite stores a stable backend-owned root ID plus an application-controlled
+  relative path, never an arbitrary frontend path.
+- A marker in the root's reserved `.linkvault` subtree binds the registered
+  root ID to that physical directory. Read/recovery paths never recreate a
+  missing registered root.
+- Existing schema-v3 assets remain under `LinkVaultData/newspaper-clippings`
+  through a read-only `legacy_managed` root; they are not moved automatically.
+- Settings exposes the registered snapshot roots created from download
+  destinations; it does not provide an arbitrary global destination override.
+- A user may recheck an unavailable root or reconnect a moved root only by
+  selecting the existing marker-bound `Newspaper snapshots` directory. The
+  backend verifies the marker before changing the stored locator and never
+  scans, merges, moves, or creates snapshot content during reconnect.
 - Asset writes use a staging file, validation, and atomic promotion.
 - The clipping row is inserted only after the canonical asset has been promoted.
 - If the database insert fails, the newly promoted asset is removed or moved to
@@ -101,7 +114,9 @@ deferred.
 
 ### Note presentation
 
-- The clipping image is rendered as a fixed source card above the note editor.
+- The clipping image is rendered as a fixed, read-only document header above
+  the note title and editor. Presentation may be visually integrated with the
+  writing surface rather than boxed as a separate card.
 - It is not inserted as an editable image node inside the Markdown document.
 - The editor is a frontend adapter that emits plain Markdown.
 - The Rust backend stores and validates Markdown but does not own WYSIWYG
@@ -131,6 +146,9 @@ deferred.
   unreadable.
 - A missing canonical asset is surfaced as a recoverable data-integrity state;
   the database record is not silently deleted.
+- An offline or marker-mismatched snapshot root does not make SQLite titles or
+  notes unavailable and does not change clipping asset state merely because a
+  status probe failed.
 
 ### Concurrency and responsiveness
 
@@ -154,7 +172,8 @@ flowchart LR
     Service --> Assets["Managed clipping asset service"]
     Service --> Crop["Native crop pipeline"]
     Repository --> Writer["Application DatabaseWriter"]
-    Assets --> DataRoot["LinkVaultData/newspaper-clippings"]
+    Assets --> SnapshotRoot["Download destination/Newspaper snapshots"]
+    Assets --> LegacyRoot["LinkVaultData/newspaper-clippings (legacy read/recovery)"]
     Crop --> Source["Registered newspaper page media"]
     Protocol["newspaper-media protocol"] --> Repository
     Protocol --> Assets
@@ -173,17 +192,19 @@ reader zoom, device scaling, CSS tone, and clipping by the window. It can be a
 future export option for preserving visual appearance, but it is not suitable
 for durable high-resolution source capture.
 
-### Store clipping files beside the downloaded edition
+### Store clipping files inside the downloaded edition directory
 
-Rejected. Edition folders are user-controlled, movable, and deletable.
-User-created clippings must survive removal or replacement of source downloads.
+Rejected. Source-edition deletion must not own clipping deletion. The approved
+snapshot root is a protected sibling under the persisted download destination,
+not a child of an individual downloaded edition. Archive scans and source reset
+explicitly exclude `Newspaper snapshots`.
 
 ### Embed the image as the first node in a rich-text document
 
 Rejected. The user could accidentally remove or reorder the source evidence,
 provenance would become editor-specific, and future editor replacement would
-be coupled to attachment ownership. A fixed source card and separate Markdown
-body preserve both provenance and editor portability.
+be coupled to attachment ownership. A fixed, read-only document header and
+separate Markdown body preserve both provenance and editor portability.
 
 ### Introduce a general notes platform now
 
@@ -232,6 +253,8 @@ valid without reproducing browser layout calculations.
   merged.
 - No crop operation may hold a database transaction during decode or encode.
 - No frontend command may supply a destination filesystem path.
+- No reconnect flow may create or rewrite a root marker, search arbitrary
+  folders, or accept an unverified directory as an existing snapshot root.
 - No protocol response may disclose an absolute path.
 - No reset or source-edition deletion may cascade into clipping deletion.
 - No editor package may become the persistent document format.

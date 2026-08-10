@@ -212,6 +212,14 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
     if !root.is_dir() {
         return Err("The selected newspaper archive folder does not exist.".to_string());
     }
+    if root.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+    }) {
+        return Err(
+            "The Newspaper snapshots folder cannot be imported as source pages.".to_string(),
+        );
+    }
     let mut stack = vec![root.to_path_buf()];
     let mut groups: std::collections::BTreeMap<(String, String, PathBuf), Vec<PathBuf>> =
         std::collections::BTreeMap::new();
@@ -221,6 +229,12 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
             if path.is_dir() {
+                if path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .eq_ignore_ascii_case(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+                }) {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }

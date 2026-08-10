@@ -103,6 +103,13 @@ async function activeEditor(page) {
 }
 
 async function loadFixture(page, buttonName, expectedText) {
+  if (
+    buttonName === "Load empty document"
+    && await page.evaluate(() => window.__CLIPPING_EDITOR_EVALUATION__?.documentId === "empty")
+  ) {
+    await page.getByRole("button", { name: "Load common fixture", exact: true }).click();
+    await page.waitForFunction(() => window.__CLIPPING_EDITOR_EVALUATION__?.documentId === "fixture");
+  }
   await page.getByRole("button", { name: buttonName, exact: true }).click();
   if (expectedText) {
     await page.locator('[data-editor-root="true"]').getByText(expectedText, { exact: true }).waitFor();
@@ -141,7 +148,6 @@ function assertNoExecutableMarkdown(markdown) {
   assert.doesNotMatch(markdown, /(^|[^\\])`[^`]+`/, "serialized Markdown retained inline code syntax");
   assert.doesNotMatch(markdown, /(^|\n)```/, "serialized Markdown retained a fenced code block");
   assert.doesNotMatch(markdown, /^\s*\|.*\|\s*$/m, "serialized Markdown retained a pipe-wrapped GFM table line");
-  assert.doesNotMatch(markdown, /(^|\n)\s*- \[[ xX]\] /, "serialized Markdown retained a task list item");
   assert.doesNotMatch(markdown, /\[\^[^\]]+\]/, "serialized Markdown retained a footnote");
   assert.doesNotMatch(markdown, /!\[[^\]]*\]\(/, "serialized Markdown retained an image");
   assert.doesNotMatch(markdown, /\]\((?:javascript|data|vbscript|file):/i, "serialized Markdown retained an unsafe link");
@@ -277,10 +283,19 @@ try {
     assert.ok((await captureMarkdown(page)).includes("Browser transaction marker"), "redo did not restore typed text");
 
     await page.keyboard.press("Control+a");
+    await page.getByRole("toolbar", { name: "Selected text formatting", exact: true }).waitFor();
     await page.getByRole("button", { name: "Bold", exact: true }).click();
     assert.ok((await captureMarkdown(page)).includes("**Browser transaction marker**"), "toolbar formatting did not serialize as Markdown");
-    await page.getByRole("button", { name: "Bulleted list", exact: true }).click();
-    assert.match(await captureMarkdown(page), /- \*\*Browser transaction marker\*\*/, "toolbar list did not serialize as Markdown");
+
+    await loadFixture(page, "Load empty document");
+    editor = await activeEditor(page);
+    await editor.click();
+    await page.keyboard.type("/bullet");
+    const slashMenu = page.getByRole("listbox", { name: "Insert a note block", exact: true });
+    await slashMenu.waitFor();
+    await slashMenu.getByRole("option", { name: /Bullet list/ }).click();
+    await page.keyboard.insertText("Slash list marker");
+    assert.match(await captureMarkdown(page), /- Slash list marker/, "slash-command list did not serialize as Markdown");
 
     await loadFixture(page, "Load empty document");
     editor = await activeEditor(page);
@@ -344,13 +359,15 @@ try {
     return "synthetic composition only; native IME remains unverified";
   });
 
-  await check("unsupported input is inert, subset-only, and unsafe links cannot open", async () => {
+  await check("unsupported input is inert, supported tasks round trip, and unsafe links cannot open", async () => {
     await page.getByRole("button", { name: "Load adversarial fixture", exact: true }).click();
     await page.waitForTimeout(100);
     const root = page.locator('[data-editor-root="true"]');
     const serialized = await captureMarkdown(page);
     assert.equal(await page.evaluate(() => window.__editor_executed), undefined, "HTML or MDX expression executed");
-    assert.equal(await root.locator("img, table, pre, code, input[type=checkbox], iframe, video, audio").count(), 0, "unsupported content rendered semantically");
+    assert.equal(await root.locator("img, table, pre, code, iframe, video, audio").count(), 0, "unsupported content rendered semantically");
+    assert.equal(await root.locator('input[type="checkbox"]').count(), 1, "supported task item did not render as an interactive checkbox");
+    assert.match(serialized, /^- \[ \] task item$/m, "supported task item did not round trip as Markdown");
     const unsafeHrefs = await root.locator("a").evaluateAll((links) => links
       .map((link) => link.getAttribute("href") ?? "")
       .filter((href) => /^(?:javascript|data|vbscript|file):/i.test(href))
@@ -409,18 +426,149 @@ try {
     return "rich HTML was flattened and image/file paste was rejected non-destructively";
   });
 
-  await check("toolbar order, keyboard focus, dialog trap, labels, and pressed states are accessible", async () => {
+  await check("slash commands filter, apply, and serialize every approved block type", async () => {
+    const cases = [
+      { query: "/text", option: "Text", marker: "Plain slash text", pattern: /^Plain slash text$/m },
+      { query: "/todo", option: "To-do list", marker: "Slash task", pattern: /^- \[ \] Slash task$/m },
+      { query: "/h1", option: "Heading 1", marker: "Slash heading one", pattern: /^# Slash heading one$/m },
+      { query: "/h2", option: "Heading 2", marker: "Slash heading two", pattern: /^## Slash heading two$/m },
+      { query: "/h3", option: "Heading 3", marker: "Slash heading three", pattern: /^### Slash heading three$/m },
+      { query: "/h4", option: "Heading 4", marker: "Slash heading four", pattern: /^#### Slash heading four$/m },
+      { query: "/bullet", option: "Bullet list", marker: "Slash bullet", pattern: /^- Slash bullet$/m },
+      { query: "/numbered", option: "Numbered list", marker: "Slash numbered", pattern: /^1\. Slash numbered$/m },
+      { query: "/quote", option: "Quote", marker: "Slash quote", pattern: /^> Slash quote$/m },
+      { query: "/divider", option: "Divider", marker: "After divider", pattern: /^---\n\nAfter divider$/m }
+    ];
+    for (const fixture of cases) {
+      await loadFixture(page, "Load empty document");
+      const editor = await activeEditor(page);
+      await editor.click();
+      await page.keyboard.type(fixture.query);
+      const menu = page.getByRole("listbox", { name: "Insert a note block", exact: true });
+      await menu.waitFor();
+      const options = menu.getByRole("option");
+      assert.ok(await options.count() >= 1, `${fixture.query} did not return a command`);
+      assert.match(
+        await menu.locator('[role="option"][aria-selected="true"]').innerText(),
+        new RegExp(`^${fixture.option}`),
+        `${fixture.query} did not rank ${fixture.option} first`
+      );
+      await options.filter({ hasText: fixture.option }).click();
+      await page.keyboard.type(fixture.marker);
+      assert.match(await captureMarkdown(page), fixture.pattern, `${fixture.option} did not serialize safely`);
+    }
+
+    await loadFixture(page, "Load empty document");
+    const editor = await activeEditor(page);
+    await editor.click();
+    await page.keyboard.type("/");
+    await page.getByRole("listbox", { name: "Insert a note block", exact: true }).waitFor();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("Keyboard slash heading");
+    assert.match(await captureMarkdown(page), /^# Keyboard slash heading$/m, "ArrowDown and Enter did not apply the selected command");
+
+    for (const { query, selected } of [
+      { query: "/h", selected: "Heading 1" },
+      { query: "/heding", selected: "Heading 1" },
+      { query: "/todo", selected: "To-do list" },
+      { query: "/hr", selected: "Divider" }
+    ]) {
+      await loadFixture(page, "Load empty document");
+      const fuzzyEditor = await activeEditor(page);
+      await fuzzyEditor.click();
+      await page.keyboard.type(query);
+      const fuzzyMenu = page.getByRole("listbox", { name: "Insert a note block", exact: true });
+      await fuzzyMenu.waitFor();
+      const selectedOption = fuzzyMenu.locator('[role="option"][aria-selected="true"]');
+      assert.equal(await selectedOption.count(), 1, `${query} did not select exactly one best command`);
+      assert.match(await selectedOption.innerText(), new RegExp(`^${selected}`), `${query} did not rank ${selected} first`);
+    }
+
+    await loadFixture(page, "Load empty document");
+    const proseEditor = await activeEditor(page);
+    await proseEditor.click();
+    await page.keyboard.type("Existing words /h2");
+    const inlineMenu = page.getByRole("listbox", { name: "Insert a note block", exact: true });
+    await inlineMenu.waitFor();
+    const popupStyle = await inlineMenu.evaluate((element) => {
+      const popover = element.parentElement;
+      if (!popover) return null;
+      const style = getComputedStyle(popover);
+      return {
+        hasPopoverClass: popover.classList.contains("clipping-note-editor__slash-popover"),
+        position: style.position,
+        zIndex: Number.parseInt(style.zIndex, 10)
+      };
+    });
+    assert.ok(popupStyle?.hasPopoverClass, "slash popup was not mounted through its positioned wrapper");
+    assert.equal(popupStyle.position, "fixed", "slash popup must use viewport positioning in the production scroll shell");
+    assert.ok(popupStyle.zIndex >= 100, "slash popup must stack above the application shell");
+    await inlineMenu.getByRole("option", { name: /Heading 2/ }).click();
+    assert.match(await captureMarkdown(page), /^## Existing words\s*$/m, "slash command after whitespace did not transform the active block");
+
+    await loadFixture(page, "Load empty document");
+    const urlEditor = await activeEditor(page);
+    await urlEditor.click();
+    await page.keyboard.type("https://example.com");
+    assert.equal(await page.getByRole("listbox", { name: "Insert a note block", exact: true }).count(), 0, "URL slashes opened the command popup");
+    return cases.map(({ option }) => option);
+  });
+
+  await check("pointer selection toolbar waits for release and anchors above the first selected word", async () => {
+    for (const direction of ["forward", "reverse"]) {
+      await loadFixture(page, "Load empty document");
+      const editor = await activeEditor(page);
+      await editor.click();
+      await page.keyboard.type("Selection toolbar marker for pointer testing");
+      const box = await editor.boundingBox();
+      assert.ok(box, "editor body has no measurable box");
+      const firstX = box.x + 20;
+      const lastX = firstX + 260;
+      const lineY = box.y + 30;
+      const toolbar = page.getByRole("toolbar", { name: "Selected text formatting", exact: true });
+      const [startX, endX] = direction === "forward" ? [firstX, lastX] : [lastX, firstX];
+      await page.mouse.move(startX, lineY);
+      await page.mouse.down({ button: "left" });
+      await page.mouse.move(endX, lineY, { steps: 5 });
+      assert.equal(await toolbar.count(), 0, "selection toolbar appeared before pointer release");
+      await page.mouse.up({ button: "left" });
+      const selectedText = await page.evaluate(() => window.getSelection()?.toString() ?? "");
+      assert.ok(selectedText.length > 0, `${direction} pointer drag did not select text`);
+      await toolbar.waitFor();
+      const geometry = await toolbar.evaluate((element) => {
+        const selection = window.getSelection();
+        const firstRect = selection?.rangeCount ? selection.getRangeAt(0).getClientRects()[0] : null;
+        const toolbarRect = element.getBoundingClientRect();
+        return firstRect ? {
+          firstLeft: firstRect.left,
+          firstTop: firstRect.top,
+          firstBottom: firstRect.bottom,
+          toolbarLeft: toolbarRect.left,
+          toolbarTop: toolbarRect.top,
+          toolbarBottom: toolbarRect.bottom
+        } : null;
+      });
+      assert.ok(geometry, `${direction} browser selection has no first text rectangle`);
+      assert.ok(Math.abs(geometry.toolbarLeft - geometry.firstLeft) <= 2, `toolbar left ${geometry.toolbarLeft} did not align with selection start ${geometry.firstLeft}`);
+      assert.ok(
+        geometry.toolbarBottom <= geometry.firstTop || geometry.toolbarTop >= geometry.firstBottom,
+        "toolbar overlapped the selected text instead of positioning above or flipping below"
+      );
+    }
+    return "forward and reverse pointer selections passed";
+  });
+
+  await check("history, selection toolbar, dialog trap, labels, and pressed states are accessible", async () => {
     await loadFixture(page, "Load common fixture", "Research note");
-    const toolbar = page.locator('[data-editor-root="true"] [role="toolbar"]');
-    const controls = await toolbar.locator("button, select").evaluateAll((elements) => elements.map((element) => ({
+    const historyToolbar = page.getByRole("toolbar", { name: "Editing history", exact: true });
+    const historyControls = await historyToolbar.locator("button").evaluateAll((elements) => elements.map((element) => ({
       disabled: element instanceof HTMLButtonElement || element instanceof HTMLSelectElement ? element.disabled : false,
       label: element.getAttribute("aria-label") ?? element.textContent?.trim() ?? "",
       pressed: element.getAttribute("aria-pressed")
     })));
-    assert.deepEqual(controls.map((control) => control.label), [
-      "Undo", "Redo", "Heading", "Bold", "Italic", "Strikethrough", "Bulleted list", "Numbered list", "Blockquote", "Link"
-    ], `unexpected toolbar order: ${JSON.stringify(controls)}`);
-    assert.ok(controls.slice(3, 9).every((control) => control.pressed === "true" || control.pressed === "false"), "toggle controls need aria-pressed state");
+    assert.deepEqual(historyControls.map((control) => control.label), ["Undo", "Redo"]);
     const editor = await activeEditor(page);
     await editor.click();
     await page.keyboard.press("Control+End");
@@ -434,8 +582,16 @@ try {
     await page.getByRole("button", { name: "Undo", exact: true }).focus();
     await page.keyboard.press("Tab");
     assert.equal(await page.locator(":focus").getAttribute("aria-label"), "Redo");
-    await page.keyboard.press("Tab");
-    assert.equal(await page.locator(":focus").getAttribute("aria-label"), "Heading");
+    await editor.click();
+    await page.keyboard.press("Control+a");
+    const selectionToolbar = page.getByRole("toolbar", { name: "Selected text formatting", exact: true });
+    await selectionToolbar.waitFor();
+    const selectionControls = await selectionToolbar.locator("button").evaluateAll((elements) => elements.map((element) => ({
+      label: element.getAttribute("aria-label") ?? "",
+      pressed: element.getAttribute("aria-pressed")
+    })));
+    assert.deepEqual(selectionControls.map((control) => control.label), ["Bold", "Italic", "Strikethrough", "Link"]);
+    assert.ok(selectionControls.every((control) => control.pressed === "true" || control.pressed === "false"));
     await page.getByRole("button", { name: "Link", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Insert link", exact: true });
     const linkInput = dialog.getByRole("textbox", { name: "Link address", exact: true });
@@ -446,14 +602,13 @@ try {
     assert.equal(await page.locator(":focus").getByText("Cancel", { exact: true }).count(), 1, "Shift+Tab must wrap inside the dialog");
     await page.keyboard.press("Tab");
     assert.equal(await linkInput.evaluate((element) => document.activeElement === element), true, "Tab must wrap back to the link input");
-    await page.keyboard.insertText("javascript:alert(1)");
+    await linkInput.fill("javascript:alert(1)");
     await page.keyboard.press("Enter");
     await dialog.getByRole("alert").waitFor();
     await page.keyboard.press("Escape");
     await assert.doesNotReject(() => dialog.waitFor({ state: "hidden" }));
-    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Link");
-    assert.equal(await page.locator(":focus").getAttribute("aria-label"), "Link");
-    return controls;
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Clipping note editor body");
+    return { historyControls, selectionControls };
   });
 
   await check("dark, high-contrast, reduced-motion, and read-only states remain usable", async () => {
@@ -466,7 +621,8 @@ try {
     await page.getByRole("button", { name: "Enable read only", exact: true }).click();
     const root = page.locator('[data-editor-root="true"]');
     assert.equal(await root.locator('[contenteditable="true"]').count(), 0, "read-only editor remains contenteditable");
-    assert.ok(await root.locator('[role="toolbar"] button:disabled').count() >= 9, "read-only toolbar controls must be disabled");
+    assert.equal(await root.getByRole("toolbar", { name: "Editing history", exact: true }).locator("button:disabled").count(), 2, "read-only history controls must be disabled");
+    assert.equal(await root.getByRole("toolbar", { name: "Selected text formatting", exact: true }).count(), 0, "read-only editor must not render a selection toolbar");
     return "dark/high-contrast/reduced-motion/read-only states rendered";
   });
 
@@ -493,7 +649,7 @@ try {
 }
 
 const report = {
-  candidate: "@tiptap/react@3.29.2 + @tiptap/starter-kit@3.29.2 + @tiptap/markdown@3.29.2",
+  candidate: "@tiptap/core@3.29.2 + @tiptap/react@3.29.2 + @tiptap/starter-kit@3.29.2 + @tiptap/markdown@3.29.2 + @tiptap/suggestion@3.29.2 + @tiptap/extension-list@3.29.2",
   baseUrl,
   checks,
   consoleErrors,
