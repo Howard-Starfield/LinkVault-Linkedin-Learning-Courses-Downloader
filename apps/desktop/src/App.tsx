@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
+  ArrowLeft,
   CalendarClock,
   ChevronDown,
   CircleHelp,
@@ -357,6 +358,7 @@ export default function App() {
     total: number;
     loading: boolean;
   } | null>(null);
+  const [isClippingDetailOpen, setIsClippingDetailOpen] = useState(false);
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [activeSearchQuery, setActiveSearchQuery] = useState("");
   const [isLinkedInExpanded, setIsLinkedInExpanded] = useState(true);
@@ -403,6 +405,11 @@ export default function App() {
         });
         return;
       }
+      if (nextView !== "newspaper-clippings") {
+        setGlobalSearchQuery("");
+        setActiveSearchQuery("");
+        setIsClippingDetailOpen(false);
+      }
       setActiveView(nextView);
       allowed = true;
     });
@@ -421,6 +428,7 @@ export default function App() {
   const openClippingsGallery = useCallback(async () => {
     if (!(await requestNavigation("newspaper-clippings"))) return;
     setPendingClippingId(null);
+    setIsClippingDetailOpen(false);
     setClippingsViewKey((current) => current + 1);
   }, [requestNavigation]);
 
@@ -1957,7 +1965,7 @@ export default function App() {
           onMouseDown={startSidebarResize}
         />
       </aside>
-      <main className="lv-main">
+      <main className="lv-main" data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>
         <button
           type="button"
           className="lv-sidebar-reopen"
@@ -1968,25 +1976,31 @@ export default function App() {
         >
           <PanelLeft aria-hidden="true" className="h-4 w-4" />
         </button>
-        <div className="lv-global-search" role="search">
-          <Search aria-hidden="true" />
-          <input
-            aria-label="Search saved newspaper clippings"
-            onChange={(event) => void updateGlobalSearch(event.target.value)}
-            placeholder="Search titles, notes, editions, dates, or pages"
-            value={globalSearchQuery}
-          />
-          {globalSearchQuery ? (
-            <button aria-label="Clear clipping search" onClick={() => void updateGlobalSearch("")} type="button">
-              <X aria-hidden="true" />
-            </button>
-          ) : activeView === "newspaper-clippings" && clippingGallerySummary ? (
-            <div className="lv-global-search__context">
-              <strong>Clippings</strong>
-              <span>{clippingGallerySummary.loading ? "Loading" : `${clippingGallerySummary.total} clipping${clippingGallerySummary.total === 1 ? "" : "s"}`}</span>
-            </div>
-          ) : <span>Clippings</span>}
-        </div>
+        {activeView === "newspaper-clippings" ? (
+          <div className="lv-global-search" data-detail={isClippingDetailOpen ? "true" : "false"} role="search">
+            {isClippingDetailOpen ? (
+              <button className="lv-global-search__back" onClick={() => void openClippingsGallery()} type="button">
+                <ArrowLeft aria-hidden="true" /> Back
+              </button>
+            ) : <Search aria-hidden="true" />}
+            <input
+              aria-label="Search saved newspaper clippings"
+              onChange={(event) => void updateGlobalSearch(event.target.value)}
+              placeholder="Search titles, notes, editions, dates, or pages"
+              value={globalSearchQuery}
+            />
+            {globalSearchQuery ? (
+              <button aria-label="Clear clipping search" onClick={() => void updateGlobalSearch("")} type="button">
+                <X aria-hidden="true" />
+              </button>
+            ) : clippingGallerySummary ? (
+              <div className="lv-global-search__context">
+                <strong>Clippings</strong>
+                <span>{clippingGallerySummary.loading ? "Loading" : `${clippingGallerySummary.total} clipping${clippingGallerySummary.total === 1 ? "" : "s"}`}</span>
+              </div>
+            ) : <span>Clippings</span>}
+          </div>
+        ) : null}
         <div className="lv-content">
           {pendingUpdate && !updateBannerDismissed && (
             <div className="update-banner" role="status" aria-live="polite">
@@ -2033,6 +2047,7 @@ export default function App() {
             <NewspaperClippings
               key={clippingsViewKey}
               onGallerySummaryChange={setClippingGallerySummary}
+              onDetailStateChange={setIsClippingDetailOpen}
               onOpenLibrary={() => void requestNavigation("newspaper-library")}
               onPendingConsumed={() => setPendingClippingId(null)}
               pendingClippingId={pendingClippingId}

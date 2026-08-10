@@ -53,7 +53,8 @@ assert.ok(list.includes("ensureNewspaperClippingThumbnail"), "visible list does 
 assert.ok(list.includes("ResizeObserver") && list.includes("columnCountForWidth"), "gallery is not responsive to its actual viewport width");
 assert.ok(list.includes("visibleItemIndexes") && list.includes("useVirtualizer"), "gallery thumbnails are not visibility-bounded");
 assert.ok(list.includes("ClippingSkeletonShelf") && list.includes("No clippings yet") && list.includes("Open Newspaper library"), "gallery first-use state is incomplete");
-assert.ok(clippings.includes("if (!selectedId)") && clippings.includes("Back to clippings"), "gallery and clipping note are not separate states");
+assert.ok(clippings.includes("if (!selectedId)") && clippings.includes("onDetailStateChange"), "gallery and clipping note are not separate states");
+assert.ok(app.includes('data-clipping-search={activeView === "newspaper-clippings"') && app.includes("lv-global-search__back"), "clipping-only search row or top-row Back control is missing");
 assert.ok(search.includes("IntersectionObserver"), "search continuation is not scroll-driven");
 assert.ok(search.includes("Possible matches"), "possible matches are not separated");
 assert.ok(roots.includes("Created automatically from Newspaper download destinations"), "Settings copy permits an arbitrary root model");

@@ -19,7 +19,7 @@ export function NewspaperClippingSourceCard({ detail }: { detail: NewspaperClipp
   return (
     <figure className="clipping-source-card" aria-label="Saved newspaper clipping source">
       <figcaption>
-        <span className="clipping-source-card__eyebrow"><Newspaper aria-hidden="true" /> Source evidence</span>
+        <span className="clipping-source-card__eyebrow"><Newspaper aria-hidden="true" /> Clipped source</span>
         <strong>{detail.editionName}</strong>
         <span>{detail.publicationDate} · page {detail.pageNumber}</span>
       </figcaption>
