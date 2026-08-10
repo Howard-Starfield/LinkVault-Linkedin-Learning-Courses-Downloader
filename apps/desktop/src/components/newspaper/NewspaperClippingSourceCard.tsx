@@ -1,4 +1,4 @@
-import { ImageOff, Newspaper } from "lucide-react";
+import { ImageOff } from "lucide-react";
 import { useState } from "react";
 import type { NewspaperClippingDetail } from "./newspaper-api";
 
@@ -18,11 +18,6 @@ export function NewspaperClippingSourceCard({ detail }: { detail: NewspaperClipp
 
   return (
     <figure className="clipping-source-card" aria-label="Saved newspaper clipping source">
-      <figcaption>
-        <span className="clipping-source-card__eyebrow"><Newspaper aria-hidden="true" /> Clipped source</span>
-        <strong>{detail.editionName}</strong>
-        <span>{detail.publicationDate} · page {detail.pageNumber}</span>
-      </figcaption>
       {unavailable ? (
         <div className="clipping-source-card__unavailable" role="status">
           <ImageOff aria-hidden="true" />
@@ -36,6 +31,13 @@ export function NewspaperClippingSourceCard({ detail }: { detail: NewspaperClipp
           src={detail.imageUrl}
         />
       )}
+      <figcaption>
+        <strong>{detail.editionName}</strong>
+        <span aria-hidden="true">·</span>
+        <span>{detail.publicationDate}</span>
+        <span aria-hidden="true">·</span>
+        <span>Page {detail.pageNumber}</span>
+      </figcaption>
     </figure>
   );
 }

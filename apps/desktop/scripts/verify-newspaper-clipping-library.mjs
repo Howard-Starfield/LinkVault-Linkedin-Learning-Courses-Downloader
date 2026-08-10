@@ -72,10 +72,19 @@ async function sourceFiles(directory) {
   }
   return files;
 }
+const tiptapOwners = new Map([
+  ["/components/newspaper/ClippingNoteEditor.tsx", 500],
+  ["/components/newspaper/clipping-note-slash-command.tsx", 300]
+]);
 for (const file of await sourceFiles(path.join(desktop, "src"))) {
   const normalized = file.replaceAll("\\", "/");
-  if (normalized.endsWith("/ClippingNoteEditor.tsx") || normalized.includes("/editor-evaluation/")) continue;
   const source = await readFile(file, "utf8");
+  const owner = [...tiptapOwners.entries()].find(([suffix]) => normalized.endsWith(suffix));
+  if (owner) {
+    assert.ok(source.split(/\r?\n/).length <= owner[1], `Tiptap owner exceeds ${owner[1]} lines: ${normalized}`);
+    continue;
+  }
+  if (normalized.includes("/editor-evaluation/")) continue;
   assert.ok(!source.includes("@tiptap/"), `Tiptap escaped the owned adapter: ${normalized}`);
 }
 

@@ -91,10 +91,131 @@
 }
 
 .clipping-note-editor {
+  position: relative;
   border: 1px solid var(--editor-evaluation-border);
   border-radius: 8px;
   overflow: hidden;
   background: var(--editor-evaluation-card);
+}
+
+.clipping-note-editor__footer {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  border-top: 1px solid var(--editor-evaluation-border);
+  color: color-mix(in srgb, var(--editor-evaluation-fg) 68%, transparent);
+  font-size: 11px;
+}
+
+.clipping-note-editor__footer-actions,
+.clipping-note-editor__history,
+.clipping-note-editor__selection-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.clipping-note-editor__history button,
+.clipping-note-editor__selection-toolbar button {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  padding: 0;
+}
+
+.clipping-note-editor__history button svg,
+.clipping-note-editor__selection-toolbar button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.clipping-note-editor__selection-toolbar {
+  padding: 4px;
+  border: 1px solid var(--editor-evaluation-border);
+  border-radius: 7px;
+  background: var(--editor-evaluation-card);
+  box-shadow: 0 12px 30px rgb(0 0 0 / .25);
+}
+
+.clipping-note-editor__selection-toolbar button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--editor-evaluation-focus) 18%, transparent);
+}
+
+.clipping-note-editor__toolbar-rule {
+  width: 1px;
+  height: 18px;
+  background: var(--editor-evaluation-border);
+}
+
+.clipping-note-editor__slash-popover {
+  z-index: 110;
+}
+
+.clipping-note-editor__slash-menu {
+  width: 340px;
+  max-height: 390px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--editor-evaluation-border);
+  border-radius: 9px;
+  background: var(--editor-evaluation-card);
+  box-shadow: 0 18px 42px rgb(0 0 0 / .28);
+  color: var(--editor-evaluation-fg);
+}
+
+.clipping-note-editor__slash-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 6px 7px;
+  color: color-mix(in srgb, var(--editor-evaluation-fg) 65%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.clipping-note-editor__slash-item {
+  display: grid;
+  width: 100%;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 7px;
+  border: 0;
+  text-align: left;
+}
+
+.clipping-note-editor__slash-item[aria-selected="true"] {
+  background: color-mix(in srgb, var(--editor-evaluation-focus) 16%, transparent);
+  box-shadow: inset 2px 0 var(--editor-evaluation-focus);
+}
+
+.clipping-note-editor__slash-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--editor-evaluation-border);
+  border-radius: 6px;
+}
+
+.clipping-note-editor__slash-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.clipping-note-editor__slash-item > span:last-child {
+  display: grid;
+  gap: 1px;
+}
+
+.clipping-note-editor__slash-item small,
+.clipping-note-editor__slash-empty {
+  color: color-mix(in srgb, var(--editor-evaluation-fg) 65%, transparent);
 }
 
 .clipping-note-editor__content {
@@ -107,17 +228,6 @@
   outline: none;
 }
 
-.clipping-note-editor__toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 10px;
-  border-bottom: 1px solid var(--editor-evaluation-border);
-  background: color-mix(in srgb, var(--editor-evaluation-card) 88%, var(--editor-evaluation-bg));
-}
-
-.clipping-note-editor__toolbar button,
-.clipping-note-editor__toolbar select,
 .clipping-note-editor__link-dialog input,
 .clipping-note-editor__link-actions button {
   border: 1px solid var(--editor-evaluation-border);
@@ -125,21 +235,6 @@
   padding: 6px 8px;
   background: var(--editor-evaluation-card);
   color: inherit;
-}
-
-.clipping-note-editor__toolbar button[aria-pressed="true"] {
-  border-color: var(--editor-evaluation-focus);
-  box-shadow: inset 0 0 0 1px var(--editor-evaluation-focus);
-}
-
-.clipping-note-editor__toolbar button:disabled,
-.clipping-note-editor__toolbar select:disabled {
-  cursor: not-allowed;
-  opacity: .58;
-}
-
-.clipping-note-editor__heading-label {
-  display: inline-flex;
 }
 
 .clipping-note-editor__content > :first-child {
@@ -156,13 +251,19 @@
 }
 
 .clipping-note-editor__link-dialog {
+  position: absolute;
+  z-index: 12;
+  top: 42px;
+  right: 10px;
   display: grid;
+  width: min(360px, calc(100% - 20px));
   gap: 10px;
-  margin: 12px;
+  margin: 0;
   padding: 12px;
   border: 1px solid var(--editor-evaluation-focus);
   border-radius: 6px;
   background: var(--editor-evaluation-card);
+  box-shadow: 0 16px 38px rgb(0 0 0 / .24);
 }
 
 .clipping-note-editor__link-dialog label {
@@ -198,14 +299,38 @@
     --editor-evaluation-border: currentColor;
   }
 
-  .clipping-note-editor__toolbar button[aria-pressed="true"] {
+  .clipping-note-editor__selection-toolbar button[aria-pressed="true"] {
     outline: 2px solid currentColor;
   }
 }
 
+.clipping-note-editor__content h1,
+.clipping-note-editor__content h2,
+.clipping-note-editor__content h3,
+.clipping-note-editor__content h4 {
+  margin: 1.5em 0 .45em;
+  line-height: 1.22;
+}
+
+.clipping-note-editor__content h1 { font-size: 2em; }
+.clipping-note-editor__content h2 { font-size: 1.55em; }
+.clipping-note-editor__content h3 { font-size: 1.24em; }
+.clipping-note-editor__content h4 { font-size: 1.06em; }
+.clipping-note-editor__content ul:not([data-type="taskList"]),
+.clipping-note-editor__content ol { padding-inline-start: 1.55em; }
+.clipping-note-editor__content blockquote { padding-left: 16px; border-left: 2px solid var(--editor-evaluation-focus); }
+.clipping-note-editor__content hr { border: 0; border-top: 1px solid var(--editor-evaluation-border); margin: 2em 0; }
+.clipping-note-editor__content ul[data-type="taskList"] { padding: 0; list-style: none; }
+.clipping-note-editor__content li[data-type="taskItem"] { display: flex; align-items: flex-start; gap: .68em; }
+.clipping-note-editor__content li[data-type="taskItem"] > label { margin-top: .48em; }
+.clipping-note-editor__content li[data-type="taskItem"] > label > span:last-child { display: none; }
+.clipping-note-editor__content li[data-type="taskItem"] > div { min-width: 0; flex: 1; }
+.clipping-note-editor__content li[data-type="taskItem"][data-checked="true"] > div { opacity: .58; text-decoration: line-through; }
+
 @media (forced-colors: active) {
   .clipping-note-editor,
-  .clipping-note-editor__toolbar,
+  .clipping-note-editor__footer,
+  .clipping-note-editor__selection-toolbar,
   .clipping-note-editor__link-dialog {
     border-color: CanvasText;
   }

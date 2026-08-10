@@ -95,12 +95,6 @@ export function NewspaperClippings({
 
   return (
     <section className="clipping-note-page" aria-label="Clipping note">
-      <header className="clipping-note-page__header">
-        <div>
-          <span>Clipping note</span>
-          <strong>{detail?.title ?? "Opening clipping"}</strong>
-        </div>
-      </header>
       <main className="clipping-note-page__body">
         {loading ? <div className="clipping-detail-state"><LoaderCircle aria-hidden="true" className="animate-spin" /> Loading clipping…</div> : null}
         {!loading && error ? <div className="clipping-detail-state" role="alert">Could not load this clipping. {error}</div> : null}
