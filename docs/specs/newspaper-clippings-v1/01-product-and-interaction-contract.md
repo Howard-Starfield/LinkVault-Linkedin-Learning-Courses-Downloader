@@ -485,16 +485,16 @@ Each loaded row includes:
 The row does not display raw asset paths, checksums, database IDs, or note
 Markdown syntax.
 
-### VIEW-004: Detail source card
+### VIEW-004: Detail clipping header
 
-The fixed source card includes:
+The fixed, read-only document header includes:
 
 - Canonical clipping image or missing-asset warning.
 - Edition, date, and page provenance snapshots.
 - `Open source` when source links still resolve.
 - Disabled `Source unavailable` explanation when they do not.
 - An optional click-to-expand read-only image overlay.
-- No crop, annotation, replace-image, or delete-image control inside the card.
+- No crop, annotation, replace-image, or delete-image control inside the header.
 
 ### VIEW-005: Editor entry
 
@@ -597,7 +597,7 @@ without explicitly entering Clip mode.
 
 ### SOURCE-002: Unavailable
 
-The source card shows:
+The clipping header shows:
 
 ```text
 Original edition is no longer in the newspaper library.

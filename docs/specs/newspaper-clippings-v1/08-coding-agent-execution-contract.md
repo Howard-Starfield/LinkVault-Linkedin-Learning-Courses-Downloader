@@ -34,6 +34,8 @@ Before changing any code, read in this order:
 7. Every prerequisite detailed specification named by the dependency graph.
 8. Existing implementation files that own the affected behavior.
 9. Existing verification scripts and tests for those files.
+10. For Phase 4C,
+    `docs/work-orders/newspaper-clipping-note-durability-plan.md` in full.
 
 ### AGENT-PREFLIGHT-001
 
@@ -98,7 +100,8 @@ Each implementation PR owns one phase from the master PRD.
 | 2 | Source resolver, geometry, native crop, lossless encode, idempotent create command, crop baseline | Reader selection UI, editor/library, source navigation/delete UI |
 | 3 | Reader selection state machine and hidden/test-only integration with Phase 2 command | Production Clippings view, editor dependency, deletion/reset UI, release bump |
 | 4A | Isolated editor candidate evaluation, adapter proof, evidence, D-024 update | Production note view, unrelated UI refactor, persistence changes beyond test fixture needs |
-| 4B | Production Clippings route/list/detail/source card/editor/autosave/conflict and reader enablement | Source-return highlight, final delete/reset implementation, OCR/AI/tags/export |
+| 4B | Production Clippings route/gallery/full-page detail/clipping header/editor/autosave/conflict and reader enablement | Source-return highlight, final delete/reset implementation, OCR/AI/tags/export |
+| 4C durability | D-034 schema-v6 recovery checkpoints, bounded autosave/checkpoint controllers, recovery UI, native close-X/tray Quit/application/updater exit authority, performance evidence | Tiptap feature expansion, search/navigation/delete scope, unrelated UI refactor, new dependency, release bump |
 | 5 | Exact source navigation/back/highlight, delete, missing states, reset preservation integration | Performance threshold invention without Phase 6 evidence, release bump, V1 extensions |
 | 6 | Full verification integration, measured thresholds, native UAT, security/license review, release readiness | New product features, schema redesign, unrelated refactors |
 
@@ -337,6 +340,13 @@ reset.
 A schema test that only checks table existence is incomplete. Verify
 constraints, foreign-key actions, indexes, preservation, version, and recovery.
 
+### AGENT-DB-004
+
+The Phase 4C checkpoint uses the existing `DatabaseWriter`. Do not add a second
+writer, connection pool, async runtime, polling thread, browser-storage journal,
+or direct write connection. Canonical save and matching checkpoint clear are
+one savepoint; a stale session/sequence may not clear a newer row.
+
 ## 9. Managed filesystem safeguards
 
 ### AGENT-FS-001
@@ -430,6 +440,21 @@ provides the complete review/note destination.
 
 Every state must have loading, empty, failure, retry, keyboard, focus, and
 accessibility behavior; success-only UI is incomplete.
+
+### AGENT-UI-008
+
+For Phase 4C, native code owns destructive close/exit authority. Window X
+prevents close and hides the existing main WebView only after the renderer
+acknowledges durable state. Tray Quit, application exit, and updater exit use
+the same tokenized preparation and terminate only after success. React cleanup,
+blur, `beforeunload`, timeout, or a missing renderer never means discard.
+
+### AGENT-UI-009
+
+Do not create a canonical durability TSX. Preserve the exact ownership and hard
+line budgets in the Phase 4C work order. `App.tsx` must become net-negative,
+`ClippingNoteEditor.tsx` remains Tiptap-only, and the large native clipping/
+database owners receive only bounded delegation seams.
 
 ## 12. Editor dependency safeguards
 
@@ -531,6 +556,14 @@ Phase 6 ratify a threshold.
 A faster implementation that violates pixel correctness, recovery, privacy, or
 memory bounds is not accepted.
 
+### AGENT-PERF-006
+
+Phase 4C performs no synchronous full-document serialization, hashing, IPC, or
+SQLite work in the Tiptap transaction/key path. Measure checkpoint/canonical
+write counts, p50/p95/max checkpoint and exit latency, memory, bundle delta, and
+SQLite/WAL growth using the approved 10-second, 10-minute, and 1 KiB/100 KiB/
+2 MiB workloads before claiming completion.
+
 ## 15. Security and privacy rules
 
 ### AGENT-SEC-001
@@ -607,6 +640,11 @@ The agent must immediately stop implementation when:
 - A required migration backup/integrity test fails.
 - A path-security test fails.
 - A clipping or note is lost in a failure/reset test.
+- A checkpoint, conflict draft, or newer writer sequence is lost in a
+  durability failure test.
+- Native close/exit reaches database shutdown before acknowledged durability.
+- A Phase 4C owner exceeds its approved hard line budget or durability logic is
+  moved into a canonical TSX/service file.
 - The reader mounted-image bound regresses.
 - Exact pixel correctness fails.
 - Chinese IME fails in Phase 4A/4B native testing.

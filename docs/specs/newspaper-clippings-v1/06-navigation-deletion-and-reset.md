@@ -4,7 +4,8 @@
 
 **Primary implementation phase:** Phase 5
 
-**Related decisions:** D-001, D-013, D-016 through D-018, D-021, D-027, D-028
+**Related decisions:** D-001, D-013, D-016 through D-018, D-021, D-027,
+D-028, D-034
 
 ## 1. Purpose
 
@@ -99,6 +100,20 @@ provider, or another clipping, the autosave controller completes the flush or
 explicit discard contract from specification 05. App state does not switch
 views first and attempt saving afterward.
 
+### FR-NAV-006A: Native window lifecycle
+
+Window X is not app navigation and must not destroy the main WebView. Native
+code prevents close, requests the exact durability handshake from specification
+05, and hides the existing main window only after success. Tray **Show** restores
+and focuses that same window. Tray **Quit**, ordinary process exit, and updater
+exit use the same preparation but terminate after success.
+
+On failure, uncheckpointed/stale conflict, missing/stale acknowledgement, or
+timeout, the application remains open and restores/focuses the main window with
+actionable state. A canonical conflict may proceed only after the exact newest
+visible draft is checkpointed for explicit recovery. Neither React unmount nor
+a timeout authorizes discard or process exit.
+
 ## 4. Reader-created clipping → Open note
 
 ### FLOW-NAV-001
@@ -126,7 +141,7 @@ After successful reader save:
    boundary.
 5. `activeView` becomes `newspaper-clippings`.
 6. The Clippings view loads the exact ID independently of current search/sort.
-7. The source card and editor load.
+7. The read-only clipping header and editor load.
 8. The first editable paragraph receives focus after the editor is ready.
 
 ### FR-NAV-007
@@ -178,7 +193,7 @@ for an older query or ranking generation.
 
 ### FLOW-NAV-002
 
-1. User chooses **Open source** on the fixed source card.
+1. User chooses **Open source** on the fixed clipping header.
 2. Pending title/note changes flush successfully or navigation is blocked.
 3. The detail’s non-null source job/page IDs are used.
 4. The frontend invokes a direct item lookup if needed:
@@ -491,7 +506,7 @@ dialog and pressing Enter must not accidentally confirm.
 While deletion runs:
 
 - Disable delete and navigation actions for that clipping.
-- Keep source card/note visible with `Deleting…`.
+- Keep the clipping header/note visible with `Deleting…`.
 - Do not remove the list row optimistically before backend success.
 
 ### FR-DELETE-005: Success
