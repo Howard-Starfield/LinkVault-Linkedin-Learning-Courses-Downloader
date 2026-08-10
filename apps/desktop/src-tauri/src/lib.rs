@@ -16,7 +16,63 @@ use providers::linkedin::{commands, linkedin};
 pub use providers::{coursera, newspaper};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+
+#[derive(Clone, Default)]
+struct CooperativeQuit {
+    inner: std::sync::Arc<CooperativeQuitInner>,
+}
+
+#[derive(Default)]
+struct CooperativeQuitInner {
+    next_token: std::sync::atomic::AtomicU64,
+    confirmed: std::sync::Mutex<Option<u64>>,
+    changed: std::sync::Condvar,
+}
+
+impl CooperativeQuit {
+    fn request(&self) -> u64 {
+        let token = self
+            .inner
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        *self
+            .inner
+            .confirmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        token
+    }
+
+    fn confirm(&self, token: u64) {
+        *self
+            .inner
+            .confirmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
+        self.inner.changed.notify_all();
+    }
+
+    fn wait(&self, token: u64, timeout: std::time::Duration) -> bool {
+        let confirmed = self
+            .inner
+            .confirmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (confirmed, _) = self
+            .inner
+            .changed
+            .wait_timeout_while(confirmed, timeout, |value| *value != Some(token))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *confirmed == Some(token)
+    }
+}
+
+#[tauri::command]
+fn confirm_cooperative_quit(state: tauri::State<'_, CooperativeQuit>, token: u64) {
+    state.confirm(token);
+}
 
 pub fn run() {
     let app = tauri::Builder::default()
@@ -62,6 +118,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_updates::check_for_app_update,
             app_updates::install_app_update,
+            confirm_cooperative_quit,
             commands::bootstrap_state,
             commands::cancel_active_download,
             commands::clear_failed_download_jobs,
@@ -125,6 +182,10 @@ pub fn run() {
             newspaper::commands::get_newspaper_reader_manifest,
             newspaper::commands::save_newspaper_reading_progress,
             newspaper::commands::ensure_newspaper_thumbnail,
+            newspaper::commands::get_newspaper_clippings_page,
+            newspaper::commands::get_newspaper_clipping,
+            newspaper::commands::update_newspaper_clipping,
+            newspaper::commands::ensure_newspaper_clipping_thumbnail,
             newspaper::commands::search_newspaper_clippings,
             newspaper::commands::search_possible_newspaper_clippings,
             newspaper::commands::list_newspaper_snapshot_roots,
@@ -207,6 +268,7 @@ pub fn run() {
             app.manage(newspaper::commands::NewspaperState::new(db_path));
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
+            app.manage(CooperativeQuit::default());
 
             // Taskbar + tray icon: the All-in-One Downloader icon, embedded
             // at compile time so the binary has no runtime file dependency.
@@ -244,7 +306,33 @@ pub fn run() {
                                 let _ = window.set_focus();
                             }
                         }
-                        "quit" => app.exit(0),
+                        "quit" => {
+                            let quit = app.state::<CooperativeQuit>().inner().clone();
+                            let token = quit.request();
+                            if app
+                                .emit(
+                                    "linkvault://quit-requested",
+                                    serde_json::json!({ "token": token }),
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let handle = app.clone();
+                            std::thread::spawn(move || {
+                                if quit.wait(token, std::time::Duration::from_secs(15)) {
+                                    handle.exit(0);
+                                } else if let Some(window) = handle.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.unminimize();
+                                    let _ = window.set_focus();
+                                    let _ = handle.emit(
+                                        "linkvault://quit-blocked",
+                                        serde_json::json!({ "token": token }),
+                                    );
+                                }
+                            });
+                        }
                         _ => {}
                     })
                     .build(app)?;
