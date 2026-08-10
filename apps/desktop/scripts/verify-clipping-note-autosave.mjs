@@ -353,4 +353,50 @@ function createFakeTimers() {
   controller.dispose();
 }
 
+{
+  const calls = [];
+  const releases = [];
+  const controller = new ClippingNoteCheckpointController(
+    "clip-1", "session-e", 5, "Initial", "",
+    (request) => {
+      calls.push(request);
+      return new Promise((resolve) => releases.push(() => resolve({
+        documentId: request.documentId,
+        writerSessionId: request.writerSessionId,
+        writerSequence: request.writerSequence
+      })));
+    },
+    code,
+    1_000,
+    2_000
+  );
+  controller.setDraft(5, "Initial", "canonical generation");
+  const submitted = controller.getSnapshot().writerSequence;
+  const ensuringSubmitted = controller.ensureDurable(submitted);
+  await Promise.resolve();
+  controller.setDraft(5, "Initial", "newer visible generation");
+  releases.shift()();
+  assert.equal(await ensuringSubmitted, true, "exact submitted generation did not become durable");
+  assert.equal(calls.length, 1, "exact-generation wait incorrectly blocked on queued-latest work");
+  assert.equal(controller.getSnapshot().writerSequence, 2);
+  controller.dispose();
+}
+
+{
+  const controller = new ClippingNoteCheckpointController(
+    "clip-1", "session-f", 5, "Initial", "", async (request) => ({
+      documentId: request.documentId,
+      writerSessionId: request.writerSessionId,
+      writerSequence: request.writerSequence
+    }), code
+  );
+  assert.equal(controller.restoreDurable(5, "Recovered", "draft", 7), true);
+  assert.equal(controller.getSnapshot().durableSequence, 7);
+  assert.equal(controller.restoreDurable(5, "Wrong", "owner", 8), false);
+  controller.resetCanonical(6, "Saved", "canonical");
+  assert.equal(controller.getSnapshot().status, "idle");
+  assert.equal(controller.getSnapshot().draftMarkdown, "canonical");
+  controller.dispose();
+}
+
 console.log("Clipping note canonical autosave, checkpoint coalescing, stable thumbnails, flush, retry, queued-latest, validation, and conflict contracts passed.");

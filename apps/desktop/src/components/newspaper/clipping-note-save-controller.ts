@@ -93,7 +93,7 @@ export class ClippingNoteSaveController {
     this.setDraft(this.view.draftTitle, markdown);
   }
 
-  private setDraft(title: string, markdown: string) {
+  setDraft(title: string, markdown: string) {
     if (this.disposed) return;
     if (this.view.status === "conflict") {
       this.setView({ ...this.view, draftTitle: title, draftMarkdown: markdown });
@@ -113,6 +113,18 @@ export class ClippingNoteSaveController {
     if (!clean && !validationError && this.view.status !== "saving") {
       this.scheduleDirtySave();
     }
+  }
+
+  restoreConflict(title: string, markdown: string) {
+    if (this.disposed) return;
+    this.clearTimers();
+    this.setView({
+      ...this.view,
+      draftTitle: title,
+      draftMarkdown: markdown,
+      status: "conflict",
+      errorCode: "CLIPPING_REVISION_CONFLICT"
+    });
   }
 
   retry() {

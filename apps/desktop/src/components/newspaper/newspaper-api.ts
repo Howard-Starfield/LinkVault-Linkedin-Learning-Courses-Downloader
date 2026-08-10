@@ -284,6 +284,7 @@ export function updateNewspaperClipping(request: {
   expectedRevision: number;
   title: string;
   noteMarkdown: string;
+  checkpoint?: { writerSessionId: string; writerSequence: number };
 }) {
   const harness = clippingBrowserHarness()?.update;
   if (harness) return harness(request);
