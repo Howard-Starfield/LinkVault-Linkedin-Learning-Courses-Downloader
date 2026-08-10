@@ -1,7 +1,8 @@
 # Newspaper Clippings core workflow implementation plan
 
-**Status:** Planning only — live owner/conflict audit completed 2026-08-09; no
-production implementation is authorized by this document
+**Status:** Authorized and in progress — live owner/conflict audit refreshed
+2026-08-09. Storage/root registration and ranked search/reconnect are complete
+as local stacked commits; Phase 2 is being adapted before Reader UI begins.
 
 **Date:** 2026-08-09
 
@@ -9,6 +10,21 @@ production implementation is authorized by this document
 drags one rectangle over one page image, saves a source-resolution lossless
 WebP beneath the source edition's newspaper download destination, opens the new
 clipping, and types a note in the approved Tiptap editor with safe autosave.
+The same clipping can later be found from the application top bar without
+enumerating the nested snapshot folders.
+
+### Execution ledger
+
+| Slice | Local state | Next gate |
+|---|---|---|
+| Snapshot root registry and reconnect backend | Complete at `95b6059` | Preserve during Phase 2 adaptation |
+| Ranked clipping search and reconnect IPC | Complete at `43e0ae5` | Production top-bar/search-results UI in Phase 4B |
+| Phase 2 native crop | Replayed and adapted on `codex/newspaper-clippings-phase2-adapted` | Multi-root crop tests, clean gates, fresh baseline |
+| Phase 3 Reader selection | Authorized, not started | Branch only after adapted Phase 2 commit |
+| Phase 4B Clippings/Tiptap/search UI | Authorized, not started | Branch only after Phase 3 commit |
+
+The local branches may be stacked to reach UAT, but Phase 3 and Phase 4B remain
+separate commit/review boundaries. No branch is pushed or merged automatically.
 
 ## 1. Decisions frozen for implementation
 
@@ -475,8 +491,9 @@ release-version changes remain later phases.
 ### 5.2 Backend IPC gap to close
 
 The repository and service already implement list, detail, optimistic note
-update, and deletion, but only create is exposed to React. Phase 4B adds thin,
-safe, camelCase commands and DTOs for:
+update, deletion, ranked search, possible-match search, and root reconnect.
+Create plus search/reconnect are exposed to React. Phase 4B adds the remaining
+thin, safe, camelCase commands and DTOs for:
 
 ```text
 get_newspaper_clippings_page
@@ -568,26 +585,50 @@ List requirements:
 
 Search requirements:
 
-- Render the specified `Search titles, notes, editions, dates, or pages` field
-  in the Clippings list and debounce backend queries by 200 ms.
-- Search server-side across title, full `note_markdown`, edition name/code,
-  publication date, and page number. Do not filter only the currently loaded
-  virtual rows.
-- Trim and cap input at 200 UTF-8 characters and preserve literal `%`, `_`,
-  backslash, apostrophe, punctuation, English, and Chinese queries through the
-  existing parameterized escaped-`LIKE` repository contract.
+- Render `Search titles, notes, editions, dates, or pages` in the application
+  top bar. A non-empty query takes over the main content area with clipping
+  results; clearing it restores the prior route and scroll position.
+- Debounce by 200 ms, keep keyboard focus in the top bar, and expose an explicit
+  close/clear action. Search must not mount or discard an active dirty editor
+  without passing through the navigation flush guard.
+- Use the existing server-side ranked FTS contract across title, full
+  `note_markdown`, edition name/code, publication date, and page number. Do not
+  filter only the currently loaded virtual rows.
+- Each confident result carries cumulative factual match tags from `Title`,
+  `Note`, `Edition`, `Date`, and `Page`, ordered by backend ranking. `Note`
+  never means OCR or newspaper article body text.
+- Load confident results in 50-row pages as the user scrolls. Keep one request
+  owner per query generation and continuation token so stale pages cannot mix
+  with a newer query.
+- Below confident results, show at most 25 separately labeled `Possible
+  matches`. These are lower-confidence fuzzy title/note/edition candidates;
+  four-character recall remains best effort under the approved trigram tradeoff.
+- Trim and cap input at 200 Unicode scalar values and preserve literal `%`, `_`,
+  backslash, apostrophe, punctuation, English, Chinese, and compatibility-
+  normalized queries through the existing parameterized repository contract.
 - Reset paging for a new query, reject stale query generations, and allow a
   direct **Open note** target to load by ID even when excluded by the current
   search.
 - Search never walks `Newspaper snapshots`, opens WebP files, or depends on the
-  storage-root locator. Moving from `LIKE` to SQLite FTS later must remain an
-  internal repository/index migration behind the same list API.
-- Keep D-019's simple substring search for V1 and record 8/50/500 response and
-  visible-update timings, including notes near the 2 MiB contract limit. Search
-  results need a bounded match-centered plain-text excerpt so a deep keyword is
-  visible without fetching full note bodies. Propose FTS if this worst-case
-  baseline misses the agreed responsiveness budget; do not introduce an FTS
-  synchronization lifecycle without that evidence.
+  storage-root locator. The approved raw external-content FTS, normalized
+  derived candidate index, metadata index, and their atomic synchronization
+  remain backend-owned.
+- Record 8/50/500 response and visible-update timings, including notes near the
+  2 MiB contract limit. Results use bounded safe excerpts. A normalized-only
+  Note match may use the approved unhighlighted fallback; the UI must not invent
+  highlight offsets.
+
+Settings snapshot-root requirements:
+
+- Settings lists roots automatically registered from newspaper download
+  destinations. It does not expose an arbitrary global snapshot-folder input.
+- Each row shows the backend-safe display path and `Connected`, `Offline`, or
+  marker-mismatch state, plus **Open folder**, **Check again**, and **Reconnect**
+  when applicable.
+- **Reconnect** uses the native directory picker and the stable root ID. React
+  never sends a replacement path to an ordinary command or rewrites clipping
+  rows. A successful reconnect refreshes visible source cards and search detail
+  without moving canonical files.
 
 Detail requirements:
 
