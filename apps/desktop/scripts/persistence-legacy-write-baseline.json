@@ -1,5 +1,5 @@
 {
-  "version": 9,
+  "version": 10,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 1,
@@ -13,6 +13,7 @@
     "src-tauri/src/providers/newspaper/clipping_service.rs": 5,
     "src-tauri/src/providers/newspaper/job_service.rs": 9,
     "src-tauri/src/providers/newspaper/media_protocol.rs": 0,
+    "src-tauri/src/providers/newspaper/optimization_service.rs": 3,
     "src-tauri/src/providers/newspaper/optimization_tasks.rs": 19,
     "src-tauri/src/providers/newspaper/page_metadata.rs": 2,
     "src-tauri/src/providers/newspaper/queue_service.rs": 17,
@@ -47,6 +48,12 @@
       "upsert_artifact": 1,
       "upsert_course_cache_entry": 1
     },
+    "src-tauri/src/providers/linkedin/commands.rs": {
+      "append_job_event": 2,
+      "clear_failed_jobs": 1,
+      "insert_job": 1,
+      "retry_failed_job": 1
+    },
     "src-tauri/src/providers/newspaper/commands.rs": {
       "clear_newspaper_provider_data": 1
     },
@@ -63,6 +70,7 @@
     "6": "Moved the media protocol's integrity mutation behind the clipping service, reducing protocol SQL primitives to zero and recording the coalesced service DatabaseWriter submission plus cleanup-cursor setting write in their service, recovery, and repository owners. No filesystem or image work enters a writer closure.",
     "7": "Removed the draft filename-cursor setting write after D-031 approved detached complete managed-directory enumeration with per-category mutation caps. This reduces the recovery DatabaseWriter submission count and repository SQL primitive count by one each; no enforcement rule is weakened.",
     "8": "Added the reviewed schema-v4 clipping root table, legacy-root seed, populated-v3 table rebuild, one root-registry repository insert, and its one DatabaseWriter submission. The root row commits before crop staging; filesystem and marker work remain outside writer closures.",
-    "9": "Added the reviewed schema-v5 raw and normalized derived search indexes, atomic repository synchronization/repair savepoints, and the conditional snapshot-root reconnect update. Canonical clipping writes and root locator mutation remain serialized through DatabaseWriter; search reads and filesystem probes do not mutate SQLite."
+    "9": "Added the reviewed schema-v5 raw and normalized derived search indexes, atomic repository synchronization/repair savepoints, and the conditional snapshot-root reconnect update. Canonical clipping writes and root locator mutation remain serialized through DatabaseWriter; search reads and filesystem probes do not mutate SQLite.",
+    "10": "Corrected production-source scanning so internal cfg(test) fields and helpers do not hide later production code. Pinned the already-existing LinkedIn command helper calls and newspaper optimization service SQL writes that were previously omitted by the scanner; no new write site was introduced."
   }
 }
