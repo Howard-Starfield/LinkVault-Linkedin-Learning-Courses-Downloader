@@ -5,10 +5,11 @@ import { fileURLToPath } from "node:url";
 
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (relative) => readFile(path.join(desktop, relative), "utf8");
-const [app, api, controller, detail, list, search, roots, commands, models, service, lib] = await Promise.all([
+const [app, api, controller, clippings, detail, list, search, roots, commands, models, service, lib] = await Promise.all([
   read("src/App.tsx"),
   read("src/components/newspaper/newspaper-api.ts"),
   read("src/components/newspaper/clipping-note-save-controller.ts"),
+  read("src/components/newspaper/NewspaperClippings.tsx"),
   read("src/components/newspaper/NewspaperClippingDetail.tsx"),
   read("src/components/newspaper/NewspaperClippingList.tsx"),
   read("src/components/newspaper/NewspaperClippingSearch.tsx"),
@@ -48,6 +49,9 @@ for (const fragment of ["Keep my changes", "Use saved version", "Copy my draft",
 
 assert.ok(list.includes("`${generation}:${offset}`"), "list request ownership is not generation+offset keyed");
 assert.ok(list.includes("ensureNewspaperClippingThumbnail"), "visible list does not request clipping thumbnails");
+assert.ok(list.includes("ResizeObserver") && list.includes("columnCountForWidth"), "gallery is not responsive to its actual viewport width");
+assert.ok(list.includes("visibleItemIndexes") && list.includes("useVirtualizer"), "gallery thumbnails are not visibility-bounded");
+assert.ok(clippings.includes("if (!selectedId)") && clippings.includes("Back to clippings"), "gallery and clipping note are not separate states");
 assert.ok(search.includes("IntersectionObserver"), "search continuation is not scroll-driven");
 assert.ok(search.includes("Possible matches"), "possible matches are not separated");
 assert.ok(roots.includes("Created automatically from Newspaper download destinations"), "Settings copy permits an arbitrary root model");

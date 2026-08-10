@@ -52,6 +52,7 @@ try {
     window.__CLIPPING_LIBRARY_TEST__ = {
       details,
       pageCalls: [],
+      detailCalls: [],
       thumbnailCalls: [],
       updateCalls: [],
       searchCalls: [],
@@ -71,6 +72,7 @@ try {
         };
       },
       async getDetail(id) {
+        window.__CLIPPING_LIBRARY_TEST__.detailCalls.push(id);
         return structuredClone(window.__CLIPPING_LIBRARY_TEST__.details.find((item) => item.id === id));
       },
       async update(request) {
@@ -158,38 +160,62 @@ try {
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), false, "normal route fetched the editor chunk");
 
   await page.getByRole("button", { name: "Clippings", exact: true }).click();
-  await page.locator(".clipping-detail").waitFor();
-  await page.getByLabel("Clipping note editor body").waitFor();
-  const mountedRows = await page.locator(".clipping-list__row").count();
-  assert.ok(mountedRows > 0 && mountedRows <= 20, `virtual list mounted ${mountedRows} rows`);
+  await page.locator(".clipping-gallery").waitFor();
+  assert.equal(await page.locator(".clipping-detail").count(), 0, "gallery eagerly mounted the clipping detail page");
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 0, "gallery eagerly fetched a clipping detail");
+  assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), false, "gallery eagerly fetched the editor chunk");
+  const firstGridRow = page.locator(".clipping-gallery__row").first();
+  await firstGridRow.waitFor();
+  assert.equal(await firstGridRow.locator(".clipping-gallery__card").count(), 4, "default window did not render four clipping columns");
+  const mountedCards = await page.locator(".clipping-gallery__card").count();
+  assert.ok(mountedCards > 0 && mountedCards <= 40, `virtual gallery mounted ${mountedCards} cards`);
   const thumbnailCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
-  assert.ok(thumbnailCalls <= mountedRows, "thumbnail generation exceeded mounted rows");
-  const firstCard = page.locator(".clipping-list__row").first();
-  await firstCard.locator(".clipping-list__thumb img[data-loaded='true']").waitFor();
-  const cardGeometry = await firstCard.evaluate((row) => {
-    const thumbnail = row.querySelector(".clipping-list__thumb").getBoundingClientRect();
-    const title = row.querySelector(".clipping-list__title").getBoundingClientRect();
-    const bounds = row.getBoundingClientRect();
+  assert.ok(thumbnailCalls > 0 && thumbnailCalls <= 50, `thumbnail generation was not viewport-bounded: ${thumbnailCalls} calls`);
+  const firstCard = page.locator(".clipping-gallery__card").first();
+  await firstCard.locator(".clipping-gallery__thumb img[data-loaded='true']").waitFor();
+  const cardGeometry = await firstCard.evaluate((card) => {
+    const thumbnail = card.querySelector(".clipping-gallery__thumb").getBoundingClientRect();
+    const title = card.querySelector(".clipping-gallery__title").getBoundingClientRect();
+    const bounds = card.getBoundingClientRect();
     return {
-      rowWidth: bounds.width,
-      rowBottom: bounds.bottom,
+      cardWidth: bounds.width,
       thumbnailWidth: thumbnail.width,
       thumbnailHeight: thumbnail.height,
       titleLeft: title.left,
       titleBottom: title.bottom,
-      thumbnailLeft: thumbnail.left
+      titleHeight: title.height,
+      thumbnailLeft: thumbnail.left,
+      thumbnailBottom: thumbnail.bottom
     };
   });
-  assert.ok(cardGeometry.thumbnailWidth >= cardGeometry.rowWidth - 28, "thumbnail does not occupy nearly the full evidence panel width");
-  assert.ok(cardGeometry.thumbnailHeight >= 198, "thumbnail card is not image-first");
+  assert.ok(cardGeometry.thumbnailWidth >= cardGeometry.cardWidth - 2, "thumbnail does not occupy the full gallery card width");
+  assert.ok(Math.abs(cardGeometry.thumbnailWidth / cardGeometry.thumbnailHeight - 1200 / 700) < 0.03, "gallery card ignored the clipping aspect ratio");
   assert.ok(Math.abs(cardGeometry.titleLeft - cardGeometry.thumbnailLeft) <= 1, "title is not anchored to the thumbnail's bottom-left veil");
-  assert.ok(cardGeometry.rowBottom - cardGeometry.titleBottom <= 12, "title veil is not anchored at the bottom of the card");
-  assert.equal(await firstCard.locator(".clipping-list__copy").count(), 0, "legacy metadata/note copy still renders beside the thumbnail");
-  assert.equal((await firstCard.innerText()).trim(), "Transit archive clipping 1", "card must show only its single title");
+  assert.ok(cardGeometry.titleHeight < 60, "title gradient covers too much of the clipping");
+  assert.ok(Math.abs(cardGeometry.thumbnailBottom - cardGeometry.titleBottom) <= 1, "title gradient bleeds beyond the thumbnail bottom edge");
+  assert.equal((await firstCard.innerText()).trim(), "Transit archive clipping 1", "gallery card must show only its single title");
+  const callsAtDefaultWidth = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
+  await page.setViewportSize({ width: 700, height: 960 });
+  await page.waitForFunction(() => document.querySelector(".clipping-gallery__row")?.children.length === 2);
+  assert.equal(await page.locator(".clipping-gallery__row").first().locator(".clipping-gallery__card").count(), 2, "narrow gallery did not reduce its column count");
+  await page.setViewportSize({ width: 1900, height: 960 });
+  await page.waitForFunction(() => document.querySelector(".clipping-gallery__row")?.children.length === 5);
+  assert.equal(await page.locator(".clipping-gallery__row").first().locator(".clipping-gallery__card").count(), 5, "wide gallery did not add a clipping column");
+  await page.waitForFunction((previous) => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length > previous, callsAtDefaultWidth);
+  await page.setViewportSize({ width: 1600, height: 960 });
+  await page.waitForFunction(() => document.querySelector(".clipping-gallery__row")?.children.length === 4);
   if (process.env.LINKVAULT_CLIPPING_SCREENSHOT) {
     await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_SCREENSHOT });
   }
+  await firstCard.click();
+  await page.locator(".clipping-detail").waitFor();
+  await page.getByLabel("Clipping note editor body").waitFor();
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 1, "thumbnail selection did not fetch exactly one clipping detail");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), true, "detail did not lazy-load the editor chunk");
+  await page.getByRole("button", { name: "Back to clippings" }).click();
+  await page.locator(".clipping-gallery").waitFor();
+  await page.locator(".clipping-gallery__card").first().click();
+  await page.getByLabel("Clipping note editor body").waitFor();
 
   const title = page.locator(".clipping-detail__title input");
   await title.fill("Transit evidence note");
@@ -212,6 +238,9 @@ try {
   const searchOffsets = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.searchCalls.map((call) => call.offset));
   assert.ok(searchOffsets.includes(50), "search scrolling did not lazy-load the next 50 results");
   await page.getByLabel("Clear clipping search").click();
+  await page.locator(".clipping-gallery").waitFor();
+  assert.equal(await page.locator(".clipping-detail").count(), 0, "clearing search bypassed the clipping gallery");
+  await page.locator(".clipping-gallery__card").first().click();
   await page.locator(".clipping-detail").waitFor();
 
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.conflictNext = true; });
@@ -236,6 +265,12 @@ try {
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.rootChecks), 1);
   await page.getByRole("button", { name: "Close", exact: true }).click();
 
+  await page.getByRole("button", { name: "Clippings", exact: true }).click();
+  await page.locator(".clipping-gallery").waitFor();
+  assert.equal(await page.locator(".clipping-detail").count(), 0, "Clippings navigation did not return to the gallery");
+  await page.locator(".clipping-gallery__card").first().click();
+  await page.getByLabel("Clipping note editor body").waitFor();
+
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.failNext = true; });
   await title.fill("Draft that initially fails");
   await page.waitForTimeout(950);
@@ -248,7 +283,7 @@ try {
   await page.locator(".newspaper-download").waitFor();
 
   assert.deepEqual(consoleErrors, [], `browser console/page errors: ${consoleErrors.join("\n")}`);
-  console.log("Clipping library browser matrix passed: virtualization, lazy editor, autosave, search paging/tags, conflict, roots, and guarded navigation.");
+  console.log("Clipping library browser matrix passed: responsive four-column gallery, contained title veil, lazy thumbnails/detail/editor, autosave, search paging/tags, conflict, roots, and guarded navigation.");
 } finally {
   await browser.close();
 }

@@ -1,6 +1,7 @@
-import { FileText, LoaderCircle } from "lucide-react";
+import { ArrowLeft, LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { Button } from "../primitives";
 import { getNewspaperClipping, type NewspaperClippingDetail } from "./newspaper-api";
 import { NewspaperClippingDetail as ClippingDetailView } from "./NewspaperClippingDetail";
 import { NewspaperClippingList } from "./NewspaperClippingList";
@@ -39,6 +40,17 @@ export function NewspaperClippings({
     setSelectedId(id);
   }, [selectedId]);
 
+  const returnToGallery = useCallback(async () => {
+    if (detailFlushRef.current && !(await detailFlushRef.current())) {
+      toast.error("This note still has unsaved changes", {
+        description: "Retry the save or resolve the conflict before returning to your clippings."
+      });
+      return;
+    }
+    setRegisteredFlush(null);
+    setSelectedId(null);
+  }, [setRegisteredFlush]);
+
   useEffect(() => {
     if (!pendingClippingId) return;
     void select(pendingClippingId).finally(onPendingConsumed);
@@ -46,7 +58,10 @@ export function NewspaperClippings({
 
   useEffect(() => {
     if (!selectedId) {
+      requestGenerationRef.current += 1;
       setDetail(null);
+      setLoading(false);
+      setError("");
       return;
     }
     const generation = requestGenerationRef.current + 1;
@@ -68,33 +83,28 @@ export function NewspaperClippings({
       });
   }, [selectedId]);
 
+  if (!selectedId) {
+    return <NewspaperClippingList onSelect={(id) => void select(id)} />;
+  }
+
   return (
-    <section className="clippings-workspace" aria-label="Newspaper clippings">
-      <header className="clippings-workspace__header">
+    <section className="clipping-note-page" aria-label="Clipping note">
+      <header className="clipping-note-page__header">
+        <Button onClick={() => void returnToGallery()} size="sm" variant="ghost">
+          <ArrowLeft aria-hidden="true" /> Back to clippings
+        </Button>
         <div>
-          <span className="clippings-workspace__eyebrow">World Journal · local evidence</span>
-          <h2>Clippings</h2>
-          <p>Saved source images and searchable notes stay together, even when an edition is removed.</p>
+          <span>Clipping note</span>
+          <strong>{detail?.title ?? "Opening clipping"}</strong>
         </div>
       </header>
-      <div className="clippings-workspace__body">
-        <NewspaperClippingList selectedId={selectedId} onSelect={(id) => void select(id)} />
-        <main className="clippings-workspace__detail">
-          {loading ? <div className="clipping-detail-state"><LoaderCircle aria-hidden="true" className="animate-spin" /> Loading clipping…</div> : null}
-          {!loading && error ? <div className="clipping-detail-state" role="alert">Could not load this clipping. {error}</div> : null}
-          {!loading && !error && !detail ? (
-            <div className="clipping-detail-state"><FileText aria-hidden="true" /> Select a clipping to open its note.</div>
-          ) : null}
-          {!loading && detail ? (
-            <ClippingDetailView
-              detail={detail}
-              key={detail.id}
-              onSaved={setDetail}
-              registerFlush={setRegisteredFlush}
-            />
-          ) : null}
-        </main>
-      </div>
+      <main className="clipping-note-page__body">
+        {loading ? <div className="clipping-detail-state"><LoaderCircle aria-hidden="true" className="animate-spin" /> Loading clipping…</div> : null}
+        {!loading && error ? <div className="clipping-detail-state" role="alert">Could not load this clipping. {error}</div> : null}
+        {!loading && detail ? (
+          <ClippingDetailView detail={detail} key={detail.id} onSaved={setDetail} registerFlush={setRegisteredFlush} />
+        ) : null}
+      </main>
     </section>
   );
 }
