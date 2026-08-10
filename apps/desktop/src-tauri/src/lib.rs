@@ -6,6 +6,7 @@ pub use app::newspaper_clipping_crop_baseline as crop_baseline;
 mod providers;
 pub mod workflow;
 
+use app::cooperative_exit::{CooperativeExit, ExitReason, WaitOutcome};
 use app::updates as app_updates;
 pub use app::{database as cache, security, storage};
 pub use providers::linkedin::{
@@ -18,60 +19,68 @@ pub use providers::{coursera, newspaper};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::{Emitter, Manager};
 
-#[derive(Clone, Default)]
-struct CooperativeQuit {
-    inner: std::sync::Arc<CooperativeQuitInner>,
-}
-
-#[derive(Default)]
-struct CooperativeQuitInner {
-    next_token: std::sync::atomic::AtomicU64,
-    confirmed: std::sync::Mutex<Option<u64>>,
-    changed: std::sync::Condvar,
-}
-
-impl CooperativeQuit {
-    fn request(&self) -> u64 {
-        let token = self
-            .inner
-            .next_token
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1);
-        *self
-            .inner
-            .confirmed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        token
-    }
-
-    fn confirm(&self, token: u64) {
-        *self
-            .inner
-            .confirmed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
-        self.inner.changed.notify_all();
-    }
-
-    fn wait(&self, token: u64, timeout: std::time::Duration) -> bool {
-        let confirmed = self
-            .inner
-            .confirmed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (confirmed, _) = self
-            .inner
-            .changed
-            .wait_timeout_while(confirmed, timeout, |value| *value != Some(token))
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *confirmed == Some(token)
-    }
-}
-
 #[tauri::command]
-fn confirm_cooperative_quit(state: tauri::State<'_, CooperativeQuit>, token: u64) {
-    state.confirm(token);
+fn resolve_cooperative_exit(
+    state: tauri::State<'_, CooperativeExit>,
+    token: u64,
+    durable: bool,
+) -> bool {
+    state.resolve(token, durable)
+}
+
+fn restore_main_window(app: &tauri::AppHandle, reason: ExitReason) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit(
+        "linkvault://exit-blocked",
+        serde_json::json!({ "reason": reason }),
+    );
+}
+
+fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
+    const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let coordinator = app.state::<CooperativeExit>().inner().clone();
+    let request = coordinator.request(reason);
+    if !request.started {
+        return;
+    }
+    if app
+        .emit(
+            "linkvault://prepare-exit",
+            serde_json::json!({
+                "token": request.token,
+                "reason": reason,
+                "deadlineMs": EXIT_TIMEOUT.as_millis()
+            }),
+        )
+        .is_err()
+    {
+        coordinator.resolve(request.token, false);
+    }
+    let handle = app.clone();
+    std::thread::spawn(
+        move || match coordinator.wait(request.token, EXIT_TIMEOUT) {
+            WaitOutcome::Durable(ExitReason::Close) => {
+                let hidden = handle
+                    .get_webview_window("main")
+                    .is_some_and(|window| window.hide().is_ok());
+                if !hidden {
+                    restore_main_window(&handle, ExitReason::Close);
+                }
+            }
+            WaitOutcome::Durable(ExitReason::Exit) => {
+                coordinator.authorize_exit();
+                handle.exit(0);
+            }
+            WaitOutcome::Blocked(reason) | WaitOutcome::TimedOut(reason) => {
+                restore_main_window(&handle, reason);
+            }
+            WaitOutcome::Stale => {}
+        },
+    );
 }
 
 pub fn run() {
@@ -118,7 +127,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_updates::check_for_app_update,
             app_updates::install_app_update,
-            confirm_cooperative_quit,
+            resolve_cooperative_exit,
             commands::bootstrap_state,
             commands::cancel_active_download,
             commands::clear_failed_download_jobs,
@@ -268,7 +277,7 @@ pub fn run() {
             app.manage(newspaper::commands::NewspaperState::new(db_path));
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
-            app.manage(CooperativeQuit::default());
+            app.manage(CooperativeExit::default());
 
             // Taskbar + tray icon: the All-in-One Downloader icon, embedded
             // at compile time so the binary has no runtime file dependency.
@@ -307,31 +316,7 @@ pub fn run() {
                             }
                         }
                         "quit" => {
-                            let quit = app.state::<CooperativeQuit>().inner().clone();
-                            let token = quit.request();
-                            if app
-                                .emit(
-                                    "linkvault://quit-requested",
-                                    serde_json::json!({ "token": token }),
-                                )
-                                .is_err()
-                            {
-                                return;
-                            }
-                            let handle = app.clone();
-                            std::thread::spawn(move || {
-                                if quit.wait(token, std::time::Duration::from_secs(15)) {
-                                    handle.exit(0);
-                                } else if let Some(window) = handle.get_webview_window("main") {
-                                    let _ = window.show();
-                                    let _ = window.unminimize();
-                                    let _ = window.set_focus();
-                                    let _ = handle.emit(
-                                        "linkvault://quit-blocked",
-                                        serde_json::json!({ "token": token }),
-                                    );
-                                }
-                            });
+                            request_cooperative_exit(app, ExitReason::Exit);
                         }
                         _ => {}
                     })
@@ -340,14 +325,27 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                request_cooperative_exit(window.app_handle(), ExitReason::Close);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building LinkVault");
 
-    app.run(|handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) {
+    app.run(|handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let coordinator = handle.state::<CooperativeExit>();
+            if !coordinator.consume_exit_authorization() {
+                api.prevent_exit();
+                request_cooperative_exit(handle, ExitReason::Exit);
+            }
+        }
+        tauri::RunEvent::Exit => {
             handle
                 .state::<newspaper::clipping_service::ClippingService>()
                 .shutdown_crop_service();
@@ -355,5 +353,6 @@ pub fn run() {
                 .state::<app::database_writer::DatabaseWriter>()
                 .shutdown();
         }
+        _ => {}
     });
 }

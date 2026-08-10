@@ -60,7 +60,7 @@ assert.ok(search.includes("Possible matches"), "possible matches are not separat
 assert.ok(roots.includes("Created automatically from Newspaper download destinations"), "Settings copy permits an arbitrary root model");
 assert.ok(!roots.includes("<Input"), "snapshot root Settings added an arbitrary path input");
 assert.ok(service.includes("write_thumbnail_cache"), "thumbnail generation does not use the bounded cache owner");
-assert.ok(lib.includes("linkvault://quit-requested") && lib.includes("confirm_cooperative_quit"), "tray quit is not cooperative");
+assert.ok(lib.includes("linkvault://prepare-exit") && lib.includes("resolve_cooperative_exit"), "tray quit is not cooperative");
 
 async function sourceFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
