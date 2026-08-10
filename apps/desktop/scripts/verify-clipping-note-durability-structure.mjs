@@ -41,6 +41,7 @@ const exitBridge = loaded.get("src/components/newspaper/useClippingNoteExitBridg
 const durabilityApi = loaded.get("src/components/newspaper/clipping-note-durability-api.ts");
 const newspaperApi = await source("src/components/newspaper/newspaper-api.ts");
 const packageJson = JSON.parse(await source("package.json"));
+const performanceReport = JSON.parse(await source("../../docs/performance/newspaper-clipping-note-durability-windows-2026-08-10.json"));
 
 assert.ok(app.includes("useClippingNoteExitBridge") && !app.includes("linkvault://prepare-exit"), "App owns native exit protocol instead of the exit bridge");
 assert.ok(exitBridge.includes("linkvault://prepare-exit") && exitBridge.includes("resolve_cooperative_exit"), "renderer exit bridge omits tokenized native preparation");
@@ -103,5 +104,11 @@ assert.ok(cargoManifest.includes("durability-baseline = []"), "release durabilit
 assert.ok(cargoManifest.includes('required-features = ["durability-baseline"]'), "durability example is not feature-gated");
 assert.ok(durabilityBaseline.includes("TEN_MINUTE_MAX_WAIT_WRITES: usize = 300"), "ten-minute write bound is not measured");
 assert.ok(!durabilityBaseline.includes("thread::sleep"), "durability collector uses time-based sleeps");
+assert.equal(performanceReport.source.nativeCollectorCommit, "879dab1", "durability report lost clean native provenance");
+assert.equal(performanceReport.source.browserMatrixCommit, "17599b8", "durability report lost clean browser provenance");
+assert.equal(performanceReport.tenMinuteEquivalent.checkpointWrites, 300, "durability report does not contain the approved ten-minute workload");
+assert.equal(performanceReport.tenMinuteEquivalent.failedWrites, 0, "durability report records failed checkpoint writes");
+assert.equal(performanceReport.tenMinuteEquivalent.finalDraftRows, 1, "durability report no longer proves one-row upsert behavior");
+assert.equal(performanceReport.nativeUat.startsWith("Pending"), true, "browser evidence was mislabeled as native UAT");
 
 console.log("Clipping note durability ownership, size, native authority, SQL, and gate contracts passed.");
