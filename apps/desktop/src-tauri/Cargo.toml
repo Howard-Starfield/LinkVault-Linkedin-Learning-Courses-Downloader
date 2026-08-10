@@ -13,9 +13,23 @@ default-run = "linkvault"
 name = "linkvault_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+crop-baseline = []
+durability-baseline = []
+
 [[bin]]
 name = "linkvault"
 path = "src/main.rs"
+
+[[example]]
+name = "newspaper_clipping_crop_baseline"
+path = "examples/newspaper_clipping_crop_baseline.rs"
+required-features = ["crop-baseline"]
+
+[[example]]
+name = "newspaper_clipping_note_durability_baseline"
+path = "examples/newspaper_clipping_note_durability_baseline.rs"
+required-features = ["durability-baseline"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -40,6 +54,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "time"] }
 url = "2"
+unicode-normalization = "0.1.25"
 webp = "0.3"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",

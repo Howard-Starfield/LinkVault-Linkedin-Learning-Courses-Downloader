@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
+  ArrowLeft,
   CalendarClock,
   ChevronDown,
   CircleHelp,
@@ -20,7 +21,9 @@ import {
   Play,
   Plus,
   RotateCcw,
+  Search,
   Settings,
+  StickyNote,
   SunMedium,
   Trash2,
   X
@@ -54,6 +57,11 @@ import {
 } from "./components/primitives";
 import { CourseraView } from "./components/coursera/CourseraView";
 import { NewspaperView } from "./components/newspaper/NewspaperView";
+import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
+import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
+import { NewspaperSnapshotRootsSettings } from "./components/newspaper/NewspaperSnapshotRootsSettings";
+import { useClippingNoteExitBridge } from "./components/newspaper/useClippingNoteExitBridge";
+import { useNewspaperClippingNavigation } from "./components/newspaper/useNewspaperClippingNavigation";
 import {
   NEWSPAPER_PAGE_TONES,
   NEWSPAPER_READER_ZOOM_MAX,
@@ -232,7 +240,7 @@ const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
 const APP_VERSION = "0.2.15";
 type AppTheme = "light" | "dark";
-type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library";
+type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings";
 
 function readInitialTheme(): AppTheme {
   if (typeof window === "undefined") return "dark";
@@ -346,6 +354,13 @@ export default function App() {
   const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>(null);
   const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<AppView>("downloads");
+  const [clippingGallerySummary, setClippingGallerySummary] = useState<{
+    total: number;
+    loading: boolean;
+  } | null>(null);
+  const [isClippingDetailOpen, setIsClippingDetailOpen] = useState(false);
+  const [globalSearchQuery, setGlobalSearchQuery] = useState("");
+  const [activeSearchQuery, setActiveSearchQuery] = useState("");
   const [isLinkedInExpanded, setIsLinkedInExpanded] = useState(true);
   const [isCourseraExpanded, setIsCourseraExpanded] = useState(true);
   const [isNewspaperExpanded, setIsNewspaperExpanded] = useState(true);
@@ -365,12 +380,84 @@ export default function App() {
   const sidebarDragAnimationFrame = useRef<number | null>(null);
   const sidebarDragCleanup = useRef<(() => void) | null>(null);
   const wasSettingsOpen = useRef(false);
+  const clippingFlushRef = useRef<ClippingFlush | null>(null);
+  const navigationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const searchRequestGenerationRef = useRef(0);
+  const clippingGalleryScrollTopRef = useRef(0);
+  const preSearchScrollRef = useRef(0);
   const automaticScheduleWaitRange = useMemo(
     () => calculateAutomaticScheduleWaitRange(scheduleWindowHours, scheduleCourseCount),
     [scheduleWindowHours, scheduleCourseCount]
   );
   const scheduleMinWaitMinutes = automaticScheduleWaitRange.minWaitMinutes;
   const scheduleMaxWaitMinutes = automaticScheduleWaitRange.maxWaitMinutes;
+
+  const registerClippingFlush = useCallback((flush: ClippingFlush | null) => {
+    clippingFlushRef.current = flush;
+  }, []);
+  const recordClippingGalleryScroll = useCallback((scrollTop: number) => {
+    clippingGalleryScrollTopRef.current = scrollTop;
+  }, []);
+  useClippingNoteExitBridge(isTauriRuntime(), clippingFlushRef);
+
+  const requestNavigation = useCallback((
+    nextView: AppView,
+    options: { preserveClippingContext?: boolean } = {}
+  ) => {
+    let allowed = false;
+    const task = navigationQueueRef.current.then(async () => {
+      const flush = clippingFlushRef.current;
+      if (flush && !(await flush())) {
+        toast.error("Navigation paused", {
+          description: "Your clipping draft is still unsaved. Retry the save or resolve the conflict first."
+        });
+        return;
+      }
+      if (nextView !== "newspaper-clippings" && !options.preserveClippingContext) {
+        setGlobalSearchQuery("");
+        setActiveSearchQuery("");
+        setIsClippingDetailOpen(false);
+      }
+      setActiveView(nextView);
+      allowed = true;
+    });
+    navigationQueueRef.current = task.then(() => undefined, () => undefined);
+    return task.then(() => allowed);
+  }, []);
+
+  const clippingNavigation = useNewspaperClippingNavigation({
+    requestNavigation,
+    setDetailOpen: setIsClippingDetailOpen,
+    setNewspaperExpanded: setIsNewspaperExpanded
+  });
+
+  async function updateGlobalSearch(nextRaw: string) {
+    const next = [...nextRaw].slice(0, 200).join("");
+    const generation = searchRequestGenerationRef.current + 1;
+    searchRequestGenerationRef.current = generation;
+    setGlobalSearchQuery(next);
+    if (!next.trim()) {
+      setActiveSearchQuery("");
+      window.requestAnimationFrame(() => {
+        const content = document.querySelector<HTMLElement>(".lv-content");
+        if (content) content.scrollTop = preSearchScrollRef.current;
+      });
+      return;
+    }
+    if (!activeSearchQuery) {
+      const content = document.querySelector<HTMLElement>(".lv-content");
+      preSearchScrollRef.current = content?.scrollTop ?? 0;
+      const flush = clippingFlushRef.current;
+      if (flush && !(await flush())) {
+        if (generation === searchRequestGenerationRef.current) setGlobalSearchQuery("");
+        toast.error("Search paused", {
+          description: "Save or resolve the current clipping note before leaving its editor."
+        });
+        return;
+      }
+    }
+    if (generation === searchRequestGenerationRef.current) setActiveSearchQuery(next);
+  }
 
   useEffect(() => {
     void refreshBootstrapState().then((state) => {
@@ -1292,6 +1379,12 @@ export default function App() {
       });
       return;
     }
+    if (clippingFlushRef.current && !(await clippingFlushRef.current())) {
+      toast.error("Update paused", {
+        description: "Save or resolve the current clipping note before installing an update."
+      });
+      return;
+    }
 
     setIsInstallingUpdate(true);
     try {
@@ -1384,8 +1477,14 @@ export default function App() {
     return queuedJobs.filter((job) => job.status === "active" && !job.paused).length;
   }
 
-  function requestResetProvider(provider: ResetProvider) {
+  async function requestResetProvider(provider: ResetProvider) {
     if (resetInProgress || pausingForReset || pendingResetProvider) return;
+    if (clippingFlushRef.current && !(await clippingFlushRef.current())) {
+      toast.error("Reset paused", {
+        description: "Your clipping draft must be saved or resolved before resetting provider data."
+      });
+      return;
+    }
     setPendingResetProvider(provider);
   }
 
@@ -1414,8 +1513,12 @@ export default function App() {
       if (provider === "linkedin") {
         await refreshBootstrapState();
       }
-      toast.success(`${resetProviderLabel(provider)} database cleared`, {
-        description: cleared,
+      toast.success(provider === "newspaper"
+        ? "World Journal download data was reset"
+        : `${resetProviderLabel(provider)} database cleared`, {
+        description: provider === "newspaper"
+          ? `Your saved clippings and notes were preserved. ${cleared}`
+          : cleared,
         action: outputDirs.length > 0
           ? {
               label: "Open output folder",
@@ -1639,11 +1742,11 @@ export default function App() {
                 if (isCurrentProvider) {
                   setIsLinkedInExpanded((expanded) => {
                     const nextExpanded = !expanded;
-                    if (nextExpanded) setActiveView("downloads");
+                    if (nextExpanded) void requestNavigation("downloads");
                     return nextExpanded;
                   });
                 } else {
-                  setActiveView("downloads");
+                  void requestNavigation("downloads");
                   setIsLinkedInExpanded(true);
                 }
               }}
@@ -1656,7 +1759,7 @@ export default function App() {
                 active={activeView === "downloads"}
                 icon={<Download aria-hidden="true" />}
                 aria-label="Download LinkedIn courses"
-                onClick={() => setActiveView("downloads")}
+                onClick={() => void requestNavigation("downloads")}
               >
                 Download LinkedIn
               </SidebarItem>
@@ -1665,7 +1768,7 @@ export default function App() {
                 active={activeView === "linkedin-history"}
                 icon={<History aria-hidden="true" />}
                 aria-label="LinkedIn download history"
-                onClick={() => setActiveView("linkedin-history")}
+                onClick={() => void requestNavigation("linkedin-history")}
               >
                 Download history
               </SidebarItem>
@@ -1681,11 +1784,11 @@ export default function App() {
                 if (isCurrentProvider) {
                   setIsCourseraExpanded((expanded) => {
                     const nextExpanded = !expanded;
-                    if (nextExpanded) setActiveView("coursera");
+                    if (nextExpanded) void requestNavigation("coursera");
                     return nextExpanded;
                   });
                 } else {
-                  setActiveView("coursera");
+                  void requestNavigation("coursera");
                   setIsCourseraExpanded(true);
                 }
               }}
@@ -1698,7 +1801,7 @@ export default function App() {
                 active={activeView === "coursera"}
                 icon={<Download aria-hidden="true" />}
                 aria-label="Download Coursera courses"
-                onClick={() => setActiveView("coursera")}
+                onClick={() => void requestNavigation("coursera")}
               >
                 Download Coursera
               </SidebarItem>
@@ -1707,7 +1810,7 @@ export default function App() {
                 active={activeView === "coursera-history"}
                 icon={<History aria-hidden="true" />}
                 aria-label="Coursera download history"
-                onClick={() => setActiveView("coursera-history")}
+                onClick={() => void requestNavigation("coursera-history")}
               >
                 Download history
               </SidebarItem>
@@ -1719,15 +1822,15 @@ export default function App() {
               trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
               aria-expanded={isNewspaperExpanded}
               onClick={() => {
-                const isCurrentProvider = activeView === "newspaper-download" || activeView === "newspaper-library";
+                const isCurrentProvider = activeView === "newspaper-download" || activeView === "newspaper-library" || activeView === "newspaper-clippings";
                 if (isCurrentProvider) {
                   setIsNewspaperExpanded((expanded) => {
                     const nextExpanded = !expanded;
-                    if (nextExpanded) setActiveView("newspaper-download");
+                    if (nextExpanded) void requestNavigation("newspaper-download");
                     return nextExpanded;
                   });
                 } else {
-                  setActiveView("newspaper-download");
+                  void requestNavigation("newspaper-download");
                   setIsNewspaperExpanded(true);
                 }
               }}
@@ -1739,7 +1842,7 @@ export default function App() {
                 className="lv-nav-child"
                 active={activeView === "newspaper-download"}
                 icon={<Download aria-hidden="true" />}
-                onClick={() => setActiveView("newspaper-download")}
+                onClick={() => void requestNavigation("newspaper-download")}
               >
                 Download editions
               </SidebarItem>
@@ -1747,9 +1850,17 @@ export default function App() {
                 className="lv-nav-child"
                 active={activeView === "newspaper-library"}
                 icon={<History aria-hidden="true" />}
-                onClick={() => setActiveView("newspaper-library")}
+                onClick={() => void requestNavigation("newspaper-library")}
               >
                 Newspaper library
+              </SidebarItem>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "newspaper-clippings"}
+                icon={<StickyNote aria-hidden="true" />}
+                onClick={() => void clippingNavigation.openGallery()}
+              >
+                Clippings
               </SidebarItem>
             </div>
           </div>
@@ -1833,7 +1944,7 @@ export default function App() {
           onMouseDown={startSidebarResize}
         />
       </aside>
-      <main className="lv-main">
+      <main className="lv-main" data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>
         <button
           type="button"
           className="lv-sidebar-reopen"
@@ -1844,6 +1955,42 @@ export default function App() {
         >
           <PanelLeft aria-hidden="true" className="h-4 w-4" />
         </button>
+        {activeView === "newspaper-clippings" ? (
+          <div
+            className="lv-global-search"
+            data-detail={isClippingDetailOpen ? "true" : "false"}
+            role={isClippingDetailOpen ? undefined : "search"}
+          >
+            {isClippingDetailOpen ? (
+              <>
+                <button className="lv-global-search__back" onClick={() => void clippingNavigation.openGallery()} type="button">
+                  <ArrowLeft aria-hidden="true" /> Back
+                </button>
+                <div className="lv-global-search__title-slot" id="clipping-detail-title-slot" />
+              </>
+            ) : (
+              <>
+                <Search aria-hidden="true" />
+                <input
+                  aria-label="Search saved newspaper clippings"
+                  onChange={(event) => void updateGlobalSearch(event.target.value)}
+                  placeholder="Search titles, notes, editions, dates, or pages"
+                  value={globalSearchQuery}
+                />
+                {globalSearchQuery ? (
+                  <button aria-label="Clear clipping search" onClick={() => void updateGlobalSearch("")} type="button">
+                    <X aria-hidden="true" />
+                  </button>
+                ) : clippingGallerySummary ? (
+                  <div className="lv-global-search__context">
+                    <strong>Clippings</strong>
+                    <span>{clippingGallerySummary.loading ? "Loading" : `${clippingGallerySummary.total} clipping${clippingGallerySummary.total === 1 ? "" : "s"}`}</span>
+                  </div>
+                ) : <span>Clippings</span>}
+              </>
+            )}
+          </div>
+        ) : null}
         <div className="lv-content">
           {pendingUpdate && !updateBannerDismissed && (
             <div className="update-banner" role="status" aria-live="polite">
@@ -1876,14 +2023,37 @@ export default function App() {
               </div>
             </div>
           )}
-          {activeView === "coursera" ? (
+          {activeView === "newspaper-clippings" && activeSearchQuery && !isClippingDetailOpen && !clippingNavigation.pendingClippingId ? (
+            <NewspaperClippingSearch query={activeSearchQuery} onOpen={(id) => void clippingNavigation.openClipping(id)} />
+          ) : activeView === "coursera" ? (
             <CourseraView />
           ) : activeView === "coursera-history" ? (
             <CourseraView mode="history" />
           ) : activeView === "newspaper-download" ? (
             <NewspaperView />
           ) : activeView === "newspaper-library" ? (
-            <NewspaperView mode="library" />
+            <NewspaperView
+              mode="library"
+              onOpenClipping={(id) => void clippingNavigation.openClipping(id, true)}
+              onReturnClipping={(id) => void clippingNavigation.openClipping(id, false, true)}
+              onReaderTargetConsumed={clippingNavigation.consumeReaderTarget}
+              readerTarget={clippingNavigation.pendingReaderTarget}
+            />
+          ) : activeView === "newspaper-clippings" ? (
+            <NewspaperClippings
+              key={clippingNavigation.clippingsViewKey}
+              onGallerySummaryChange={setClippingGallerySummary}
+              initialGalleryScrollTop={clippingGalleryScrollTopRef.current}
+              onDetailStateChange={setIsClippingDetailOpen}
+              onGalleryScrollTopChange={recordClippingGalleryScroll}
+              onOpenLibrary={() => void requestNavigation("newspaper-library")}
+              onOpenSource={(detail) => void clippingNavigation.openSource(detail)}
+              onPendingConsumed={clippingNavigation.consumePendingClipping}
+              pendingFocusEditor={clippingNavigation.pendingFocusEditor}
+              pendingFocusSource={clippingNavigation.pendingFocusSource}
+              pendingClippingId={clippingNavigation.pendingClippingId}
+              registerFlush={registerClippingFlush}
+            />
           ) : activeView === "linkedin-history" ? (
             <HistoryPage
               entries={downloadHistory}
@@ -2336,6 +2506,7 @@ export default function App() {
               Repair existing
             </Button>
           </div>
+          <NewspaperSnapshotRootsSettings open={isSettingsOpen} />
           <div className="settings-section-subtitle">Optimization governor</div>
           <div className="settings-two-column">
             <Field label="Memory per worker (MB)">
@@ -2501,11 +2672,19 @@ export default function App() {
     >
       {pendingResetProvider ? (
         <div className="reset-confirm">
-          <p>
-            Clearing the {resetProviderLabel(pendingResetProvider)} database removes the in-app records
-            for that provider. Files you have already saved to your download folder are <strong>not</strong> deleted.
-            Your saved LinkedIn <code>li_at</code> cookie is preserved.
-          </p>
+          {pendingResetProvider === "newspaper" ? (
+            <p>
+              Resetting World Journal removes downloaded-edition records, reading progress,
+              schedules, and generated newspaper previews. <strong>Your saved clippings and
+              clipping notes are preserved.</strong>
+            </p>
+          ) : (
+            <p>
+              Clearing the {resetProviderLabel(pendingResetProvider)} database removes the in-app records
+              for that provider. Files you have already saved to your download folder are <strong>not</strong> deleted.
+              Your saved LinkedIn <code>li_at</code> cookie is preserved.
+            </p>
+          )}
           <ul className="reset-confirm-list">
             {pendingResetProvider === "linkedin" ? (
               <>
@@ -2526,6 +2705,7 @@ export default function App() {
                 <li>Thumbnail cache, optimization ledger, reading progress</li>
                 <li>Newspaper schedules and provider settings</li>
                 <li>On-disk <code>newspaper-thumbnails/</code> directory</li>
+                <li>Saved clipping images, notes, and Snapshot locations are preserved</li>
               </>
             ) : null}
           </ul>

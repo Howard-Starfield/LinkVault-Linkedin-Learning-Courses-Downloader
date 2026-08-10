@@ -20,7 +20,7 @@ use thiserror::Error;
 // Bump this whenever any provider-owned schema changes. Provider migrations run
 // only while advancing this global version, so leaving it unchanged would make
 // existing installations skip new columns that fresh databases already have.
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 6;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -393,6 +393,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.execute_batch(SCHEMA)?;
     crate::newspaper::storage::initialize(connection)?;
+    crate::app::database_migrations::migrate(connection)?;
     migrate_jobs_download_quizzes(connection)?;
     migrate_jobs_source_url(connection)?;
     migrate_jobs_quiz_hints(connection)?;
@@ -1545,6 +1546,19 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
         connection
+    }
+
+    fn drop_clipping_search_derived_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS newspaper_clippings_fts_ai;
+                 DROP TRIGGER IF EXISTS newspaper_clippings_fts_ad;
+                 DROP TRIGGER IF EXISTS newspaper_clippings_fts_au;
+                 DROP TABLE IF EXISTS newspaper_clippings_fts;
+                 DROP TABLE IF EXISTS newspaper_clippings_normalized_fts;
+                 DROP TABLE IF EXISTS newspaper_clipping_search_metadata;",
+            )
+            .unwrap();
     }
 
     #[test]
@@ -2789,7 +2803,7 @@ mod tests {
         source_checksum_snapshot, edition_code_snapshot, edition_name_snapshot,
         publication_date_snapshot, page_number_snapshot, source_pixel_width,
         source_pixel_height, crop_x, crop_y, crop_width, crop_height,
-        asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
+        asset_root_id, asset_relative_path, asset_mime_type, asset_pixel_width, asset_pixel_height,
         asset_byte_count, asset_checksum_sha256, asset_version, asset_state,
         asset_error_code, title, note_markdown, revision, created_at, updated_at)";
 
@@ -2904,7 +2918,7 @@ mod tests {
                     "INSERT INTO newspaper_clippings {CLIPPING_TEST_COLUMNS}
                      VALUES (?1, 'np-job', 'np-page', 2, 'optimized', 'image/webp', NULL,
                              'NY', 'New York', '2026-08-01', 'A01', 800, 1200,
-                             10, 20, 300, 400, ?2, 'image/webp', 300, 400, 64,
+                             10, 20, 300, 400, 'legacy-managed-v1', ?2, 'image/webp', 300, 400, 64,
                              '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
                              1, ?3, ?4, 'Title', 'note body', 1, 100, 100)"
                 ),
@@ -2944,7 +2958,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(index_count, 6);
+        assert_eq!(index_count, 7);
         let fk_actions: Vec<(String, String)> = connection
             .prepare("PRAGMA foreign_key_list(newspaper_clippings)")
             .unwrap()
@@ -2954,8 +2968,31 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(fk_actions.len(), 2);
-        assert!(fk_actions.iter().all(|(_, action)| action == "SET NULL"));
+        assert_eq!(fk_actions.len(), 3);
+        assert!(fk_actions
+            .iter()
+            .any(|(table, action)| table == "newspaper_clipping_roots" && action == "RESTRICT"));
+        assert_eq!(
+            fk_actions
+                .iter()
+                .filter(|(_, action)| action == "SET NULL")
+                .count(),
+            2
+        );
+        let legacy_root: (String, String) = connection
+            .query_row(
+                "SELECT kind, locator FROM newspaper_clipping_roots WHERE id = 'legacy-managed-v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_root,
+            (
+                "legacy_managed".to_owned(),
+                "app-data:newspaper-clippings".to_owned()
+            )
+        );
         let backup_count = fs::read_dir(directory.path())
             .unwrap()
             .filter_map(std::result::Result::ok)
@@ -2979,9 +3016,11 @@ mod tests {
             legacy.pragma_update(None, "foreign_keys", true).unwrap();
             initialize(&legacy).unwrap();
             insert_representative_provider_rows(&legacy);
+            drop_clipping_search_derived_fixture(&legacy);
             legacy
                 .execute_batch(
                     "DROP TABLE newspaper_clippings;
+                 DROP TABLE newspaper_clipping_roots;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_updated;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_created;
                  DROP INDEX IF EXISTS idx_newspaper_clippings_publication;
@@ -3142,6 +3181,217 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_v3_clippings_backfill_to_legacy_root_with_verified_backup() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            insert_test_clipping(
+                &legacy,
+                "11111111-1111-4111-8111-111111111111",
+                "ready",
+                None,
+            );
+            legacy.pragma_update(None, "foreign_keys", false).unwrap();
+            drop_clipping_search_derived_fixture(&legacy);
+            legacy
+                .execute_batch(
+                    "CREATE TABLE newspaper_clippings_v3_fixture AS
+                         SELECT id, source_job_id, source_page_id,
+                            source_media_version_snapshot, source_kind_snapshot,
+                            source_mime_type_snapshot, source_checksum_snapshot,
+                            edition_code_snapshot, edition_name_snapshot,
+                            publication_date_snapshot, page_number_snapshot,
+                            source_pixel_width, source_pixel_height, crop_x, crop_y,
+                            crop_width, crop_height, asset_relative_path, asset_mime_type,
+                            asset_pixel_width, asset_pixel_height, asset_byte_count,
+                            asset_checksum_sha256, asset_version, asset_state,
+                            asset_error_code, title, note_markdown, revision,
+                            created_at, updated_at
+                         FROM newspaper_clippings;
+                     DROP TABLE newspaper_clippings;
+                     ALTER TABLE newspaper_clippings_v3_fixture RENAME TO newspaper_clippings;
+                     DROP TABLE newspaper_clipping_roots;
+                     PRAGMA user_version = 3;",
+                )
+                .unwrap();
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 3);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        assert!(initialization.backup_path.unwrap().is_file());
+        let migrated: (String, String, String) = connection
+            .query_row(
+                "SELECT asset_root_id, asset_relative_path, note_markdown
+                 FROM newspaper_clippings WHERE id = '11111111-1111-4111-8111-111111111111'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated.0, "legacy-managed-v1");
+        assert_eq!(
+            migrated.1,
+            "assets/11111111-1111-4111-8111-111111111111/clipping-v1.webp"
+        );
+        assert_eq!(migrated.2, "note body");
+        let foreign_key_check: usize = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+    }
+
+    #[test]
+    fn persistence_gate_v4_clippings_receive_verified_fts_migration_backup() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            insert_test_clipping(
+                &legacy,
+                "44444444-4444-4444-8444-444444444444",
+                "ready",
+                None,
+            );
+            drop_clipping_search_derived_fixture(&legacy);
+            legacy.execute_batch("PRAGMA user_version = 4;").unwrap();
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 4);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let backup_path = initialization
+            .backup_path
+            .expect("populated v4 database must receive a verified backup");
+        let backup = Connection::open(backup_path).unwrap();
+        assert_eq!(schema_version(&backup).unwrap(), 4);
+        for table in [
+            "newspaper_clippings_fts",
+            "newspaper_clippings_normalized_fts",
+            "newspaper_clipping_search_metadata",
+        ] {
+            let exists: bool = backup
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = ?1
+                    )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "v4 backup unexpectedly contains {table}");
+        }
+        let backup_note: String = backup
+            .query_row(
+                "SELECT note_markdown FROM newspaper_clippings
+                 WHERE id = '44444444-4444-4444-8444-444444444444'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backup_note, "note body");
+
+        let migrated_match_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_fts
+                 WHERE newspaper_clippings_fts MATCH 'note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_match_count, 1);
+        let normalized_match_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_normalized_fts
+                 WHERE newspaper_clippings_normalized_fts MATCH 'note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized_match_count, 1);
+        assert_eq!(schema_version(&connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        let foreign_key_check: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn persistence_gate_failed_v5_fts_install_keeps_v4_and_retries() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            insert_test_clipping(
+                &legacy,
+                "55555555-5555-4555-8555-555555555555",
+                "ready",
+                None,
+            );
+            drop_clipping_search_derived_fixture(&legacy);
+            legacy
+                .execute_batch(
+                    "CREATE VIEW newspaper_clippings_fts AS
+                         SELECT id AS unexpected FROM newspaper_clippings;
+                     PRAGMA user_version = 4;",
+                )
+                .unwrap();
+        }
+
+        assert!(initialize_database(&db_path).is_err());
+        let failed = Connection::open(&db_path).unwrap();
+        assert_eq!(schema_version(&failed).unwrap(), 4);
+        assert_eq!(
+            failed
+                .query_row("SELECT note_markdown FROM newspaper_clippings", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "note body"
+        );
+        failed
+            .execute("DROP VIEW newspaper_clippings_fts", [])
+            .unwrap();
+        drop(failed);
+
+        let (repaired, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 4);
+        assert_eq!(schema_version(&repaired).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            repaired
+                .query_row(
+                    "SELECT COUNT(*) FROM newspaper_clippings_fts
+                     WHERE newspaper_clippings_fts MATCH 'note'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let backups = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert!(
+            backups >= 2,
+            "failed and retried migrations retain verified backups"
+        );
+    }
+
+    #[test]
     fn persistence_gate_clipping_source_deletion_sets_null_without_removing_rows() {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
@@ -3220,6 +3470,16 @@ mod tests {
             "missing",
             Some("ASSET_CREATION_INCOMPLETE"),
         );
+        connection
+            .execute(
+                "INSERT INTO newspaper_clipping_roots
+                    (id, kind, locator, locator_key, created_at, updated_at)
+                 VALUES ('clipping-root-test-1', 'download_snapshot',
+                    'C:/Papers/Newspaper snapshots',
+                    'c:/papers/newspaper snapshots', 10, 10)",
+                [],
+            )
+            .unwrap();
         // Record the exact pre-reset row content.
         let before: Vec<ClippingResetSnapshot> = connection
             .prepare(
@@ -3249,6 +3509,12 @@ mod tests {
         assert_eq!(counts.clippings_preserved, 2);
         assert_eq!(counts.jobs, 1);
         assert_eq!(counts.pages, 1);
+        let roots_after_reset: usize = connection
+            .query_row("SELECT COUNT(*) FROM newspaper_clipping_roots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(roots_after_reset, 2, "reset must preserve registered roots");
         let after: Vec<ClippingResetSnapshot> = connection
             .prepare(
                 "SELECT id, source_job_id, source_page_id, note_markdown, revision

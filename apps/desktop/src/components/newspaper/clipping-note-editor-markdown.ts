@@ -305,11 +305,10 @@ function inertifyMdxExpressions(markdown: string) {
 export function normalizeClippingNoteMarkdown(markdown: string) {
   let normalized = stripUnsupportedBlocks(markdown.replace(/\r\n?/g, "\n").replace(/\u0000/g, ""));
 
-  // Images become their alt text. Code and task-list markers become ordinary
-  // safe text/list content rather than reintroducing unsupported syntax.
+  // Images become their alt text. Inline code becomes ordinary safe text
+  // rather than reintroducing syntax outside the approved editor subset.
   normalized = normalized.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
   normalized = normalized.replace(/(^|[^\\])`([^`]+)`/g, "$1$2");
-  normalized = normalized.replace(/^(\s*)[-*+]\s+\[[ xX]\]\s*/gm, "$1- ");
   normalized = normalized.replace(/\[\^[^\]]+\]/g, "");
 
   // Retain only the explicit link schemes allowed by the adapter. Any other

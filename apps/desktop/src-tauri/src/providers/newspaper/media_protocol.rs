@@ -11,7 +11,7 @@ use tauri::http::{
 
 const CACHE_SCHEMA_VERSION: i64 = 1;
 
-use super::clipping_assets::ClippingAssetLayout;
+use super::clipping_assets::{ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION};
 use super::clipping_models::{validate_clipping_id, ClippingErrorCode};
 use super::clipping_service::ClippingService;
 
@@ -136,45 +136,52 @@ fn resolve_clipping(
 ) -> Result<ResolvedMedia, MediaError> {
     let record = connection
         .query_row(
-            "SELECT asset_relative_path, asset_version, asset_state, asset_byte_count,
+            "SELECT asset_root_id, asset_relative_path, asset_version, asset_state, asset_byte_count,
                     asset_pixel_width, asset_pixel_height, asset_checksum_sha256
              FROM newspaper_clippings WHERE id = ?1",
             params![clipping_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, u32>(4)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
                     row.get::<_, u32>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
         .optional()
         .map_err(|_| MediaError::Internal)?
         .ok_or(MediaError::NotFound)?;
-    if record.2 != "ready" || requested_version != record.1.to_string() {
+    if record.3 != "ready" || requested_version != record.2.to_string() {
         return Err(MediaError::NotFound);
     }
-    let expected_relative = ClippingAssetLayout::canonical_relative_path(clipping_id)
-        .map_err(|_| MediaError::BadRequest)?;
-    if record.0 != expected_relative
-        || ClippingAssetLayout::validate_relative_path(&record.0).is_err()
-    {
+    if ClippingAssetLayout::validate_relative_path_for_id(&record.1, clipping_id).is_err() {
         return Err(MediaError::NotFound);
     }
-    let validated = service.layout().read_validated_canonical_for_protocol(
+    let layout = service
+        .root_layout(&record.0)
+        .map_err(|_| MediaError::NotFound)?;
+    let validated = layout.read_validated_canonical_at(
         clipping_id,
-        record.3,
+        &record.1,
         record.4,
         record.5,
-        &record.6,
+        record.6,
+        &record.7,
     );
     let (bytes, mime) = match validated {
         Ok(validated) => validated,
         Err(error) => {
+            // `root_layout` may use the deliberately short verified-root
+            // cache. Recheck after an I/O failure so an offline removable
+            // drive does not permanently turn a healthy clipping `missing`.
+            if service.verify_root_fresh_for_integrity(&record.0).is_err() {
+                return Err(MediaError::NotFound);
+            }
             let safe_code = match error.code {
                 ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
                 _ => "CLIPPING_ASSET_MISSING",
@@ -190,7 +197,7 @@ fn resolve_clipping(
     Ok(ResolvedMedia {
         bytes,
         mime_type: mime.to_string(),
-        etag: format!("clipping-{clipping_id}-{}", record.1),
+        etag: format!("clipping-{clipping_id}-{}", record.2),
     })
 }
 
@@ -209,7 +216,7 @@ fn resolve_clipping_thumbnail(
         .optional()
         .map_err(|_| MediaError::Internal)?
         .ok_or(MediaError::NotFound)?;
-    let expected = format!("{}-{}", record.0, CACHE_SCHEMA_VERSION);
+    let expected = format!("{}-{}", record.0, THUMBNAIL_CACHE_SCHEMA_VERSION);
     if record.1 != "ready" || requested_version != expected {
         return Err(MediaError::NotFound);
     }
@@ -504,7 +511,7 @@ mod tests {
         let bytes = encode_test_webp(24, 16);
         clipping_layout.write_staging(ID, &bytes).unwrap();
         service
-            .register_staged(NewClippingRecord {
+            .register_staged_legacy_fixture(NewClippingRecord {
                 id: ID.to_string(),
                 source_job_id: None,
                 source_page_id: None,
@@ -522,6 +529,7 @@ mod tests {
                 crop_y: 0,
                 crop_width: 24,
                 crop_height: 16,
+                asset_root_id: crate::newspaper::storage::LEGACY_CLIPPING_ROOT_ID.to_owned(),
                 asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
                 asset_byte_count: bytes.len() as u64,
                 asset_checksum_sha256: sha256_hex(&bytes),
@@ -531,7 +539,7 @@ mod tests {
             .unwrap();
         std::fs::write(clipping_layout.thumbnail_path(ID, 1).unwrap(), &bytes).unwrap();
 
-        for (route, expected) in [("clipping", "1"), ("clipping-thumbnail", "1-1")] {
+        for (route, expected) in [("clipping", "1"), ("clipping-thumbnail", "1-2")] {
             let request = request_for_url(&format!(
                 "http://newspaper-media.localhost/{route}/{ID}?v={expected}"
             ))
@@ -571,12 +579,27 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_media_response_is_nonblocking_coalesced_and_eventually_marks_missing() {
-        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
-        let (directory, db_path, cache_root, layout, writer, service, diagnostics) = fixture();
+    fn offline_snapshot_root_does_not_poison_ready_clipping_state() {
+        const ID: &str = "11111111-1111-4111-8111-111111111111";
+        let (directory, db_path, cache_root, _clipping_layout, _writer, service, _diagnostics) =
+            fixture();
+        let destination = directory.path().join("downloads");
+        std::fs::create_dir(&destination).unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE newspaper_batches SET destination = ?1 WHERE id = 'batch'",
+                params![destination.to_string_lossy()],
+            )
+            .unwrap();
+        let root = service.register_source_job_root("job", 100).unwrap();
+        let layout = service.root_layout(&root.id).unwrap();
         let bytes = encode_test_webp(24, 16);
         layout.write_staging(ID, &bytes).unwrap();
-        let created = service
+        let relative =
+            ClippingAssetLayout::snapshot_relative_path("New York", "NY", "2026-08-08", "A01", ID)
+                .unwrap();
+        service
             .register_staged(NewClippingRecord {
                 id: ID.to_string(),
                 source_job_id: None,
@@ -595,6 +618,64 @@ mod tests {
                 crop_y: 0,
                 crop_width: 24,
                 crop_height: 16,
+                asset_root_id: root.id.clone(),
+                asset_relative_path: relative,
+                asset_byte_count: bytes.len() as u64,
+                asset_checksum_sha256: sha256_hex(&bytes),
+                title: "New York - 2026-08-08 - A01".to_string(),
+                now: 100,
+            })
+            .unwrap();
+
+        let offline = destination.join("snapshots-offline");
+        std::fs::rename(&root.locator, &offline).unwrap();
+        let request = request_for_url(&format!(
+            "http://newspaper-media.localhost/clipping/{ID}?v=1"
+        ))
+        .unwrap();
+        assert_eq!(
+            handle_request(&db_path, &cache_root, &service, &request).status(),
+            StatusCode::NOT_FOUND
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let state: String = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT asset_state FROM newspaper_clippings WHERE id = ?1",
+                params![ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+        assert!(!PathBuf::from(&root.locator).exists());
+    }
+
+    #[test]
+    fn corrupt_media_response_is_nonblocking_coalesced_and_eventually_marks_missing() {
+        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let (directory, db_path, cache_root, layout, writer, service, diagnostics) = fixture();
+        let bytes = encode_test_webp(24, 16);
+        layout.write_staging(ID, &bytes).unwrap();
+        let created = service
+            .register_staged_legacy_fixture(NewClippingRecord {
+                id: ID.to_string(),
+                source_job_id: None,
+                source_page_id: None,
+                source_media_version_snapshot: 1,
+                source_kind_snapshot: ClippingSourceKind::Optimized,
+                source_mime_type_snapshot: "image/webp".to_string(),
+                source_checksum_snapshot: None,
+                edition_code_snapshot: "NY".to_string(),
+                edition_name_snapshot: "New York".to_string(),
+                publication_date_snapshot: "2026-08-08".to_string(),
+                page_number_snapshot: "A01".to_string(),
+                source_pixel_width: 24,
+                source_pixel_height: 16,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 24,
+                crop_height: 16,
+                asset_root_id: crate::newspaper::storage::LEGACY_CLIPPING_ROOT_ID.to_owned(),
                 asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
                 asset_byte_count: bytes.len() as u64,
                 asset_checksum_sha256: sha256_hex(&bytes),
@@ -695,7 +776,7 @@ mod tests {
         let bytes = encode_test_webp(24, 16);
         layout.write_staging(ID, &bytes).unwrap();
         service
-            .register_staged(NewClippingRecord {
+            .register_staged_legacy_fixture(NewClippingRecord {
                 id: ID.to_string(),
                 source_job_id: None,
                 source_page_id: None,
@@ -713,6 +794,7 @@ mod tests {
                 crop_y: 0,
                 crop_width: 24,
                 crop_height: 16,
+                asset_root_id: crate::newspaper::storage::LEGACY_CLIPPING_ROOT_ID.to_owned(),
                 asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
                 asset_byte_count: bytes.len() as u64,
                 asset_checksum_sha256: sha256_hex(&bytes),
@@ -762,7 +844,7 @@ mod tests {
         let canonical = encode_test_webp(24, 16);
         layout.write_staging(ID, &canonical).unwrap();
         service
-            .register_staged(NewClippingRecord {
+            .register_staged_legacy_fixture(NewClippingRecord {
                 id: ID.to_string(),
                 source_job_id: None,
                 source_page_id: None,
@@ -780,6 +862,7 @@ mod tests {
                 crop_y: 0,
                 crop_width: 24,
                 crop_height: 16,
+                asset_root_id: crate::newspaper::storage::LEGACY_CLIPPING_ROOT_ID.to_owned(),
                 asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
                 asset_byte_count: canonical.len() as u64,
                 asset_checksum_sha256: sha256_hex(&canonical),
@@ -809,7 +892,7 @@ mod tests {
             .unwrap();
 
         let current = request_for_url(&format!(
-            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=2-1"
+            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=2-2"
         ))
         .unwrap();
         assert_eq!(
@@ -864,7 +947,7 @@ mod tests {
         );
 
         let stale = request_for_url(&format!(
-            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=1-1"
+            "http://newspaper-media.localhost/clipping-thumbnail/{ID}?v=1-2"
         ))
         .unwrap();
         assert_eq!(

@@ -22,6 +22,7 @@ import { toast } from "sonner";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
 import { readNewspaperOptimizationPreferences } from "./newspaper-optimization-preferences";
+import type { NewspaperReaderSourceTarget } from "./newspaper-navigation";
 
 type EditionKind = "daily" | "weekly" | "special";
 type NewspaperEdition = {
@@ -164,7 +165,19 @@ function editionKey(edition: NewspaperEdition) {
   return edition.publicationDate ? `${edition.code}@${edition.publicationDate}` : edition.code;
 }
 
-export function NewspaperView({ mode = "download" }: { mode?: "download" | "library" }) {
+export function NewspaperView({
+  mode = "download",
+  onOpenClipping,
+  onReturnClipping,
+  readerTarget,
+  onReaderTargetConsumed
+}: {
+  mode?: "download" | "library";
+  onOpenClipping?: (clippingId: string) => void;
+  onReturnClipping?: (clippingId: string) => void;
+  readerTarget?: NewspaperReaderSourceTarget | null;
+  onReaderTargetConsumed?: (generation: number) => void;
+}) {
   const initial = useRef(readPreferences());
   const [catalog, setCatalog] = useState<NewspaperEdition[]>(FALLBACK_CATALOG);
   const [jobs, setJobs] = useState<NewspaperJob[]>([]);
@@ -602,7 +615,14 @@ export function NewspaperView({ mode = "download" }: { mode?: "download" | "libr
   }
 
   if (mode === "library") {
-    return <NewspaperLibrary />;
+    return (
+      <NewspaperLibrary
+        clippingCapability={{ enabled: true, onCreated: onOpenClipping }}
+        onReaderTargetConsumed={onReaderTargetConsumed}
+        onReturnClipping={onReturnClipping ?? onOpenClipping}
+        readerTarget={readerTarget}
+      />
+    );
   }
 
   return (

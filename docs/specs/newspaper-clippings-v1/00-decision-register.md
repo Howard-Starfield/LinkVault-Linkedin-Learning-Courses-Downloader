@@ -2,7 +2,7 @@
 
 **Status:** Approved with the V1 specification set
 
-**Last updated:** 2026-08-09
+**Last updated:** 2026-08-10
 
 This register is the authoritative record for choices that materially constrain
 Newspaper Clippings V1. A coding agent may not replace an approved decision
@@ -30,7 +30,7 @@ migrations, tests, and rollback impact.
 | D-006 | Expected page media version is required and stale media is rejected. | Approved |
 | D-007 | Source priority is retained original, then current optimized image. | Approved |
 | D-008 | Canonical output is lossless WebP with no resize. | Approved |
-| D-009 | Canonical assets are application-managed durable data. | Approved |
+| D-009 | Canonical assets are application-managed durable data. | Superseded by D-032 |
 | D-010 | One clipping owns one note in V1. | Approved |
 | D-011 | SQLite Markdown is the note source of truth. | Approved |
 | D-012 | Source image is a fixed card outside the editable document. | Approved |
@@ -40,7 +40,7 @@ migrations, tests, and rollback impact.
 | D-016 | Source deletion and World Journal reset preserve clippings. | Approved |
 | D-017 | Source provenance is denormalized and foreign keys use `SET NULL`. | Approved |
 | D-018 | Note updates use optimistic revisions. | Approved |
-| D-019 | Search is local substring search; FTS is deferred. | Approved |
+| D-019 | Search uses ranked local FTS with bounded fuzzy suggestions. | Approved |
 | D-020 | Derived thumbnails are regenerable cache data. | Approved |
 | D-021 | Clipping media is served by the protected newspaper media protocol. | Approved |
 | D-022 | Crop work is bounded and performed outside database transactions. | Approved |
@@ -53,6 +53,9 @@ migrations, tests, and rollback impact.
 | D-029 | OCR, AI, annotations, multiple attachments, tags, and sync are deferred. | Deferred |
 | D-030 | Canonical screenshots are rejected for V1. | Rejected |
 | D-031 | Deferred cleanup fully enumerates managed categories with bounded mutations. | Approved |
+| D-032 | New canonical assets live in a registered snapshot root under the source download destination. | Approved |
+| D-033 | Settings manages registered snapshot locations and marker-verified reconnection. | Approved |
+| D-034 | Native recovery checkpoints and cooperative exit protect clipping-note drafts. | Approved |
 
 ---
 
@@ -209,7 +212,7 @@ unavailable or unreliable in the supported Rust build.
 
 ## D-009: Asset ownership and location
 
-**Status:** Approved
+**Status:** Superseded by D-032
 
 **Decision:** Canonical clipping assets live under an application-managed root
 beneath resolved `LinkVaultData/newspaper-clippings`. They do not live under the
@@ -222,6 +225,76 @@ replaceable source data and may be moved, deleted, re-registered, or reset.
 never chooses or receives the absolute canonical path.
 
 **Affected specifications:** ADR-002, 02, 06.
+
+## D-032: Download-destination snapshot roots
+
+**Status:** Approved
+
+**Decision:** A new clipping uses the persisted `newspaper_batches.destination`
+of its source job. Its canonical image is stored beneath:
+
+```text
+<destination>/Newspaper snapshots/<sanitized edition name - code>/<publication-date>/Page <page> - <clipping-id>/clipping-v1.webp
+```
+
+The readable leaf repeats the page label but retains the full clipping UUID,
+so multiple selections from the same edition, date, and page cannot collide.
+Edition and date are not repeated in the leaf because the parent hierarchy is
+already authoritative and Windows path-length headroom is finite. Existing
+UUID-only snapshot leaves remain valid and are not renamed or migrated.
+
+SQLite stores `asset_root_id` and a root-relative asset path. The backend owns
+a root registry and a marker under the reserved `.linkvault` subtree. Staging,
+trash, and quarantine are on that same volume. Thumbnails remain regenerable
+cache data beneath `LinkVaultData`.
+
+Existing schema-v3 rows are backfilled to a read-only `legacy_managed` root and
+continue to resolve `LinkVaultData/newspaper-clippings`; migration does not move
+their bytes. New creation accepts only `download_snapshot` roots.
+
+An unavailable registered root is a transient storage state. Startup, media,
+and cleanup do not recreate it or mark all of its rows missing. A reused path or
+drive letter must present the matching marker. Archive import/repair and source
+reset must exclude `Newspaper snapshots`. V1 does not scan for or automatically
+rebind a moved root; a future reconnect flow must require the matching marker.
+
+**Rationale:** The user wants crops visible beside the newspaper collection,
+while the registry/marker boundary preserves deterministic ownership across
+multiple destinations, offline drives, source deletion, and path reuse.
+
+**Supersedes:** D-009 location only. Application ownership, backend-derived
+paths, explicit deletion, and durable note semantics remain binding.
+
+**Affected specifications:** ADR-002, README, 02, 06, 07, 08.
+
+## D-033: Snapshot location management and reconnection
+
+**Status:** Approved
+
+**Decision:** Newspaper Settings shows the registered snapshot locations that
+were created automatically from persisted newspaper download destinations. It
+does not provide an arbitrary global snapshot-folder override.
+
+Each location exposes a backend-derived display path. A newly opened Settings
+view may briefly show `checking`; the verified outcome is `connected`,
+`offline`, or `marker_mismatch`. **Check again** retries the registered
+location. **Reconnect…** opens a backend-owned native folder selection flow for
+an offline or mismatched root and updates the locator only after the selected
+`Newspaper snapshots` directory presents the matching root marker. **Open
+folder** is available only after current marker verification.
+
+Reconnect never copies, merges, scans for, renames, or creates snapshot data.
+It rejects an empty/unmarked directory, a marker for another root, a location
+already registered to another root, symlinks/reparse points, and paths outside
+the selected marker-bound root. Notes and search remain available while a root
+is offline.
+
+**Rationale:** “Sync again” would imply data transfer or filesystem indexing.
+The actual operation restores the trusted locator for durable data that has
+moved, while preserving the same-download-destination ownership model and
+preventing drive-letter/path reuse from rebinding unrelated files.
+
+**Affected specifications:** 02, 05, 06, 07, 08.
 
 ## D-010: Clipping-to-note cardinality
 
@@ -258,9 +331,10 @@ export format, but not as a second live source of truth.
 
 **Status:** Approved
 
-**Decision:** The canonical clipping image and provenance render in a fixed
-source card above the editor. The image is not represented as a movable or
-deletable node inside Markdown.
+**Decision:** The canonical clipping image and provenance render as a fixed,
+read-only document header above the title and editor. It may share one visual
+writing surface with the note, but the image is not represented as a movable
+or deletable node inside Markdown.
 
 **Rationale:** The clipping is the evidence that gives the note meaning. Keeping
 it outside the editor prevents accidental deletion, keeps provenance
@@ -309,17 +383,18 @@ values, and never generated by AI in V1.
 
 **Status:** Approved
 
-**Decision:** The Clippings view uses a desktop two-pane layout: paged and
-virtualized rows on the left, selected source card and note editor on the right.
-The default sort is most recently updated.
+**Decision:** The Clippings view uses a responsive, virtualized thumbnail
+gallery. Opening a thumbnail navigates to a separate full-page note document;
+the gallery search is not repeated on that detail page. The default sort is
+most recently updated.
 
-**Rationale:** A gallery-only view is weak for note review and editing. A
-master-detail layout supports rapid scanning while keeping one full clipping
-and editor mounted.
+**Rationale:** Four visual thumbnails at the default desktop width make saved
+clippings faster to scan, while a separate document removes split-pane limits
+from long-form note editing.
 
-**Constraints:** Page size is 50, list overscan is 4 rows, list thumbnails are
-requested only for visible rows, and fixture gates cover 8, 50, and 500
-clippings.
+**Constraints:** Page size is 50, row overscan is 2, thumbnails are requested
+only for visible rows, columns respond from 1 through 6 with 4 at the default
+desktop width, and fixture gates cover 8, 50, and 500 clippings.
 
 **Affected specifications:** 05, 07.
 
@@ -370,16 +445,35 @@ companion views must not silently lose user text.
 
 **Status:** Approved
 
-**Decision:** V1 provides local substring search over title, Markdown,
-edition name/code, date, and page number using bounded escaped SQLite `LIKE`
-queries. SQLite FTS is deferred.
+**Decision:** V1 provides local relevance-ranked search over title, Markdown,
+edition name/code, date, and page number. Schema v5 adds a rebuildable SQLite
+FTS5 trigram index for title, note, and edition candidate retrieval. Exact and
+prefix title matches are ranked ahead of weighted FTS relevance; date and page
+matches are literal only. Updated time and clipping ID are deterministic final
+ties.
 
-**Rationale:** The expected V1 scale is modest, the result list is paged, and
-introducing an FTS index adds migration and synchronization behavior before
-there is measured need.
+Confident results lazy-load in pages of 50. After every confident result is
+exhausted, the UI may request one separately labelled **Possible matches**
+section capped at 25 unique rows. Fuzzy matching applies only to Title, Note,
+and Edition, requires at least four Unicode scalar values, and operates only on
+a bounded FTS candidate/window set. It never scans every full note per
+keystroke. Date and Page are never fuzzed.
 
-**Constraints:** Search input is trimmed, capped at 200 UTF-8 characters, uses
-an explicit escape character, and never interpolates SQL.
+**Rationale:** The user needs fast keyword retrieval independent of the nested
+snapshot folders, explainable field tags, useful typo tolerance, and stable
+ranking. A derived local index provides these without making filesystem layout
+or the index itself authoritative.
+
+**Constraints:** Search input is normalized, trimmed, capped at 200 Unicode
+scalar values, bound as data, and treated literally rather than as FTS syntax.
+Title, Edition, Date, and Page may match from one Unicode scalar value. Note
+body matching begins at three Unicode scalar values; shorter queries do not
+scan note bodies and the UI explains the limit. Results return factual
+cumulative match fields: `title`, `note`, `edition`, `date`, and `page`. No
+confidence percentage is shown. While a query is active, the visible sort is
+`Relevance`; ordinary list sort resumes after clearing it. The FTS index is
+derived, transactionally synchronized, integrity-checked, and rebuildable
+without changing title or note source data.
 
 **Affected specifications:** 02, 05, 07.
 
@@ -389,7 +483,7 @@ an explicit escape character, and never interpolates SQL.
 
 **Decision:** List thumbnails are regenerable cache files derived from the
 canonical clipping, generated on demand for visible rows. They preserve aspect
-ratio, do not upscale, and fit within a 512×320 pixel box.
+ratio, do not upscale, and fit within a 1024×640 pixel box.
 
 **Rationale:** Loading full-resolution canonical crops in every visible row can
 create avoidable decode and memory cost. Derived thumbnails can be safely
@@ -397,7 +491,8 @@ removed and rebuilt.
 
 **Constraints:** Thumbnail cache schema version and canonical asset version are
 part of the URL/version key. Thumbnail absence does not make a clipping
-unavailable.
+unavailable. The 1024×640 cache is schema version 2 so pre-density cache files
+cannot be mistaken for current output.
 
 **Affected specifications:** 02, 05, 07.
 
@@ -451,10 +546,12 @@ accessibility fixes, and Markdown normalization.
 
 **Status:** Approved — 2026-08-09
 
-**Decision:** Use `@tiptap/react`, `@tiptap/starter-kit`, and
-`@tiptap/markdown`, each pinned at `3.29.2`, behind the LinkVault-owned
-`ClippingNoteEditor` Markdown adapter. Persist plain Markdown only; never
-persist Tiptap/ProseMirror JSON.
+**Decision:** Use `@tiptap/core`, `@tiptap/react`, `@tiptap/starter-kit`,
+`@tiptap/markdown`, `@tiptap/suggestion`, and `@tiptap/extension-list`, each
+pinned at `3.29.2`, behind the LinkVault-owned `ClippingNoteEditor` Markdown
+adapter. The suggestion utility is limited to a local, Markdown-safe
+slash-command menu; the list extension enables Markdown task items. Persist
+plain Markdown only; never persist Tiptap/ProseMirror JSON.
 
 **Required evidence:**
 
@@ -495,9 +592,10 @@ desktop flow.
 **Status:** Approved
 
 **Decision:** V1 supports paragraphs, headings 1–4, bold, italic,
-strikethrough, unordered/ordered lists, blockquotes, links, and line breaks.
+strikethrough, unordered/ordered/task lists, blockquotes, links, horizontal
+rules, and line breaks.
 Executable MDX, JSX, arbitrary raw HTML, embedded scripts, remote iframes,
-editor-inserted images, tables, code blocks, and task lists are excluded.
+editor-inserted images, tables, and code blocks are excluded.
 
 **Rationale:** This covers ordinary reading notes while keeping rendering,
 security, round-trip tests, and toolbar scope bounded.
@@ -546,7 +644,7 @@ database error does not silently leave an unreadable row.
 - **Source unavailable:** The clipping and note remain fully usable; `Open
   source` is disabled with explanatory copy.
 - **Canonical asset missing/corrupt:** The note and provenance remain visible,
-  the source card shows an integrity warning, and repair/recovery is attempted
+  the clipping header shows an integrity warning, and repair/recovery is attempted
   or offered. The row is not silently removed.
 
 **Rationale:** Source removal is expected lifecycle behavior. Canonical asset
@@ -590,11 +688,13 @@ specified, but it must not replace the managed source crop.
 **Approval:** Approved by the product owner on 2026-08-09 for the Phase 1
 review correction.
 
-**Decision:** V1 deferred cleanup runs only in the detached blocking lifecycle
-task and may completely enumerate each application-managed clipping category.
-It does not claim that directory enumeration or inspection is bounded. Actual
-`ReadDir` items consumed are counted, while filesystem mutation attempts remain
-limited to 32 per managed category per launch.
+**Decision:** V1 deferred cleanup waits for a five-second startup quiet period,
+then runs only in one detached blocking lifecycle task and may completely
+enumerate each application-managed clipping category. Critical database-driven
+recovery of `creating` and `delete_pending` rows remains synchronous. The
+deferred task does not claim that directory enumeration or inspection is
+bounded. Actual `ReadDir` items consumed are counted, while filesystem mutation
+attempts remain limited to 32 per managed category per launch.
 
 The managed categories are staging, canonical assets, trash, quarantine, and
 derived clipping thumbnails. Traversal streams entries without sorting or
@@ -625,8 +725,9 @@ safe classifications only.
 **Test and release-gate impact:** Phase 1 tests must count actual iterator items,
 prove at most 32 mutation attempts per category, prove repeated passes reach
 removable leftovers, and record 500-entry and 5,000-entry wall time plus
-approximate/peak memory evidence. Production composition must prove no UI or
-startup thread waits for enumeration.
+approximate/peak memory evidence. Production composition must prove the quiet
+period precedes the blocking worker and no UI or startup thread waits for
+enumeration.
 
 **Backward compatibility and rollback:** Managed paths and database rows are
 unchanged. Reverting before release restores the prior cleanup implementation;
@@ -634,6 +735,78 @@ after release, a forward fix is preferred. Cleanup rollback never deletes the
 managed root or scans user download folders.
 
 **Affected specifications:** 02 and 07.
+
+## D-034: Clipping-note recovery checkpoints and cooperative exit
+
+**Status:** Approved
+
+**Approval:** Approved by the product owner on 2026-08-10. The product owner
+delegated approval of the recommended durability defaults after separately
+approving the close-X and recovery-envelope choices.
+
+**Decision:** Keep D-026's 800 ms canonical autosave debounce and add a 5-second
+maximum canonical-save wait during continuous typing. Persist a separate native
+SQLite recovery checkpoint after 500 ms of quiet time and at least every 2
+seconds during continuous typing. The recovery-only limits are 4 KiB of UTF-8
+title bytes and 4 MiB of UTF-8 Markdown bytes; canonical validation remains 800
+title bytes and 2 MiB Markdown.
+
+Window X prevents native close, completes the durability handshake, and hides
+the existing main WebView only on success. Tray **Quit**, ordinary application
+exit, and updater-controlled exit use the same handshake and exit only on
+success. A canonical revision conflict may proceed only when the exact newest
+visible draft has a matching acknowledged recovery checkpoint; the next launch
+must offer both versions explicitly. Failure, an uncheckpointed/stale conflict,
+missing/stale acknowledgement, or timeout keeps the application alive and
+restores/focuses the main window. Timeout never means discard.
+
+The journal stores one sequence-aware checkpoint per clipping. It is not
+searchable and does not update canonical metadata or FTS. A canonical save
+clears only the matching acknowledged checkpoint in the same SQLite savepoint.
+Recovery after renderer/process loss is explicit and revision-aware; a stale or
+different writer session cannot overwrite or clear a newer draft silently.
+
+**Supersedes:** D-026 only where it states that V1 has no second local draft
+journal and accepts loss within the debounce window. D-026's canonical debounce,
+single in-flight save, optimistic revision, and explicit flush boundaries remain
+binding.
+
+**Product rationale:** Ordinary navigation already blocks on failed saves, but
+React cleanup cannot safely await persistence and the current native close/exit
+paths do not cover every destructive lifecycle edge. A bounded native
+checkpoint closes that gap without writing SQLite on each keystroke or turning
+the Tiptap editor component into a persistence/lifecycle owner.
+
+**Persistence and migration impact:** Schema version 6 adds
+`newspaper_clipping_note_drafts` after the existing verified backup. The table
+has a clipping foreign key with `ON DELETE CASCADE`, canonical base revision,
+writer session/sequence, title, Markdown, and update time. It has no FTS trigger.
+Fresh, v5-to-v6, current, failure, and future-version cases must pass the normal
+application migration boundary.
+
+**Security and privacy impact:** Draft bytes stay in the local application
+database and never enter logs, diagnostics, search, telemetry, or filesystem
+paths. Backend byte limits and typed path-free errors are authoritative. No
+browser storage, second writer, new network surface, or new dependency is
+approved.
+
+**Test and release-gate impact:** Add deterministic controller, migration,
+repository, conflict, sequence, close-X, tray Quit, updater, timeout, crash
+recovery, browser, performance, and installed Windows lifecycle evidence. The
+structural gate enforces module-size and ownership budgets from the durability
+work order. No ignored durability test is accepted.
+
+**Backward compatibility and rollback:** Older binaries cannot open schema 6.
+Rollback therefore preserves recovery rows and uses a forward fix; it never
+downgrades `user_version` or drops a draft automatically. UI/native wiring may
+be disabled while leaving canonical saves and recoverable rows intact.
+
+**Implementation boundary:** Phase 4C is a separately reviewed durability
+slice after Phase 4B behavior is available. It follows
+`docs/work-orders/newspaper-clipping-note-durability-plan.md` and may not grow
+the canonical TSX/service owners beyond that work order's budgets.
+
+**Affected specifications:** README, 02, 05, 06, 07, and 08.
 
 ## Change procedure
 

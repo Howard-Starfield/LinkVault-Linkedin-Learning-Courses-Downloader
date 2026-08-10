@@ -2,16 +2,18 @@
 
 **Status:** Approved
 
-**Primary implementation phases:** Phase 4A editor evaluation and Phase 4B
+**Primary implementation phases:** Phase 4A editor evaluation, Phase 4B
+integration, and Phase 4C durability hardening
 production integration
 
 **Related decisions:** D-001, D-010 through D-015, D-018 through D-026, D-028,
+D-032 through D-034,
 D-029
 
 ## 1. Purpose
 
 This specification defines the dedicated Clippings view, paged and virtualized
-list, detail source card, search and sorting, frontend data contracts, internal
+gallery, detail clipping header, search and sorting, frontend data contracts, internal
 editor adapter, approved Markdown subset, autosave state machine, optimistic
 conflict handling, navigation guards, empty/loading/error states, accessibility,
 and editor-selection gate.
@@ -220,57 +222,173 @@ export type NewspaperClippingsInvalidatedEvent = {
 `clippingIds` is bounded. A large reset/source-change event may use an empty
 array to mean refresh affected pages rather than emit unbounded IDs.
 
-## 4. Master-detail layout
+### 3.6 Ranked search queries
 
-### Desktop layout
+Search uses dedicated commands rather than overloading the ordinary list query.
+The backend owns ranking, candidate bounds, and confident-result exclusion.
 
-At content width ≥900 CSS px:
+```ts
+export type NewspaperClippingMatchField =
+  | "title"
+  | "note"
+  | "edition"
+  | "date"
+  | "page";
 
-```text
-┌───────────────────────────────────────────────────────────────────────┐
-│ Clippings     [Search…………………………] [Recently updated ▾]             │
-├───────────────────────────────┬───────────────────────────────────────┤
-│ virtualized list              │ selected clipping detail              │
-│  thumbnail  title             │ fixed source card                     │
-│             provenance        │ title field                           │
-│             excerpt           │ WYSIWYG Markdown editor               │
-│             updated           │ save state                            │
-│                               │                                       │
-└───────────────────────────────┴───────────────────────────────────────┘
+export type NewspaperClippingSearchSnippet = {
+  field: NewspaperClippingMatchField;
+  parts: Array<{
+    text: string;
+    highlighted: boolean;
+  }>;
+};
+
+export type NewspaperClippingSearchResult = {
+  clipping: NewspaperClippingSummary;
+  matchedFields: NewspaperClippingMatchField[];
+  snippets: NewspaperClippingSearchSnippet[];
+  possibleMatch: boolean;
+};
+
+export type SearchNewspaperClippingsRequest = {
+  query: string;
+  offset: number;
+  limit: 50;
+};
+
+export type SearchNewspaperClippingsPage = {
+  items: NewspaperClippingSearchResult[];
+  total: number;
+  offset: number;
+  limit: 50;
+  noteSearchApplied: boolean;
+  revision: number;
+};
+
+export type SearchPossibleNewspaperClippingsRequest = {
+  query: string;
+};
+
+export type SearchPossibleNewspaperClippingsResponse = {
+  items: NewspaperClippingSearchResult[];
+  limit: 25;
+  revision: number;
+};
 ```
 
-Recommended starting pane sizes:
+Commands:
 
-- Left: 340 CSS px, resizable only if an existing application split-pane
-  primitive is available without adding a new dependency.
-- Right: remaining width, minimum 480 CSS px.
-- No second persistent right sidebar in V1.
+```text
+search_newspaper_clippings
+search_possible_newspaper_clippings
+```
 
-At width <900 CSS px:
+`parts` avoids ambiguous byte/Unicode offsets and is rendered as plain text;
+React must not interpret snippet text as HTML. Confident results always have
+`possibleMatch: false`; the second command always returns `true`, never returns
+more than 25 items, and internally excludes every confident match for the same
+normalized query. Neither response exposes a numeric relevance or similarity
+score. `noteSearchApplied` is authoritative after backend normalization and
+drives the short-query helper; React does not infer that notes were searched.
 
-- List is full width.
-- Selecting a clipping opens a full-width detail surface.
-- Detail has `Back to clippings`.
-- Dirty-navigation guards remain identical.
+### 3.7 Snapshot-location Settings queries
+
+```ts
+export type NewspaperSnapshotRootStatus =
+  | "unchecked"
+  | "connected"
+  | "offline"
+  | "marker_mismatch";
+
+export type NewspaperSnapshotRootSummary = {
+  rootId: string;
+  kind: "download_snapshot" | "legacy_managed";
+  displayPath: string;
+  status: NewspaperSnapshotRootStatus;
+  lastCheckedAt?: number | null;
+};
+
+export type ReconnectNewspaperSnapshotRootResult =
+  | { status: "cancelled" }
+  | { status: "connected"; root: NewspaperSnapshotRootSummary };
+```
+
+Commands:
+
+```text
+list_newspaper_snapshot_roots
+check_newspaper_snapshot_root
+reconnect_newspaper_snapshot_root
+open_newspaper_snapshot_root
+```
+
+All action inputs contain only `rootId`. `displayPath` is presentation data and
+must never be accepted back as filesystem authority. Reconnect owns the native
+directory picker at the Tauri boundary and returns `cancelled` without mutation
+when the user dismisses it. Legacy managed roots are listed for diagnostics but
+cannot be reconnected to a download destination.
+
+## 4. Gallery and full-page detail
+
+### Desktop gallery
+
+The Clippings route opens as a responsive, row-virtualized image gallery. At
+the default desktop content width it displays four thumbnails per row. The
+column count responds from one through six as available width changes while
+preserving each clipping's bounded source aspect ratio. Only visible or
+near-visible thumbnails are generated and mounted.
+
+Selecting a thumbnail opens a separate full-page note document. The app-level
+Clippings toolbar becomes a compact row containing `Back` and the editable note
+title; the gallery-only search box is absent. The detail uses one centered
+writing column containing, in order:
+
+1. fixed read-only clipping image and provenance;
+2. continuous Tiptap Markdown body;
+3. quiet bottom footer with save state and history controls.
+
+The detail does not render a split pane, a duplicate internal header, or an
+editor card. Dirty-navigation guards are identical at every width.
+
+When the Clippings toolbar query is non-empty, a search-results surface takes
+over the provider-owned main content area at every width. The toolbar remains
+visible. The ordinary gallery/detail composition and its Tiptap instance retain
+their state but are removed from focus/accessibility navigation; search does
+not destroy a draft merely because the first character was typed.
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ Clippings   [ Search clipping notes…                              ] │
+├──────────────────────────────────────────────────────────────────────┤
+│ 18 results · Relevance                                               │
+│ [Title] [Note]  Result title                                         │
+│ matching plain-text note excerpt with safe visual emphasis           │
+│ Edition · date · page                                                 │
+│                                                                      │
+│ Possible matches                                                     │
+│ [Possible match] [Edition] …                                         │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ### FR-LAYOUT-001
 
-Only the list pane scrolls its rows. Detail may have its own vertical scroll.
-Scrolling a long note must not move the list position.
+The gallery owns its virtual scroll surface. The separate detail owns its own
+vertical scroll; scrolling a long note cannot mutate the retained gallery
+position.
 
 ### FR-LAYOUT-002
 
 Returning from detail or source reader restores list query, sort, selected ID,
 and scroll position when still valid.
 
-## 5. List loading and virtualization
+## 5. Gallery loading and virtualization
 
 The list follows the existing Newspaper library’s bounded loading pattern.
 
 ```text
 PAGE_SIZE = 50
-ESTIMATED_ROW_HEIGHT = 128 CSS px
-OVERSCAN = 4 rows
+ESTIMATED_ROW_HEIGHT = responsive to column width and source aspect ratio
+OVERSCAN = 2 rows
 SEARCH_DEBOUNCE = 200 ms
 ```
 
@@ -346,6 +464,58 @@ while restoring scroll anchor/selected ID after layout.
 - Empty query is represented as `""`, not `%` or null.
 - Search state is local to the Clippings view for V1; it need not persist across
   app restart.
+- Title, Edition, Date, and Page matching starts at one Unicode scalar value.
+  Note matching starts at three. With a one- or two-scalar query, show
+  `Type 3 characters to search notes` and do not produce a Note tag or snippet.
+- After the 200 ms debounce, a non-empty query replaces the ordinary
+  list/detail presentation with full-width ranked results without unmounting
+  or clearing the active editor draft.
+- Each request has a monotonically increasing frontend generation. Stale
+  responses are discarded and duplicate IDs are removed across pages.
+- Confident results load 50 at a time as the virtual scroll approaches its
+  tail. At most the current and one near-future page are in flight.
+- Only after the confident result count is exhausted may the frontend request
+  one fuzzy page. It is headed `Possible matches`, contains at most 25 unique
+  rows, and is never interleaved into confident ranking.
+- Clicking a result flushes/resolves any dirty note before changing detail. A
+  failed flush keeps the current note and query visible with a retry action.
+- Returning from a result restores the exact query, loaded-page boundary,
+  scroll anchor, and focused result when it still exists.
+
+### Match fields and snippets
+
+- Result tags are factual and cumulative: `Title`, `Note`, `Edition`, `Date`,
+  and `Page`.
+- Fuzzy rows also display `Possible match`; no numeric confidence is shown.
+- Confident matching covers all five fields. Fuzzy matching covers only Title,
+  Note, and Edition. Date and Page are literal and never approximated.
+- A safe bounded plain-text snippet is selected around a Note match. Markdown
+  syntax, raw HTML/MDX, and executable content are never rendered from a search
+  snippet.
+- Highlighting uses the returned plain-text `parts`; the UI does not reconstruct
+  byte or Unicode offsets and never uses `dangerouslySetInnerHTML`.
+- A title or provenance-only result does not invent a Note tag or note match.
+
+### Relevance contract
+
+Confident ordering is deterministic:
+
+1. Exact normalized title.
+2. Normalized title prefix.
+3. Weighted FTS relevance, with Title weighted above Note and Note above
+   Edition.
+4. Literal Date/Page match contribution below text-field matches.
+5. `updated_at DESC`, then clipping ID as final ties.
+
+FTS weights are frozen only after the committed mixed English/Chinese golden
+ranking fixture proves representative ordering. The UI does not expose the
+internal numeric score.
+
+Possible-match candidate generation uses the trigram index and a bounded
+candidate/window limit. Similarity evaluation never reads every full note per
+keystroke. It requires at least four Unicode scalar values and uses a documented
+Unicode-normalized edit-distance threshold. Confident IDs are excluded before
+the maximum 25 fuzzy rows are returned.
 
 ### Sort
 
@@ -361,6 +531,9 @@ Title A–Z         → title_asc
 Sort selection may persist in localStorage under a versioned clipping-specific
 key. It is preference data, not SQLite domain state.
 
+While search is non-empty, the sort control reads `Relevance` and ordinary sort
+choices are disabled/hidden. Clearing search restores the previous list sort.
+
 ### AC-LIBRARY-001
 
 Given `%`, `_`, backslash/escape, apostrophe, Chinese text, and mixed date/page
@@ -370,6 +543,19 @@ When search runs
 
 Then values are treated literally, results are paged deterministically, and no
 SQL syntax is interpolated.
+
+### AC-LIBRARY-002
+
+Given confident matches, typo candidates, one- to four-character queries,
+mixed English/Chinese text, a two-megabyte note, and more than 50 results
+
+When the user types, scrolls through confident pages, reaches Possible matches,
+opens a result, and returns
+
+Then ranking/tags/snippets are factual, one- and two-character queries exclude
+Note and explain its three-character minimum, no more than 25 fuzzy rows appear,
+stale pages cannot append, full notes are not linearly scanned for fuzzy
+scoring, and query/scroll/draft state is preserved.
 
 ## 7. Loading, empty, and failure states
 
@@ -411,11 +597,12 @@ Retry
 The list remains usable. A `CLIPPING_NOT_FOUND` caused by external deletion
 removes the stale row after confirmation from a refreshed list.
 
-## 8. Source card
+## 8. Read-only clipping header
 
 ### FR-SOURCE-CARD-001
 
-The source card is outside the editable document and contains:
+The clipping header is outside the editable ProseMirror document but shares
+the same full-width writing column. It contains:
 
 - Canonical image when asset state is ready.
 - Provenance line.
@@ -440,7 +627,7 @@ canonical media URL. It may pan/scroll but cannot crop, annotate, replace, or
 export. Closing returns focus to the source image button.
 
 If implementation cost threatens Phase 4B gates, expanded viewing may be
-removed without changing aggregate behavior; the ordinary source card is
+removed without changing aggregate behavior; the ordinary clipping header is
 required.
 
 ### FR-SOURCE-CARD-004: Missing asset
@@ -459,8 +646,9 @@ The title and note remain editable. Repair behavior is in specification 06.
 
 ### FR-TITLE-001
 
-The title is a normal accessible text input above the editor with label
-`Clipping note title`.
+The title is a normal accessible text input beside `Back` in the app-level top
+bar with label `Clipping note title`. It is not duplicated in the writing
+column.
 
 ### FR-TITLE-002
 
@@ -534,32 +722,43 @@ Paste priority inside the editor:
    Images aren't supported inside clipping notes.
    ```
 
-The source card is the clipping image and cannot be replaced by paste.
+The clipping header is the clipping image and cannot be replaced by paste.
 
-## 11. Editor toolbar
+## 11. Editor commands and contextual toolbar
 
-Required controls, in order where layout permits:
+The full-page editor does not use a permanent boxed formatting strip. Required
+controls are divided by intent:
 
-```text
-Undo
-Redo
-Heading
-Bold
-Italic
-Strikethrough
-Bulleted list
-Numbered list
-Blockquote
-Link
-```
+- A quiet bottom-right footer exposes save state, Undo, and Redo without
+  interrupting the editor body.
+- Typing `/` at a text-block start or after whitespace opens a body-portaled
+  command menu above the application shell for
+  paragraph, Heading 1-4, task list, bulleted list, numbered list, blockquote,
+  and horizontal rule.
+- Selecting non-empty text exposes Bold, Italic, Strikethrough, and Link in a
+  toolbar above the selection.
+- The selection toolbar remains hidden during pointer drag and appears only
+  after pointer release. It anchors to the document-order beginning of the
+  selection, including reverse selections, then flips/shifts within the
+  viewport when required.
 
-At narrow widths, formatting controls may use an overflow menu while Undo/Redo
-remain directly accessible.
+Slash commands support alias-aware fuzzy ranking, pointer selection, Arrow
+Up/Down, Enter, and Escape. The best result is selected as the query changes,
+but typing never executes it automatically. Composition suppresses both
+transient menus.
 
-No image, file, table, code, task-list, AI, or source-MDX control is shown.
+No image, file, table, code, AI, or source-MDX control is shown.
 A Markdown source toggle is optional only if the selected editor can guarantee
 round-trip safety and product owner approves it during Phase 4A; it is not a V1
 requirement.
+
+### 11.1 Visual reference and license boundary
+
+The compact icon/title/description interaction is informed by Novel's
+Apache-2.0 slash-command design, while colors and spacing are independently
+implemented with LinkVault-owned tokens. NoteGen is a visual/behavioral
+reference only because its implementation is GPL-3.0; no NoteGen CSS or source
+is copied. Paid Tiptap templates are not used.
 
 ## 12. Internal editor adapter
 
@@ -705,7 +904,14 @@ type ClippingDraftState = {
   draftTitle: string;
   draftMarkdown: string;
   revision: number;
-  status: "clean" | "dirty" | "saving" | "failed" | "conflict";
+  status:
+    | "loading-recovery"
+    | "clean"
+    | "dirty"
+    | "saving"
+    | "failed"
+    | "conflict"
+    | "recovered";
   errorCode?: string | null;
   inFlight?: {
     submittedTitle: string;
@@ -726,6 +932,11 @@ dirty.
 Schedule save 800 ms after the latest valid title or Markdown change. Reset the
 timer on each change. Invalid title or over-limit Markdown stays dirty with
 inline validation and does not submit.
+
+Continuous typing must not postpone canonical durability indefinitely. A
+separate maximum-wait timer submits the latest valid canonical snapshot no more
+than 5 seconds after the first unsaved valid change, without creating a second
+in-flight update.
 
 ### FR-AUTOSAVE-003: One in-flight update
 
@@ -781,12 +992,63 @@ Discard changes and continue
 persisted values before completing the pending action. No background list/search
 response may choose it automatically.
 
-### FR-AUTOSAVE-008: Close limitation
+### FR-AUTOSAVE-008: Native recovery checkpoint
 
-A normal Tauri close request may wait briefly for one update. Forced process
-termination, OS kill, or power loss inside the 800 ms debounce window remains a
-known V1 limitation and must be documented honestly. V1 does not add a second
-local draft journal.
+D-034 supersedes the earlier no-journal limitation. Independently of canonical
+autosave, coalesce a recovery checkpoint after 500 ms of quiet time and at
+least every 2 seconds during continuous typing. The checkpoint carries
+clipping ID, canonical base revision, an unguessable mounted-writer session,
+monotonic sequence, title, and Markdown. Only one checkpoint write is in flight;
+newer visible edits become queued-latest work.
+
+Recovery checkpoints accept an empty or otherwise canonically invalid title
+when within the approved 4 KiB title / 4 MiB Markdown recovery envelope. They do
+not update the clipping revision, canonical metadata, list excerpt, or search
+index.
+
+### FR-AUTOSAVE-009: Cooperative close and exit
+
+Window X prevents native close and requests the latest durability state. On a
+successful canonical flush or acknowledged matching recovery checkpoint, hide
+the existing main WebView. Tray **Quit**, application exit, and updater exit use
+the same handshake and terminate only after success. A canonical revision
+conflict may proceed only when the exact newest visible draft has a matching
+durable checkpoint, with recovery copy shown before exit and both versions
+offered next launch. Failure, an uncheckpointed/stale conflict, missing/stale
+acknowledgement, or timeout keeps the application alive and shows/focuses the
+main window. Timeout never means discard.
+
+The database writer remains available until the renderer acknowledges the
+exact native request token. Only the subsequently confirmed exit may stop crop
+work, drain accepted work, and shut down the writer.
+
+### FR-AUTOSAVE-010: Recovery classification
+
+Before enabling edits, load any checkpoint for the clipping and compare its
+base revision and bytes with the canonical note:
+
+- equal bytes: clear the redundant matching checkpoint;
+- matching base revision with different bytes: offer the recovered draft;
+- advanced canonical revision or different unresolved writer session: enter a
+  recovery conflict and preserve both complete documents;
+- malformed or over-envelope row: fail safely without displaying raw database
+  or path details and preserve the row for forward repair.
+
+No recovery draft is silently applied, overwritten, indexed, or discarded.
+
+### FR-AUTOSAVE-011: Sequence-safe acknowledgement
+
+A canonical save acknowledges the writer session and submitted sequence. The
+backend atomically saves canonical title/Markdown/revision/FTS and clears only a
+matching checkpoint no newer than that submission. A stale async completion
+cannot clear a newer visible draft.
+
+### FR-AUTOSAVE-012: Unmount is not durability authority
+
+React cleanup may unregister the surface and stop timers, but it cannot claim a
+final save succeeded. Application-controlled navigation flushes before unmount;
+native code owns close/exit prevention. Browser storage, `beforeunload`, blur,
+and fire-and-forget cleanup are never the source of truth.
 
 ## 15. Revision conflict handling
 
@@ -797,8 +1059,10 @@ On `CLIPPING_REVISION_CONFLICT`:
 1. Preserve local draft in state.
 2. Fetch latest clipping detail.
 3. Stop ordinary autosave.
-4. Show `Changed elsewhere` with the latest saved updated time.
-5. Offer:
+4. Continue accepting visible edits and checkpoint them under the current
+   writer session; conflict never freezes or discards later typing.
+5. Show `Changed elsewhere` with the latest saved updated time.
+6. Offer:
 
    ```text
    Keep my changes
@@ -893,7 +1157,7 @@ nested interactive controls in a way that breaks keyboard access.
 
 ### FR-A11Y-LIBRARY-002
 
-Search, sort, list, source card, title, editor toolbar, editor body, save state,
+Search, sort, gallery, clipping header, title, editor controls, editor body, save state,
 conflict actions, and delete overflow follow a predictable focus order.
 
 ### FR-A11Y-LIBRARY-003
@@ -936,6 +1200,8 @@ reader/app shortcuts while the editor owns focus.
 - Note-only change.
 - Simultaneous title/note change.
 - 800 ms debounce with fake timers.
+- 5-second maximum canonical wait under continuous typing.
+- 500 ms quiet / 2-second maximum recovery checkpoint coalescing.
 - Edit during in-flight save.
 - Failure and manual retry.
 - Navigation flush success/failure/discard.
@@ -955,6 +1221,8 @@ reader/app shortcuts while the editor owns focus.
 - Keyboard-only toolbar and editor use.
 - Labels, focus order, and visible focus in keyboard-only operation.
 - Normal close with dirty note and failed-save navigation guard.
+- Window X hide, tray Quit exit, timeout/failure blocking, and isolated-profile
+  crash/restart recovery.
 
 ## 20. Phase 4A exit gate
 
@@ -979,7 +1247,7 @@ Phase 4B is complete only when:
 - Phases 3 and 4A are merged.
 - The Clippings sidebar item and view are production-enabled.
 - Reader `Open note` action navigates to the created clipping.
-- Paged/virtualized list, visible-only thumbnails, detail source card, title,
+- Paged/virtualized gallery, visible-only thumbnails, detail clipping header, title,
   selected editor, search/sort, autosave, navigation guard, and conflict UI are
   complete.
 - All automated list/editor tests pass at 8, 50, and 500 clipping sizes.
@@ -990,3 +1258,28 @@ Phase 4B is complete only when:
 - Deletion and exact source-return implementation remain for Phase 5; Phase 4B
   may render disabled/appropriate source state but must not fake completion.
 - The coding agent stops.
+
+## 22. Phase 4C exit gate
+
+Phase 4C is complete only when:
+
+- Phase 4B behavior is available on the reviewed Phase 4C base.
+- D-034 schema-v6 migration and recovery contracts pass fresh, populated-v5,
+  current-v6, failure, and future-version fixtures.
+- Canonical autosave, checkpoint coalescing, conflict capture, recovery
+  classification, and sequence-safe acknowledgement pass deterministic tests.
+- Window X safely hides; tray Quit/application/updater exit safely terminate;
+  failed, uncheckpointed/stale-conflict, stale-token, missing-owner, and
+  timed-out attempts remain open. A canonical conflict proceeds only with the
+  exact newest recovery checkpoint durable.
+- Database shutdown occurs only after an exact confirmed durability token.
+- Search, list metadata, and FTS never expose a recovery draft.
+- Every ownership and hard line-size budget in the Phase 4C work order passes its
+  structural gate.
+- Release measurements cover write counts, latency, memory, bundle size, and
+  SQLite/WAL growth without unacceptable regression.
+- Installed Windows lifecycle and isolated-profile crash-recovery UAT is
+  recorded separately from browser automation.
+- All existing Phase 4B, persistence, architecture, UI, browser, Rust, and
+  release gates remain green, generated output is cleaned, and the coding agent
+  stops before Phase 5.

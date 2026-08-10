@@ -1,7 +1,7 @@
 # Newspaper clipping note editor evaluation — 2026-08-09
 
 **Phase:** 4A — isolated compatibility spike only
-**Status:** Complete. D-024 approves the Tiptap 3.29.2 trio; production
+**Status:** Complete. D-024 approves the Tiptap 3.29.2 package set; production
 integration remains Phase 4B work.
 **Branch / base:** `spike/newspaper-clippings-phase-4a-editor` at the evaluation
 worktree based on `60071e4ee868dacb016c62ab0e69ba174e09b6f6`; merged target
@@ -125,9 +125,9 @@ historical evaluation evidence only.
 
 | Item | Evidence at evaluation time |
 |---|---|
-| Direct packages | `@tiptap/react`, `@tiptap/starter-kit`, and `@tiptap/markdown`, all `3.29.2` |
+| Direct packages | `@tiptap/core`, `@tiptap/react`, `@tiptap/starter-kit`, `@tiptap/markdown`, and `@tiptap/suggestion`, all `3.29.2` |
 | React compatibility | `@tiptap/react` peers allow React and React DOM 17, 18, or 19; the application resolves React 19. |
-| License | All three manifests and bundled `LICENSE.md` files state MIT, copyright (c) 2025 Tiptap GmbH. The required notice and full MIT text are in `THIRD_PARTY_NOTICES.md`. |
+| License | All five manifests and bundled `LICENSE.md` files state MIT, copyright (c) 2025 Tiptap GmbH. The required notice and full MIT text are in `THIRD_PARTY_NOTICES.md`. |
 | Release date | npm registry time for each direct package: 2026-07-28T11:55:15Z (within milliseconds). |
 | Maintenance | `ueberdosis/tiptap` was non-archived, MIT, on `main`, pushed 2026-08-08T13:32:31Z, and reported 845 open issues. The issue count is a maintenance risk to monitor, not a known enabled-path defect. |
 | Install behavior | Direct manifests expose only `build: tsup`; no direct install lifecycle script or native binary was observed. The 53-entry lockfile delta is MIT-only and has no `hasInstallScript` marker; 15 installed transitive manifests declare `prepare` only. The serial evaluation installs used `--ignore-scripts`. `marked` exposes a JavaScript CLI bin but no install hook or native binary. |
@@ -202,7 +202,7 @@ stress test. Its final serialisation length was 2,097,152 bytes and its matrix
 row completed in 731 ms. The synthetic composition row is browser regression
 coverage only; it is not native IME evidence.
 
-| Comparison | Candidate A: MDXEditor 4.2.0 | Candidate B: Tiptap 3.29.2 trio |
+| Comparison | Candidate A: MDXEditor 4.2.0 | Candidate B: Tiptap 3.29.2 package set |
 |---|---|---|
 | Isolated JS build | 871.27 kB raw / 273.76 kB gzip in one entry | 651.72 kB raw / 205.22 kB gzip total: 62.69 kB startup entry plus 142.53 kB lazy editor chunk |
 | Browser result | 10/17 passed; raw `<script` persisted | 15/15 passed; raw HTML/MDX, disabled GFM/code/task features, and unsafe links cannot round trip |

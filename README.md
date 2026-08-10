@@ -67,6 +67,83 @@ The desktop app opens from Tauri. The Vite frontend runs at:
 http://127.0.0.1:1420
 ```
 
+Stop the development app with `Ctrl+C` in the terminal that launched it.
+
+### Developer test: Newspaper Clippings
+
+Run this test in the native Tauri window, not the frontend-only browser preview.
+Desktop commands, managed snapshot files, and native input behavior require the
+Tauri runtime.
+
+Before testing, make sure **World Journal → Newspaper library** contains at
+least one downloaded edition with a readable completed page.
+
+1. Open an edition, choose **Clip**, and drag over part of one newspaper page.
+   Confirm that the selection follows the pointer, then choose **Save clipping**.
+   The reader must remain open and offer **Open note** after the save succeeds.
+2. Open **World Journal → Clippings**. At the default desktop width, confirm
+   that four thumbnails fit on each row. Resize the window and confirm that the
+   responsive column count changes without stretching the crop. Thumbnails
+   should replace their placeholders without flashing back to an empty image.
+3. Hover a thumbnail. Only its image should enlarge slightly; the card must not
+   jump upward. Select the thumbnail to open its separate note page.
+4. Confirm the detail page has a compact **Back** action with the editable note
+   title beside it, no search box, and no boxed editor card. The saved crop
+   should be the large read-only header above its provenance and note body.
+   Save state plus Undo/Redo belong in the bottom-right note footer.
+5. At the start of a paragraph or after a space, type `/`. Confirm the popup is
+   visible above the note, then filter it and exercise **Text**,
+   **To-do list**, **Heading 1–4**, **Bullet list**, **Numbered list**,
+   **Quote**, and **Divider** with both pointer selection and the arrow keys
+   plus `Enter`. Confirm `/h` selects **Heading 1**, `/todo` selects
+   **To-do list**, `/hr` selects **Divider**, and a close typo such as
+   `/heding` still ranks **Heading 1** first without executing it automatically.
+6. Drag across note text with the left mouse button. No formatting toolbar
+   should appear during the drag. After release, it should appear above the
+   selection, aligned with the first selected word. Check **Bold**, **Italic**,
+   **Strikethrough**, and **Link**.
+7. Paste plain text, then try pasting an image or file. Text must remain usable;
+   image/file paste must be rejected without replacing the saved clipping.
+8. Edit the title and note, wait for **Saved**, choose **Back**, and reopen the
+   clipping. Confirm that the title, Markdown formatting, and note content were
+   persisted. Optionally repeat typing with a Chinese IME to verify native
+   composition does not duplicate or lose committed text.
+9. Use the Clippings search box. Search separately for words found in the title,
+   note, edition, date, and page. Confirm the matching field tags are correct,
+   lower-confidence results are separated as **Possible matches**, and more
+   results load while scrolling. The search box must remain exclusive to the
+   gallery/search surface.
+10. In **Settings → Snapshot locations**, confirm the derived root is connected.
+    On disk, the clipping belongs under the same newspaper download destination
+    at `Newspaper snapshots/<edition>/`; Settings must not offer an arbitrary
+    global snapshot-folder override.
+11. Add a unique title/body suffix and click the window **X** before the footer
+    reaches **Saved**. The window should hide instead of exiting. Choose
+    **Show LinkVault** from the tray, reopen the clipping, and confirm the exact
+    suffix is canonical or appears in the explicit recovery state. There must
+    still be only one main window.
+12. Type continuously, click **X** while the footer says **Saving…**, then show
+    LinkVault from the tray. Confirm the newest text—not an earlier keystroke—is
+    present. Repeat the hide/show cycle once to catch duplicate close handlers.
+13. Add another unique suffix and immediately choose **Quit** from the tray.
+    Relaunch LinkVault and confirm the exact latest text is saved or explicitly
+    offered for recovery. Tray Quit must exit; window X must only hide.
+14. Do not use Task Manager against a real user database to test crash recovery.
+    Forced-termination and injected save/checkpoint failures belong to the
+    isolated automated harness or a disposable test profile.
+
+Focused automated checks for this workflow:
+
+```powershell
+npm --prefix apps\desktop run verify:clipping-note-editor-markdown
+npm --prefix apps\desktop run verify:clipping-note-editor
+npm --prefix apps\desktop run verify:clipping-note-autosave
+npm --prefix apps\desktop run verify:clipping-note-lifecycle
+npm --prefix apps\desktop run verify:clipping-note-durability-structure
+npm --prefix apps\desktop run verify:clipping-note-durability-browser
+npm --prefix apps\desktop run verify:newspaper-clipping-library
+```
+
 ## Architecture
 
 Backend ownership, the unified workflow decision, and the provider migration

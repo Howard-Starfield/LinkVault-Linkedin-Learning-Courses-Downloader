@@ -6,6 +6,8 @@
 
 **Date:** 2026-08-07
 
+**Last amended:** 2026-08-10 for approved D-034 clipping-note durability
+
 **Product owner:** Howard Deng
 
 **Architecture owner:** LinkVault engineering
@@ -58,17 +60,28 @@ are treated as requirements unless superseded in the decision register.
 9. The source image is a fixed attachment card above the note editor; it is not
    an editable image node inside the note body.
 10. SQLite stores the title and Markdown source of truth.
-11. Canonical clipping images live in an application-managed clipping root
-    beneath `LinkVaultData`, not beside downloaded editions.
+11. New canonical clipping images live under the source download destination
+    in `Newspaper snapshots/<edition>/<date>/Page <page> - <clipping-id>/`.
+    Existing UUID-only snapshot paths and v3 assets remain readable.
 12. Saving returns the user to reader browse mode and offers an **Open note**
     action rather than forcing navigation away from the newspaper.
 13. Deleting or resetting downloaded newspaper data preserves clipping images
     and notes.
 14. When the original edition still exists, a clipping can open the exact page
     and briefly highlight its saved region.
-15. OCR, AI summaries, drawing annotations, multiple clipping attachments in a
+15. Clippings search takes over the provider main view from the Clippings
+    toolbar. It ranks Title, Note, Edition, Date, and Page matches; then, only
+    after confident results are exhausted, offers at most 25 separately labeled
+    **Possible matches** for fuzzy Title, Note, and Edition matches.
+16. Settings lists the snapshot locations created from newspaper download
+    destinations. Users may open, recheck, or marker-verify a moved location,
+    but may not configure an unrelated global snapshot override.
+17. OCR, AI summaries, drawing annotations, multiple clipping attachments in a
     note, tags, cloud synchronization, and a general cross-provider notes
     workspace are outside V1.
+18. Native recovery checkpoints protect recent clipping-note drafts. Window X
+    flushes/checkpoints and hides the existing main window; tray Quit and other
+    approved exits flush/checkpoint and terminate only after success.
 
 The complete decision history is in [00-decision-register.md](00-decision-register.md).
 
@@ -82,6 +95,7 @@ The complete decision history is in [00-decision-register.md](00-decision-regist
 | **Canonical clipping asset** | The lossless WebP file owned by the clipping aggregate. It is durable user data. |
 | **Derived thumbnail** | A regenerable, lower-resolution cache used only for list rendering. It is not durable user data. |
 | **Clipping note** | The title and plain Markdown body owned by one clipping record. |
+| **Recovery checkpoint** | A bounded, local, non-searchable schema-v6 draft used only to recover note edits that are newer than canonical storage. |
 | **Source card** | The non-editable image and provenance block displayed above the editor. |
 | **Source available** | Both source foreign keys still resolve to a completed page that can be opened in the reader. |
 | **Asset ready** | The canonical clipping asset has been validated, promoted to its managed path, and marked ready in SQLite. |
@@ -115,7 +129,7 @@ Every implementation phase must preserve these invariants.
 - Saving a clipping never silently navigates away from the current newspaper.
 - Reader tone and zoom never alter canonical saved pixels.
 - An unavailable source does not make an existing clipping unavailable.
-- The source card cannot be deleted through ordinary note editing.
+- The read-only clipping header cannot be deleted through ordinary note editing.
 
 ### Architecture invariants
 
@@ -134,6 +148,8 @@ Every implementation phase must preserve these invariants.
 - Reset logic excludes clipping rows and managed clipping assets.
 - Note updates use optimistic revision checks and never silently overwrite a
   newer revision.
+- Recovery checkpoints are session/sequence-aware, never searchable, and clear
+  only atomically with an acknowledged canonical save or explicit discard.
 - A database/file mismatch becomes a typed recoverable state rather than silent
   data deletion.
 
@@ -170,6 +186,9 @@ Every implementation phase must preserve these invariants.
 | [06-navigation-deletion-and-reset.md](06-navigation-deletion-and-reset.md) | Sidebar routing, source return navigation, deletion semantics, reset preservation, and unavailable states. |
 | [07-verification-performance-and-release.md](07-verification-performance-and-release.md) | Test matrix, automated commands, evidence, performance measurement, accessibility, native UAT, and release gate. |
 | [08-coding-agent-execution-contract.md](08-coding-agent-execution-contract.md) | Mandatory rules and PR evidence contract for an implementation agent. |
+| [work-orders/phase-1b-search-reconnect.md](work-orders/phase-1b-search-reconnect.md) | Detailed backend work order for ranked search and snapshot-root status/reconnection. |
+| [../../work-orders/newspaper-clipping-note-durability-plan.md](../../work-orders/newspaper-clipping-note-durability-plan.md) | Approved Phase 4C work order for bounded autosave, native close/exit coordination, recovery checkpoints, module size budgets, and performance gates. |
+| [../../work-orders/newspaper-clippings-phase-5-navigation-lifecycle-plan.md](../../work-orders/newspaper-clippings-phase-5-navigation-lifecycle-plan.md) | Approved Phase 5 work order for exact source return, transient highlight, clipping deletion, missing states, and reset preservation. |
 
 If documents conflict, authority is resolved in this order:
 
@@ -187,18 +206,23 @@ conflict cannot be resolved by that order.
 ```mermaid
 flowchart TD
     P0["Phase 0: approve specifications"] --> P1["Phase 1: persistence and managed assets"]
-    P1 --> P2["Phase 2: deterministic native crop service"]
+    P1 --> P1A["Phase 1A: snapshot-root storage amendment"]
+    P1A --> P1B["Phase 1B: ranked search and root reconnect foundation"]
+    P1A --> P2["Phase 2: deterministic native crop service"]
     P2 --> P3["Phase 3: reader clipping interaction"]
     P1 --> P4A["Phase 4A: editor compatibility spike"]
     P3 --> P4B["Phase 4B: clippings library and editor integration"]
+    P1B --> P4B
     P4A --> P4B
-    P4B --> P5["Phase 5: source navigation, deletion, and reset"]
+    P4B --> P4C["Phase 4C: note durability and native lifecycle"]
+    P4C --> P5["Phase 5: source navigation, deletion, and reset"]
     P5 --> P6["Phase 6: performance, native UAT, and release integration"]
 ```
 
-The graph means that Phase 4A may be evaluated after persistence contracts are
-stable, but full library/editor integration may not begin before both the
-reader save path and the editor decision gate are complete.
+The graph means that Phase 1B and the rebased Phase 2 crop work may proceed as
+separate branches after Phase 1A lands. Neither needs the other's implementation.
+Full library/editor integration may not begin before the reader save path,
+ranked-search/reconnect services, and editor decision gate are complete.
 
 ## Phase control table
 
@@ -206,11 +230,14 @@ reader save path and the editor decision gate are complete.
 |---|---|---|---|---|
 | 0 | Review ADR-002 and all V1 specifications. Resolve blocking decisions. | Documentation branch exists. | ADR-002 and all documents approved and merged. | Complete |
 | 1 | Schema, repository, managed roots, asset state machine, protocol route, recovery foundations. No crop UI. | Phase 0 complete. | Migration, reset-preservation, repository, protocol, lifecycle, and persistence gates pass. | Complete |
-| 2 | Native source resolver, normalized-to-pixel conversion, crop encoder, checksum, bounded blocking execution, create command. No reader selection UI. | Phase 1 complete. | Deterministic crop and failure-path tests pass; measured crop baseline recorded. | Ready |
-| 3 | Reader Clip action, pointer/keyboard state machine, selection overlay, save confirmation, non-disruptive success flow. | Phase 2 complete. | Browser interaction matrix and native DPI smoke pass without reader virtualization regression. | Blocked |
+| 1A | Place new clipping assets under each download destination's protected `Newspaper snapshots` root; add root registry/marker and legacy reads. | Phase 1 complete. | Storage-amendment lifecycle, recovery, media, archive/reset, and migration gates pass. | Implemented locally in the stacked integration history; merge pending |
+| 1B | Add schema-v5 FTS, deterministic ranked/fuzzy repository contracts, and root list/check/reconnect services. No production UI. | Phase 1A available on the stacked base. | Migration/index/ranking/root-service and full repository gates pass. | Implemented locally; merge pending |
+| 2 | Native source resolver, normalized-to-pixel conversion, crop encoder, checksum, bounded blocking execution, create command. No reader selection UI. | Phase 1A available; Phase 2 rebased on it. | Deterministic crop and failure-path tests pass; measured crop baseline recorded. | Implemented locally; merge pending |
+| 3 | Reader Clip action, pointer/keyboard state machine, selection overlay, save confirmation, non-disruptive success flow. | Phase 2 complete on the stacked base. | Browser interaction matrix and native DPI smoke pass without reader virtualization regression. | Implemented locally; merge pending |
 | 4A | Compare approved editor candidates behind an isolated adapter. No production note UI. | Phase 1 complete and editor criteria approved. | One candidate is recorded as Approved in the decision register with evidence. | Complete |
-| 4B | Sidebar Clippings view, paged/virtualized list, detail source card, selected editor, autosave, optimistic conflict handling, search/sort. | Phases 3 and 4A complete. | List, editor, IME, autosave, search, and conflict tests pass. | Blocked |
-| 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4B complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Blocked |
+| 4B | Sidebar Clippings view, paged/virtualized gallery, full-page detail with read-only clipping header, Tiptap editor, autosave, optimistic conflict handling, search takeover, and Snapshot locations Settings UI. | Phases 1B, 3, and 4A available on the stacked base. | Gallery, editor, IME, autosave, ranked-search, reconnect, conflict, visual, native, and release gates pass. | Implemented locally at `12a65a1`; review/merge pending |
+| 4C | Schema-v6 recovery checkpoints, bounded canonical/checkpoint autosave, recovery/conflict UI, and native close-X/tray Quit/application/updater exit authority. | Audited Phase 4B behavior available; D-034 and the Phase 4C work order approved. | Migration, recovery, ownership, browser, native lifecycle, performance, and release-regression gates pass. | Implemented locally; native close-X/tray Show/tray Quit/restart UAT passed 2026-08-10; disposable fault-injection evidence remains Phase 6 |
+| 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4C complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Automated implementation and release gates complete locally; native dev UAT pending 2026-08-10 |
 | 6 | Final performance budgets, accessibility audit, native installed-app UAT, visual evidence, release verification. | Phase 5 complete. | All automated and manual release gates pass and evidence is committed. | Blocked |
 
 ## Required implementation PR sequence
@@ -221,10 +248,13 @@ change.
 
 ```text
 PR 1  feat(newspaper): add clipping persistence and managed asset lifecycle
+PR 1A feat(newspaper): store clipping assets with newspaper snapshots
+PR 1B feat(newspaper): add ranked clipping search and root reconnect foundation
 PR 2  feat(newspaper): add deterministic native clipping crop service
 PR 3  feat(newspaper): add reader clipping selection workflow
 PR 4A test(editor): evaluate clipping note editor candidates
 PR 4B feat(newspaper): add clippings library and Markdown note editor
+PR 4C feat(newspaper): harden clipping note durability and native exit
 PR 5  feat(newspaper): add clipping source navigation and lifecycle controls
 PR 6  perf(newspaper): certify clippings release and native UAT
 ```
@@ -265,7 +295,7 @@ reason to weaken the V1 data model or test gates.
 ## Resolved editor decision
 
 The core product contract and editor selection are approved. D-024 selects the
-exact Tiptap 3.29.2 trio behind the LinkVault-owned Markdown adapter. Phase 4B
+exact Tiptap 3.29.2 package set behind the LinkVault-owned Markdown adapter. Phase 4B
 retains native Tauri IME validation as an integration exit gate; screen-reader
 UAT is not a product blocker.
 

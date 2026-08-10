@@ -13,8 +13,8 @@ use std::path::{Component, Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::clipping_models::{
-    validate_asset_byte_count, validate_clipping_id, ClippingError, ClippingErrorCode,
-    CLIPPING_ASSET_MIME,
+    validate_asset_byte_count, validate_clipping_id, validate_page_number, ClippingError,
+    ClippingErrorCode, CLIPPING_ASSET_MIME,
 };
 
 /// Canonical clipping asset file name (FR-ASSET-001).
@@ -24,13 +24,16 @@ pub const STAGING_PART_SUFFIX: &str = ".part";
 /// Canonical relative path template (FR-ASSET-001).
 pub const CANONICAL_RELATIVE_TEMPLATE: &str = "assets/<clipping-id>/clipping-v1.webp";
 /// Cache schema version for derived clipping thumbnails (D-020).
-pub const THUMBNAIL_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const THUMBNAIL_CACHE_SCHEMA_VERSION: u32 = 2;
 /// Conservative serve-side byte ceiling for regenerable clipping thumbnails.
-/// A 512x320 RGBA decode is under 1 MiB; 8 MiB leaves ample WebP/container
+/// A 1024x640 RGBA decode is 2.5 MiB; 8 MiB leaves ample WebP/container
 /// overhead without permitting an unbounded cache-file allocation.
 pub const THUMBNAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
-pub const THUMBNAIL_MAX_WIDTH: u32 = 512;
-pub const THUMBNAIL_MAX_HEIGHT: u32 = 320;
+pub const THUMBNAIL_MAX_WIDTH: u32 = 1024;
+pub const THUMBNAIL_MAX_HEIGHT: u32 = 640;
+pub const SNAPSHOT_EDITION_SEGMENT_MAX_CHARS: usize = 96;
+pub const SNAPSHOT_CLIPPING_SEGMENT_MAX_CHARS: usize = 80;
+const SNAPSHOT_PAGE_LABEL_MAX_CHARS: usize = 32;
 
 /// Directory names beneath the managed clipping root.
 pub const ASSETS_DIR: &str = "assets";
@@ -38,13 +41,15 @@ pub const THUMBNAILS_DIR: &str = "thumbnails";
 pub const STAGING_DIR: &str = "staging";
 pub const TRASH_DIR: &str = "trash";
 pub const QUARANTINE_DIR: &str = "quarantine";
-pub const THUMBNAIL_VERSION_DIR: &str = "v1";
+pub const THUMBNAIL_VERSION_DIR: &str = "v2";
 
 /// The managed clipping root layout beneath `LinkVaultData`.
 #[derive(Clone, Debug)]
 pub struct ClippingAssetLayout {
     root: PathBuf,
     data_parent: PathBuf,
+    create_root_if_missing: bool,
+    management_prefix: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,6 +59,83 @@ pub struct ThumbnailCleanupSummary {
 }
 
 impl ClippingAssetLayout {
+    fn sanitize_snapshot_segment(value: &str) -> String {
+        let filtered = value
+            .chars()
+            .filter(|character| !character.is_control() && !r#"\/:*?"<>|"#.contains(*character))
+            .collect::<String>();
+        filtered
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_matches([' ', '.'])
+            .to_owned()
+    }
+
+    pub fn snapshot_edition_segment(edition_name: &str, edition_code: &str) -> String {
+        let code = {
+            let candidate = Self::sanitize_snapshot_segment(edition_code);
+            let candidate = candidate.chars().take(32).collect::<String>();
+            if candidate.is_empty() {
+                "edition".to_owned()
+            } else {
+                candidate
+            }
+        };
+        let suffix = format!(" - {code}");
+        let name_limit = SNAPSHOT_EDITION_SEGMENT_MAX_CHARS.saturating_sub(suffix.chars().count());
+        let name = Self::sanitize_snapshot_segment(edition_name)
+            .chars()
+            .take(name_limit)
+            .collect::<String>();
+        let name = if name.is_empty() { "Newspaper" } else { &name };
+        let combined = format!("{name}{suffix}");
+        if is_windows_reserved_segment(&combined) {
+            format!("Newspaper{suffix}")
+        } else {
+            combined
+        }
+    }
+
+    pub fn snapshot_clipping_segment(
+        page_number: &str,
+        clipping_id: &str,
+    ) -> Result<String, ClippingError> {
+        if !validate_page_number(page_number) || !validate_clipping_id(clipping_id) {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        let page = Self::sanitize_snapshot_segment(page_number)
+            .chars()
+            .take(SNAPSHOT_PAGE_LABEL_MAX_CHARS)
+            .collect::<String>();
+        let label = if page.is_empty() {
+            "Page".to_owned()
+        } else {
+            format!("Page {page}")
+        };
+        Ok(format!("{label} - {clipping_id}"))
+    }
+
+    pub fn snapshot_relative_path(
+        edition_name: &str,
+        edition_code: &str,
+        publication_date: &str,
+        page_number: &str,
+        clipping_id: &str,
+    ) -> Result<String, ClippingError> {
+        if !validate_clipping_id(clipping_id)
+            || chrono::NaiveDate::parse_from_str(publication_date, "%Y-%m-%d").is_err()
+        {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        Ok(format!(
+            "{}/{}/{}/{}",
+            Self::snapshot_edition_segment(edition_name, edition_code),
+            publication_date,
+            Self::snapshot_clipping_segment(page_number, clipping_id)?,
+            CANONICAL_FILE_NAME
+        ))
+    }
     /// Adopt a root directory. The caller resolves the production root via
     /// `app::storage::resolve_newspaper_clippings_root`; tests inject
     /// temporary directories.
@@ -62,7 +144,28 @@ impl ClippingAssetLayout {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| root.clone());
-        Self { root, data_parent }
+        Self {
+            root,
+            data_parent,
+            create_root_if_missing: true,
+            management_prefix: None,
+        }
+    }
+
+    /// Adopt a registered root that must already exist. Read, recovery, and
+    /// cleanup paths use this constructor so an offline or reused destination
+    /// is never recreated implicitly.
+    pub fn new_existing(root: PathBuf) -> Self {
+        let data_parent = root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        Self {
+            root,
+            data_parent,
+            create_root_if_missing: false,
+            management_prefix: Some(".linkvault"),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -86,9 +189,16 @@ impl ClippingAssetLayout {
                     return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&self.root)
-                    .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && self.create_root_if_missing =>
+            {
+                match fs::create_dir(&self.root) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => {
+                        return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
+                    }
+                }
             }
             Err(_) => {
                 return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
@@ -125,8 +235,15 @@ impl ClippingAssetLayout {
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&dir)
-                        .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+                    match fs::create_dir(&dir) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(_) => {
+                            return Err(ClippingError::new(
+                                ClippingErrorCode::AssetRootUnavailable,
+                            ));
+                        }
+                    }
                 }
                 Err(_) => {
                     return Err(ClippingError::new(ClippingErrorCode::AssetRootUnavailable));
@@ -153,19 +270,26 @@ impl ClippingAssetLayout {
     }
 
     pub fn staging_dir(&self) -> Result<PathBuf, ClippingError> {
-        self.ensure_dir(STAGING_DIR)
+        self.ensure_management_dir(STAGING_DIR)
     }
 
     pub fn trash_dir(&self) -> Result<PathBuf, ClippingError> {
-        self.ensure_dir(TRASH_DIR)
+        self.ensure_management_dir(TRASH_DIR)
     }
 
     pub fn quarantine_dir(&self) -> Result<PathBuf, ClippingError> {
-        self.ensure_dir(QUARANTINE_DIR)
+        self.ensure_management_dir(QUARANTINE_DIR)
     }
 
     pub fn thumbnails_dir(&self) -> Result<PathBuf, ClippingError> {
         self.ensure_dir(&format!("{THUMBNAILS_DIR}/{THUMBNAIL_VERSION_DIR}"))
+    }
+
+    fn ensure_management_dir(&self, category: &str) -> Result<PathBuf, ClippingError> {
+        match self.management_prefix {
+            Some(prefix) => self.ensure_dir(&format!("{prefix}/{category}")),
+            None => self.ensure_dir(category),
+        }
     }
 
     /// The canonical relative path stored in SQLite (FR-ASSET-001). React
@@ -219,6 +343,84 @@ impl ClippingAssetLayout {
             return Err(invalid());
         }
         Ok(())
+    }
+
+    /// Validate either the legacy v3 shape or the snapshot-root shape for one
+    /// exact clipping ID. Snapshot relative paths are either the legacy
+    /// `<edition>/<yyyy-mm-dd>/<id>/clipping-v1.webp` shape or the readable
+    /// `<edition>/<yyyy-mm-dd>/Page <page> - <id>/clipping-v1.webp` shape.
+    pub fn validate_relative_path_for_id(
+        relative: &str,
+        clipping_id: &str,
+    ) -> Result<(), ClippingError> {
+        if Self::validate_relative_path(relative).is_ok() {
+            return relative
+                .split('/')
+                .nth(1)
+                .filter(|id| *id == clipping_id)
+                .map(|_| ())
+                .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        if !validate_clipping_id(clipping_id) || relative.contains('\\') {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        let components = Path::new(relative).components().collect::<Vec<_>>();
+        if components.len() != 4 {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        let normal = components
+            .iter()
+            .map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?;
+        let edition = normal[0];
+        let date = normal[1];
+        if edition.is_empty()
+            || edition == "."
+            || edition == ".."
+            || edition.ends_with([' ', '.'])
+            || edition.chars().count() > SNAPSHOT_EDITION_SEGMENT_MAX_CHARS
+            || edition
+                .chars()
+                .any(|character| character.is_control() || r#"\/:*?"<>|"#.contains(character))
+            || is_windows_reserved_segment(edition)
+            || date.len() != 10
+            || !date.chars().enumerate().all(|(index, ch)| {
+                matches!(index, 4 | 7) && ch == '-'
+                    || !matches!(index, 4 | 7) && ch.is_ascii_digit()
+            })
+            || !Self::is_snapshot_clipping_segment_for_id(normal[2], clipping_id)
+            || normal[3] != CANONICAL_FILE_NAME
+        {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        Ok(())
+    }
+
+    fn is_snapshot_clipping_segment_for_id(segment: &str, clipping_id: &str) -> bool {
+        if segment == clipping_id {
+            return true;
+        }
+        let suffix = format!(" - {clipping_id}");
+        segment.starts_with("Page ")
+            && segment.ends_with(&suffix)
+            && segment.chars().count() <= SNAPSHOT_CLIPPING_SEGMENT_MAX_CHARS
+            && !segment.ends_with([' ', '.'])
+            && !segment
+                .chars()
+                .any(|character| character.is_control() || r#"\/:*?"<>|"#.contains(character))
+    }
+
+    pub fn canonical_path_at(
+        &self,
+        clipping_id: &str,
+        relative: &str,
+    ) -> Result<PathBuf, ClippingError> {
+        Self::validate_relative_path_for_id(relative, clipping_id)?;
+        Ok(self.ensure_root()?.join(relative))
     }
 
     fn canonical_dir_for(&self, clipping_id: &str) -> Result<PathBuf, ClippingError> {
@@ -359,8 +561,21 @@ impl ClippingAssetLayout {
     /// (CREATE-STATE-003, FR-ASSET-003). An unexpected existing canonical
     /// directory is a collision, not an overwrite.
     pub fn promote_staging(&self, clipping_id: &str) -> Result<(), ClippingError> {
+        let relative = Self::canonical_relative_path(clipping_id)?;
+        self.promote_staging_to(clipping_id, &relative)
+    }
+
+    pub fn promote_staging_to(
+        &self,
+        clipping_id: &str,
+        relative: &str,
+    ) -> Result<(), ClippingError> {
         let staging_dir = self.staging_dir_for(clipping_id)?;
-        let canonical_dir = self.canonical_dir_for(clipping_id)?;
+        let canonical_path = self.canonical_path_at(clipping_id, relative)?;
+        let canonical_dir = canonical_path
+            .parent()
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?
+            .to_path_buf();
         let staging_metadata = staging_dir
             .symlink_metadata()
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
@@ -377,10 +592,12 @@ impl ClippingAssetLayout {
         if canonical_dir.symlink_metadata().is_ok() {
             return Err(ClippingError::new(ClippingErrorCode::AssetCollision));
         }
-        if let Some(parent) = canonical_dir.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
-        }
+        let relative_parent = Path::new(relative)
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::to_str)
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?;
+        self.ensure_dir(relative_parent)?;
         fs::rename(&canonical_staging_dir, &canonical_dir)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetPromotionFailed))?;
         Ok(())
@@ -395,8 +612,30 @@ impl ClippingAssetLayout {
         expected_height: u32,
         expected_sha256: &str,
     ) -> Result<(), ClippingError> {
-        self.read_validated_canonical_for_protocol(
+        let relative = Self::canonical_relative_path(clipping_id)?;
+        self.verify_canonical_at(
             clipping_id,
+            &relative,
+            expected_byte_count,
+            expected_width,
+            expected_height,
+            expected_sha256,
+        )
+        .map(|_| ())
+    }
+
+    pub fn verify_canonical_at(
+        &self,
+        clipping_id: &str,
+        relative: &str,
+        expected_byte_count: u64,
+        expected_width: u32,
+        expected_height: u32,
+        expected_sha256: &str,
+    ) -> Result<(), ClippingError> {
+        self.read_validated_canonical_at(
+            clipping_id,
+            relative,
             expected_byte_count,
             expected_width,
             expected_height,
@@ -506,13 +745,34 @@ impl ClippingAssetLayout {
         clipping_id: &str,
         nonce: u128,
     ) -> Result<Option<PathBuf>, ClippingError> {
-        let canonical_dir = self.canonical_dir_for(clipping_id)?;
+        let relative = Self::canonical_relative_path(clipping_id)?;
+        self.move_canonical_to_trash_at(clipping_id, &relative, nonce)
+    }
+
+    pub fn move_canonical_to_trash_at(
+        &self,
+        clipping_id: &str,
+        relative: &str,
+        nonce: u128,
+    ) -> Result<Option<PathBuf>, ClippingError> {
+        let canonical_path = self.canonical_path_at(clipping_id, relative)?;
+        let canonical_dir = canonical_path
+            .parent()
+            .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetPathInvalid))?
+            .to_path_buf();
         let metadata = match canonical_dir.symlink_metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(ClippingError::new(ClippingErrorCode::DeleteFailed)),
         };
         if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+            return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
+        }
+        let root = self.ensure_root()?;
+        let canonical_dir = canonical_dir
+            .canonicalize()
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DeleteFailed))?;
+        if !canonical_dir.starts_with(&root) {
             return Err(ClippingError::new(ClippingErrorCode::AssetPathInvalid));
         }
         let trash_root = self.trash_dir()?;
@@ -663,8 +923,29 @@ impl ClippingAssetLayout {
         expected_height: u32,
         expected_sha256: &str,
     ) -> Result<(Vec<u8>, &'static str), ClippingError> {
+        let relative = Self::canonical_relative_path(clipping_id)?;
+        self.read_validated_canonical_at(
+            clipping_id,
+            &relative,
+            expected_byte_count,
+            expected_width,
+            expected_height,
+            expected_sha256,
+        )
+    }
+
+    pub fn read_validated_canonical_at(
+        &self,
+        clipping_id: &str,
+        relative: &str,
+        expected_byte_count: u64,
+        expected_width: u32,
+        expected_height: u32,
+        expected_sha256: &str,
+    ) -> Result<(Vec<u8>, &'static str), ClippingError> {
         self.read_validated_canonical_for_protocol_inner(
             clipping_id,
+            relative,
             expected_byte_count,
             expected_width,
             expected_height,
@@ -673,9 +954,11 @@ impl ClippingAssetLayout {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_validated_canonical_for_protocol_inner<F>(
         &self,
         clipping_id: &str,
+        relative: &str,
         expected_byte_count: u64,
         expected_width: u32,
         expected_height: u32,
@@ -685,7 +968,7 @@ impl ClippingAssetLayout {
     where
         F: FnOnce(&Path),
     {
-        let path = self.contained_regular_file(&self.canonical_path(clipping_id)?)?;
+        let path = self.contained_regular_file(&self.canonical_path_at(clipping_id, relative)?)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
         if !validate_asset_byte_count(expected_byte_count) || metadata.len() != expected_byte_count
@@ -703,6 +986,64 @@ impl ClippingAssetLayout {
         )?;
         after_validation(&path);
         Ok((bytes, CLIPPING_ASSET_MIME))
+    }
+
+    /// Atomically publish one derived thumbnail inside the application cache.
+    /// Canonical clipping bytes are never modified by this cache operation.
+    pub fn write_thumbnail_cache(
+        &self,
+        clipping_id: &str,
+        asset_version: u32,
+        bytes: &[u8],
+    ) -> Result<(u32, u32), ClippingError> {
+        let invalid = || ClippingError::new(ClippingErrorCode::AssetValidationFailed);
+        if bytes.is_empty() || bytes.len() as u64 > THUMBNAIL_MAX_BYTES || !is_webp_container(bytes)
+        {
+            return Err(invalid());
+        }
+        let features = webp::BitstreamFeatures::new(bytes).ok_or_else(invalid)?;
+        if features.has_animation()
+            || features.width() == 0
+            || features.width() > THUMBNAIL_MAX_WIDTH
+            || features.height() == 0
+            || features.height() > THUMBNAIL_MAX_HEIGHT
+        {
+            return Err(invalid());
+        }
+        let decoded = webp::Decoder::new(bytes).decode().ok_or_else(invalid)?;
+        if decoded.width() != features.width() || decoded.height() != features.height() {
+            return Err(invalid());
+        }
+
+        let target = self.thumbnail_path(clipping_id, asset_version)?;
+        if self
+            .read_thumbnail_for_protocol(clipping_id, asset_version)
+            .is_ok()
+        {
+            return Ok((features.width(), features.height()));
+        }
+        if target.symlink_metadata().is_ok() {
+            let contained = self.contained_regular_file(&target)?;
+            fs::remove_file(contained)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        }
+        let part = target.with_extension("webp.part");
+        if part.symlink_metadata().is_ok() {
+            let contained = self.contained_regular_file(&part)?;
+            fs::remove_file(contained)
+                .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        fs::rename(&part, &target)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetWriteFailed))?;
+        Ok((features.width(), features.height()))
     }
 
     /// Serve-side validation for derived thumbnails (FR-MEDIA-002).
@@ -741,6 +1082,21 @@ impl ClippingAssetLayout {
         }
         Ok((bytes, CLIPPING_ASSET_MIME))
     }
+}
+
+fn is_windows_reserved_segment(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
 }
 
 /// SHA-256 over canonical bytes, lowercase hex (D-008).
@@ -853,6 +1209,47 @@ mod tests {
             format!("assets/{TEST_ID}/clipping-v1.webp")
         );
         assert!(ClippingAssetLayout::canonical_relative_path("not-a-uuid").is_err());
+        let snapshot = ClippingAssetLayout::snapshot_relative_path(
+            "World Journal / West",
+            "WJ-LA",
+            "2026-08-09",
+            "A01",
+            TEST_ID,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot,
+            format!("World Journal West - WJ-LA/2026-08-09/Page A01 - {TEST_ID}/clipping-v1.webp")
+        );
+        assert!(ClippingAssetLayout::validate_relative_path_for_id(&snapshot, TEST_ID).is_ok());
+        let legacy_snapshot =
+            format!("World Journal West - WJ-LA/2026-08-09/{TEST_ID}/clipping-v1.webp");
+        assert!(
+            ClippingAssetLayout::validate_relative_path_for_id(&legacy_snapshot, TEST_ID).is_ok()
+        );
+        assert!(ClippingAssetLayout::snapshot_relative_path(
+            "World Journal",
+            "WJ",
+            "2026-02-30",
+            "A01",
+            TEST_ID
+        )
+        .is_err());
+        assert_eq!(
+            ClippingAssetLayout::snapshot_clipping_segment(" A/01:* ", TEST_ID).unwrap(),
+            format!("Page A01 - {TEST_ID}")
+        );
+        assert!(ClippingAssetLayout::snapshot_clipping_segment("", TEST_ID).is_err());
+        assert!(ClippingAssetLayout::validate_relative_path_for_id(
+            &format!(
+                "World Journal West - WJ-LA/2026-08-09/Page A01 - {OTHER_ID}/clipping-v1.webp"
+            ),
+            TEST_ID,
+        )
+        .is_err());
+        let long = ClippingAssetLayout::snapshot_edition_segment(&"x".repeat(200), "NY");
+        assert!(long.ends_with(" - NY"));
+        assert!(long.chars().count() <= SNAPSHOT_EDITION_SEGMENT_MAX_CHARS);
     }
 
     #[test]
@@ -864,7 +1261,7 @@ mod tests {
             "../assets/x/clipping-v1.webp",
             "assets/../assets/x/clipping-v1.webp",
             "assets/../../secret.webp",
-            "thumbnails/v1/x.webp",
+            "thumbnails/v2/x.webp",
             &format!("assets/{TEST_ID}/other.webp"),
             &format!("assets/{TEST_ID}/sub/clipping-v1.webp"),
             &format!("assets/{OTHER_ID}"),
@@ -1096,6 +1493,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_delete_rejects_escape_through_edition_parent_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Newspaper snapshots");
+        fs::create_dir(&root).unwrap();
+        let layout = ClippingAssetLayout::new_existing(root.clone());
+        let outside = directory.path().join("outside-edition");
+        let outside_clipping = outside.join("2026-08-09").join(TEST_ID);
+        fs::create_dir_all(&outside_clipping).unwrap();
+        fs::write(outside_clipping.join(CANONICAL_FILE_NAME), b"keep-me").unwrap();
+        let edition = "Daily News - DN";
+        if !create_dir_link(&outside, &root.join(edition)) {
+            eprintln!("directory link creation unavailable on this machine");
+            return;
+        }
+        let relative = format!("{edition}/2026-08-09/{TEST_ID}/{CANONICAL_FILE_NAME}");
+
+        let error = layout
+            .move_canonical_to_trash_at(TEST_ID, &relative, 1)
+            .expect_err("a linked parent must not move data from outside the root");
+
+        assert_eq!(error.code, ClippingErrorCode::AssetPathInvalid);
+        assert_eq!(
+            fs::read(outside_clipping.join(CANONICAL_FILE_NAME)).unwrap(),
+            b"keep-me"
+        );
+    }
+
+    #[test]
     fn symlinked_canonical_asset_is_rejected_without_reading_outside_bytes() {
         let (directory, layout) = temp_layout();
         let outside = directory.path().join("outside");
@@ -1205,9 +1630,15 @@ mod tests {
         layout.promote_staging(TEST_ID).unwrap();
 
         let (served, mime) = layout
-            .read_validated_canonical_for_protocol_inner(TEST_ID, len, 24, 16, &checksum, |path| {
-                fs::write(path, &replacement).unwrap()
-            })
+            .read_validated_canonical_for_protocol_inner(
+                TEST_ID,
+                &ClippingAssetLayout::canonical_relative_path(TEST_ID).unwrap(),
+                len,
+                24,
+                16,
+                &checksum,
+                |path| fs::write(path, &replacement).unwrap(),
+            )
             .unwrap();
 
         assert_eq!(served, bytes, "served bytes must be the validated buffer");
@@ -1229,8 +1660,8 @@ mod tests {
             .unwrap()
             .join(format!("{TEST_ID}0-asset-1.webp"));
         assert_ne!(first, second);
-        assert!(first.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-1.webp")));
-        assert!(second.ends_with(format!("thumbnails/v1/{TEST_ID}-asset-2.webp")));
+        assert!(first.ends_with(format!("thumbnails/v2/{TEST_ID}-asset-1.webp")));
+        assert!(second.ends_with(format!("thumbnails/v2/{TEST_ID}-asset-2.webp")));
         for path in [&first, &second, &other, &lookalike] {
             fs::write(path, encode_test_webp(4, 4)).unwrap();
         }

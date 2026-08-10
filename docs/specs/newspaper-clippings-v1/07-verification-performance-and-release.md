@@ -5,8 +5,8 @@
 **Primary implementation phase:** Phase 6, with mandatory checkpoints in every
 prior phase
 
-**Related decisions:** All V1 decisions, especially D-004 through D-009,
-D-015 through D-028
+**Related decisions:** All V1 decisions, especially D-004 through D-008,
+D-015 through D-028, and D-032 through D-034
 
 ## 1. Purpose
 
@@ -36,6 +36,8 @@ Recommended new scripts:
 ```text
 apps/desktop/scripts/verify-newspaper-clippings.mjs
 apps/desktop/scripts/verify-newspaper-clippings-browser.mjs
+apps/desktop/scripts/verify-clipping-note-durability-structure.mjs
+apps/desktop/scripts/verify-clipping-note-durability-browser.mjs
 ```
 
 Recommended package scripts:
@@ -45,7 +47,11 @@ Recommended package scripts:
   "verify:newspaper-clippings":
     "node --experimental-strip-types ./scripts/verify-newspaper-clippings.mjs",
   "verify:newspaper-clippings-browser":
-    "node ./scripts/verify-newspaper-clippings-browser.mjs"
+    "node ./scripts/verify-newspaper-clippings-browser.mjs",
+  "verify:clipping-note-durability-structure":
+    "node ./scripts/verify-clipping-note-durability-structure.mjs",
+  "verify:clipping-note-durability-browser":
+    "node ./scripts/verify-clipping-note-durability-browser.mjs"
 }
 ```
 
@@ -92,6 +98,9 @@ npm.cmd --prefix apps\desktop run verify:newspaper-performance
 npm.cmd --prefix apps\desktop run verify:newspaper-performance-browser
 npm.cmd --prefix apps\desktop run verify:newspaper-clippings
 npm.cmd --prefix apps\desktop run verify:newspaper-clippings-browser
+npm.cmd --prefix apps\desktop run verify:clipping-note-autosave
+npm.cmd --prefix apps\desktop run verify:clipping-note-durability-structure
+npm.cmd --prefix apps\desktop run verify:clipping-note-durability-browser
 ```
 
 ### Rust gates
@@ -284,6 +293,17 @@ clipping_persistence_
 - One source-page delete unlinks one/multiple clippings without changing notes.
 - Job cascade unlinks source IDs without deleting clipping rows.
 - Reset preserves clipping rows/assets/thumbnails.
+
+#### Startup reconciliation scheduling
+
+- Database-driven `creating` and `delete_pending` recovery completes before
+  clipping state is exposed.
+- Managed-folder reconciliation waits for the approved five-second quiet
+  period, then runs once on a blocking worker.
+- Application setup performs no directory enumeration and does not wait for
+  deferred cleanup.
+- Reconciliation is limited to backend-derived managed categories and never
+  scans the visible newspaper edition/date tree for filename-based imports.
 - Reset preserves byte-identical note Markdown and checksums.
 - Reset works with foreign keys enabled.
 - Explicit unlink path protects legacy/test connections where foreign keys are
@@ -296,7 +316,21 @@ The clipping migration and reset suite passes from at least:
 
 - A fresh database.
 - The immediately previous supported schema.
+- A populated schema-v3 clipping table backfilled to the legacy root with a
+  verified backup and byte-identical note/asset metadata.
 - A populated realistic test database with all providers represented.
+
+### FTS migration and integrity
+
+- Bundled SQLite reports `ENABLE_FTS5` before schema-v5 installation.
+- A populated schema-v4 database receives a verified backup, FTS objects,
+  triggers, rebuild, parity check, and only then `user_version = 5`.
+- Insert, title/note update, delete, recovery-state change, reset/source unlink,
+  and optimistic-conflict paths keep canonical rows and the index consistent.
+- Forced trigger/rebuild failure rolls back without changing title/note bytes.
+- Repair drops/rebuilds only derived FTS objects and restores representative
+  English/Chinese results.
+- Corrupt/missing index never causes clipping or note deletion.
 
 ## 7. Managed asset and recovery suite
 
@@ -310,6 +344,12 @@ clipping_recovery_
 ### Path and security tests
 
 - Invalid/Unicode-lookalike operation IDs.
+- New snapshot paths use `Page <page> - <full UUID>` leaves, sanitize/bound the
+  page label, and retain the exact full operation ID.
+- Two same-edition/date/page crops at the same timestamp produce distinct
+  readable folders and both canonical assets remain intact.
+- Existing UUID-only snapshot paths remain readable; mismatched UUID suffixes
+  and malformed readable leaves are rejected.
 - Absolute paths.
 - Parent components.
 - Alternate separators.
@@ -322,6 +362,16 @@ clipping_recovery_
 - Thumbnail path outside root.
 - Stale media version URL.
 - Checksum mismatch.
+- Missing/mismatched root marker and reused destination path.
+- Offline removable/network root remains transient and is not recreated.
+- Settings list reads registry rows without probing every root synchronously.
+- Coalesced `Check again` returns connected/offline/marker-mismatch by root ID.
+- Marker-verified reconnect updates only the requested root locator/key.
+- Reconnect rejects empty/unmarked roots, another root's marker, duplicate
+  locator ownership, reparse points, and database-write failure without moving
+  or rewriting files.
+- Open folder is rejected unless the current marker verifies.
+- Search/note edit remain available with every canonical root offline.
 - Error body/log redaction.
 
 ### Creation recovery tests
@@ -337,7 +387,8 @@ without touching source media or another clipping.
 ### Orphan cleanup tests
 
 - Grace period respected.
-- Staging/canonical orphans move to quarantine before deletion.
+- Staging orphans and legacy-root canonical orphans move to quarantine before
+  deletion. Visible snapshot edition/date trees are never recursively swept.
 - Trash orphan cleanup.
 - Exact-ID derived-thumbnail orphan cleanup without touching malformed,
   prefix-lookalike, symlinked, or another clipping's entries.
@@ -348,19 +399,25 @@ without touching source media or another clipping.
 - 500-entry and 5,000-entry Windows measurements record wall time and
   approximate/peak memory.
 - No recursive scan outside managed root.
+- Cleanup ownership is root-scoped; an ID in one root does not retain an
+  orphan staging/trash entry in another root.
+- Archive import and job deletion cannot descend into or remove
+  `Newspaper snapshots`.
 
 ### Media protocol tests
 
 - Current canonical request returns correct bytes/MIME/ETag/cache policy.
 - Current thumbnail request returns correct cache bytes.
 - Thumbnail bytes are read only after a positive 8 MiB metadata limit and are
-  static decodable WebP within the 512×320 box.
+  static decodable WebP within the 1024×640 box without upscaling the canonical
+  clipping.
 - Empty, oversized-byte, oversized-dimension, malformed, and animated
   thumbnails fail safely without altering the clipping aggregate.
 - Stale/malformed/missing/corrupt/symlink/escaped requests fail safely.
 - Error responses use `no-store`.
 - Absolute paths never appear in body/header.
 - Only ready canonical assets are served.
+- Root-unavailable requests do not transition ready rows to missing.
 
 ### AC-VERIFY-ASSET-001
 
@@ -496,6 +553,10 @@ Full Markdown bodies fetched for list = 0
 Canonical full images mounted in detail = 1
 Canonical full images mounted in list = 0
 Thumbnail ensure requests = visible rows only, coalesced per ID
+Offline root probes = coalesced per root, not per visible row
+Confident search page size = 50
+Possible matches total <= 25
+Fuzzy candidate/window set = bounded and measured before release
 ```
 
 A browser fixture must expose instrumentation so these conditions are asserted,
@@ -504,11 +565,25 @@ not judged visually.
 ### Search/sort
 
 - Literal wildcard/escape handling.
-- Chinese text.
-- Dates/pages.
-- All sort modes and tie-break IDs.
+- FTS query operators and quotes remain literal user text.
+- One- and two-character Title/Edition/Date/Page matching with Note excluded,
+  exact helper copy, and no Note tag/snippet; three characters enables Note.
+- Mixed English/Chinese exact, substring, and typo candidates.
+- Exact title, title prefix, weighted Title/Note/Edition relevance, and stable
+  updated-time/ID ties against a committed golden ranking fixture.
+- Exact Date/Page matching with proof that neither field is fuzzed.
+- Cumulative factual Title/Note/Edition/Date/Page match tags.
+- Safe bounded highlighted Note snippet.
+- Confident pages 0/1/50/51/500 and one Possible matches page capped at 25.
+- Confident IDs excluded from Possible matches.
+- Fuzzy query under four Unicode scalar values returns no fuzzy page.
+- Two-megabyte note does not cause per-keystroke full-note fuzzy scanning.
+- Search generation cancellation, cross-page dedupe, and invalidation restart.
+- Relevance enforced while searching; ordinary sort modes and ties resume after
+  clear.
 - Clear search.
-- Search excluding current detail with dirty guard.
+- Search takeover retains current editor state; result activation and return
+  preserve dirty guard, query, loaded boundary, anchor, and focus.
 
 ### Source card
 
@@ -542,6 +617,8 @@ clipping_autosave_
 ### Autosave
 
 - Exact 800 ms debounce.
+- Canonical 5-second maximum wait during continuous typing.
+- Recovery checkpoint at 500 ms quiet / 2-second maximum wait.
 - No Tauri write per keystroke.
 - Title-only, note-only, combined changes.
 - Edit during in-flight save.
@@ -550,7 +627,14 @@ clipping_autosave_
 - Flush on every specified boundary.
 - Navigation block and explicit discard.
 - Window blur.
-- Cooperative close.
+- Window X prevents close, flushes/checkpoints, and hides only on success.
+- Tray Quit/application/updater exit flushes/checkpoints and exits only on
+  success.
+- Failed, uncheckpointed/stale-conflict, stale-token, missing-owner, and
+  timed-out lifecycle requests remain open and preserve the draft; a
+  canonical conflict exits only with the exact newest checkpoint durable.
+- Canonical save clears only the matching acknowledged checkpoint atomically.
+- Crash/restart recovery is revision-, writer-session-, and sequence-aware.
 - Maximum-size validation.
 
 ### Revision conflicts
@@ -773,6 +857,11 @@ Required measurements at 8/50/500 clippings:
 - First editable readiness.
 - Typing/IME main-thread long-task evidence.
 - Autosave request duration.
+- Checkpoint p50/p95/max latency and submitted/coalesced write counts.
+- Close/quit handshake p50/p95/max for clean, dirty, in-flight, and checkpoint
+  fallback states.
+- SQLite WAL growth during 10 minutes of near-limit continuous typing and after
+  the idle checkpoint interval.
 - List scroll dropped-frame/long-task evidence where tooling permits.
 - Process memory before/after detail and after closing.
 
@@ -801,6 +890,10 @@ List overscan = 4
 Canonical full images mounted = 1
 Canonical images in list = 0
 Visible-only thumbnail requests
+Offline root probes coalesced per root
+Confident search page size = 50
+Possible matches total <= 25
+No per-keystroke full-note fuzzy scan
 No image processing in database transactions
 No per-keystroke IPC autosave
 No editor eager load on unrelated routes
@@ -817,7 +910,10 @@ Add deterministic visual fixtures for:
 
 - World Journal sidebar with Clippings inactive/active.
 - Clippings empty state.
-- 8-row populated master-detail view.
+- Populated four-column default gallery and responsive column variants.
+- Ranked search takeover with cumulative match tags.
+- Confident-results tail followed by a separated Possible matches section.
+- Snapshot locations in connected/offline/marker-mismatch/checking states.
 - Long Chinese/English title and note excerpt.
 - Source available/unavailable.
 - Asset missing warning.
@@ -905,6 +1001,22 @@ confirm no reader shortcut fires in editor fields.
 Review 500-clipping fixture, search, scroll deeply, open/edit, and return without
 unbounded row/image loading or obvious UI stalls.
 
+#### UAT-011: Ranked and fuzzy retrieval
+
+Search representative English/Chinese Title, Note, Edition, Date, and Page
+values; verify explainable order, factual cumulative tags, safe snippets,
+the one/two-character Note exclusion helper, exact-only Date/Page, lazy
+confident pages, and no more than 25 visibly separated Possible matches. Open
+a result with a pending draft and return to the same query/anchor without data
+loss.
+
+#### UAT-012: Snapshot location reconnect
+
+With test-owned removable or moved snapshot data, verify Connected, Offline,
+Check again, marker mismatch, and Reconnect states. Reconnect only the matching
+marker-bound folder, confirm notes remain searchable while offline, and confirm
+that no file is copied, merged, created, or deleted.
+
 ### UAT result format
 
 For each case:
@@ -977,6 +1089,19 @@ Adds:
 - Visual fixtures and native DPI/IME checks.
 - Production enablement only after gates pass.
 
+### Phase 4C
+
+Adds:
+
+- Schema-v6 recovery checkpoint migration/repository/service suite.
+- Pure autosave/checkpoint controller and sequence/conflict matrix.
+- Native close-X, tray Quit, application/updater exit, timeout, stale-token,
+  writer-shutdown-order, and crash/restart tests.
+- Durability ownership/line-budget structural gate.
+- Browser integration plus installed Windows lifecycle/crash-recovery UAT.
+- Release measurements for write counts, checkpoint/exit latency, memory, and
+  SQLite/WAL growth.
+
 ### Phase 5
 
 Adds:
@@ -1001,6 +1126,10 @@ Release is blocked by any of:
   media/Markdown link execution.
 - Creation/deletion crash state cannot recover deterministically.
 - Revision conflict silently loses a draft.
+- A native close/exit path can destroy the editor or shut down the database
+  writer before acknowledged durability.
+- A stale session/sequence can overwrite or clear a newer recovery checkpoint.
+- Recovery draft bytes enter canonical FTS, logs, diagnostics, or list excerpts.
 - Chinese IME cannot compose reliably in title/editor.
 - Reader exceeds its mounted-page bound.
 - List loads canonical images/full Markdown for all rows.
@@ -1045,12 +1174,15 @@ preserved and reported, not rewritten by older code.
 Final release notes/help must state, without overstating capability:
 
 - Crop drawing requires a pointer; surrounding actions are keyboard accessible.
-- Forced process termination/power loss inside the 800 ms note debounce window
-  can lose the most recent unsubmitted draft.
+- A forced process termination or power loss may lose normally no more than the
+  500 ms quiet checkpoint window and no more than 2 seconds during continuous
+  typing. This is bounded recovery, not a zero-loss hard-crash guarantee.
 - Missing canonical assets are not silently recopied from potentially changed
   source pages.
 - Deleted source editions are not heuristically relinked after redownload.
-- Search is local substring search, not OCR/full article text or semantic search.
+- Search is local ranked title/note/provenance retrieval with bounded typo
+  suggestions; it is not OCR/full article text, semantic search, or fuzzy
+  Date/Page matching.
 - One clipping contains one image/note.
 - OCR, AI summary, annotations, tags, export, sharing, and sync are not included.
 
