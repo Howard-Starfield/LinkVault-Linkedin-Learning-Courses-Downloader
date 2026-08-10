@@ -238,7 +238,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.16-rc.1";
+const APP_VERSION = "0.2.16";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings";
 
