@@ -1,9 +1,33 @@
 import assert from "node:assert/strict";
 import { ClippingNoteSaveController } from "../src/components/newspaper/clipping-note-save-controller.ts";
+import { preserveStableClippingThumbnail } from "../src/components/newspaper/clipping-thumbnail-state.ts";
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const initial = { documentId: "clip-1", title: "Initial", markdown: "", revision: 5 };
 const code = (error) => String(error);
+
+{
+  const cached = {
+    id: "clip-1",
+    assetState: "ready",
+    assetVersion: 3,
+    thumbnailReady: true,
+    thumbnailUrl: "http://newspaper-media.localhost/clipping-thumbnail/clip-1?v=3-1",
+    thumbnailVersion: "3-1",
+    revision: 4
+  };
+  const refreshed = preserveStableClippingThumbnail({
+    ...cached,
+    thumbnailReady: false,
+    thumbnailUrl: null,
+    thumbnailVersion: null,
+    revision: 5
+  }, cached);
+  assert.equal(refreshed.thumbnailReady, true, "note invalidation regressed a proven thumbnail to its placeholder");
+  assert.equal(refreshed.revision, 5, "thumbnail preservation discarded fresh canonical list data");
+  assert.equal(preserveStableClippingThumbnail({ ...refreshed, assetVersion: 4, thumbnailReady: false }, cached).thumbnailReady, false);
+  assert.equal(preserveStableClippingThumbnail({ ...refreshed, assetState: "missing", thumbnailReady: false }, cached).thumbnailReady, false);
+}
 
 {
   const calls = [];
@@ -126,4 +150,4 @@ const code = (error) => String(error);
   controller.dispose();
 }
 
-console.log("Clipping note autosave, flush, retry, queued-latest, validation, and conflict contracts passed.");
+console.log("Clipping note autosave, stable thumbnails, flush, retry, queued-latest, validation, and conflict contracts passed.");

@@ -42,6 +42,7 @@ try {
       sourceAvailable: detail.sourceAvailable,
       assetState: detail.assetState,
       assetErrorCode: detail.assetErrorCode,
+      assetVersion: 1,
       assetWidth: detail.assetWidth,
       assetHeight: detail.assetHeight,
       revision: detail.revision,
@@ -163,6 +164,31 @@ try {
   assert.ok(mountedRows > 0 && mountedRows <= 20, `virtual list mounted ${mountedRows} rows`);
   const thumbnailCalls = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
   assert.ok(thumbnailCalls <= mountedRows, "thumbnail generation exceeded mounted rows");
+  const firstCard = page.locator(".clipping-list__row").first();
+  await firstCard.locator(".clipping-list__thumb img[data-loaded='true']").waitFor();
+  const cardGeometry = await firstCard.evaluate((row) => {
+    const thumbnail = row.querySelector(".clipping-list__thumb").getBoundingClientRect();
+    const title = row.querySelector(".clipping-list__title").getBoundingClientRect();
+    const bounds = row.getBoundingClientRect();
+    return {
+      rowWidth: bounds.width,
+      rowBottom: bounds.bottom,
+      thumbnailWidth: thumbnail.width,
+      thumbnailHeight: thumbnail.height,
+      titleLeft: title.left,
+      titleBottom: title.bottom,
+      thumbnailLeft: thumbnail.left
+    };
+  });
+  assert.ok(cardGeometry.thumbnailWidth >= cardGeometry.rowWidth - 28, "thumbnail does not occupy nearly the full evidence panel width");
+  assert.ok(cardGeometry.thumbnailHeight >= 198, "thumbnail card is not image-first");
+  assert.ok(Math.abs(cardGeometry.titleLeft - cardGeometry.thumbnailLeft) <= 1, "title is not anchored to the thumbnail's bottom-left veil");
+  assert.ok(cardGeometry.rowBottom - cardGeometry.titleBottom <= 12, "title veil is not anchored at the bottom of the card");
+  assert.equal(await firstCard.locator(".clipping-list__copy").count(), 0, "legacy metadata/note copy still renders beside the thumbnail");
+  assert.equal((await firstCard.innerText()).trim(), "Transit archive clipping 1", "card must show only its single title");
+  if (process.env.LINKVAULT_CLIPPING_SCREENSHOT) {
+    await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_SCREENSHOT });
+  }
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), true, "detail did not lazy-load the editor chunk");
 
   const title = page.locator(".clipping-detail__title input");
