@@ -61,6 +61,7 @@ import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/N
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
 import { NewspaperSnapshotRootsSettings } from "./components/newspaper/NewspaperSnapshotRootsSettings";
 import { useClippingNoteExitBridge } from "./components/newspaper/useClippingNoteExitBridge";
+import { useNewspaperClippingNavigation } from "./components/newspaper/useNewspaperClippingNavigation";
 import {
   NEWSPAPER_PAGE_TONES,
   NEWSPAPER_READER_ZOOM_MAX,
@@ -353,8 +354,6 @@ export default function App() {
   const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>(null);
   const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<AppView>("downloads");
-  const [pendingClippingId, setPendingClippingId] = useState<string | null>(null);
-  const [clippingsViewKey, setClippingsViewKey] = useState(0);
   const [clippingGallerySummary, setClippingGallerySummary] = useState<{
     total: number;
     loading: boolean;
@@ -384,6 +383,7 @@ export default function App() {
   const clippingFlushRef = useRef<ClippingFlush | null>(null);
   const navigationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const searchRequestGenerationRef = useRef(0);
+  const clippingGalleryScrollTopRef = useRef(0);
   const preSearchScrollRef = useRef(0);
   const automaticScheduleWaitRange = useMemo(
     () => calculateAutomaticScheduleWaitRange(scheduleWindowHours, scheduleCourseCount),
@@ -395,9 +395,15 @@ export default function App() {
   const registerClippingFlush = useCallback((flush: ClippingFlush | null) => {
     clippingFlushRef.current = flush;
   }, []);
+  const recordClippingGalleryScroll = useCallback((scrollTop: number) => {
+    clippingGalleryScrollTopRef.current = scrollTop;
+  }, []);
   useClippingNoteExitBridge(isTauriRuntime(), clippingFlushRef);
 
-  const requestNavigation = useCallback((nextView: AppView) => {
+  const requestNavigation = useCallback((
+    nextView: AppView,
+    options: { preserveClippingContext?: boolean } = {}
+  ) => {
     let allowed = false;
     const task = navigationQueueRef.current.then(async () => {
       const flush = clippingFlushRef.current;
@@ -407,7 +413,7 @@ export default function App() {
         });
         return;
       }
-      if (nextView !== "newspaper-clippings") {
+      if (nextView !== "newspaper-clippings" && !options.preserveClippingContext) {
         setGlobalSearchQuery("");
         setActiveSearchQuery("");
         setIsClippingDetailOpen(false);
@@ -419,20 +425,11 @@ export default function App() {
     return task.then(() => allowed);
   }, []);
 
-  const openClipping = useCallback(async (clippingId: string) => {
-    if (!(await requestNavigation("newspaper-clippings"))) return;
-    setPendingClippingId(clippingId);
-    setActiveSearchQuery("");
-    setGlobalSearchQuery("");
-    setIsNewspaperExpanded(true);
-  }, [requestNavigation]);
-
-  const openClippingsGallery = useCallback(async () => {
-    if (!(await requestNavigation("newspaper-clippings"))) return;
-    setPendingClippingId(null);
-    setIsClippingDetailOpen(false);
-    setClippingsViewKey((current) => current + 1);
-  }, [requestNavigation]);
+  const clippingNavigation = useNewspaperClippingNavigation({
+    requestNavigation,
+    setDetailOpen: setIsClippingDetailOpen,
+    setNewspaperExpanded: setIsNewspaperExpanded
+  });
 
   async function updateGlobalSearch(nextRaw: string) {
     const next = [...nextRaw].slice(0, 200).join("");
@@ -1516,8 +1513,12 @@ export default function App() {
       if (provider === "linkedin") {
         await refreshBootstrapState();
       }
-      toast.success(`${resetProviderLabel(provider)} database cleared`, {
-        description: cleared,
+      toast.success(provider === "newspaper"
+        ? "World Journal download data was reset"
+        : `${resetProviderLabel(provider)} database cleared`, {
+        description: provider === "newspaper"
+          ? `Your saved clippings and notes were preserved. ${cleared}`
+          : cleared,
         action: outputDirs.length > 0
           ? {
               label: "Open output folder",
@@ -1857,7 +1858,7 @@ export default function App() {
                 className="lv-nav-child"
                 active={activeView === "newspaper-clippings"}
                 icon={<StickyNote aria-hidden="true" />}
-                onClick={() => void openClippingsGallery()}
+                onClick={() => void clippingNavigation.openGallery()}
               >
                 Clippings
               </SidebarItem>
@@ -1962,7 +1963,7 @@ export default function App() {
           >
             {isClippingDetailOpen ? (
               <>
-                <button className="lv-global-search__back" onClick={() => void openClippingsGallery()} type="button">
+                <button className="lv-global-search__back" onClick={() => void clippingNavigation.openGallery()} type="button">
                   <ArrowLeft aria-hidden="true" /> Back
                 </button>
                 <div className="lv-global-search__title-slot" id="clipping-detail-title-slot" />
@@ -2022,8 +2023,8 @@ export default function App() {
               </div>
             </div>
           )}
-          {activeSearchQuery ? (
-            <NewspaperClippingSearch query={activeSearchQuery} onOpen={(id) => void openClipping(id)} />
+          {activeView === "newspaper-clippings" && activeSearchQuery && !isClippingDetailOpen && !clippingNavigation.pendingClippingId ? (
+            <NewspaperClippingSearch query={activeSearchQuery} onOpen={(id) => void clippingNavigation.openClipping(id)} />
           ) : activeView === "coursera" ? (
             <CourseraView />
           ) : activeView === "coursera-history" ? (
@@ -2031,15 +2032,26 @@ export default function App() {
           ) : activeView === "newspaper-download" ? (
             <NewspaperView />
           ) : activeView === "newspaper-library" ? (
-            <NewspaperView mode="library" onOpenClipping={(id) => void openClipping(id)} />
+            <NewspaperView
+              mode="library"
+              onOpenClipping={(id) => void clippingNavigation.openClipping(id, true)}
+              onReturnClipping={(id) => void clippingNavigation.openClipping(id, false, true)}
+              onReaderTargetConsumed={clippingNavigation.consumeReaderTarget}
+              readerTarget={clippingNavigation.pendingReaderTarget}
+            />
           ) : activeView === "newspaper-clippings" ? (
             <NewspaperClippings
-              key={clippingsViewKey}
+              key={clippingNavigation.clippingsViewKey}
               onGallerySummaryChange={setClippingGallerySummary}
+              initialGalleryScrollTop={clippingGalleryScrollTopRef.current}
               onDetailStateChange={setIsClippingDetailOpen}
+              onGalleryScrollTopChange={recordClippingGalleryScroll}
               onOpenLibrary={() => void requestNavigation("newspaper-library")}
-              onPendingConsumed={() => setPendingClippingId(null)}
-              pendingClippingId={pendingClippingId}
+              onOpenSource={(detail) => void clippingNavigation.openSource(detail)}
+              onPendingConsumed={clippingNavigation.consumePendingClipping}
+              pendingFocusEditor={clippingNavigation.pendingFocusEditor}
+              pendingFocusSource={clippingNavigation.pendingFocusSource}
+              pendingClippingId={clippingNavigation.pendingClippingId}
               registerFlush={registerClippingFlush}
             />
           ) : activeView === "linkedin-history" ? (
@@ -2660,11 +2672,19 @@ export default function App() {
     >
       {pendingResetProvider ? (
         <div className="reset-confirm">
-          <p>
-            Clearing the {resetProviderLabel(pendingResetProvider)} database removes the in-app records
-            for that provider. Files you have already saved to your download folder are <strong>not</strong> deleted.
-            Your saved LinkedIn <code>li_at</code> cookie is preserved.
-          </p>
+          {pendingResetProvider === "newspaper" ? (
+            <p>
+              Resetting World Journal removes downloaded-edition records, reading progress,
+              schedules, and generated newspaper previews. <strong>Your saved clippings and
+              clipping notes are preserved.</strong>
+            </p>
+          ) : (
+            <p>
+              Clearing the {resetProviderLabel(pendingResetProvider)} database removes the in-app records
+              for that provider. Files you have already saved to your download folder are <strong>not</strong> deleted.
+              Your saved LinkedIn <code>li_at</code> cookie is preserved.
+            </p>
+          )}
           <ul className="reset-confirm-list">
             {pendingResetProvider === "linkedin" ? (
               <>
@@ -2685,6 +2705,7 @@ export default function App() {
                 <li>Thumbnail cache, optimization ledger, reading progress</li>
                 <li>Newspaper schedules and provider settings</li>
                 <li>On-disk <code>newspaper-thumbnails/</code> directory</li>
+                <li>Saved clipping images, notes, and Snapshot locations are preserved</li>
               </>
             ) : null}
           </ul>

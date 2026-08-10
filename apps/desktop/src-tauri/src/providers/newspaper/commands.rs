@@ -20,6 +20,7 @@ use super::{
     clipping_models::{
         ClippingErrorCode, ClippingRootSummary, CreateNewspaperClippingFailure,
         CreateNewspaperClippingRequest, CreateNewspaperClippingResponse,
+        DeleteNewspaperClippingRequest, DeleteNewspaperClippingResponse,
         EnsureNewspaperClippingThumbnailResponse, GetNewspaperClippingsPageRequest,
         NewspaperClippingDetail, NewspaperClippingsPage, ReconnectNewspaperSnapshotRootResult,
         SearchNewspaperClippingsPage, SearchNewspaperClippingsRequest,
@@ -335,6 +336,10 @@ pub fn reset_newspaper_database(
             "thumbnailWarning": thumbnail_wipe_warning,
         }),
     );
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "reason": "source_changed" }),
+    );
     Ok(counts)
 }
 
@@ -348,6 +353,7 @@ pub fn reorder_newspaper_jobs(
 
 #[tauri::command]
 pub fn remove_newspaper_job(
+    app: tauri::AppHandle,
     state: State<'_, NewspaperState>,
     job_id: String,
 ) -> Result<(), String> {
@@ -355,6 +361,10 @@ pub fn remove_newspaper_job(
     if matches!(status.as_str(), "active" | "optimizing") {
         state.cancelled.store(true, Ordering::SeqCst);
     }
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "reason": "source_changed", "jobId": job_id }),
+    );
     Ok(())
 }
 
@@ -385,6 +395,17 @@ pub async fn get_newspaper_library_page(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_newspaper_library_item(
+    state: State<'_, NewspaperState>,
+    job_id: String,
+) -> Result<super::models::NewspaperLibraryItem, String> {
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || library_service::query_item(&db_path, &job_id))
+        .await
+        .map_err(|_| "DATABASE_UNAVAILABLE".to_string())?
 }
 
 #[tauri::command]
@@ -511,6 +532,58 @@ pub async fn update_newspaper_clipping(
     let _ = app.emit(
         "newspaper://clipping-invalidated",
         serde_json::json!({ "clippingId": clipping_id, "revision": detail.revision }),
+    );
+    Ok(detail)
+}
+
+#[tauri::command]
+pub async fn delete_newspaper_clipping(
+    app: tauri::AppHandle,
+    state: State<'_, ClippingService>,
+    request: DeleteNewspaperClippingRequest,
+) -> Result<DeleteNewspaperClippingResponse, String> {
+    let clipping_id = request.clipping_id.clone();
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .delete(&request.clipping_id, request.expected_revision)
+            .map_err(|error| match error.code {
+                ClippingErrorCode::RevisionConflict => {
+                    "CLIPPING_DELETE_REVISION_CONFLICT".to_string()
+                }
+                _ => error.as_safe_string(),
+            })
+    })
+    .await
+    .map_err(|_| "CLIPPING_DELETE_FAILED".to_string())??;
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "clippingId": clipping_id, "reason": "deleted" }),
+    );
+    Ok(DeleteNewspaperClippingResponse {
+        clipping_id,
+        deleted: true,
+    })
+}
+
+#[tauri::command]
+pub async fn recover_newspaper_clipping_asset(
+    app: tauri::AppHandle,
+    state: State<'_, ClippingService>,
+    clipping_id: String,
+) -> Result<NewspaperClippingDetail, String> {
+    let event_id = clipping_id.clone();
+    let service = state.inner().clone();
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        service
+            .recover_asset(&clipping_id)
+            .map_err(|error| error.as_safe_string())
+    })
+    .await
+    .map_err(|_| "CLIPPING_ASSET_RECOVERY_FAILED".to_string())??;
+    let _ = app.emit(
+        "newspaper://clipping-invalidated",
+        serde_json::json!({ "clippingId": event_id, "reason": "asset_recovered" }),
     );
     Ok(detail)
 }

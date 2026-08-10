@@ -188,6 +188,7 @@ Every implementation phase must preserve these invariants.
 | [08-coding-agent-execution-contract.md](08-coding-agent-execution-contract.md) | Mandatory rules and PR evidence contract for an implementation agent. |
 | [work-orders/phase-1b-search-reconnect.md](work-orders/phase-1b-search-reconnect.md) | Detailed backend work order for ranked search and snapshot-root status/reconnection. |
 | [../../work-orders/newspaper-clipping-note-durability-plan.md](../../work-orders/newspaper-clipping-note-durability-plan.md) | Approved Phase 4C work order for bounded autosave, native close/exit coordination, recovery checkpoints, module size budgets, and performance gates. |
+| [../../work-orders/newspaper-clippings-phase-5-navigation-lifecycle-plan.md](../../work-orders/newspaper-clippings-phase-5-navigation-lifecycle-plan.md) | Approved Phase 5 work order for exact source return, transient highlight, clipping deletion, missing states, and reset preservation. |
 
 If documents conflict, authority is resolved in this order:
 
@@ -236,7 +237,7 @@ ranked-search/reconnect services, and editor decision gate are complete.
 | 4A | Compare approved editor candidates behind an isolated adapter. No production note UI. | Phase 1 complete and editor criteria approved. | One candidate is recorded as Approved in the decision register with evidence. | Complete |
 | 4B | Sidebar Clippings view, paged/virtualized gallery, full-page detail with read-only clipping header, Tiptap editor, autosave, optimistic conflict handling, search takeover, and Snapshot locations Settings UI. | Phases 1B, 3, and 4A available on the stacked base. | Gallery, editor, IME, autosave, ranked-search, reconnect, conflict, visual, native, and release gates pass. | Implemented locally at `12a65a1`; review/merge pending |
 | 4C | Schema-v6 recovery checkpoints, bounded canonical/checkpoint autosave, recovery/conflict UI, and native close-X/tray Quit/application/updater exit authority. | Audited Phase 4B behavior available; D-034 and the Phase 4C work order approved. | Migration, recovery, ownership, browser, native lifecycle, performance, and release-regression gates pass. | Implemented locally; native close-X/tray Show/tray Quit/restart UAT passed 2026-08-10; disposable fault-injection evidence remains Phase 6 |
-| 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4C complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Blocked |
+| 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4C complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Automated implementation and release gates complete locally; native dev UAT pending 2026-08-10 |
 | 6 | Final performance budgets, accessibility audit, native installed-app UAT, visual evidence, release verification. | Phase 5 complete. | All automated and manual release gates pass and evidence is committed. | Blocked |
 
 ## Required implementation PR sequence

@@ -151,6 +151,10 @@ export type NewspaperClippingDetail = {
   pageNumber: string;
   imageUrl: string;
   sourceAvailable: boolean;
+  sourceJobId?: string | null;
+  sourcePageId?: string | null;
+  sourceMediaVersionSnapshot: number;
+  normalizedRect: NormalizedCropRect;
   assetState: ClippingAssetState;
   assetErrorCode?: string | null;
   storageStatus: ClippingRootStatus;
@@ -159,6 +163,11 @@ export type NewspaperClippingDetail = {
   revision: number;
   createdAt: number;
   updatedAt: number;
+};
+
+export type DeleteNewspaperClippingResponse = {
+  clippingId: string;
+  deleted: true;
 };
 
 export type NewspaperClippingSearchSnippet = {
@@ -209,9 +218,14 @@ export type EnsureNewspaperClippingThumbnailResponse = {
 };
 
 type NewspaperClippingsBrowserHarness = {
+  getLibraryItem?: typeof getLibraryItem;
+  getReaderManifest?: typeof getReaderManifest;
+  saveReadingProgress?: typeof saveReadingProgress;
   getPage?: typeof getNewspaperClippingsPage;
   getDetail?: typeof getNewspaperClipping;
   update?: typeof updateNewspaperClipping;
+  delete?: typeof deleteNewspaperClipping;
+  recoverAsset?: typeof recoverNewspaperClippingAsset;
   ensureThumbnail?: typeof ensureNewspaperClippingThumbnail;
   search?: typeof searchNewspaperClippings;
   searchPossible?: typeof searchPossibleNewspaperClippings;
@@ -246,10 +260,14 @@ export function ensureThumbnail(jobId: string) {
 }
 
 export function getReaderManifest(jobId: string) {
+  const harness = clippingBrowserHarness()?.getReaderManifest;
+  if (harness) return harness(jobId);
   return invoke<NewspaperReaderPage[]>("get_newspaper_reader_manifest", { jobId });
 }
 
 export function saveReadingProgress(jobId: string, pageId: string) {
+  const harness = clippingBrowserHarness()?.saveReadingProgress;
+  if (harness) return harness(jobId, pageId);
   return invoke<NewspaperReadingProgress>("save_newspaper_reading_progress", {
     jobId,
     pageId
@@ -260,6 +278,12 @@ export function createNewspaperClipping(request: CreateNewspaperClippingRequest)
   return invoke<CreateNewspaperClippingResponse>("create_newspaper_clipping", {
     request
   });
+}
+
+export function getLibraryItem(jobId: string) {
+  const harness = clippingBrowserHarness()?.getLibraryItem;
+  if (harness) return harness(jobId);
+  return invoke<NewspaperLibraryItem>("get_newspaper_library_item", { jobId });
 }
 
 export function getNewspaperClippingsPage(request: {
@@ -289,6 +313,21 @@ export function updateNewspaperClipping(request: {
   const harness = clippingBrowserHarness()?.update;
   if (harness) return harness(request);
   return invoke<NewspaperClippingDetail>("update_newspaper_clipping", { request });
+}
+
+export function deleteNewspaperClipping(request: {
+  clippingId: string;
+  expectedRevision: number;
+}) {
+  const harness = clippingBrowserHarness()?.delete;
+  if (harness) return harness(request);
+  return invoke<DeleteNewspaperClippingResponse>("delete_newspaper_clipping", { request });
+}
+
+export function recoverNewspaperClippingAsset(clippingId: string) {
+  const harness = clippingBrowserHarness()?.recoverAsset;
+  if (harness) return harness(clippingId);
+  return invoke<NewspaperClippingDetail>("recover_newspaper_clipping_asset", { clippingId });
 }
 
 export function ensureNewspaperClippingThumbnail(clippingId: string) {

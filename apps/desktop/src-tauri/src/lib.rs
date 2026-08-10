@@ -188,6 +188,7 @@ pub fn run() {
             newspaper::commands::remove_newspaper_job,
             newspaper::commands::list_newspaper_library,
             newspaper::commands::get_newspaper_library_page,
+            newspaper::commands::get_newspaper_library_item,
             newspaper::commands::get_newspaper_activity_snapshot,
             newspaper::commands::get_newspaper_reader_manifest,
             newspaper::commands::save_newspaper_reading_progress,
@@ -195,6 +196,8 @@ pub fn run() {
             newspaper::commands::get_newspaper_clippings_page,
             newspaper::commands::get_newspaper_clipping,
             newspaper::commands::update_newspaper_clipping,
+            newspaper::commands::delete_newspaper_clipping,
+            newspaper::commands::recover_newspaper_clipping_asset,
             newspaper::commands::checkpoint_newspaper_clipping_note,
             newspaper::commands::load_newspaper_clipping_note_recovery,
             newspaper::commands::claim_newspaper_clipping_note_recovery,
@@ -279,13 +282,8 @@ pub fn run() {
             app.manage(app_updates::PendingUpdate::default());
             app.manage(CooperativeExit::default());
 
-            // Taskbar + tray icon: the All-in-One Downloader icon, embedded
-            // at compile time so the binary has no runtime file dependency.
-            // Applied to every window so the taskbar shows the right icon,
-            // and to the system tray so the app stays reachable from the
-            // notification area. The tray carries a right-click menu with
-            // Show / Quit so the user can reopen or exit the app when the
-            // main window is closed.
+            // Embed the taskbar/tray icon so the binary has no runtime file
+            // dependency. The tray keeps Show / Quit available after close.
             let icon_bytes = include_bytes!("../icons/icon-taskbar.png");
             if let Ok(decoded) = image::load_from_memory(icon_bytes) {
                 let rgba = decoded.to_rgba8();

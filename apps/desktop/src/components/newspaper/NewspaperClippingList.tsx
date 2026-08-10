@@ -12,6 +12,7 @@ import {
 
 const PAGE_SIZE = 50;
 const GRID_GAP = 16;
+const MAX_MOUNTED_CARDS = 48;
 
 function columnCountForWidth(width: number) {
   if (width < 560) return 1;
@@ -36,11 +37,19 @@ function ClippingSkeletonShelf({ loading = false }: { loading?: boolean }) {
 }
 
 export function NewspaperClippingList({
+  hidden,
+  initialScrollTop,
   onOpenLibrary,
+  onOrderedIdsChange,
+  onScrollTopChange,
   onSelect,
   onSummaryChange
 }: {
+  hidden: boolean;
+  initialScrollTop: number;
   onOpenLibrary: () => void;
+  onOrderedIdsChange: (ids: string[]) => void;
+  onScrollTopChange: (scrollTop: number) => void;
   onSelect: (id: string) => void;
   onSummaryChange: (summary: { total: number; loading: boolean } | null) => void;
 }) {
@@ -50,6 +59,7 @@ export function NewspaperClippingList({
   const thumbnailRef = useRef(new Set<string>());
   const thumbnailErrorRef = useRef(new Set<string>());
   const mountedRef = useRef(true);
+  const scrollRestoredRef = useRef(false);
   const [items, setItems] = useState<Array<NewspaperClippingSummary | undefined>>([]);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
@@ -109,7 +119,14 @@ export function NewspaperClippingList({
     onSummaryChange({ total, loading: initialLoading });
   }, [initialLoading, onSummaryChange, total]);
 
-  useEffect(() => () => onSummaryChange(null), [onSummaryChange]);
+  useEffect(() => {
+    onOrderedIdsChange(items.flatMap((item) => item ? [item.id] : []));
+  }, [items, onOrderedIdsChange]);
+
+  useEffect(() => () => {
+    onOrderedIdsChange([]);
+    onSummaryChange(null);
+  }, [onOrderedIdsChange, onSummaryChange]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -125,6 +142,26 @@ export function NewspaperClippingList({
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const reportScroll = () => onScrollTopChange(element.scrollTop);
+    element.addEventListener("scroll", reportScroll, { passive: true });
+    return () => {
+      reportScroll();
+      element.removeEventListener("scroll", reportScroll);
+    };
+  }, [onScrollTopChange]);
+
+  useEffect(() => {
+    if (initialLoading || scrollRestoredRef.current) return;
+    scrollRestoredRef.current = true;
+    const frame = window.requestAnimationFrame(() => {
+      if (scrollRef.current) scrollRef.current.scrollTop = initialScrollTop;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [initialLoading, initialScrollTop]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -147,10 +184,21 @@ export function NewspaperClippingList({
     overscan: 2
   });
   const virtualRows = virtualizer.getVirtualItems();
-  const visibleItemIndexes = useMemo(() => virtualRows.flatMap((row) => {
+  const boundedVirtualRows = useMemo(() => {
+    const maxRows = Math.max(1, Math.ceil(MAX_MOUNTED_CARDS / columnCount));
+    const scrollTop = virtualizer.scrollOffset ?? scrollRef.current?.scrollTop ?? 0;
+    const viewportHeight = scrollRef.current?.clientHeight ?? 960;
+    const rowSize = virtualRows[0]?.size ?? 180;
+    const nearViewport = virtualRows.filter((row) => (
+      row.end >= scrollTop - rowSize * 2
+      && row.start <= scrollTop + viewportHeight + rowSize * 2
+    ));
+    return (nearViewport.length ? nearViewport : virtualRows).slice(0, maxRows);
+  }, [columnCount, viewportWidth, virtualRows, virtualizer.scrollOffset]);
+  const visibleItemIndexes = useMemo(() => boundedVirtualRows.flatMap((row) => {
     const start = row.index * columnCount;
     return Array.from({ length: columnCount }, (_, column) => start + column).filter((index) => index < total);
-  }), [columnCount, total, virtualRows]);
+  }), [boundedVirtualRows, columnCount, total]);
 
   useEffect(() => {
     if (!visibleItemIndexes.length) return;
@@ -189,7 +237,7 @@ export function NewspaperClippingList({
   }, [items, visibleItemIndexes]);
 
   return (
-    <section className="clipping-gallery" aria-label="Saved clippings">
+    <section className="clipping-gallery" aria-label="Saved clippings" hidden={hidden}>
       <div className="clipping-gallery__scroll" ref={scrollRef} data-testid="newspaper-clipping-list-scroll">
         {error ? <div className="clipping-gallery__message" role="alert">Could not load clippings. {error}</div> : null}
         {!error && initialLoading ? (
@@ -210,7 +258,7 @@ export function NewspaperClippingList({
           </div>
         ) : null}
         <div className="clipping-gallery__virtual" style={{ height: `${virtualizer.getTotalSize()}px` }}>
-          {virtualRows.map((row) => {
+          {boundedVirtualRows.map((row) => {
             const start = row.index * columnCount;
             return (
               <div

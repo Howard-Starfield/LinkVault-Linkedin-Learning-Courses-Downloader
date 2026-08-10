@@ -5,7 +5,7 @@ use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
 use super::{
-    archive_service, batch_service, catalog_service, job_repository, job_service,
+    archive_service, batch_service, catalog_service, job_repository, job_service, library_service,
     models::*,
     optimization_service,
     optimizer::{optimize_page, OptimizationOutcome},
@@ -52,6 +52,34 @@ fn request_validation_rejects_invalid_delay_profile_and_quality() {
     assert!(batch_service::validate_request(&request).is_ok());
     request.optimization_quality = 24;
     assert!(batch_service::validate_request(&request).is_err());
+}
+
+#[test]
+fn exact_library_item_lookup_is_id_bound_and_requires_a_readable_job() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let destination = directory.path().join("papers");
+    let job =
+        batch_service::create_with_connection(&mut connection, request(&destination, "2026-07-24"))
+            .unwrap()
+            .jobs
+            .remove(0);
+    connection
+        .execute(
+            "UPDATE newspaper_jobs SET status = 'completed' WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let item = library_service::query_item(&db_path, &job.id).unwrap();
+    assert_eq!(item.job_id, job.id);
+    assert_eq!(item.status, "completed");
+    assert_eq!(
+        library_service::query_item(&db_path, "not-the-job").unwrap_err(),
+        "NEWSPAPER_SOURCE_JOB_NOT_FOUND"
+    );
 }
 
 #[test]

@@ -199,7 +199,13 @@ fn mark_ready(writer: &DatabaseWriter, clipping_id: &str, now: i64) -> Result<()
         .execute(
             write_context("clipping_recovery_mark_ready"),
             move |connection| {
-                repository::mark_ready_from_creating(connection, &id, now).map_err(Into::into)
+                repository::mark_ready_after_validation(
+                    connection,
+                    &id,
+                    ClippingAssetState::Creating,
+                    now,
+                )
+                .map_err(Into::into)
             },
         )
         .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))?;
