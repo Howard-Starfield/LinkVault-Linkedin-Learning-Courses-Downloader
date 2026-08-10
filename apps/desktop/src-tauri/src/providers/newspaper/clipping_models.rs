@@ -448,6 +448,10 @@ pub enum ClippingErrorCode {
     DatabaseWriteFailed,
     DatabaseReadFailed,
     RecoveryFailed,
+    RecoveryInvalid,
+    RecoveryTooLarge,
+    RecoveryStaleSequence,
+    RecoveryWriterConflict,
     DeleteFailed,
     InvalidCropRect,
     CropTooSmall,
@@ -491,6 +495,10 @@ impl ClippingErrorCode {
             Self::DatabaseWriteFailed => "CLIPPING_DATABASE_WRITE_FAILED",
             Self::DatabaseReadFailed => "CLIPPING_DATABASE_READ_FAILED",
             Self::RecoveryFailed => "CLIPPING_RECOVERY_FAILED",
+            Self::RecoveryInvalid => "CLIPPING_RECOVERY_INVALID",
+            Self::RecoveryTooLarge => "CLIPPING_RECOVERY_TOO_LARGE",
+            Self::RecoveryStaleSequence => "CLIPPING_RECOVERY_STALE_SEQUENCE",
+            Self::RecoveryWriterConflict => "CLIPPING_RECOVERY_WRITER_CONFLICT",
             Self::DeleteFailed => "CLIPPING_DELETE_FAILED",
             Self::InvalidCropRect => "INVALID_CROP_RECT",
             Self::CropTooSmall => "CROP_TOO_SMALL",
@@ -554,6 +562,12 @@ impl ClippingErrorCode {
             Self::DatabaseWriteFailed => "The clipping could not be saved.",
             Self::DatabaseReadFailed => "Clipping data could not be read.",
             Self::RecoveryFailed => "Clipping recovery did not complete.",
+            Self::RecoveryInvalid => "The recovered clipping note is invalid.",
+            Self::RecoveryTooLarge => "The recovered clipping note is too large.",
+            Self::RecoveryStaleSequence => "A newer recovered clipping note already exists.",
+            Self::RecoveryWriterConflict => {
+                "The recovered clipping note is open in another editor."
+            }
             Self::DeleteFailed => "The clipping could not be deleted.",
         }
     }
@@ -767,11 +781,19 @@ pub struct NewspaperClippingDetail {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClippingNoteCheckpointIdentityRequest {
+    pub writer_session_id: String,
+    pub writer_sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateNewspaperClippingRequest {
     pub clipping_id: String,
     pub expected_revision: u64,
     pub title: String,
     pub note_markdown: String,
+    pub checkpoint: Option<ClippingNoteCheckpointIdentityRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

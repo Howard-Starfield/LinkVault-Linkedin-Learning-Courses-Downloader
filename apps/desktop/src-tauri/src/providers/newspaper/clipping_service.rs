@@ -23,6 +23,7 @@ use super::clipping_assets::{
     ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION, THUMBNAIL_MAX_HEIGHT, THUMBNAIL_MAX_WIDTH,
 };
 use super::clipping_crop;
+use super::clipping_draft_repository::DraftCheckpointAck;
 use super::clipping_models::{
     normalize_search_query, normalize_search_text, normalize_title, validate_asset_byte_count,
     validate_clipping_id, validate_edition_code, validate_edition_name, validate_list_limit,
@@ -41,10 +42,12 @@ use super::clipping_recovery;
 use super::clipping_repository::{self as repository, ClippingDetail};
 use super::clipping_roots::ClippingRootRegistry;
 
+type CanonicalNoteDurability = (i64, Option<DraftCheckpointAck>);
+
 #[derive(Clone)]
 pub struct ClippingService {
-    db_path: PathBuf,
-    writer: DatabaseWriter,
+    pub(super) db_path: PathBuf,
+    pub(super) writer: DatabaseWriter,
     layout: ClippingAssetLayout,
     roots: ClippingRootRegistry,
     diagnostics: DatabaseDiagnostics,
@@ -259,7 +262,6 @@ impl ClippingService {
     pub fn layout(&self) -> &ClippingAssetLayout {
         &self.layout
     }
-
     pub(crate) fn root_layout(&self, root_id: &str) -> Result<ClippingAssetLayout, ClippingError> {
         self.roots.resolve(root_id)
     }
@@ -652,21 +654,28 @@ impl ClippingService {
         note_markdown: &str,
         now: i64,
     ) -> Result<NewspaperClipping, ClippingError> {
-        self.update_note_inner(id, expected_revision, title, note_markdown, now, || {})
+        self.update_note_inner(
+            id,
+            expected_revision,
+            title,
+            note_markdown,
+            (now, None),
+            || {},
+        )
     }
-
     fn update_note_inner<F>(
         &self,
         id: &str,
         expected_revision: u64,
         title: &str,
         note_markdown: &str,
-        now: i64,
+        durability: CanonicalNoteDurability,
         after_writer: F,
     ) -> Result<NewspaperClipping, ClippingError>
     where
         F: FnOnce(),
     {
+        let (now, checkpoint) = durability;
         if !validate_clipping_id(id) {
             return Err(ClippingError::new(ClippingErrorCode::InvalidId));
         }
@@ -677,8 +686,16 @@ impl ClippingService {
         let outcome = self
             .writer
             .execute(Self::context("clipping_update_note"), move |db| {
-                repository::update_note(db, &owned_id, expected_revision, &title, &owned_note, now)
-                    .map_err(Into::into)
+                repository::update_note(
+                    db,
+                    &owned_id,
+                    expected_revision,
+                    &title,
+                    &owned_note,
+                    now,
+                    checkpoint.as_ref(),
+                )
+                .map_err(Into::into)
             })
             .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseWriteFailed))?;
         after_writer();
@@ -837,9 +854,17 @@ impl ClippingService {
         expected_revision: u64,
         title: &str,
         note_markdown: &str,
+        checkpoint: Option<DraftCheckpointAck>,
         now: i64,
     ) -> Result<NewspaperClippingDetail, ClippingError> {
-        self.update_note(id, expected_revision, title, note_markdown, now)?;
+        self.update_note_inner(
+            id,
+            expected_revision,
+            title,
+            note_markdown,
+            (now, checkpoint),
+            || {},
+        )?;
         self.detail_response(id)?
             .ok_or_else(|| ClippingError::new(ClippingErrorCode::NotFound))
     }
@@ -1373,6 +1398,9 @@ fn validate_record(record: &mut repository::NewClippingRecord) -> Result<(), Cli
 
 #[cfg(test)]
 mod tests {
+    #[path = "tests.rs"]
+    mod clipping_draft_service_tests;
+
     use super::super::clipping_assets::{encode_test_webp, sha256_hex};
     use super::super::clipping_models::{
         ClippingSourceKind, NewspaperClippingSort, NormalizedCropRect,
@@ -2304,7 +2332,7 @@ mod tests {
         assert_eq!(detail.storage_status, ClippingRootStatus::Unchecked);
 
         let updated = service
-            .update_note_response(ID, created.revision, "  Evidence  ", "中文 note", 101)
+            .update_note_response(ID, created.revision, "  Evidence  ", "中文 note", None, 101)
             .unwrap();
         assert_eq!(updated.title, "Evidence");
         assert_eq!(updated.note_markdown, "中文 note");
@@ -2406,7 +2434,7 @@ mod tests {
                 created.revision,
                 "  Revision two  ",
                 "first caller",
-                101,
+                (101, None),
                 || {
                     acknowledged_tx.send(()).unwrap();
                     release_rx.recv().unwrap();

@@ -185,6 +185,10 @@ pub fn run() {
             newspaper::commands::get_newspaper_clippings_page,
             newspaper::commands::get_newspaper_clipping,
             newspaper::commands::update_newspaper_clipping,
+            newspaper::commands::checkpoint_newspaper_clipping_note,
+            newspaper::commands::load_newspaper_clipping_note_recovery,
+            newspaper::commands::claim_newspaper_clipping_note_recovery,
+            newspaper::commands::discard_newspaper_clipping_note_recovery,
             newspaper::commands::ensure_newspaper_clipping_thumbnail,
             newspaper::commands::search_newspaper_clippings,
             newspaper::commands::search_possible_newspaper_clippings,
@@ -248,10 +252,6 @@ pub fn run() {
             );
             let _recovery_summary =
                 clipping_service.recover_startup(&diagnostics, commands::now_unix_timestamp());
-            // Row-level clipping recovery failures remain in their durable
-            // retryable states and are reported through safe diagnostics. A
-            // single clipping must not prevent unrelated providers or the
-            // application shell from starting.
             let cleanup_service = clipping_service.clone();
             let cleanup_diagnostics = diagnostics.clone();
             tauri::async_runtime::spawn_blocking(move || {
