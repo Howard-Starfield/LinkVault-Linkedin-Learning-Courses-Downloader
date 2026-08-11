@@ -82,6 +82,10 @@ are treated as requirements unless superseded in the decision register.
 18. Native recovery checkpoints protect recent clipping-note drafts. Window X
     flushes/checkpoints and hides the existing main window; tray Quit and other
     approved exits flush/checkpoint and terminate only after success.
+19. SQLite remains canonical, while exact Markdown bytes are exposed as an
+    export-only `note.md` beside each clipping image and repaired after failure.
+20. Installed LinkVault permits one desktop process; a second launch activates
+    and safely refreshes the existing window.
 
 The complete decision history is in [00-decision-register.md](00-decision-register.md).
 
@@ -95,6 +99,7 @@ The complete decision history is in [00-decision-register.md](00-decision-regist
 | **Canonical clipping asset** | The lossless WebP file owned by the clipping aggregate. It is durable user data. |
 | **Derived thumbnail** | A regenerable, lower-resolution cache used only for list rendering. It is not durable user data. |
 | **Clipping note** | The title and plain Markdown body owned by one clipping record. |
+| **Note mirror** | The export-only `note.md` projection beside `clipping-v1.webp`; it is written from SQLite and never imported as a source of truth. |
 | **Recovery checkpoint** | A bounded, local, non-searchable schema-v6 draft used only to recover note edits that are newer than canonical storage. |
 | **Source card** | The non-editable image and provenance block displayed above the editor. |
 | **Source available** | Both source foreign keys still resolve to a completed page that can be opened in the reader. |
@@ -238,6 +243,7 @@ ranked-search/reconnect services, and editor decision gate are complete.
 | 4B | Sidebar Clippings view, paged/virtualized gallery, full-page detail with read-only clipping header, Tiptap editor, autosave, optimistic conflict handling, search takeover, and Snapshot locations Settings UI. | Phases 1B, 3, and 4A available on the stacked base. | Gallery, editor, IME, autosave, ranked-search, reconnect, conflict, visual, native, and release gates pass. | Implemented locally at `12a65a1`; review/merge pending |
 | 4C | Schema-v6 recovery checkpoints, bounded canonical/checkpoint autosave, recovery/conflict UI, and native close-X/tray Quit/application/updater exit authority. | Audited Phase 4B behavior available; D-034 and the Phase 4C work order approved. | Migration, recovery, ownership, browser, native lifecycle, performance, and release-regression gates pass. | Implemented locally; native close-X/tray Show/tray Quit/restart UAT passed 2026-08-10; disposable fault-injection evidence remains Phase 6 |
 | 5 | Open-source navigation, return targets, transient highlight, clipping deletion, missing-source/missing-asset states, reset integration. | Phase 4C complete. | Lifecycle, recovery, navigation, delete, and reset tests pass. | Automated implementation and release gates complete locally; native dev UAT pending 2026-08-10 |
+| 5A | Atomic local `note.md` projection and single-instance activation/refresh. | Phase 5 and D-035/D-036 approved. | Exact-byte, I/O failure, concurrency, paced repair, double-launch, flush-before-refresh, and release gates pass. | In progress on the post-v0.2.16 worktree |
 | 6 | Final performance budgets, accessibility audit, native installed-app UAT, visual evidence, release verification. | Phase 5 complete. | All automated and manual release gates pass and evidence is committed. | Blocked |
 
 ## Required implementation PR sequence

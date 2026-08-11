@@ -108,27 +108,35 @@ least one downloaded edition with a readable completed page.
    clipping. Confirm that the title, Markdown formatting, and note content were
    persisted. Optionally repeat typing with a Chinese IME to verify native
    composition does not duplicate or lose committed text.
-9. Use the Clippings search box. Search separately for words found in the title,
+9. Open that clipping's snapshot directory. Confirm `note.md` sits beside
+   `clipping-v1.webp` and contains the saved Markdown. SQLite remains canonical:
+   editing `note.md` externally is not imported and may be overwritten by the
+   next save or startup repair.
+10. Use the Clippings search box. Search separately for words found in the title,
    note, edition, date, and page. Confirm the matching field tags are correct,
    lower-confidence results are separated as **Possible matches**, and more
    results load while scrolling. The search box must remain exclusive to the
    gallery/search surface.
-10. In **Settings → Snapshot locations**, confirm the derived root is connected.
+11. In **Settings → Snapshot locations**, confirm the derived root is connected.
     On disk, the clipping belongs under the same newspaper download destination
     at `Newspaper snapshots/<edition>/`; Settings must not offer an arbitrary
     global snapshot-folder override.
-11. Add a unique title/body suffix and click the window **X** before the footer
+12. Add a unique title/body suffix and click the window **X** before the footer
     reaches **Saved**. The window should hide instead of exiting. Choose
     **Show LinkVault** from the tray, reopen the clipping, and confirm the exact
     suffix is canonical or appears in the explicit recovery state. There must
     still be only one main window.
-12. Type continuously, click **X** while the footer says **Saving…**, then show
+13. Type continuously, click **X** while the footer says **Saving…**, then show
     LinkVault from the tray. Confirm the newest text—not an earlier keystroke—is
     present. Repeat the hide/show cycle once to catch duplicate close handlers.
-13. Add another unique suffix and immediately choose **Quit** from the tray.
+14. While LinkVault is running, launch it again from the Start menu or installed
+    executable. Confirm the existing window is shown and focused, Task Manager
+    still reports one `linkvault.exe`, and the current clipping note remains
+    visible after its durability flush/refresh.
+15. Add another unique suffix and immediately choose **Quit** from the tray.
     Relaunch LinkVault and confirm the exact latest text is saved or explicitly
     offered for recovery. Tray Quit must exit; window X must only hide.
-14. Do not use Task Manager against a real user database to test crash recovery.
+16. Do not use Task Manager against a real user database to test crash recovery.
     Forced-termination and injected save/checkpoint failures belong to the
     isolated automated harness or a disposable test profile.
 

@@ -1131,7 +1131,7 @@ pub(crate) fn thumbnail_owner(file_name: &str) -> Option<(&str, u32)> {
     (version > 0).then_some((clipping_id, version))
 }
 
-fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }

@@ -9,6 +9,7 @@ mod providers;
 pub mod workflow;
 use app::cooperative_exit::{CooperativeExit, ExitReason, WaitOutcome};
 use app::updates as app_updates;
+use app::window_activation::{activate_existing_instance, restore_main_window, show_main_window};
 pub use app::{database as cache, security, storage};
 pub use providers::linkedin::{
     artifact_downloader, auth, browser_cookies, course, download_orchestrator, exercise_archive,
@@ -27,18 +28,6 @@ fn resolve_cooperative_exit(
     durable: bool,
 ) -> bool {
     state.resolve(token, durable)
-}
-
-fn restore_main_window(app: &tauri::AppHandle, reason: ExitReason) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
-    let _ = app.emit(
-        "linkvault://exit-blocked",
-        serde_json::json!({ "reason": reason }),
-    );
 }
 
 fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
@@ -86,6 +75,9 @@ fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            activate_existing_instance(app);
+        }))
         .register_asynchronous_uri_scheme_protocol(
             "newspaper-media",
             |context, request, responder| {
@@ -307,11 +299,7 @@ pub fn run() {
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id().as_ref() {
                         "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.unminimize();
-                                let _ = window.set_focus();
-                            }
+                            show_main_window(app);
                         }
                         "quit" => {
                             request_cooperative_exit(app, ExitReason::Exit);

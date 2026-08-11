@@ -404,6 +404,23 @@ without touching source media or another clipping.
 - Archive import and job deletion cannot descend into or remove
   `Newspaper snapshots`.
 
+### Note mirror projection tests
+
+- Creating a ready clipping creates an empty `note.md` beside the exact
+  canonical WebP.
+- Changed and cleared notes produce byte-exact UTF-8 Markdown and zero-byte
+  truncation respectively; no part file remains after success.
+- Part-file write/flush/replace failure never rolls back the committed SQLite
+  revision and produces only a path-free recovery diagnostic.
+- Repair rewrites a missing/stale mirror from SQLite and never imports external
+  file edits.
+- Concurrent saves and a startup page cannot leave an older mirror than the
+  newest canonical database revision.
+- Startup waits five seconds, handles at most 32 IDs per keyset page, and yields
+  at least 50 ms between pages.
+- Symlink/reparse/file-type/path substitution fails without touching an
+  outside-root sentinel.
+
 ### Media protocol tests
 
 - Current canonical request returns correct bytes/MIME/ETag/cache policy.
@@ -1107,7 +1124,12 @@ Adds:
 Adds:
 
 - Navigation/highlight/delete/reset/recovery suite.
+- Atomic `note.md` projection, failure recovery, and paced startup suite.
+- Official single-instance activation plus dirty-flush-before-refresh browser
+  and structural proof.
 - Installed lifecycle smoke.
+- Installed Windows double-launch smoke proves one LinkVault process, one tray
+  authority, existing-window focus, and current clipping detail after refresh.
 
 ### Phase 6
 

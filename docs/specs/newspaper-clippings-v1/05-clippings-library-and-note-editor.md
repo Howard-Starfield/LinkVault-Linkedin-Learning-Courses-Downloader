@@ -781,6 +781,13 @@ export type ClippingNoteEditorHandle = {
 };
 ```
 
+Tiptap is a rendering/editing adapter, not a persistence authority. `onUpdate`
+serializes the approved document subset with `getMarkdown()`. Parent autosave
+sends that Markdown to Rust, which validates and commits it to SQLite. LinkVault
+does not persist Tiptap-specific JSON or HTML. The local `note.md` file is a
+post-commit export projection governed by D-035, never editor state or an input
+to this adapter.
+
 ### FR-EDITOR-001
 
 The adapter root is marked:
@@ -954,6 +961,11 @@ Show `Saved` only when current draft equals the latest acknowledged persisted
 values. Update list title/excerpt/updated time in place and emit/consume the
 invalidation event without disrupting focus.
 
+`Saved` means the SQLite canonical commit and checkpoint acknowledgement
+succeeded. A subsequent `note.md` projection failure is recorded for repair and
+must not provoke an invalid optimistic-revision retry of an already committed
+save.
+
 ### FR-AUTOSAVE-005: Failure
 
 - Preserve draft, editor selection where possible, and persisted revision.
@@ -1049,6 +1061,14 @@ React cleanup may unregister the surface and stop timers, but it cannot claim a
 final save succeeded. Application-controlled navigation flushes before unmount;
 native code owns close/exit prevention. Browser storage, `beforeunload`, blur,
 and fire-and-forget cleanup are never the source of truth.
+
+### FR-AUTOSAVE-013: Second-launch activation
+
+Installed LinkVault permits one desktop process. A second launch activates the
+existing main window. If a clipping detail is open, the frontend first invokes
+the registered durability flush, then reloads canonical detail and gallery
+pages. A failed flush or unresolved conflict preserves the current editor draft
+and blocks that refresh.
 
 ## 15. Revision conflict handling
 
