@@ -141,6 +141,10 @@ assert.ok(readerPreferences.includes("window.localStorage.setItem"), "Reader pre
 
 assert.equal((app.match(/className="lv-sidebar-reopen"/g) ?? []).length, 1, "The shared main surface must own one sidebar reopen control.");
 assert.ok(app.indexOf('className="lv-sidebar-reopen"') < app.indexOf('className="lv-content"'), "The sidebar reopen control must not be scoped to one provider view.");
+assert.ok(app.includes('className="settings-dialog"'), "Settings must own a compact responsive dialog contract.");
+assert.ok(app.includes("lv-sidebar-optimization"), "Sidebar runtime status needs an intrinsic-width owner.");
+assert.ok(css.includes(".settings-dialog") && css.includes("overflow-x: hidden"), "Settings must not expose a horizontal scroll surface.");
+assert.ok(css.includes(".lv-sidebar-optimization > span") && css.includes("text-overflow: ellipsis"), "Sidebar runtime text can widen the navigation rail.");
 assert.ok(!library.includes(">Read</Button>"), "Opening a newspaper must be owned by the whole library row.");
 assert.ok(!library.includes("Register archive") && !library.includes("Repair existing"), "Archive maintenance belongs in Settings, not the Library toolbar.");
 assert.ok(!library.includes("Default newspaper zoom"), "Reader defaults belong in Settings, not the Library toolbar.");

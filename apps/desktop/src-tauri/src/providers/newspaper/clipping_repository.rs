@@ -1674,6 +1674,27 @@ pub fn load_all_ids_for_root(connection: &Connection, root_id: &str) -> Result<V
         .collect()
 }
 
+/// Keyset page used by the delayed `note.md` projection repair. Only ready
+/// rows own a readable canonical directory. Fetch one extra ID so callers can
+/// pace large libraries without an eager startup scan.
+pub fn load_ready_ids_after(
+    connection: &Connection,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+    connection
+        .prepare(
+            "SELECT id FROM newspaper_clippings
+             WHERE asset_state = 'ready'
+               AND (?1 IS NULL OR id > ?1)
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?
+        .query_map(params![after_id, fetch_limit], |row| row.get(0))?
+        .collect()
+}
+
 /// Explicit source unlink for the World Journal reset transaction
 /// (FR-SOURCE-DELETE-001). Runs on the reset connection so preservation is
 /// deterministic even when the foreign_keys pragma is disabled. Only the

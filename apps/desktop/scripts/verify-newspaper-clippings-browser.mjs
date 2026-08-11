@@ -174,6 +174,11 @@ try {
         }
       }
     };
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+      unregisterListener(_event, id) {
+        callbacks.delete(id);
+      }
+    };
   });
 
   const consoleErrors = [];

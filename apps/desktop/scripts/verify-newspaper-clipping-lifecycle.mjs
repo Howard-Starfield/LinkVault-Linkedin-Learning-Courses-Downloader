@@ -13,9 +13,17 @@ const highlight = read("src/components/newspaper/NewspaperSourceHighlight.tsx");
 const detail = read("src/components/newspaper/NewspaperClippingDetail.tsx");
 const deleteHook = read("src/components/newspaper/useNewspaperClippingDelete.ts");
 const selectionHook = read("src/components/newspaper/useNewspaperClippingSelection.ts");
+const activation = read("src/components/newspaper/clipping-instance-activation.ts");
+const clippingList = read("src/components/newspaper/NewspaperClippingList.tsx");
 const sourceCard = read("src/components/newspaper/NewspaperClippingSourceCard.tsx");
+const imagePreview = read("src/components/newspaper/useClippingImagePreview.ts");
+const nativeEntry = read("src-tauri/src/lib.rs");
+const windowActivation = read("src-tauri/src/app/window_activation.rs");
+const cargoManifest = read("src-tauri/Cargo.toml");
 const commands = read("src-tauri/src/providers/newspaper/commands.rs");
+const noteMirror = read("src-tauri/src/providers/newspaper/clipping_note_mirror.rs");
 const service = read("src-tauri/src/providers/newspaper/clipping_service.rs");
+const startup = read("src-tauri/src/providers/newspaper/clipping_startup.rs");
 const repository = read("src-tauri/src/providers/newspaper/clipping_repository.rs");
 
 requireText(navigation, "jobId: detail.sourceJobId", "exact source job target");
@@ -31,16 +39,47 @@ requireText(highlight, 'aria-hidden="true"', "non-interactive highlight semantic
 requireText(detail, "useNewspaperClippingDelete", "delete UI wiring");
 requireText(deleteHook, "deleteNewspaperClipping", "revision-guarded delete UI");
 requireText(selectionHook, "previousOrder[deletedIndex] ?? previousOrder[deletedIndex - 1]", "logical post-delete selection");
+requireText(activation, 'listen("linkvault://instance-activated"', "second-launch activation adapter");
+requireText(selectionHook, "listenForClippingInstanceActivation", "second-launch detail refresh");
+requireText(selectionHook, "detailFlushRef.current", "dirty flush before second-launch refresh");
+requireText(clippingList, "listenForClippingInstanceActivation", "second-launch gallery refresh");
 requireText(sourceCard, "Original edition is no longer in the newspaper library.", "missing-source copy");
 requireText(sourceCard, "Retry image check", "targeted recovery action");
+requireText(sourceCard, "Zoom clipping image", "canonical clipping zoom action");
+requireText(sourceCard, "data-alignment={alignment}", "newspaper image alignment state");
+requireText(sourceCard, "linkvault.clippingImageAlignment.v1", "local presentation preference");
+requireText(sourceCard, 'className="clipping-source-card__media"', "hover-owned clipping chrome");
+requireText(sourceCard, 'role="button"', "actual preview image interaction target");
+requireText(imagePreview, "setPointerCapture(event.pointerId)", "preview image pointer ownership");
+requireText(imagePreview, "DRAG_THRESHOLD_PX", "preview click versus drag threshold");
+requireText(imagePreview, "panLimits", "bounded preview panning");
+requireText(detail, "headerContent", "visually integrated editor image header");
+assert.ok(!detail.includes("@tiptap/extension-image") && !sourceCard.includes("@tiptap/"), "canonical clipping became a Tiptap document node");
 requireText(commands, "delete_newspaper_clipping", "delete command");
 requireText(commands, '"source_changed"', "source invalidation");
+requireText(cargoManifest, 'tauri-plugin-single-instance = "2"', "official single-instance dependency");
+requireText(nativeEntry, "tauri_plugin_single_instance::init", "single-instance native registration");
+requireText(nativeEntry, "activate_existing_instance(app)", "single-instance activation callback");
+requireText(windowActivation, 'app.emit("linkvault://instance-activated", ())', "single-instance activation event");
+assert.ok(
+  nativeEntry.indexOf("tauri_plugin_single_instance::init") < nativeEntry.indexOf("register_asynchronous_uri_scheme_protocol"),
+  "single-instance plugin must register before application protocol/setup work"
+);
+requireText(noteMirror, "SQLite remains canonical", "note mirror source-of-truth boundary");
+requireText(noteMirror, "NOTE_MIRROR_FILE_NAME", "fixed note mirror filename");
+requireText(noteMirror, "MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH", "Windows atomic mirror replace");
+requireText(service, "sync_note_mirror_best_effort", "post-commit note mirror projection");
+requireText(service, "reconcile_note_mirror_batch", "paced note mirror repair");
+requireText(startup, "NOTE_MIRROR_BATCH_DELAY", "startup note mirror pacing");
 requireText(service, "read_validated_canonical_at", "exact canonical recovery validation");
 requireText(repository, "unlink_sources_for_job", "single-job source unlink");
 requireText(repository, "unlink_all_sources", "reset source unlink");
 assert.ok(!service.includes("reqwest"), "clipping lifecycle service must not fetch remote media");
+assert.ok(sourceCard.split(/\r?\n/).length <= 220, "clipping source card exceeded its 220-line UI ownership budget");
+assert.ok(imagePreview.split(/\r?\n/).length <= 180, "clipping preview interaction hook exceeded 180 lines");
 assert.ok(navigation.split(/\r?\n/).length <= 100, "navigation contract module exceeded 100 lines");
 assert.ok(navigationHook.split(/\r?\n/).length <= 100, "navigation hook exceeded 100 lines");
 assert.ok(highlight.split(/\r?\n/).length <= 80, "highlight component exceeded 80 lines");
+assert.ok(noteMirror.split(/\r?\n/).length <= 180, "note mirror module exceeded 180 lines");
 
 console.log("Newspaper clipping Phase 5 navigation and lifecycle structure passed.");

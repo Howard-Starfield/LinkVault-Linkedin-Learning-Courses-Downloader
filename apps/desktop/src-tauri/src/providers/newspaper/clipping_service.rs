@@ -38,6 +38,7 @@ use super::clipping_models::{
     SearchPossibleNewspaperClippingsRequest, SearchPossibleNewspaperClippingsResponse,
     FUZZY_CANDIDATE_LIMIT, POSSIBLE_MATCH_LIMIT, SEARCH_PAGE_LIMIT, SEARCH_SNIPPET_MAX_CHARS,
 };
+use super::clipping_note_mirror;
 use super::clipping_recovery;
 use super::clipping_repository::{self as repository, ClippingDetail};
 use super::clipping_roots::ClippingRootRegistry;
@@ -59,12 +60,23 @@ pub struct ClippingService {
     /// Derived thumbnails are serialized separately from full-page crop work.
     /// This prevents duplicate cache writers without blocking note updates.
     thumbnail_permit: Arc<Mutex<()>>,
+    /// Serializes the export-only `note.md` projection. The database writer is
+    /// deliberately not held during filesystem I/O.
+    note_mirror_permit: Arc<Mutex<()>>,
     /// Shutdown first closes admission, then waits on `crop_permit` so a
     /// started operation reaches the Phase 1 recoverable state machine.
     crop_accepting: Arc<AtomicBool>,
 }
 
 pub(crate) const MEDIA_INTEGRITY_QUEUE_CAPACITY: usize = 32;
+pub const NOTE_MIRROR_RECONCILIATION_BATCH_SIZE: usize = 32;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NoteMirrorReconciliationBatch {
+    pub processed: usize,
+    pub failures: usize,
+    pub next_after: Option<String>,
+}
 
 /// Whether the current staging directory is backed by a durable clipping row.
 ///
@@ -255,6 +267,7 @@ impl ClippingService {
             integrity_scheduler,
             crop_permit: Arc::new(Mutex::new(())),
             thumbnail_permit: Arc::new(Mutex::new(())),
+            note_mirror_permit: Arc::new(Mutex::new(())),
             crop_accepting: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -525,7 +538,9 @@ impl ClippingService {
         &self,
         record: repository::NewClippingRecord,
     ) -> Result<NewspaperClipping, ClippingError> {
-        self.register_staged_inner(record, false)
+        let clipping = self.register_staged_inner(record, false)?;
+        self.sync_note_mirror_best_effort(&clipping.id);
+        Ok(clipping)
     }
 
     fn register_staged_inner(
@@ -643,7 +658,11 @@ impl ClippingService {
         now: i64,
     ) -> Result<NewspaperClipping, ClippingError> {
         match existing.asset_state {
-            ClippingAssetState::Ready | ClippingAssetState::Missing => Ok(existing),
+            ClippingAssetState::Ready => {
+                self.sync_note_mirror_best_effort(&existing.id);
+                Ok(existing)
+            }
+            ClippingAssetState::Missing => Ok(existing),
             ClippingAssetState::DeletePending => {
                 Err(ClippingError::new(ClippingErrorCode::OperationConflict))
             }
@@ -717,7 +736,10 @@ impl ClippingService {
         after_writer();
         match outcome {
             repository::NoteUpdateOutcome::Updated { clipping }
-            | repository::NoteUpdateOutcome::Unchanged { clipping } => Ok(clipping),
+            | repository::NoteUpdateOutcome::Unchanged { clipping } => {
+                self.sync_note_mirror_best_effort(&clipping.id);
+                Ok(clipping)
+            }
             repository::NoteUpdateOutcome::NotFound => {
                 Err(ClippingError::new(ClippingErrorCode::NotFound))
             }
@@ -1260,6 +1282,76 @@ impl ClippingService {
             }
         }
         summary
+    }
+
+    /// Repair one paced keyset page of the export-only Markdown projection.
+    /// The startup coordinator sleeps between pages so a large clipping
+    /// library never becomes an eager launch-time filesystem sweep.
+    pub fn reconcile_note_mirror_batch(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<NoteMirrorReconciliationBatch, ClippingError> {
+        if limit == 0 {
+            return Ok(NoteMirrorReconciliationBatch::default());
+        }
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let mut ids = repository::load_ready_ids_after(&connection, after_id, limit)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let next_after = has_more.then(|| ids.last().cloned()).flatten();
+        let mut failures = 0;
+        for id in &ids {
+            if !self.sync_note_mirror_best_effort(id) {
+                failures += 1;
+            }
+        }
+        Ok(NoteMirrorReconciliationBatch {
+            processed: ids.len(),
+            failures,
+            next_after,
+        })
+    }
+
+    fn sync_note_mirror_best_effort(&self, clipping_id: &str) -> bool {
+        let started = Instant::now();
+        match self.sync_note_mirror(clipping_id) {
+            Ok(()) => true,
+            Err(_) => {
+                record_integrity_diagnostic(
+                    &self.diagnostics,
+                    "clipping_note_mirror_sync",
+                    started.elapsed(),
+                );
+                false
+            }
+        }
+    }
+
+    fn sync_note_mirror(&self, clipping_id: &str) -> Result<(), ClippingError> {
+        let _permit = self
+            .note_mirror_permit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Reload under the mirror permit. A queued save may have committed a
+        // newer revision since a startup page collected this ID.
+        let Some(clipping) = self.read_by_id(clipping_id)? else {
+            return Ok(());
+        };
+        if clipping.asset_state != ClippingAssetState::Ready {
+            return Ok(());
+        }
+        validate_note_markdown(&clipping.note_markdown).map_err(ClippingError::new)?;
+        let layout = self.roots.resolve(&clipping.asset_root_id)?;
+        clipping_note_mirror::write_note_mirror(
+            &layout,
+            &clipping.id,
+            &clipping.asset_relative_path,
+            &clipping.note_markdown,
+        )?;
+        Ok(())
     }
 }
 
@@ -2479,6 +2571,128 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_note_mirror_tracks_database_canonical_markdown_bytes() {
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let created = service
+            .register_staged(staged_snapshot_record(&service, &destination, ID))
+            .unwrap();
+        let layout = service.root_layout(&created.asset_root_id).unwrap();
+        let canonical = layout
+            .canonical_path_at(ID, &created.asset_relative_path)
+            .unwrap();
+        let mirror = canonical
+            .parent()
+            .unwrap()
+            .join(clipping_note_mirror::NOTE_MIRROR_FILE_NAME);
+        assert_eq!(std::fs::read(&mirror).unwrap(), b"");
+
+        let markdown = "# Saved locally\n\n- [x] SQLite stays canonical\n- [ ] readable mirror";
+        let updated = service
+            .update_note(ID, created.revision, "Portable note", markdown, 101)
+            .unwrap();
+        assert_eq!(std::fs::read(&mirror).unwrap(), markdown.as_bytes());
+        assert!(!mirror.with_file_name(".note.md.part").exists());
+
+        let cleared = service
+            .update_note(ID, updated.revision, "Portable note", "", 102)
+            .unwrap();
+        assert_eq!(cleared.note_markdown, "");
+        assert_eq!(std::fs::read(&mirror).unwrap(), b"");
+    }
+
+    #[test]
+    fn persistence_gate_note_mirror_failure_never_rolls_back_database_and_is_repairable() {
+        let (temp, service, diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let created = service
+            .register_staged(staged_snapshot_record(&service, &destination, ID))
+            .unwrap();
+        let layout = service.root_layout(&created.asset_root_id).unwrap();
+        let canonical = layout
+            .canonical_path_at(ID, &created.asset_relative_path)
+            .unwrap();
+        let mirror = canonical
+            .parent()
+            .unwrap()
+            .join(clipping_note_mirror::NOTE_MIRROR_FILE_NAME);
+        std::fs::remove_file(&mirror).unwrap();
+        std::fs::create_dir(&mirror).unwrap();
+
+        let markdown = "Database commit survives a mirror I/O failure.";
+        let updated = service
+            .update_note(ID, created.revision, "Durable note", markdown, 101)
+            .unwrap();
+        assert_eq!(updated.note_markdown, markdown);
+        assert_eq!(
+            service.read_by_id(ID).unwrap().unwrap().note_markdown,
+            markdown
+        );
+        assert!(diagnostics.snapshot().iter().any(|event| {
+            event.operation == "clipping_note_mirror_sync"
+                && event.outcome == DatabaseDiagnosticOutcome::Error
+                && event.error_class == Some(DatabaseErrorClass::Recovery)
+        }));
+
+        std::fs::remove_dir(&mirror).unwrap();
+        let repaired = service
+            .reconcile_note_mirror_batch(None, NOTE_MIRROR_RECONCILIATION_BATCH_SIZE)
+            .unwrap();
+        assert_eq!(repaired.processed, 1);
+        assert_eq!(repaired.failures, 0);
+        assert_eq!(repaired.next_after, None);
+        assert_eq!(std::fs::read(&mirror).unwrap(), markdown.as_bytes());
+    }
+
+    #[test]
+    fn persistence_gate_note_mirror_repair_uses_stable_keyset_pages() {
+        let (temp, service, _diagnostics) = fixture();
+        let destination = temp.path().join("newspaper-downloads");
+        let first = service
+            .register_staged(staged_snapshot_record(&service, &destination, ID))
+            .unwrap();
+        let second = service
+            .register_staged(staged_snapshot_record(&service, &destination, CROP_ID))
+            .unwrap();
+        for clipping in [&first, &second] {
+            let layout = service.root_layout(&clipping.asset_root_id).unwrap();
+            let canonical = layout
+                .canonical_path_at(&clipping.id, &clipping.asset_relative_path)
+                .unwrap();
+            std::fs::remove_file(
+                canonical
+                    .parent()
+                    .unwrap()
+                    .join(clipping_note_mirror::NOTE_MIRROR_FILE_NAME),
+            )
+            .unwrap();
+        }
+
+        let first_page = service.reconcile_note_mirror_batch(None, 1).unwrap();
+        assert_eq!(first_page.processed, 1);
+        assert_eq!(first_page.failures, 0);
+        assert_eq!(first_page.next_after.as_deref(), Some(ID));
+        let second_page = service
+            .reconcile_note_mirror_batch(first_page.next_after.as_deref(), 1)
+            .unwrap();
+        assert_eq!(second_page.processed, 1);
+        assert_eq!(second_page.failures, 0);
+        assert_eq!(second_page.next_after, None);
+
+        for clipping in [&first, &second] {
+            let layout = service.root_layout(&clipping.asset_root_id).unwrap();
+            let canonical = layout
+                .canonical_path_at(&clipping.id, &clipping.asset_relative_path)
+                .unwrap();
+            assert!(canonical
+                .parent()
+                .unwrap()
+                .join(clipping_note_mirror::NOTE_MIRROR_FILE_NAME)
+                .is_file());
+        }
+    }
+
+    #[test]
     fn persistence_gate_new_creation_rejects_legacy_managed_root() {
         let (_temp, service, _diagnostics) = fixture();
         let error = service
@@ -2782,6 +2996,12 @@ mod tests {
         let stored = service.detail(ID).unwrap().unwrap().clipping;
         assert_eq!(stored.revision, 3);
         assert_eq!(stored.note_markdown, "second caller");
+        let canonical = service.layout.canonical_path(ID).unwrap();
+        let mirror = canonical
+            .parent()
+            .unwrap()
+            .join(clipping_note_mirror::NOTE_MIRROR_FILE_NAME);
+        assert_eq!(std::fs::read(mirror).unwrap(), b"second caller");
     }
 
     #[test]

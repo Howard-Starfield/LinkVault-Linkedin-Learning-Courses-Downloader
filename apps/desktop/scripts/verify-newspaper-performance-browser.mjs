@@ -157,6 +157,11 @@ try {
           }
         }
       };
+      window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+        unregisterListener(_event, id) {
+          callbacks.delete(id);
+        }
+      };
     }, { count: editionCount });
 
     const startedAt = performance.now();
@@ -164,6 +169,27 @@ try {
     await page.getByRole("button", { name: "Newspaper library" }).click();
     await page.locator(".newspaper-library-row:not(.newspaper-library-row-skeleton)").first().waitFor();
     await page.getByRole("button", { name: "Open settings" }).click();
+    const settingsDialog = page.getByRole("dialog", { name: "LinkVault settings" });
+    const settingsGeometry = await settingsDialog.evaluate((dialog) => {
+      const grid = dialog.querySelector(".settings-grid");
+      const controls = [...dialog.querySelectorAll("input, select, button")]
+        .filter((control) => !control.getAttribute("aria-label")?.startsWith("Close LinkVault"));
+      return {
+        dialogClientWidth: dialog.clientWidth,
+        dialogScrollWidth: dialog.scrollWidth,
+        gridClientWidth: grid?.clientWidth ?? 0,
+        gridScrollWidth: grid?.scrollWidth ?? 1,
+        tallestControl: Math.max(0, ...controls.map((control) => control.getBoundingClientRect().height))
+      };
+    });
+    assert.ok(settingsGeometry.dialogScrollWidth <= settingsGeometry.dialogClientWidth + 1, "Settings dialog has horizontal overflow");
+    assert.ok(settingsGeometry.gridScrollWidth <= settingsGeometry.gridClientWidth + 1, "Settings content exceeds its dialog");
+    assert.ok(settingsGeometry.tallestControl <= 32.5, `Settings controls are not compact: ${settingsGeometry.tallestControl}px`);
+    assert.equal(
+      await page.locator(".lv-sidebar nav").evaluate((nav) => nav.scrollWidth <= nav.clientWidth + 1),
+      true,
+      "Sidebar navigation has horizontal overflow"
+    );
     const defaultZoomControl = page.getByLabel("Default newspaper zoom");
     const clickZoomControl = page.getByLabel("Newspaper left-click zoom");
     const defaultToneControl = page.getByLabel("Default newspaper page tone");

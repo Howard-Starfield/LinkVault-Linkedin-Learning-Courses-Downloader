@@ -4,6 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { Button } from "../primitives";
 import { preserveStableClippingThumbnail } from "./clipping-thumbnail-state";
 import {
+  canListenForClippingInstanceActivation,
+  listenForClippingInstanceActivation
+} from "./clipping-instance-activation";
+import {
   ensureNewspaperClippingThumbnail,
   getNewspaperClippingsPage,
   isTauriRuntime,
@@ -25,7 +29,7 @@ function columnCountForWidth(width: number) {
 
 function clippingAspectRatio(item: NewspaperClippingSummary | undefined) {
   if (!item || item.assetWidth <= 0 || item.assetHeight <= 0) return 1.45;
-  return Math.min(2.4, Math.max(0.72, item.assetWidth / item.assetHeight));
+  return item.assetWidth / item.assetHeight;
 }
 
 function ClippingSkeletonShelf({ loading = false }: { loading?: boolean }) {
@@ -166,10 +170,33 @@ export function NewspaperClippingList({
   useEffect(() => {
     if (!isTauriRuntime()) return;
     let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen("newspaper://clipping-invalidated", () => {
+    const unlisteners: Array<() => void> = [];
+    const refreshFromBackend = () => {
       if (!disposed) refreshLoadedPages();
-    }).then((cleanup) => { unlisten = cleanup; });
+    };
+    const retainCleanup = (registration: Promise<() => void>) => {
+      void registration.then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisteners.push(cleanup);
+      });
+    };
+    retainCleanup(listen("newspaper://clipping-invalidated", refreshFromBackend));
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [refreshLoadedPages]);
+
+  useEffect(() => {
+    if (!canListenForClippingInstanceActivation()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForClippingInstanceActivation(() => {
+      if (!disposed) refreshLoadedPages();
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
     return () => {
       disposed = true;
       unlisten?.();
@@ -302,8 +329,8 @@ export function NewspaperClippingList({
                             role="img"
                           />
                         )}
-                        {item ? <span className="clipping-gallery__title"><strong>{item.title}</strong></span> : null}
                       </span>
+                      {item ? <span className="clipping-gallery__title"><strong>{item.title}</strong></span> : null}
                     </button>
                   );
                 })}

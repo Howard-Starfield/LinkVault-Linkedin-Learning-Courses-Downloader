@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { installClippingNoteExitBrowserHarness } from "./clipping-note-exit-browser-harness.mjs";
+import { installClippingInstanceActivationBrowserHarness } from "./clipping-instance-activation-browser-harness.mjs";
 import { measureClippingNoteDurabilityBrowser } from "./clipping-note-durability-browser-performance.mjs";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
@@ -10,7 +11,7 @@ const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL 
 try {
   const page = await browser.newPage({ viewport: { width: 1600, height: 960 } });
   await page.addInitScript(() => {
-    const svg = (label) => `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="100%" height="100%" fill="#ede6d2"/><path d="M20 70h600M20 130h600M20 190h600M20 250h600" stroke="#8b806b"/><text x="24" y="42" fill="#27231d" font-size="22">${label}</text></svg>`)}`;
+    const svg = (label) => `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700"><rect width="100%" height="100%" fill="#ede6d2"/><path d="M20 70h1160M20 190h1160M20 310h1160M20 430h1160M20 550h1160M20 680h1160" stroke="#8b806b"/><text x="24" y="42" fill="#27231d" font-size="22">${label}</text></svg>`)}`;
     const details = Array.from({ length: 500 }, (_, index) => ({
       id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
       title: `Transit archive clipping ${index + 1}`,
@@ -230,7 +231,7 @@ try {
       async ensureThumbnail(id) {
         const test = window.__CLIPPING_LIBRARY_TEST__;
         test.thumbnailCalls.push(id);
-        return { status: "generated", thumbnailUrl: svg("Thumbnail"), thumbnailVersion: "1-1", width: 320, height: 180 };
+        return { status: "generated", thumbnailUrl: svg("Thumbnail"), thumbnailVersion: "1-1", width: 1024, height: 597 };
       },
       async search(query, offset) {
         const test = window.__CLIPPING_LIBRARY_TEST__;
@@ -278,6 +279,7 @@ try {
     };
   });
   await page.addInitScript(installClippingNoteExitBrowserHarness);
+  await page.addInitScript(installClippingInstanceActivationBrowserHarness);
 
   const consoleErrors = [];
   page.on("console", (message) => {
@@ -295,6 +297,7 @@ try {
 
   await page.getByRole("button", { name: "Clippings", exact: true }).click();
   await page.locator(".clipping-gallery").waitFor();
+  await page.waitForFunction(() => window.__CLIPPING_INSTANCE_ACTIVATION__.listenerCount() === 1);
   assert.equal(await page.locator(".clipping-gallery__header").count(), 0, "gallery still renders a second header below search");
   await page.getByText("Clippings", { exact: true }).last().waitFor();
   await page.getByText("500 clippings", { exact: true }).waitFor();
@@ -313,32 +316,44 @@ try {
   const cardGeometry = await firstCard.evaluate((card) => {
     const thumbnail = card.querySelector(".clipping-gallery__thumb").getBoundingClientRect();
     const title = card.querySelector(".clipping-gallery__title").getBoundingClientRect();
+    const image = card.querySelector(".clipping-gallery__thumb img");
+    const imageBounds = image.getBoundingClientRect();
     const bounds = card.getBoundingClientRect();
     return {
       cardWidth: bounds.width,
       thumbnailWidth: thumbnail.width,
       thumbnailHeight: thumbnail.height,
+      thumbnailTop: thumbnail.top,
       titleLeft: title.left,
-      titleBottom: title.bottom,
-      titleHeight: title.height,
+      titleTop: title.top,
       thumbnailLeft: thumbnail.left,
-      thumbnailBottom: thumbnail.bottom
+      thumbnailBottom: thumbnail.bottom,
+      imageLeft: imageBounds.left,
+      imageTop: imageBounds.top,
+      imageRight: imageBounds.right,
+      imageBottom: imageBounds.bottom,
+      imageNaturalRatio: image.naturalWidth / image.naturalHeight,
+      objectFit: getComputedStyle(image).objectFit
     };
   });
   assert.ok(cardGeometry.thumbnailWidth >= cardGeometry.cardWidth - 2, "thumbnail does not occupy the full gallery card width");
   assert.ok(Math.abs(cardGeometry.thumbnailWidth / cardGeometry.thumbnailHeight - 1200 / 700) < 0.03, "gallery card ignored the clipping aspect ratio");
-  assert.ok(Math.abs(cardGeometry.titleLeft - cardGeometry.thumbnailLeft) <= 1, "title is not anchored to the thumbnail's bottom-left veil");
-  assert.ok(cardGeometry.titleHeight < 60, "title gradient covers too much of the clipping");
-  assert.ok(Math.abs(cardGeometry.thumbnailBottom - cardGeometry.titleBottom) <= 1, "title gradient bleeds beyond the thumbnail bottom edge");
+  assert.ok(Math.abs(cardGeometry.imageNaturalRatio - 1200 / 700) < 0.001, "browser fixture no longer represents the clipping's full aspect ratio");
+  assert.equal(cardGeometry.objectFit, "contain", "gallery image can crop the canonical clipping");
+  assert.ok(cardGeometry.imageLeft >= cardGeometry.thumbnailLeft - 1 && cardGeometry.imageTop >= cardGeometry.thumbnailTop - 1, "gallery image escapes its full-size frame");
+  assert.ok(cardGeometry.imageRight <= cardGeometry.thumbnailLeft + cardGeometry.thumbnailWidth + 1 && cardGeometry.imageBottom <= cardGeometry.thumbnailBottom + 1, "gallery image is clipped outside its frame");
+  assert.ok(Math.abs(cardGeometry.titleLeft - cardGeometry.thumbnailLeft) <= 3, "title is not anchored below the thumbnail's left edge");
+  assert.ok(cardGeometry.titleTop >= cardGeometry.thumbnailBottom, "title still covers clipping pixels");
   assert.equal((await firstCard.innerText()).trim(), "Transit archive clipping 1", "gallery card must show only its single title");
   await firstCard.hover();
   await page.waitForTimeout(220);
   const hoverTransforms = await firstCard.evaluate((card) => {
     const image = new DOMMatrixReadOnly(getComputedStyle(card.querySelector(".clipping-gallery__thumb img")).transform);
     const thumbnail = new DOMMatrixReadOnly(getComputedStyle(card.querySelector(".clipping-gallery__thumb")).transform);
-    return { imageScaleX: image.a, imageScaleY: image.d, thumbnailX: thumbnail.e, thumbnailY: thumbnail.f };
+    return { imageScaleX: image.a, imageScaleY: image.d, thumbnailScaleX: thumbnail.a, thumbnailScaleY: thumbnail.d, thumbnailX: thumbnail.e, thumbnailY: thumbnail.f };
   });
-  assert.ok(Math.abs(hoverTransforms.imageScaleX - 1.05) < 0.01 && Math.abs(hoverTransforms.imageScaleY - 1.05) < 0.01, "hover does not enlarge the clipping image by 5%");
+  assert.ok(Math.abs(hoverTransforms.imageScaleX - 1) < 0.01 && Math.abs(hoverTransforms.imageScaleY - 1) < 0.01, "hover still crops by enlarging the image inside its frame");
+  assert.ok(Math.abs(hoverTransforms.thumbnailScaleX - 1.05) < 0.01 && Math.abs(hoverTransforms.thumbnailScaleY - 1.05) < 0.01, "hover does not enlarge the complete clipping thumbnail by 5%");
   assert.ok(Math.abs(hoverTransforms.thumbnailX) < 0.01 && Math.abs(hoverTransforms.thumbnailY) < 0.01, "hover still moves the clipping card");
   const callsAtDefaultWidth = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.thumbnailCalls.length);
   await page.setViewportSize({ width: 700, height: 960 });
@@ -367,15 +382,132 @@ try {
   assert.equal(await page.locator(".clipping-note-editor__footer").getByRole("toolbar", { name: "Editing history", exact: true }).count(), 1, "Undo and Redo are not inside the note footer");
   assert.equal(await page.locator(".lv-global-search__title-slot .clipping-detail__title input").count(), 1, "editable note title is not beside Back in the top bar");
   assert.equal(await page.locator(".clipping-detail__writing > .clipping-detail__title").count(), 0, "note title is still duplicated above the editor body");
-  await page.locator(".clipping-source-card > img").evaluate((image) => image.dispatchEvent(new Event("error")));
+  const integratedClipping = page.locator(".clipping-note-editor > .clipping-source-card");
+  await integratedClipping.waitFor();
+  assert.equal(await page.locator(".clipping-note-editor__content img").count(), 0, "canonical clipping leaked into Markdown-owned editor content");
+  await page.setViewportSize({ width: 640, height: 900 });
+  assert.equal(await page.getByRole("toolbar", { name: "Clipping image alignment" }).isVisible(), false, "narrow editor exposed controls whose float layout is intentionally disabled");
+  assert.equal(await integratedClipping.evaluate((element) => getComputedStyle(element).float), "none", "narrow editor did not restore full-width clipping flow");
+  await page.setViewportSize({ width: 1600, height: 960 });
+  const clippingMedia = integratedClipping.locator(".clipping-source-card__media");
+  const clippingCaption = clippingMedia.locator("figcaption");
+  await page.mouse.move(2, 2);
+  await page.waitForTimeout(170);
+  assert.equal(await clippingCaption.evaluate((element) => Number(getComputedStyle(element).opacity) < 0.05), true, "clipping title chrome is visible before hover");
+  const compactMediaGeometry = await integratedClipping.evaluate((element) => {
+    const card = element.getBoundingClientRect();
+    const media = element.querySelector(".clipping-source-card__media").getBoundingClientRect();
+    const caption = element.querySelector("figcaption");
+    return {
+      cardBottom: card.bottom,
+      mediaBottom: media.bottom,
+      captionPosition: getComputedStyle(caption).position
+    };
+  });
+  assert.equal(compactMediaGeometry.captionPosition, "absolute", "clipping title still reserves float height");
+  assert.ok(Math.abs(compactMediaGeometry.cardBottom - compactMediaGeometry.mediaBottom) < 1, "clipping chrome leaves dead space below the media rectangle");
+  await clippingMedia.hover();
+  await page.waitForFunction(() => Number(getComputedStyle(document.querySelector(".clipping-source-card__media > figcaption")).opacity) > .95);
+  assert.equal(await clippingCaption.evaluate((element) => getComputedStyle(element).pointerEvents), "auto", "hovered title and source actions are not interactive");
+  assert.equal(await page.getByRole("toolbar", { name: "Clipping image alignment" }).evaluate((element) => getComputedStyle(element).pointerEvents), "auto", "hovered alignment controls are not interactive");
+  await page.getByRole("button", { name: "Align clipping left" }).click();
+  assert.equal(await integratedClipping.getAttribute("data-alignment"), "left", "left newspaper alignment did not apply");
+  assert.equal(await integratedClipping.evaluate((element) => getComputedStyle(element).float), "left", "clipping did not float beside note text");
+  const wrapGeometry = await page.locator(".clipping-note-editor").evaluate((root) => {
+    const clipping = root.querySelector(".clipping-source-card").getBoundingClientRect();
+    const content = root.querySelector(".clipping-note-editor__content");
+    const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+    let text = walker.nextNode();
+    while (text && !text.textContent.trim()) text = walker.nextNode();
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, 1);
+    const firstCharacter = range.getBoundingClientRect();
+    return { clippingRight: clipping.right, clippingBottom: clipping.bottom, textLeft: firstCharacter.left, textTop: firstCharacter.top };
+  });
+  assert.ok(
+    wrapGeometry.textLeft > wrapGeometry.clippingRight && wrapGeometry.textTop < wrapGeometry.clippingBottom,
+    `note text did not start beside the floated clipping: ${JSON.stringify(wrapGeometry)}`
+  );
+  await page.getByRole("button", { name: "Align clipping right" }).click();
+  assert.equal(await integratedClipping.getAttribute("data-alignment"), "right", "right newspaper alignment did not apply");
+  assert.equal(await integratedClipping.evaluate((element) => getComputedStyle(element).float), "right", "right clipping alignment did not change layout");
+  assert.equal(await page.evaluate(() => localStorage.getItem("linkvault.clippingImageAlignment.v1")), "right", "presentation alignment was not retained locally");
+  await page.getByRole("button", { name: "Zoom clipping image" }).click();
+  const preview = page.getByRole("dialog", { name: "Clipping image preview" });
+  await preview.waitFor();
+  assert.equal(await preview.evaluate((element) => element.open), true, "left click did not open the canonical clipping preview");
+  assert.equal(
+    await preview.locator("img").getAttribute("src"),
+    await page.getByRole("button", { name: "Zoom clipping image" }).locator("img").getAttribute("src"),
+    "zoom preview did not reuse the canonical clipping URL"
+  );
+  const previewImage = preview.getByRole("button", { name: "Zoom in clipping preview" });
+  await previewImage.waitFor();
+  const previewHitLayer = await previewImage.evaluate((image) => {
+    const rect = image.getBoundingClientRect();
+    const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return {
+      hitActualImage: target === image,
+      imagePointerEvents: getComputedStyle(image).pointerEvents,
+      viewportPointerEvents: getComputedStyle(image.parentElement).pointerEvents
+    };
+  });
+  assert.deepEqual(previewHitLayer, { hitActualImage: true, imagePointerEvents: "auto", viewportPointerEvents: "none" }, "preview layers intercept the cropped image hit target");
+  await previewImage.click();
+  await page.waitForFunction(() => document.querySelector("dialog[aria-label='Clipping image preview']")?.dataset.zoomed === "true");
+  const pannedImage = preview.getByRole("button", { name: "Fit clipping preview" });
+  const panBefore = await pannedImage.evaluate((image) => ({
+    x: image.style.getPropertyValue("--clipping-preview-x"),
+    y: image.style.getPropertyValue("--clipping-preview-y")
+  }));
+  const panBox = await pannedImage.boundingBox();
+  assert.ok(panBox, "zoomed clipping image has no hit-testable bounds");
+  await page.mouse.move(panBox.x + panBox.width / 2, panBox.y + panBox.height / 2);
+  await page.mouse.down({ button: "left" });
+  await page.mouse.move(panBox.x + panBox.width / 2 + 70, panBox.y + panBox.height / 2 + 35, { steps: 5 });
+  await page.mouse.up({ button: "left" });
+  const panAfter = await pannedImage.evaluate((image) => ({
+    x: image.style.getPropertyValue("--clipping-preview-x"),
+    y: image.style.getPropertyValue("--clipping-preview-y"),
+    dragging: image.dataset.dragging
+  }));
+  assert.notDeepEqual({ x: panAfter.x, y: panAfter.y }, panBefore, "left-button drag did not pan the magnified clipping image");
+  assert.equal(panAfter.dragging, "false", "preview retained its dragging layer state after pointer release");
+  assert.equal(await preview.getAttribute("data-zoomed"), "true", "drag gesture was misread as a click-to-fit action");
+  await pannedImage.click();
+  await page.waitForFunction(() => document.querySelector("dialog[aria-label='Clipping image preview']")?.dataset.zoomed === "false");
+  assert.equal(await preview.getByRole("button", { name: "Zoom in clipping preview" }).count(), 1, "second left click did not restore fit mode");
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector("dialog[aria-label='Clipping image preview']")?.open);
+  assert.equal(await page.getByRole("button", { name: "Zoom clipping image" }).evaluate((element) => element === document.activeElement), true, "closing image preview did not restore trigger focus");
+  await page.locator(".clipping-source-card__image-button > img").evaluate((image) => image.dispatchEvent(new Event("error")));
   await page.getByRole("button", { name: "Retry image check" }).click();
-  await page.locator(".clipping-source-card > img").waitFor();
+  await page.locator(".clipping-source-card__image-button > img").waitFor();
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.recoveryCalls.length), 1, "successful exact-asset retry did not remount the verified clipping image");
   if (process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT) {
     await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_DETAIL_SCREENSHOT });
   }
   assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 1, "thumbnail selection did not fetch exactly one clipping detail");
   assert.equal((await page.evaluate(() => performance.getEntriesByType("resource").some((entry) => entry.name.includes("ClippingNoteEditor")))), true, "detail did not lazy-load the editor chunk");
+  await page.waitForFunction(() => window.__CLIPPING_INSTANCE_ACTIVATION__.listenerCount() === 2);
+  const callsBeforeActivation = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length);
+  await page.evaluate(async () => {
+    const detail = window.__CLIPPING_LIBRARY_TEST__.details[0];
+    detail.noteMarkdown = "Refreshed from the canonical database";
+    detail.revision += 1;
+    detail.updatedAt += 1;
+    await window.__CLIPPING_INSTANCE_ACTIVATION__.emit();
+  });
+  await page.getByLabel("Clipping note editor body").getByText("Refreshed from the canonical database", { exact: true }).waitFor();
+  assert.equal(
+    await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length),
+    callsBeforeActivation + 1,
+    "second-launch activation did not reload exactly one selected clipping detail"
+  );
+  assert.equal(await page.evaluate(() => window.__CLIPPING_INSTANCE_ACTIVATION__.listenerCount()), 2, "activation refresh leaked a Strict Mode listener");
+  const callsBeforeSourceRoundTrip = await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length);
+  await page.locator(".clipping-source-card__media").hover();
   await page.getByRole("button", { name: "Open source newspaper page" }).click();
   await page.locator(".newspaper-reader").waitFor();
   await page.getByRole("button", { name: "Back to clipping" }).waitFor();
@@ -396,7 +528,7 @@ try {
   await page.getByRole("button", { name: "Back to clipping" }).click();
   await page.getByLabel("Clipping note editor body").waitFor();
   assert.equal(await page.getByRole("button", { name: "Open source newspaper page" }).evaluate((element) => element === document.activeElement), true, "source return did not restore focus to Open source");
-  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), 2, "Back to clipping did not reload the exact clipping ID once");
+  assert.equal(await page.evaluate(() => window.__CLIPPING_LIBRARY_TEST__.detailCalls.length), callsBeforeSourceRoundTrip + 1, "Back to clipping did not reload the exact clipping ID once");
   await topBack.click();
   await page.locator(".clipping-gallery").waitFor();
   await page.locator(".clipping-gallery__card").first().click();
@@ -433,6 +565,7 @@ try {
   assert.ok(searchOffsets.includes(50), "search scrolling did not lazy-load the next 50 results");
   await page.locator(".clipping-search-row").first().click();
   await page.locator(".clipping-detail").waitFor();
+  await page.locator(".clipping-source-card__media").hover();
   await page.getByRole("button", { name: "Open source newspaper page" }).click();
   await page.getByRole("button", { name: "Back to clipping" }).waitFor();
   await page.getByRole("button", { name: "Back to clipping" }).click();
@@ -645,7 +778,7 @@ try {
   await page.locator(".newspaper-library").waitFor();
 
   assert.deepEqual(consoleErrors, [], `browser console/page errors: ${consoleErrors.join("\n")}`);
-  console.log("Clipping library browser matrix passed: compact search-row summary, responsive gallery, first-use skeletons, contained title veil, lazy thumbnails/detail/editor, autosave, recovery, native preparation, search, conflict, roots, and guarded navigation.");
+  console.log("Clipping library browser matrix passed: compact search-row summary, responsive full-snapshot gallery, metadata below pixels, first-use skeletons, lazy thumbnails/detail/editor, autosave, recovery, native preparation, search, conflict, roots, and guarded navigation.");
 } finally {
   await browser.close();
 }

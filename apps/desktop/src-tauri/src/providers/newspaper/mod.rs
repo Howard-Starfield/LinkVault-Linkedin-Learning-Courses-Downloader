@@ -15,6 +15,7 @@ pub mod clipping_draft_models;
 pub mod clipping_draft_repository;
 pub mod clipping_draft_service;
 pub mod clipping_models;
+pub mod clipping_note_mirror;
 pub mod clipping_recovery;
 pub mod clipping_repository;
 pub mod clipping_roots;

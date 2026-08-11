@@ -111,6 +111,14 @@ deferred.
   a recoverable cleanup area.
 - Derived list thumbnails are cache data and may be regenerated; they are not
   the canonical clipping.
+- SQLite remains the canonical note store. Each ready clipping directory also
+  receives an export-only `note.md` containing the exact canonical Markdown
+  bytes; LinkVault never imports it over SQLite.
+- The mirror is written after the database commit through a flushed
+  same-directory part file and atomic replacement. Failure is diagnostic and
+  repairable, but never turns a successful canonical save into a failed save.
+- Delayed startup reconciliation repairs mirrors in paced keyset pages rather
+  than scanning user folders on the render/startup path.
 
 ### Note presentation
 
@@ -140,8 +148,8 @@ deferred.
 - Deleting a downloaded edition does not delete its clippings.
 - Resetting World Journal provider download data does not delete clippings or
   clipping notes.
-- Deleting a clipping deletes its note and managed canonical asset after an
-  explicit user action.
+- Deleting a clipping deletes its database note and managed clipping directory,
+  including the export-only `note.md`, after an explicit user action.
 - A missing source edition disables `Open source` but does not make the clipping
   unreadable.
 - A missing canonical asset is surfaced as a recoverable data-integrity state;
