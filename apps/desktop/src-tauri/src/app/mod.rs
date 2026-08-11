@@ -16,3 +16,4 @@ pub mod newspaper_clipping_note_durability_baseline;
 pub mod security;
 pub mod storage;
 pub(crate) mod updates;
+pub(crate) mod window_activation;

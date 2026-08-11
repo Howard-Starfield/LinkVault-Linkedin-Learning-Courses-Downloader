@@ -56,6 +56,8 @@ migrations, tests, and rollback impact.
 | D-032 | New canonical assets live in a registered snapshot root under the source download destination. | Approved |
 | D-033 | Settings manages registered snapshot locations and marker-verified reconnection. | Approved |
 | D-034 | Native recovery checkpoints and cooperative exit protect clipping-note drafts. | Approved |
+| D-035 | SQLite remains canonical while each clipping exposes an atomic export-only `note.md` mirror. | Approved |
+| D-036 | The desktop application has one process-level note/database authority. | Approved |
 
 ---
 
@@ -322,8 +324,8 @@ editor-specific document JSON is not persisted.
 search, and local durability. Markdown remains portable and permits later
 export without coupling data to a WYSIWYG package.
 
-**Deferred alternative:** A per-clipping `note.md` bundle. It may be added as an
-export format, but not as a second live source of truth.
+**Export projection:** D-035 approves a per-clipping `note.md` mirror. It is not
+a second live source of truth and is never imported over SQLite.
 
 **Affected specifications:** 02, 05.
 
@@ -807,6 +809,87 @@ slice after Phase 4B behavior is available. It follows
 the canonical TSX/service owners beyond that work order's budgets.
 
 **Affected specifications:** README, 02, 05, 06, 07, and 08.
+
+## D-035: Readable per-clipping Markdown projection
+
+**Status:** Approved
+
+**Approval:** Approved by the product owner on 2026-08-10 after confirming the
+industry-standard Tiptap persistence boundary.
+
+**Decision:** SQLite `note_markdown` remains the canonical note. After a
+successful canonical create or save, LinkVault writes the exact Markdown bytes
+to `note.md` beside `clipping-v1.webp`. An empty canonical note produces an
+empty file. LinkVault never imports or merges this file; an external edit is an
+export edit and may be replaced by the next projection repair.
+
+The backend derives the path from the registered root and validated clipping
+asset path. It writes a same-directory part file, flushes it, and atomically
+replaces `note.md`. A projection failure never reverses or reports failure for
+an already committed SQLite save. It records a path-free recovery diagnostic
+and remains repairable by the next save or delayed startup reconciliation.
+
+Startup waits for D-031's five-second quiet period, then repairs ready clipping
+IDs in keyset pages of 32 with a 100 ms yield between pages. Each ID is reloaded
+under the process-local projection permit before writing, preventing an older
+startup snapshot from replacing a newer save.
+
+**Supersedes:** D-011 only where it called `note.md` deferred. D-011's SQLite
+source-of-truth and editor-JSON prohibition remain binding.
+
+**Persistence and migration impact:** No schema-version change. Existing ready
+rows receive their mirror through paced startup repair. Search, revision,
+checkpoint, backup, and conflict behavior continue to use SQLite only.
+
+**Security and privacy impact:** React supplies neither a path nor note-mirror
+filename. Existing root containment, clipping-ID, regular-file, symlink, and
+Windows reparse checks apply. Note bytes remain excluded from diagnostics.
+
+**Test and release-gate impact:** Prove exact UTF-8 Markdown bytes, empty-note
+truncation, atomic part cleanup, concurrent-save freshness, database survival
+when projection I/O fails, and paced startup repair. No ignored test is
+accepted.
+
+**Backward compatibility and rollback:** Older releases ignore `note.md`.
+Rollback may leave readable mirror files beside canonical images; they are
+non-authoritative and do not affect database or media behavior.
+
+**Affected specifications:** README, ADR-002, 02, 05, 06, 07, and 08.
+
+## D-036: Single desktop process and activation refresh
+
+**Status:** Approved
+
+**Approval:** Approved by the product owner on 2026-08-10 after a live v0.2.16
+audit found two installed LinkVault processes using the same release path.
+
+**Decision:** Register Tauri's official single-instance plugin before other
+desktop lifecycle work. A second launch shows, unminimizes, and focuses the
+existing main window, then requests a frontend refresh. An open clipping first
+passes its existing durability flush; failed flush/conflict preserves the
+current draft instead of replacing editor state.
+
+**Product rationale:** The database writer, note-mirror permit, recovery
+checkpoint owner, and tray lifecycle are intentionally process-local. Two
+processes can display different revisions even though SQLite prevents corrupt
+writes. One process makes the existing save/conflict model honest.
+
+**Persistence and migration impact:** No schema change. SQLite remains capable
+of optimistic conflict detection, but ordinary installed use has one writer
+queue and one visible editor authority.
+
+**Security and privacy impact:** Second-launch arguments and working directory
+are ignored. The activation event carries no path, note text, or credentials.
+
+**Test and release-gate impact:** Structural proof requires early official
+plugin registration, focus/activation wiring, dirty-flush-before-refresh, and
+library/detail refresh listeners. Installed Windows UAT launches LinkVault
+twice and verifies one process plus one tray authority.
+
+**Backward compatibility and rollback:** Removing the plugin restores the old
+multi-process risk without changing stored data. A forward fix is preferred.
+
+**Affected specifications:** README, 05, 07, and 08.
 
 ## Change procedure
 

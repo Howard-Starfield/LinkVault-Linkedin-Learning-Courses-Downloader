@@ -238,7 +238,7 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.16";
+const APP_VERSION = "0.2.17";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings";
 
@@ -1866,7 +1866,7 @@ export default function App() {
           </div>
           <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
           <div
-            className="mt-6 flex flex-col gap-1.5 border-t border-sidebar-border pt-4 text-xs text-sidebar-muted"
+            className="lv-sidebar-optimization mt-4 flex min-w-0 flex-col gap-1.5 border-t border-sidebar-border pt-3 text-xs text-sidebar-muted"
             aria-label="Newspaper optimization performance"
           >
             <span>Optimization</span>
@@ -2367,7 +2367,7 @@ export default function App() {
       open={isSettingsOpen}
       onOpenChange={setIsSettingsOpen}
       title="LinkVault settings"
-      description="Save downloader defaults, session behavior, and artifact options without storing plaintext LinkedIn tokens."
+      description="Save downloader defaults, session behavior, and artifact options without storing plaintext LinkedIn tokens." className="settings-dialog"
     >
       <div className="settings-grid">
         <section className="settings-section">

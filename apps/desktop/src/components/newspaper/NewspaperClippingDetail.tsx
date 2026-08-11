@@ -100,17 +100,16 @@ export function NewspaperClippingDetail({
     onDeleted,
     onSaved
   });
+  const sourceHeader = (
+    <NewspaperClippingSourceCard detail={detail} onOpenSource={onOpenSource}
+      onRetryAsset={retryAsset} recovering={recoveringAsset} />
+  );
 
   if (!durability.ready || !view) {
     const invalid = durability.recovery?.status === "invalid";
     return (
       <article className="clipping-detail" aria-label="Clipping note detail">
-        <NewspaperClippingSourceCard
-          detail={detail}
-          onOpenSource={onOpenSource}
-          onRetryAsset={retryAsset}
-          recovering={recoveringAsset}
-        />
+        {sourceHeader}
         <div className="clipping-detail-state" role={invalid || durability.initializationError ? "alert" : "status"}>
           {invalid ? (
             <>
@@ -166,12 +165,6 @@ export function NewspaperClippingDetail({
         titleSlot
       ) : null}
       <article className="clipping-detail" aria-label="Clipping note detail">
-        <NewspaperClippingSourceCard
-          detail={detail}
-          onOpenSource={onOpenSource}
-          onRetryAsset={retryAsset}
-          recovering={recoveringAsset}
-        />
         <div className="clipping-detail__writing">
           {durability.recovery?.status === "matching" ? (
             <div className="clipping-recovery-notice" role="status">
@@ -183,6 +176,7 @@ export function NewspaperClippingDetail({
               key={`${detail.id}-${editorIdentity}`}
               autoFocus={focusEditor}
               documentId={`${detail.id}-${editorIdentity}`}
+              headerContent={sourceHeader}
               footerContent={(
                 <div className="clipping-save-status" data-status={view.status} role="status">
                   {view.status === "saving" ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Check aria-hidden="true" />}

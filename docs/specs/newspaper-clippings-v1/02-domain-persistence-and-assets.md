@@ -414,7 +414,9 @@ from the source job's persisted batch destination, never a frontend payload:
    │  └─ quarantine/<timestamp>-<reason>-<name>/
    └─ <sanitized edition name - code>/
       └─ <publication-date>/
-         └─ Page <page> - <clipping-id>/clipping-v1.webp
+         └─ Page <page> - <clipping-id>/
+            ├─ clipping-v1.webp
+            └─ note.md
 ```
 
 Derived thumbnails remain under the dedicated app-data cache. Existing v3
@@ -436,6 +438,10 @@ assets require no rename or migration.
 
 React cannot override root, directory, filename, extension, asset version, or
 relative path.
+
+`note.md` is a readable projection, not a second canonical asset or database
+authority. Its bytes exactly equal SQLite `note_markdown`, including the empty
+string. LinkVault never imports it.
 
 ### FR-ASSET-002: Containment
 
@@ -681,6 +687,15 @@ revision conflict, validation failure, SQL failure, or stale session/sequence
 leaves the checkpoint intact. A no-op canonical update may clear it only after
 proving the submitted title and Markdown equal the canonical bytes.
 
+### FR-UPDATE-007: Post-commit Markdown projection
+
+After the SQLite update commits, the backend reloads the newest clipping under
+the note-mirror permit and atomically replaces backend-derived `note.md`. The
+database writer is not held during filesystem I/O. Failure records a path-free
+recovery diagnostic but the canonical save still succeeds; a later save or
+startup reconciliation repairs the projection. Clearing a note truncates the
+mirror to zero bytes.
+
 ## 11. Read and list contract
 
 ### Repository detail read
@@ -888,6 +903,10 @@ included in release diagnostics but not required on every launch.
 - Cleanup retains every containment and age rule above and must not scan user
   newspaper download directories or infer clipping identity from files in the
   visible edition/date tree.
+- After the same five-second quiet period, ready clipping IDs are read from
+  SQLite in keyset pages of 32. Each page repairs exact `note.md` projections
+  and yields for 100 ms before continuing. This is database-directed repair,
+  not discovery or import of arbitrary user files.
 
 The 500-entry and 5,000-entry managed-directory measurements record wall time
 and approximate/peak process memory for the supported Windows environment.

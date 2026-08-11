@@ -59,7 +59,7 @@ export function NewspaperClippings({
             detail={selection.detail}
             focusEditor={selection.focusEditor}
             focusSource={selection.focusSource}
-            key={selection.detail.id}
+            key={`${selection.detail.id}-${selection.detailIdentity}`}
             onDeleted={selection.handleDeleted}
             onOpenSource={onOpenSource}
             onSaved={selection.setDetail}
