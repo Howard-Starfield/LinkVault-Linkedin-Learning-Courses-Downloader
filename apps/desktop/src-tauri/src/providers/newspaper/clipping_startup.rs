@@ -14,6 +14,9 @@ use super::{clipping_recovery::StartupRecoverySummary, clipping_service::Clippin
 /// A short quiet period lets the window and provider catalog finish starting
 /// before managed clipping folders are enumerated.
 pub const STARTUP_FOLDER_RECONCILIATION_DELAY: Duration = Duration::from_secs(5);
+/// Yield between small note-mirror pages so startup repair remains background
+/// maintenance rather than a burst of filesystem work.
+pub const NOTE_MIRROR_BATCH_DELAY: Duration = Duration::from_millis(100);
 
 pub fn recover_transactional_state(
     service: &ClippingService,
@@ -39,10 +42,33 @@ pub fn schedule_managed_folder_reconciliation(
 ) {
     let _reconciliation_task = tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_FOLDER_RECONCILIATION_DELAY).await;
+        let cleanup_service = service.clone();
+        let cleanup_diagnostics = diagnostics.clone();
         let _worker_result = tauri::async_runtime::spawn_blocking(move || {
-            service.run_deferred_cleanup(&diagnostics)
+            cleanup_service.run_deferred_cleanup(&cleanup_diagnostics)
         })
         .await;
+
+        let mut after_id = None;
+        loop {
+            let worker = service.clone();
+            let worker_after = after_id.clone();
+            let batch = tauri::async_runtime::spawn_blocking(move || {
+                worker.reconcile_note_mirror_batch(
+                    worker_after.as_deref(),
+                    super::clipping_service::NOTE_MIRROR_RECONCILIATION_BATCH_SIZE,
+                )
+            })
+            .await;
+            let Ok(Ok(batch)) = batch else {
+                break;
+            };
+            let Some(next_after) = batch.next_after else {
+                break;
+            };
+            after_id = Some(next_after);
+            tokio::time::sleep(NOTE_MIRROR_BATCH_DELAY).await;
+        }
     });
 }
 
@@ -54,5 +80,7 @@ mod tests {
     fn startup_folder_reconciliation_has_a_bounded_quiet_period() {
         assert_eq!(STARTUP_FOLDER_RECONCILIATION_DELAY, Duration::from_secs(5));
         assert!(STARTUP_FOLDER_RECONCILIATION_DELAY < Duration::from_secs(30));
+        assert!(NOTE_MIRROR_BATCH_DELAY >= Duration::from_millis(50));
+        assert!(NOTE_MIRROR_BATCH_DELAY <= Duration::from_millis(500));
     }
 }

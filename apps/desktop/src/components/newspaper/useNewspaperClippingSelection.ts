@@ -1,6 +1,10 @@
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import {
+  canListenForClippingInstanceActivation,
+  listenForClippingInstanceActivation
+} from "./clipping-instance-activation";
 import { getNewspaperClipping, isTauriRuntime, type NewspaperClippingDetail } from "./newspaper-api";
 
 export type ClippingFlush = () => Promise<boolean>;
@@ -26,6 +30,7 @@ export function useNewspaperClippingSelection({
   const [error, setError] = useState("");
   const [focusEditor, setFocusEditor] = useState(pendingFocusEditor);
   const [focusSource, setFocusSource] = useState(pendingFocusSource);
+  const [detailIdentity, setDetailIdentity] = useState(0);
   const detailFlushRef = useRef<ClippingFlush | null>(null);
   const cachedOrderRef = useRef<string[]>([]);
   const selectedOrderRef = useRef<string[]>([]);
@@ -37,6 +42,24 @@ export function useNewspaperClippingSelection({
   }, [registerFlush]);
   const recordOrderedIds = useCallback((ids: string[]) => {
     cachedOrderRef.current = ids;
+  }, []);
+  const loadDetail = useCallback(async (id: string, remount = false) => {
+    const generation = ++requestGenerationRef.current;
+    setLoading(true);
+    setError("");
+    try {
+      const next = await getNewspaperClipping(id);
+      if (generation === requestGenerationRef.current) {
+        setDetail(next);
+        if (remount) setDetailIdentity((current) => current + 1);
+      }
+    } catch (cause) {
+      if (generation !== requestGenerationRef.current) return;
+      setDetail(null);
+      setError(String(cause));
+    } finally {
+      if (generation === requestGenerationRef.current) setLoading(false);
+    }
   }, []);
   const select = useCallback(async (id: string, nextFocusEditor = false, nextFocusSource = false) => {
     if (id === selectedId) return;
@@ -66,19 +89,8 @@ export function useNewspaperClippingSelection({
       setError("");
       return;
     }
-    const generation = ++requestGenerationRef.current;
-    setLoading(true);
-    setError("");
-    void getNewspaperClipping(selectedId).then((next) => {
-      if (generation === requestGenerationRef.current) setDetail(next);
-    }, (cause) => {
-      if (generation !== requestGenerationRef.current) return;
-      setDetail(null);
-      setError(String(cause));
-    }).finally(() => {
-      if (generation === requestGenerationRef.current) setLoading(false);
-    });
-  }, [selectedId]);
+    void loadDetail(selectedId);
+  }, [loadDetail, selectedId]);
   useEffect(() => {
     if (!selectedId || !isTauriRuntime()) return;
     let disposed = false;
@@ -95,6 +107,27 @@ export function useNewspaperClippingSelection({
       unlisten?.();
     };
   }, [selectedId]);
+  useEffect(() => {
+    if (!selectedId || !canListenForClippingInstanceActivation()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForClippingInstanceActivation(async () => {
+      if (detailFlushRef.current && !(await detailFlushRef.current())) {
+        toast.error("LinkVault kept your current draft open", {
+          description: "Resolve or retry the note save before refreshing this clipping."
+        });
+        return;
+      }
+      if (!disposed) await loadDetail(selectedId, true);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [loadDetail, selectedId]);
 
   const handleDeleted = useCallback((clippingId: string) => {
     setRegisteredFlush(null);
@@ -110,6 +143,7 @@ export function useNewspaperClippingSelection({
 
   return {
     detail,
+    detailIdentity,
     error,
     focusEditor,
     focusSource,

@@ -46,13 +46,15 @@ for (const fragment of [
   'status: code === "CLIPPING_REVISION_CONFLICT" ? "conflict" : "failed"'
 ]) assert.ok(controller.includes(fragment), `autosave controller missing ${fragment}`);
 
-for (const fragment of ["Keep my changes", "Use saved version", "Copy my draft", "lazy(() => import(\"./ClippingNoteEditor\")"])
+for (const fragment of ["Keep my changes", "Use saved version", "Copy my draft", "lazy(() => import(\"./ClippingNoteEditor\")", "headerContent"])
   assert.ok(detail.includes(fragment), `detail conflict/editor contract missing ${fragment}`);
 
 assert.ok(list.includes("`${generation}:${offset}`"), "list request ownership is not generation+offset keyed");
 assert.ok(list.includes("ensureNewspaperClippingThumbnail"), "visible list does not request clipping thumbnails");
 assert.ok(list.includes("ResizeObserver") && list.includes("columnCountForWidth"), "gallery is not responsive to its actual viewport width");
 assert.ok(list.includes("visibleItemIndexes") && list.includes("useVirtualizer"), "gallery thumbnails are not visibility-bounded");
+assert.ok(list.includes("return item.assetWidth / item.assetHeight"), "gallery does not preserve the full clipping aspect ratio");
+assert.ok(/\.clipping-gallery__thumb img\s*\{[^}]*object-fit:\s*contain/s.test(styles) && !styles.includes(".clipping-source-card::before"), "clipping images may crop or retain the source-card hairline");
 assert.ok(list.includes("ClippingSkeletonShelf") && list.includes("No clippings yet") && list.includes("Open Newspaper library"), "gallery first-use state is incomplete");
 assert.ok(
   clippings.includes("hidden={selection.selectedId !== null}")

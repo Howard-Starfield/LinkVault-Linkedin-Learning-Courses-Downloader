@@ -37,6 +37,7 @@ export type ClippingNoteEditorProps = {
   onMarkdownChange: (markdown: string) => void;
   onBlur: () => void;
   onReady?: () => void;
+  headerContent?: ReactNode;
   footerContent?: ReactNode;
 };
 
@@ -63,7 +64,7 @@ function selectionStartVirtualElement(editor: Editor) {
  */
 export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingNoteEditorProps>(
   function ClippingNoteEditor(
-    { documentId, initialMarkdown, readOnly = false, autoFocus = false, onMarkdownChange, onBlur, onReady, footerContent },
+    { documentId, initialMarkdown, readOnly = false, autoFocus = false, onMarkdownChange, onBlur, onReady, headerContent, footerContent },
     forwardedRef
   ) {
     const normalizedInitialMarkdown = useMemo(
@@ -338,7 +339,10 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
           hideSelectionToolbar();
         }}
         onPointerUpCapture={(event) => {
-          if (event.button === 0) showSelectionToolbarAfterInput();
+          if (event.button === 0 && event.target instanceof Element
+            && event.target.closest(".clipping-note-editor__content")) {
+            showSelectionToolbarAfterInput();
+          }
         }}
       >
         {editor && !readOnly ? (
@@ -398,6 +402,7 @@ export const ClippingNoteEditor = forwardRef<ClippingNoteEditorHandle, ClippingN
           </div>
         ) : null}
 
+        {headerContent}
         {pasteNotice ? <p className="clipping-note-editor__notice" role="status">{pasteNotice}</p> : null}
         <EditorContent editor={editor} />
         <footer className="clipping-note-editor__footer">
