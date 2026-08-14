@@ -112,6 +112,21 @@ type QueuedDownloadJob = {
   created_at?: number;
   updated_at?: number;
   artifact_counts?: ArtifactProgressCounts;
+  video_artifacts?: VideoDownloadArtifact[];
+};
+
+type VideoDownloadArtifact = {
+  id: string;
+  display_name: string;
+  status: string;
+  size_bytes?: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type VideoActivityItem = {
+  artifact: VideoDownloadArtifact;
+  job: QueuedDownloadJob;
 };
 
 type ArtifactProgressCounts = {
@@ -139,6 +154,7 @@ type PersistedJobEvent = {
   job_id: string;
   event_type: string;
   message: string;
+  payload_json?: string | null;
   created_at: number;
 };
 
@@ -163,7 +179,7 @@ type StartDownloadRequest = {
 };
 
 type DownloadScheduleRequest = {
-  windowHours: number;
+  windowMinutes: number;
   minWaitMinutes: number;
   maxWaitMinutes: number;
 };
@@ -238,7 +254,8 @@ const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const APP_VERSION = "0.2.17";
+const VIDEO_ACTIVITY_PAGE_SIZE = 12;
+const APP_VERSION = "0.2.18";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings";
 
@@ -268,17 +285,17 @@ function readStoredDownloadDelaySeconds() {
   return Number.isFinite(parsed) ? normalizeDelaySeconds(parsed) : null;
 }
 
-function calculateAutomaticScheduleWaitRange(windowHours: number, courseCount: number): AutomaticScheduleWaitRange {
-  const normalizedHours = Number.isFinite(windowHours)
-    ? Math.min(168, Math.max(1, windowHours))
+function calculateAutomaticScheduleWaitRange(windowMinutes: number, courseCount: number): AutomaticScheduleWaitRange {
+  const normalizedWindowMinutes = Number.isFinite(windowMinutes)
+    ? Math.min(10_080, Math.max(1, Math.round(windowMinutes)))
     : 1;
   const normalizedCourseCount = Math.max(1, Math.floor(courseCount));
-  const windowMinutes = Math.round(normalizedHours * 60);
-  const targetWaitMinutes = windowMinutes / normalizedCourseCount;
-  const minWaitMinutes = Math.max(1, Math.min(1_440, Math.floor(targetWaitMinutes * 0.7)));
+  const targetWaitMinutes = normalizedWindowMinutes / normalizedCourseCount;
+  const minWaitMinutes = Math.max(1, Math.min(10_080, Math.floor(targetWaitMinutes * 0.7)));
+  const firstWaitCapacity = normalizedWindowMinutes - (normalizedCourseCount - 1) * minWaitMinutes;
   const maxWaitMinutes = Math.max(
     minWaitMinutes,
-    Math.min(1_440, Math.ceil(targetWaitMinutes * 1.3))
+    Math.min(10_080, firstWaitCapacity, Math.ceil(targetWaitMinutes * 1.3))
   );
 
   return {
@@ -343,6 +360,7 @@ export default function App() {
   const [isScheduleOpen, setIsScheduleOpen] = useState(false);
   const [scheduleStep, setScheduleStep] = useState<"configure" | "confirm">("configure");
   const [scheduleWindowHours, setScheduleWindowHours] = useState(6);
+  const [scheduleWindowMinutes, setScheduleWindowMinutes] = useState(0);
   const [scheduleCourseCount, setScheduleCourseCount] = useState(0);
   const [isTokenGuideOpen, setIsTokenGuideOpen] = useState(false);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
@@ -351,7 +369,7 @@ export default function App() {
   const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
   const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
-  const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>(null);
+  const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>("active");
   const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<AppView>("downloads");
   const [clippingGallerySummary, setClippingGallerySummary] = useState<{
@@ -385,9 +403,10 @@ export default function App() {
   const searchRequestGenerationRef = useRef(0);
   const clippingGalleryScrollTopRef = useRef(0);
   const preSearchScrollRef = useRef(0);
+  const scheduleWindowTotalMinutes = scheduleWindowHours * 60 + scheduleWindowMinutes;
   const automaticScheduleWaitRange = useMemo(
-    () => calculateAutomaticScheduleWaitRange(scheduleWindowHours, scheduleCourseCount),
-    [scheduleWindowHours, scheduleCourseCount]
+    () => calculateAutomaticScheduleWaitRange(scheduleWindowTotalMinutes, scheduleCourseCount),
+    [scheduleWindowTotalMinutes, scheduleCourseCount]
   );
   const scheduleMinWaitMinutes = automaticScheduleWaitRange.minWaitMinutes;
   const scheduleMaxWaitMinutes = automaticScheduleWaitRange.maxWaitMinutes;
@@ -836,6 +855,18 @@ export default function App() {
   const scheduledCount = queuedJobs.filter(isScheduledJob).length;
   const pausedCount = pausableQueueJobs.filter((job) => job.paused).length;
   const persistedActivityEvents = coalesceActivityEvents(persistedEvents);
+  const videoActivityItems = queuedJobs.flatMap((job) =>
+    (job.video_artifacts ?? []).map((artifact) => ({ artifact, job }))
+  );
+  const activeVideoItems = videoActivityItems.filter(({ artifact, job }) =>
+    job.status === "active" && (artifact.status === "pending" || artifact.status === "active")
+  );
+  const completedVideoItems = videoActivityItems
+    .filter(({ artifact }) => artifact.status === "completed")
+    .sort((left, right) => right.artifact.updated_at - left.artifact.updated_at);
+  const failedVideoItems = videoActivityItems
+    .filter(({ artifact }) => artifact.status === "failed" || artifact.status === "cancelled")
+    .sort((left, right) => right.artifact.updated_at - left.artifact.updated_at);
 
   const queueSummary = queuedJobs.length > 0
     ? ([
@@ -860,11 +891,15 @@ export default function App() {
     : persistedActivityEvents;
 
   const activitySummary = {
-    active: queueCounts.active ?? 0,
-    completed: queueCounts.completed ?? 0,
-    failed: (queueCounts.failed ?? 0) + (queueCounts.cancelled ?? 0)
+    active: activeVideoItems.length,
+    completed: completedVideoItems.length,
+    failed: failedVideoItems.length + queuedJobs.filter((job) =>
+      (job.status === "failed" || job.status === "cancelled") && (job.video_artifacts?.length ?? 0) === 0
+    ).length
   };
-  const filteredActivityJobs = activityFilter ? jobsForActivityFilter(queuedJobs, activityFilter) : [];
+  const failedCourseJobsWithoutVideos = jobsForActivityFilter(queuedJobs, "failed").filter(
+    (job) => (job.video_artifacts?.length ?? 0) === 0
+  );
 
   async function clearFailedQueueItems() {
     if (activitySummary.failed === 0) return;
@@ -1025,8 +1060,10 @@ export default function App() {
   }
 
   async function reviewDownloadSchedule() {
-    if (!Number.isInteger(scheduleWindowHours) || scheduleWindowHours < 1 || scheduleWindowHours > 168) {
-      toast.warning("Choose a valid schedule window", { description: "Use a whole number between 1 hour and 7 days." });
+    const hasValidHours = Number.isInteger(scheduleWindowHours) && scheduleWindowHours >= 0 && scheduleWindowHours <= 168;
+    const hasValidMinutes = Number.isInteger(scheduleWindowMinutes) && scheduleWindowMinutes >= 0 && scheduleWindowMinutes <= 59;
+    if (!hasValidHours || !hasValidMinutes || scheduleWindowTotalMinutes < 1 || scheduleWindowTotalMinutes > 10_080) {
+      toast.warning("Choose a valid schedule window", { description: "Use 1 minute to 7 days, with minutes between 0 and 59." });
       return;
     }
     if (scheduleMinWaitMinutes < 1 || scheduleMaxWaitMinutes < scheduleMinWaitMinutes) {
@@ -1035,9 +1072,9 @@ export default function App() {
     }
     const parsed = await validateUrls();
     if (parsed.length === 0) return;
-    if (scheduleMinWaitMinutes * parsed.length > scheduleWindowHours * 60) {
+    if (scheduleMinWaitMinutes * parsed.length > scheduleWindowTotalMinutes) {
       toast.warning("Schedule window is too short", {
-        description: `At least ${Math.ceil((scheduleMinWaitMinutes * parsed.length) / 60)} hours are needed for ${parsed.length} courses at this minimum wait.`
+        description: `At least ${scheduleMinWaitMinutes * parsed.length} minutes are needed for ${parsed.length} courses at this minimum wait.`
       });
       return;
     }
@@ -1122,7 +1159,7 @@ export default function App() {
         setIsScheduleOpen(false);
         setScheduleStep("configure");
         toast.success("Courses scheduled", {
-          description: `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will download automatically within ${schedule.windowHours} hour${schedule.windowHours === 1 ? "" : "s"}.`
+          description: `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will start automatically over the next ${formatScheduleDuration(schedule.windowMinutes)}.`
         });
       } else {
         toast.success(addingToActiveQueue ? "Added to download queue" : "Download queued", {
@@ -1145,7 +1182,7 @@ export default function App() {
 
   async function confirmDownloadSchedule() {
     await queueDownloads({
-      windowHours: scheduleWindowHours,
+      windowMinutes: scheduleWindowTotalMinutes,
       minWaitMinutes: scheduleMinWaitMinutes,
       maxWaitMinutes: scheduleMaxWaitMinutes
     });
@@ -2063,11 +2100,11 @@ export default function App() {
           ) : (
           <>
           <div className="lv-workspace">
-            <Panel className="command-panel">
+            <Panel className="command-panel linkedin-command-board">
               <div className="section-heading command-section-heading">
                 <div className="min-w-0">
-                  <h3>Linkedin Course</h3>
-                  <p>Paste LinkedIn Learning course URLs and choose what to download.</p>
+                  <h3>LinkedIn course dispatch</h3>
+                  <p>Build the course queue, confirm access, then choose the files to keep.</p>
                 </div>
                 <div className="ml-auto flex shrink-0 items-center gap-2">
                   <StatusBadge tone={hasSavedToken ? "success" : "muted"}>
@@ -2076,8 +2113,13 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="command-grid">
-                <Field label="Course URLs">
+              <div className="linkedin-dispatch-grid">
+                <section className="linkedin-dispatch-panel linkedin-source-panel" aria-label="LinkedIn course list">
+                  <div className="linkedin-panel-heading">
+                    <div><strong>Course list</strong><span>One LinkedIn Learning URL per line</span></div>
+                    <span>{parsedCourses.length > 0 ? `${parsedCourses.length} ready` : "Paste URLs"}</span>
+                  </div>
+                  <Field label="Course URLs">
                   <div className="course-url-field compact-url-field">
                     <Textarea
                       value={courseUrls}
@@ -2092,13 +2134,20 @@ export default function App() {
                       aria-label="Course URLs"
                     />
                   </div>
-                </Field>
+                  </Field>
+                  <div className="linkedin-panel-footnote">
+                    Valid courses are normalized locally before anything enters the queue.
+                  </div>
+                </section>
 
-                <div className="compact-field-row">
+                <section className="linkedin-dispatch-panel linkedin-access-panel" aria-label="LinkedIn access and destination">
+                  <div className="linkedin-panel-heading">
+                    <div><strong>Access &amp; destination</strong><span>Local folder and saved LinkedIn session</span></div>
+                  </div>
                   <Field label="Download folder">
-                    <div className="field-action-grid">
+                    <div className="field-action-grid linkedin-folder-grid">
                       <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Download folder" />
-                      <Button type="button" onClick={browseDownloadFolder}>
+                      <Button type="button" variant="outline" onClick={browseDownloadFolder}>
                         <Folder aria-hidden="true" className="h-3.5 w-3.5" />
                         Browse
                       </Button>
@@ -2106,7 +2155,7 @@ export default function App() {
                   </Field>
 
                   <Field label="Token cookie">
-                    <div className="field-action-grid token-grid">
+                    <div className="field-action-grid linkedin-token-grid">
                       <Input
                         value={token}
                         onChange={(event) => setToken(event.target.value)}
@@ -2119,41 +2168,53 @@ export default function App() {
                         <CircleHelp aria-hidden="true" className="h-3.5 w-3.5" />
                         Guide
                       </Button>
-                      <Button type="button" onClick={clearToken}>
+                      <Button type="button" variant="ghost" onClick={clearToken}>
                         <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
                         Clear
                       </Button>
                     </div>
                   </Field>
-                </div>
+                  <div className="linkedin-session-note" data-active={hasSavedToken ? "true" : "false"}>
+                    <span className="status-dot" />
+                    {hasSavedToken ? "Encrypted session available on this device" : "Paste a valid session or use a supported browser session"}
+                  </div>
+                </section>
 
-                <div className="option-row">
-                  <Field label="Quality">
-                    <Select value={resolution} onChange={(event) => setResolution(event.target.value)} aria-label="Video resolution">
-                      <option value="1080">1080 (Best)</option>
-                      <option value="720">720 (High)</option>
-                      <option value="540">540 (Medium)</option>
-                      <option value="360">360 (Low)</option>
-                    </Select>
-                  </Field>
-                  <Field label="Delay">
-                    <Input
-                      value={delaySeconds}
-                      type="number"
-                      min={0}
-                      max={DOWNLOAD_DELAY_MAX_SECONDS}
-                      step={1}
-                      onChange={(event) => updateDelaySeconds(event.target.value)}
-                      aria-label="Delay seconds"
-                    />
-                  </Field>
+                <section className="linkedin-dispatch-panel linkedin-options-panel" aria-label="LinkedIn download settings">
+                  <div className="linkedin-panel-heading">
+                    <div><strong>Download settings</strong><span>Quality, course pacing, and file types</span></div>
+                  </div>
+                  <div className="linkedin-quality-row">
+                    <Field label="Quality">
+                      <Select value={resolution} onChange={(event) => setResolution(event.target.value)} aria-label="Video resolution">
+                        <option value="1080">1080 (Best)</option>
+                        <option value="720">720 (High)</option>
+                        <option value="540">540 (Medium)</option>
+                        <option value="360">360 (Low)</option>
+                      </Select>
+                    </Field>
+                    <Field label="Between courses">
+                      <div className="linkedin-delay-field">
+                        <Input
+                          value={delaySeconds}
+                          type="number"
+                          min={0}
+                          max={DOWNLOAD_DELAY_MAX_SECONDS}
+                          step={1}
+                          onChange={(event) => updateDelaySeconds(event.target.value)}
+                          aria-label="Delay seconds"
+                        />
+                        <span>sec</span>
+                      </div>
+                    </Field>
+                  </div>
                   <div className="download-toggles">
                     <Checkbox checked={downloadVideos} onChange={(event) => setDownloadVideos(event.target.checked)} label="Videos" />
                     <Checkbox checked={downloadExercises} onChange={(event) => setDownloadExercises(event.target.checked)} label="Exercises" />
                     <Checkbox checked={downloadSubtitles} onChange={(event) => setDownloadSubtitles(event.target.checked)} label="Subtitles" />
                     <Checkbox checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Quizzes" />
                   </div>
-                  <div className="command-actions">
+                  <div className="command-actions linkedin-primary-actions">
                     <Button type="button" variant="primary" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
                       {isProcessingDownload ? <Plus aria-hidden="true" className="h-3.5 w-3.5" /> : <Play aria-hidden="true" className="h-3.5 w-3.5" />}
                       {isValidatingToken
@@ -2166,6 +2227,8 @@ export default function App() {
                       <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
                       Schedule
                     </Button>
+                  </div>
+                  <div className="linkedin-queue-controls" aria-label="LinkedIn queue controls">
                     <Button
                       type="button"
                       variant="outline"
@@ -2193,7 +2256,7 @@ export default function App() {
                       {isCancellingDownload ? "Cancelling" : "Cancel active"}
                     </Button>
                   </div>
-                </div>
+                </section>
               </div>
             </Panel>
 
@@ -2240,14 +2303,37 @@ export default function App() {
                   <h4>{activityFilterLabel(activityFilter)}</h4>
                   <button type="button" onClick={() => setActivityFilter(null)}>Show overview</button>
                 </div>
-                <FilteredTaskList
-                  jobs={filteredActivityJobs}
-                  filter={activityFilter}
-                  onOpenFolder={openCompletedFolder}
-                  onRetry={retryDownloadJob}
-                  onClear={clearStatusTask}
-                  clearingTaskId={clearingTaskId}
-                />
+                {activityFilter === "active" ? (
+                  <VideoArtifactActivityList
+                    items={activeVideoItems}
+                    mode="active"
+                    events={persistedEvents}
+                  />
+                ) : activityFilter === "completed" ? (
+                  <VideoArtifactActivityList
+                    items={completedVideoItems}
+                    mode="completed"
+                    events={persistedEvents}
+                  />
+                ) : (
+                  <div className="failed-activity-stack">
+                    <VideoArtifactActivityList
+                      items={failedVideoItems}
+                      mode="failed"
+                      events={persistedEvents}
+                    />
+                    {failedCourseJobsWithoutVideos.length > 0 ? (
+                      <FilteredTaskList
+                        jobs={failedCourseJobsWithoutVideos}
+                        filter="failed"
+                        onOpenFolder={openCompletedFolder}
+                        onRetry={retryDownloadJob}
+                        onClear={clearStatusTask}
+                        clearingTaskId={clearingTaskId}
+                      />
+                    ) : null}
+                  </div>
+                )}
               </div>
             ) : (
               <>
@@ -2279,49 +2365,50 @@ export default function App() {
       }}
       title={scheduleStep === "configure" ? "Schedule course downloads" : "Confirm automatic schedule"}
       description={scheduleStep === "configure"
-        ? `Choose when ${scheduleCourseCount} course${scheduleCourseCount === 1 ? "" : "s"} should finish. LinkVault calculates the randomized pacing.`
+        ? `Choose a start window for ${scheduleCourseCount} course${scheduleCourseCount === 1 ? "" : "s"}. LinkVault calculates bounded randomized pacing.`
         : "Review the queue behavior before LinkVault saves the schedule."}
       className="schedule-dialog"
     >
       {scheduleStep === "configure" ? (
         <div className="schedule-config">
           <div className="schedule-field-grid">
-            <Field label="Finish within (hours)" className="schedule-window-field">
+            <Field label="Start within (hours)" className="schedule-window-field">
               <Input
                 type="number"
-                min={1}
+                min={0}
                 max={168}
                 step={1}
                 value={scheduleWindowHours}
-                aria-label="Finish within hours"
+                aria-label="Start within hours"
                 onChange={(event) => setScheduleWindowHours(Number(event.target.value))}
               />
             </Field>
-            <Field label="Minimum wait (minutes)">
+            <Field label="Plus minutes" className="schedule-window-field">
+              <Input
+                type="number"
+                min={0}
+                max={59}
+                step={1}
+                value={scheduleWindowMinutes}
+                aria-label="Start within additional minutes"
+                onChange={(event) => setScheduleWindowMinutes(Number(event.target.value))}
+              />
+            </Field>
+            <Field label="Automatic minimum wait">
               <div className="schedule-auto-control">
-                <Input
-                  type="number"
-                  min={1}
-                  max={1440}
-                  value={scheduleMinWaitMinutes}
+                <output
                   aria-label="Automatic minimum wait minutes"
-                  className="schedule-auto-input"
-                  readOnly
-                />
+                  className="schedule-auto-output"
+                >{formatScheduleDuration(scheduleMinWaitMinutes)}</output>
                 <span>Auto</span>
               </div>
             </Field>
-            <Field label="Maximum wait (minutes)">
+            <Field label="Automatic maximum wait">
               <div className="schedule-auto-control">
-                <Input
-                  type="number"
-                  min={1}
-                  max={1440}
-                  value={scheduleMaxWaitMinutes}
+                <output
                   aria-label="Automatic maximum wait minutes"
-                  className="schedule-auto-input"
-                  readOnly
-                />
+                  className="schedule-auto-output"
+                >{formatScheduleDuration(scheduleMaxWaitMinutes)}</output>
                 <span>Auto</span>
               </div>
             </Field>
@@ -2349,10 +2436,10 @@ export default function App() {
         <div className="schedule-confirmation">
           <div className="schedule-confirmation-grid">
             <div><span>Courses</span><strong>{scheduleCourseCount}</strong></div>
-            <div><span>Finish within</span><strong>{scheduleWindowHours}h</strong></div>
+            <div><span>Start within</span><strong>{formatScheduleDuration(scheduleWindowTotalMinutes)}</strong></div>
             <div><span>Random wait</span><strong>{scheduleMinWaitMinutes}–{scheduleMaxWaitMinutes}m</strong></div>
           </div>
-          <p>The first course receives a randomized delay, and every following course stays inside the selected window. Each item can still be started manually from the queue.</p>
+          <p>The first course receives a randomized delay, and every following course is assigned a start time inside the selected window. Each item can still be started manually from the queue.</p>
           <div className="schedule-actions">
             <Button type="button" variant="ghost" onClick={() => setScheduleStep("configure")}>Back</Button>
             <Button type="button" variant="primary" loading={isQueueingDownload} loadingLabel="Scheduling" onClick={() => void confirmDownloadSchedule()}>
@@ -2764,9 +2851,9 @@ function formatScheduledTime(timestamp: number) {
 
 function formatScheduleDuration(minutes: number) {
   if (minutes < 60) return `${minutes} min`;
-  const hours = minutes / 60;
-  const formattedHours = Number.isInteger(hours) ? String(hours) : hours.toFixed(1);
-  return `${formattedHours} hr`;
+  const wholeHours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${wholeHours} hr ${remainingMinutes} min` : `${wholeHours} hr`;
 }
 
 function completedCourseJobs(jobs: QueuedDownloadJob[]) {
@@ -2916,6 +3003,157 @@ function ActivityLog({ events }: { events: ActivityRow[] }) {
   );
 }
 
+function VideoArtifactActivityList({
+  items,
+  mode,
+  events
+}: {
+  items: VideoActivityItem[];
+  mode: ActivityFilter;
+  events: PersistedJobEvent[];
+}) {
+  const [visibleCount, setVisibleCount] = useState(VIDEO_ACTIVITY_PAGE_SIZE);
+  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
+  const loadMoreRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    setVisibleCount(VIDEO_ACTIVITY_PAGE_SIZE);
+  }, [mode]);
+
+  useEffect(() => {
+    if (mode !== "active") return;
+    const intervalId = window.setInterval(
+      () => setNowSeconds(Math.floor(Date.now() / 1000)),
+      1_000
+    );
+    return () => window.clearInterval(intervalId);
+  }, [mode]);
+
+  const orderedItems = useMemo(() => {
+    if (mode !== "active") return items;
+    return [...items].sort((left, right) => {
+      const leftRank = videoActivityRank(left, events, nowSeconds);
+      const rightRank = videoActivityRank(right, events, nowSeconds);
+      return leftRank - rightRank || left.artifact.created_at - right.artifact.created_at;
+    });
+  }, [events, items, mode, nowSeconds]);
+  const visibleItems = orderedItems.slice(0, visibleCount);
+  const remainingCount = Math.max(0, orderedItems.length - visibleItems.length);
+
+  useEffect(() => {
+    setVisibleCount((current) => Math.max(
+      VIDEO_ACTIVITY_PAGE_SIZE,
+      Math.min(current, orderedItems.length || VIDEO_ACTIVITY_PAGE_SIZE)
+    ));
+  }, [orderedItems.length]);
+
+  useEffect(() => {
+    const loadMoreButton = loadMoreRef.current;
+    if (!loadMoreButton || remainingCount === 0 || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) return;
+        setVisibleCount((current) => Math.min(current + VIDEO_ACTIVITY_PAGE_SIZE, orderedItems.length));
+      },
+      { threshold: 0.15 }
+    );
+    observer.observe(loadMoreButton);
+    return () => observer.disconnect();
+  }, [orderedItems.length, remainingCount]);
+
+  if (orderedItems.length === 0) {
+    const message = mode === "active"
+      ? "Videos appear here after the active course finishes planning."
+      : mode === "completed"
+        ? "Completed course videos will appear here."
+        : "No failed video downloads.";
+    return <div className="video-activity-empty">{message}</div>;
+  }
+
+  return (
+    <div className="video-activity-list" data-mode={mode}>
+      {visibleItems.map((item) => {
+        const waitUntil = mode === "active"
+          ? pacingWaitUntil(events, item.job.id, item.artifact.id)
+          : null;
+        const remainingSeconds = waitUntil ? Math.max(0, waitUntil - nowSeconds) : 0;
+        const isWaitingNext = !item.job.paused && item.artifact.status === "pending" && remainingSeconds > 0;
+        const statusLabel = item.job.paused
+          ? "Paused"
+          : item.artifact.status === "active"
+          ? "Downloading"
+          : isWaitingNext
+            ? `Next in ${formatCountdown(remainingSeconds)}`
+            : mode === "completed"
+              ? formatArtifactBytes(item.artifact.size_bytes)
+              : mode === "failed"
+                ? item.artifact.status === "cancelled" ? "Cancelled" : "Failed"
+                : "Waiting";
+        return (
+          <article
+            className={`video-activity-row${isWaitingNext ? " is-next" : ""}`}
+            data-status={item.artifact.status}
+            key={`${item.job.id}-${item.artifact.id}`}
+          >
+            <span className="video-activity-state" aria-hidden="true">
+              {item.artifact.status === "active" ? <Download /> : isWaitingNext ? <Clock3 /> : <span className="status-dot" />}
+            </span>
+            <div className="video-activity-copy">
+              <strong title={item.artifact.display_name}>{item.artifact.display_name}</strong>
+              <span title={courseDisplayName(item.job)}>{courseDisplayName(item.job)}</span>
+            </div>
+            <span className="video-activity-status" aria-live={isWaitingNext ? "polite" : undefined}>{statusLabel}</span>
+          </article>
+        );
+      })}
+      {remainingCount > 0 ? (
+        <button
+          ref={loadMoreRef}
+          type="button"
+          className="video-activity-load-more"
+          onClick={() => setVisibleCount((current) => Math.min(current + VIDEO_ACTIVITY_PAGE_SIZE, orderedItems.length))}
+        >
+          Show {Math.min(VIDEO_ACTIVITY_PAGE_SIZE, remainingCount)} more
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function videoActivityRank(item: VideoActivityItem, events: PersistedJobEvent[], nowSeconds: number) {
+  if (item.artifact.status === "active") return 0;
+  const waitUntil = pacingWaitUntil(events, item.job.id, item.artifact.id);
+  if (waitUntil && waitUntil > nowSeconds) return 1;
+  return 2;
+}
+
+function pacingWaitUntil(events: PersistedJobEvent[], jobId: string, artifactId: string) {
+  for (const event of events) {
+    if (event.job_id !== jobId || event.event_type !== "video.pacing.wait" || !event.payload_json) continue;
+    try {
+      const payload = JSON.parse(event.payload_json) as { artifactId?: unknown; waitUntil?: unknown };
+      if (payload.artifactId === artifactId && typeof payload.waitUntil === "number") {
+        return payload.waitUntil;
+      }
+    } catch {
+      // Ignore malformed diagnostic payloads; artifact state remains authoritative.
+    }
+  }
+  return null;
+}
+
+function formatCountdown(seconds: number) {
+  const safeSeconds = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(safeSeconds % 60).padStart(2, "0")}`;
+}
+
+function formatArtifactBytes(bytes: number | null | undefined) {
+  if (!bytes || bytes <= 0) return "Completed";
+  if (bytes < 1_048_576) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1_048_576).toFixed(bytes >= 10_485_760 ? 0 : 1)} MB`;
+}
+
 function DownloadQueueTable({
   jobs,
   parsedCourses,
@@ -2943,6 +3181,7 @@ function DownloadQueueTable({
         <span>Status</span>
         <span>Course</span>
         <span>Progress</span>
+        <span className="queue-actions-heading">Actions</span>
       </DataTableHeader>
       {jobs.length > 0 ? (
         jobs.map((job) => (
@@ -3010,7 +3249,8 @@ function QueueJobRow({
       </div>
       <div className="table-progress-cell">
         {scheduled ? <span className="scheduled-time-compact">{formatScheduledTime(job.scheduled_at ?? 0)}</span> : <><Progress value={progress} /><span>{progress}%</span></>}
-        <div className="queue-row-actions">
+      </div>
+      <div className="queue-row-actions">
           {scheduled && !job.paused ? (
             <Tooltip label="Download now">
               <IconButton
@@ -3051,7 +3291,6 @@ function QueueJobRow({
               </IconButton>
             </Tooltip>
           ) : null}
-        </div>
       </div>
     </DataTableRow>
   );
@@ -3137,6 +3376,7 @@ function ValidatedQueueRow({ course }: { course: ParsedCourse }) {
         </div>
       </div>
       <span className="text-muted">Waiting</span>
+      <span aria-hidden="true" />
     </DataTableRow>
   );
 }
@@ -3861,7 +4101,7 @@ function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownlo
 
 function previewScheduledTimes(schedule: DownloadScheduleRequest | undefined, courseCount: number, timestamp: number) {
   if (!schedule) return Array.from({ length: courseCount }, () => null as number | null);
-  const windowMinutes = schedule.windowHours * 60;
+  const windowMinutes = schedule.windowMinutes;
   let elapsedMinutes = 0;
   return Array.from({ length: courseCount }, (_, index) => {
     const remainingCourses = courseCount - index - 1;
@@ -4224,13 +4464,18 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[], q
     ...jobs[queuedIndex],
     status: "active",
     updated_at: timestamp,
+    video_artifacts: [
+      previewVideoArtifact("preview-video-1", "01-course-introduction.mp4", "completed", timestamp - 2, 18_400_000),
+      previewVideoArtifact("preview-video-2", "02-building-the-first-workflow.mp4", "pending", timestamp),
+      previewVideoArtifact("preview-video-3", "03-review-and-next-steps.mp4", "pending", timestamp)
+    ],
     artifact_counts: {
       total: 6,
       completed: 1,
       failed: 0,
       cancelled: 0,
-      active: 1,
-      pending: 4,
+      active: 0,
+      pending: 5,
       skipped: 0,
       video_total: 3,
       video_completed: 1,
@@ -4251,23 +4496,32 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[], q
     {
       id: 2,
       job_id: activeJob.id,
-      event_type: "artifact.active",
-      message: "Live polling course video started.",
+      event_type: "video.pacing.wait",
+      message: "Waiting 20 seconds before the next video request.",
+      payload_json: JSON.stringify({
+        artifactId: "preview-video-2",
+        waitSeconds: 20,
+        waitStartedAt: timestamp,
+        waitUntil: timestamp + 20
+      }),
       created_at: timestamp
     }
   ]);
 
-  await sleep(900);
+  await sleep(5_000);
 
   const updatedActiveJob = {
     ...activeJob,
     updated_at: timestamp + 1,
+    video_artifacts: activeJob.video_artifacts.map((artifact) =>
+      artifact.id === "preview-video-2" ? { ...artifact, status: "active", updated_at: timestamp + 5 } : artifact
+    ),
     artifact_counts: {
       ...activeJob.artifact_counts,
-      completed: 3,
+      completed: 2,
       active: 1,
-      pending: 2,
-      video_completed: 2,
+      pending: 3,
+      video_completed: 1,
       subtitle_completed: 1
     }
   };
@@ -4275,9 +4529,9 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[], q
     {
       id: 3,
       job_id: activeJob.id,
-      event_type: "artifact.completed",
-      message: "Live polling course video completed.",
-      created_at: timestamp + 1
+      event_type: "artifact.active",
+      message: "Live polling course video started.",
+      created_at: timestamp + 5
     },
     {
       id: 2,
@@ -4288,12 +4542,18 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[], q
     }
   ]);
 
-  await sleep(900);
+  await sleep(1_500);
 
   const completedJob = {
     ...updatedActiveJob,
     status: "completed",
     updated_at: timestamp + 2,
+    video_artifacts: updatedActiveJob.video_artifacts.map((artifact, index) => ({
+      ...artifact,
+      status: "completed",
+      size_bytes: artifact.size_bytes ?? 22_000_000 + index * 4_000_000,
+      updated_at: timestamp + 7 + index
+    })),
     artifact_counts: {
       ...updatedActiveJob.artifact_counts,
       completed: 6,
@@ -4326,6 +4586,23 @@ async function processLivePollingProgressForPreview(jobs: QueuedDownloadJob[], q
     completed_artifacts: 6,
     failed_artifacts: 0,
     cancelled_artifacts: 0
+  };
+}
+
+function previewVideoArtifact(
+  id: string,
+  displayName: string,
+  status: string,
+  timestamp: number,
+  sizeBytes?: number
+): VideoDownloadArtifact {
+  return {
+    id,
+    display_name: displayName,
+    status,
+    size_bytes: sizeBytes ?? null,
+    created_at: timestamp,
+    updated_at: timestamp
   };
 }
 
