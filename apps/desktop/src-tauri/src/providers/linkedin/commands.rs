@@ -152,7 +152,7 @@ pub struct StartDownloadRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadScheduleRequest {
-    window_hours: u32,
+    window_minutes: u32,
     min_wait_minutes: u32,
     max_wait_minutes: u32,
 }
@@ -182,6 +182,17 @@ pub struct PersistedDownloadJob {
     created_at: i64,
     updated_at: i64,
     artifact_counts: ArtifactProgressCounts,
+    video_artifacts: Vec<PersistedDownloadArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistedDownloadArtifact {
+    id: String,
+    display_name: String,
+    status: String,
+    size_bytes: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -211,6 +222,7 @@ pub struct PersistedJobEvent {
     job_id: String,
     event_type: String,
     message: String,
+    payload_json: Option<String>,
     created_at: i64,
 }
 
@@ -1131,25 +1143,24 @@ fn scheduled_download_times(
     let Some(schedule) = schedule else {
         return Ok(vec![None; courses.len()]);
     };
-    if schedule.window_hours == 0 || schedule.window_hours > 168 {
-        return Err("Schedule window must be between 1 and 168 hours.".to_string());
+    if schedule.window_minutes == 0 || schedule.window_minutes > 10_080 {
+        return Err("Schedule window must be between 1 minute and 7 days.".to_string());
     }
-    if schedule.min_wait_minutes == 0 || schedule.min_wait_minutes > 1_440 {
-        return Err("Minimum random wait must be between 1 and 1440 minutes.".to_string());
+    if schedule.min_wait_minutes == 0 || schedule.min_wait_minutes > 10_080 {
+        return Err("Minimum random wait must be between 1 minute and 7 days.".to_string());
     }
-    if schedule.max_wait_minutes < schedule.min_wait_minutes || schedule.max_wait_minutes > 1_440 {
+    if schedule.max_wait_minutes < schedule.min_wait_minutes || schedule.max_wait_minutes > 10_080 {
         return Err(
-            "Maximum random wait must be at least the minimum and no more than 1440 minutes."
-                .to_string(),
+            "Maximum random wait must be at least the minimum and no more than 7 days.".to_string(),
         );
     }
 
-    let window_minutes = u64::from(schedule.window_hours) * 60;
+    let window_minutes = u64::from(schedule.window_minutes);
     let minimum_required = u64::from(schedule.min_wait_minutes) * courses.len() as u64;
     if minimum_required > window_minutes {
         return Err(format!(
-            "The schedule needs at least {} hours for {} courses at a {} minute minimum wait.",
-            (minimum_required + 59) / 60,
+            "The schedule needs at least {} minutes for {} courses at a {} minute minimum wait.",
+            minimum_required,
             courses.len(),
             schedule.min_wait_minutes
         ));
@@ -1258,6 +1269,7 @@ fn load_bootstrap_state(
                     job_id: event.job_id,
                     event_type: event.event_type,
                     message: event.message,
+                    payload_json: event.payload_json,
                     created_at: event.created_at,
                 }),
         );
@@ -1275,6 +1287,23 @@ fn load_bootstrap_state(
         let artifacts =
             list_artifacts_for_job(connection, &job.id).map_err(|error| error.to_string())?;
         let artifact_counts = summarize_artifacts(&artifacts);
+        let video_artifacts = artifacts
+            .iter()
+            .filter(|artifact| artifact.artifact_type == "video")
+            .map(|artifact| PersistedDownloadArtifact {
+                id: artifact.id.clone(),
+                display_name: Path::new(&artifact.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("Course video")
+                    .to_string(),
+                status: artifact.status.clone(),
+                size_bytes: artifact.size_bytes,
+                created_at: artifact.created_at,
+                updated_at: artifact.updated_at,
+            })
+            .collect();
         let cached_course = get_course_cache_entry(connection, &job.course_slug)
             .ok()
             .flatten();
@@ -1299,6 +1328,7 @@ fn load_bootstrap_state(
             created_at: job.created_at,
             updated_at: job.updated_at,
             artifact_counts,
+            video_artifacts,
         });
     }
     let download_history = list_download_history(connection).map_err(|error| error.to_string())?;
@@ -1514,7 +1544,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: Some(DownloadScheduleRequest {
-                    window_hours: 2,
+                    window_minutes: 120,
                     min_wait_minutes: 10,
                     max_wait_minutes: 30,
                 }),
@@ -1543,6 +1573,38 @@ mod tests {
     }
 
     #[test]
+    fn queue_download_jobs_accepts_a_sub_hour_schedule_window() {
+        let connection = initialized_connection();
+        let created_at = 1_700_000_000;
+
+        let response = queue_download_jobs(
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/short-window-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: Some(DownloadScheduleRequest {
+                    window_minutes: 15,
+                    min_wait_minutes: 5,
+                    max_wait_minutes: 15,
+                }),
+            },
+            created_at,
+        )
+        .unwrap();
+
+        let scheduled_at = response.jobs[0].scheduled_at.unwrap();
+        assert!(scheduled_at >= created_at + 5 * 60);
+        assert!(scheduled_at <= created_at + 15 * 60);
+    }
+
+    #[test]
     fn queue_download_jobs_rejects_schedule_window_shorter_than_minimum_waits() {
         let connection = initialized_connection();
         let course_urls = (0..5)
@@ -1563,7 +1625,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: Some(DownloadScheduleRequest {
-                    window_hours: 1,
+                    window_minutes: 60,
                     min_wait_minutes: 15,
                     max_wait_minutes: 30,
                 }),
@@ -1572,7 +1634,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("at least 2 hours"));
+        assert!(error.contains("at least 75 minutes"));
         assert!(list_jobs_by_status(&connection, "queued")
             .unwrap()
             .is_empty());
@@ -1739,6 +1801,15 @@ mod tests {
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.failed, 1);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.cancelled, 1);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.video_total, 2);
+        assert_eq!(bootstrap.persisted_jobs[0].video_artifacts.len(), 2);
+        assert_eq!(
+            bootstrap.persisted_jobs[0].video_artifacts[0].display_name,
+            "video-1"
+        );
+        assert_eq!(
+            bootstrap.persisted_jobs[0].video_artifacts[1].status,
+            "failed"
+        );
         assert_eq!(
             bootstrap.persisted_jobs[0].artifact_counts.video_completed,
             1
@@ -1765,6 +1836,7 @@ mod tests {
         assert_eq!(bootstrap.recent_events.len(), 3);
         assert_eq!(bootstrap.recent_events[0].event_type, "job.failed");
         assert_eq!(bootstrap.recent_events[0].message, "Metadata fetch failed.");
+        assert!(bootstrap.recent_events[0].payload_json.is_none());
         assert_eq!(bootstrap.recent_events[0].job_id, response.jobs[0].id);
         assert_eq!(
             bootstrap.persisted_jobs[0].source_url,
@@ -1886,7 +1958,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: Some(DownloadScheduleRequest {
-                    window_hours: 2,
+                    window_minutes: 120,
                     min_wait_minutes: 30,
                     max_wait_minutes: 30,
                 }),
