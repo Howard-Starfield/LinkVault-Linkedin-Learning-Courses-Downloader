@@ -6,8 +6,20 @@ use crate::exercise_archive::{extract_zip_and_delete_archive, ExerciseArchiveExt
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
+
+// Conservative load-smoothing defaults, not a provider-published safe rate.
+#[cfg(not(test))]
+const DEFAULT_VIDEO_WAIT_MIN_SECONDS: u32 = 20;
+#[cfg(not(test))]
+const DEFAULT_VIDEO_WAIT_MAX_SECONDS: u32 = 40;
+#[cfg(test)]
+const DEFAULT_VIDEO_WAIT_MIN_SECONDS: u32 = 0;
+#[cfg(test)]
+const DEFAULT_VIDEO_WAIT_MAX_SECONDS: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactDownloadSource {
@@ -101,6 +113,34 @@ pub fn download_artifacts_for_active_job(
     downloads: &[PlannedArtifactDownload],
     timestamp: i64,
 ) -> Result<ArtifactDownloadSummary, ArtifactDownloadError> {
+    let mut pacing = VideoPacingPolicy::new(
+        DEFAULT_VIDEO_WAIT_MIN_SECONDS,
+        DEFAULT_VIDEO_WAIT_MAX_SECONDS,
+        video_pacing_seed(job_id, timestamp),
+    );
+    download_artifacts_for_active_job_with_pacing(
+        connection,
+        client,
+        cancellation,
+        job_id,
+        downloads,
+        timestamp,
+        &mut pacing,
+        &mut wait_for_video_pacing,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_artifacts_for_active_job_with_pacing(
+    connection: &Connection,
+    client: &mut impl ArtifactHttpClient,
+    cancellation: &impl CancellationFlag,
+    job_id: &str,
+    downloads: &[PlannedArtifactDownload],
+    timestamp: i64,
+    pacing: &mut VideoPacingPolicy,
+    wait_for: &mut impl FnMut(u32, &dyn CancellationFlag) -> bool,
+) -> Result<ArtifactDownloadSummary, ArtifactDownloadError> {
     let job = get_job(connection, job_id)?
         .filter(|job| job.status == "active")
         .ok_or_else(|| ArtifactDownloadError::JobNotActive {
@@ -113,10 +153,60 @@ pub fn download_artifacts_for_active_job(
         cancelled: 0,
     };
     let existing_artifacts = list_artifacts_for_job(connection, &job.id)?;
+    let mut attempted_video_request = false;
 
     for (index, download) in downloads.iter().enumerate() {
         cancellation.wait_if_paused();
-        if cancellation.is_cancelled() {
+        let mut cancellation_reason = cancellation
+            .is_cancelled()
+            .then_some("Download was cancelled before all artifacts completed.");
+
+        if cancellation_reason.is_none() {
+            upsert_artifact(connection, &download.artifact)?;
+            if let Some(size_bytes) = reusable_artifact_size(&existing_artifacts, download) {
+                update_artifact_status(
+                    connection,
+                    &download.artifact.id,
+                    "completed",
+                    size_bytes,
+                    timestamp,
+                )?;
+                append_artifact_event(
+                    connection,
+                    &job.id,
+                    "artifact.completed",
+                    format!(
+                        "Reused existing {}.",
+                        artifact_display_name(&download.artifact)
+                    ),
+                    &download.artifact.id,
+                    timestamp,
+                )?;
+                summary.completed += 1;
+                continue;
+            }
+
+            if is_video_artifact(&download.artifact) {
+                if attempted_video_request {
+                    let wait_seconds = pacing.next_wait_seconds(&download.artifact.id);
+                    if wait_seconds > 0 {
+                        append_video_pacing_event(
+                            connection,
+                            &job.id,
+                            &download.artifact.id,
+                            wait_seconds,
+                        )?;
+                        if !wait_for(wait_seconds, cancellation) {
+                            cancellation_reason =
+                                Some("Download was cancelled while pacing video requests.");
+                        }
+                    }
+                }
+                attempted_video_request = true;
+            }
+        }
+
+        if let Some(reason) = cancellation_reason {
             cancel_artifacts_from(connection, &job.id, &downloads[index..], None, timestamp)?;
             summary.cancelled += downloads.len() - index;
             crate::cache::transition_job_status(
@@ -124,33 +214,9 @@ pub fn download_artifacts_for_active_job(
                 &job.id,
                 "cancelled",
                 timestamp,
-                Some("Download was cancelled before all artifacts completed."),
+                Some(reason),
             )?;
             return Ok(summary);
-        }
-
-        upsert_artifact(connection, &download.artifact)?;
-        if let Some(size_bytes) = reusable_artifact_size(&existing_artifacts, download) {
-            update_artifact_status(
-                connection,
-                &download.artifact.id,
-                "completed",
-                size_bytes,
-                timestamp,
-            )?;
-            append_artifact_event(
-                connection,
-                &job.id,
-                "artifact.completed",
-                format!(
-                    "Reused existing {}.",
-                    artifact_display_name(&download.artifact)
-                ),
-                &download.artifact.id,
-                timestamp,
-            )?;
-            summary.completed += 1;
-            continue;
         }
 
         update_artifact_status(connection, &download.artifact.id, "active", None, timestamp)?;
@@ -367,6 +433,70 @@ pub fn download_artifacts_for_active_job(
     Ok(summary)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VideoPacingPolicy {
+    min_seconds: u32,
+    max_seconds: u32,
+    state: u64,
+}
+
+impl VideoPacingPolicy {
+    fn new(min_seconds: u32, max_seconds: u32, seed: u64) -> Self {
+        Self {
+            min_seconds: min_seconds.min(max_seconds),
+            max_seconds: max_seconds.max(min_seconds),
+            state: seed,
+        }
+    }
+
+    fn next_wait_seconds(&mut self, artifact_id: &str) -> u32 {
+        for byte in artifact_id.bytes() {
+            self.state ^= u64::from(byte);
+            self.state = self.state.wrapping_mul(0x100000001b3);
+        }
+        self.state = splitmix64(self.state);
+        if self.max_seconds <= self.min_seconds {
+            return self.min_seconds;
+        }
+        self.min_seconds + (self.state % u64::from(self.max_seconds - self.min_seconds + 1)) as u32
+    }
+}
+
+fn video_pacing_seed(job_id: &str, timestamp: i64) -> u64 {
+    let mut seed = 0xcbf29ce484222325_u64 ^ timestamp as u64;
+    for byte in job_id.bytes() {
+        seed ^= u64::from(byte);
+        seed = seed.wrapping_mul(0x100000001b3);
+    }
+    seed
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn wait_for_video_pacing(seconds: u32, cancellation: &dyn CancellationFlag) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(u64::from(seconds));
+    loop {
+        cancellation.wait_if_paused();
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+fn is_video_artifact(artifact: &ArtifactRecord) -> bool {
+    artifact.artifact_type == "video"
+}
+
 fn reusable_artifact_size(
     existing_artifacts: &[ArtifactRecord],
     download: &PlannedArtifactDownload,
@@ -507,17 +637,65 @@ fn append_artifact_event(
     artifact_id: &str,
     timestamp: i64,
 ) -> Result<(), ArtifactDownloadError> {
+    append_artifact_event_with_payload(
+        connection,
+        job_id,
+        event_type,
+        message,
+        serde_json::json!({ "artifactId": artifact_id }),
+        timestamp,
+    )
+}
+
+fn append_artifact_event_with_payload(
+    connection: &Connection,
+    job_id: &str,
+    event_type: &str,
+    message: String,
+    payload: serde_json::Value,
+    timestamp: i64,
+) -> Result<(), ArtifactDownloadError> {
     append_job_event(
         connection,
         &NewJobEvent {
             job_id: job_id.to_string(),
             event_type: event_type.to_string(),
             message,
-            payload_json: Some(serde_json::json!({ "artifactId": artifact_id }).to_string()),
+            payload_json: Some(payload.to_string()),
             created_at: timestamp,
         },
     )?;
     Ok(())
+}
+
+fn append_video_pacing_event(
+    connection: &Connection,
+    job_id: &str,
+    artifact_id: &str,
+    wait_seconds: u32,
+) -> Result<(), ArtifactDownloadError> {
+    let wait_started_at = current_unix_timestamp();
+    let wait_until = wait_started_at.saturating_add(i64::from(wait_seconds));
+    append_artifact_event_with_payload(
+        connection,
+        job_id,
+        "video.pacing.wait",
+        format!("Waiting {wait_seconds} seconds before the next video request."),
+        serde_json::json!({
+            "artifactId": artifact_id,
+            "waitSeconds": wait_seconds,
+            "waitStartedAt": wait_started_at,
+            "waitUntil": wait_until,
+        }),
+        wait_started_at,
+    )
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn append_artifact_source_event(
@@ -774,6 +952,142 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "job.completed"));
+    }
+
+    #[test]
+    fn video_requests_wait_once_between_actual_video_downloads() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let first_video = output.path().join("Sample Course").join("first.mp4");
+        let subtitle = output.path().join("Sample Course").join("first.srt");
+        let second_video = output.path().join("Sample Course").join("second.mp4");
+        let downloads = vec![
+            planned_url(
+                "artifact-video-1",
+                "job-1",
+                "video",
+                &first_video,
+                "https://cdn/first.mp4",
+            ),
+            planned_text(
+                "artifact-subtitle",
+                "job-1",
+                "subtitle",
+                &subtitle,
+                "1\ntext\n",
+            ),
+            planned_url(
+                "artifact-video-2",
+                "job-1",
+                "video",
+                &second_video,
+                "https://cdn/second.mp4",
+            ),
+        ];
+        let mut client = FakeArtifactClient::new(vec![
+            ("https://cdn/first.mp4", 200, b"first"),
+            ("https://cdn/second.mp4", 200, b"second"),
+        ]);
+        let mut pacing = VideoPacingPolicy::new(20, 40, 7);
+        let mut observed_waits = Vec::new();
+        let mut waiter = |seconds: u32, _cancellation: &dyn CancellationFlag| {
+            observed_waits.push(seconds);
+            true
+        };
+
+        let summary = download_artifacts_for_active_job_with_pacing(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+            &mut pacing,
+            &mut waiter,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 3);
+        assert_eq!(observed_waits.len(), 1);
+        assert!((20..=40).contains(&observed_waits[0]));
+        let events = list_job_events(&connection, "job-1").unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "video.pacing.wait")
+                .count(),
+            1
+        );
+        let pacing_payload = events
+            .iter()
+            .find(|event| event.event_type == "video.pacing.wait")
+            .and_then(|event| event.payload_json.as_deref())
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .unwrap();
+        assert_eq!(pacing_payload["artifactId"], "artifact-video-2");
+        assert_eq!(
+            pacing_payload["waitUntil"].as_i64().unwrap()
+                - pacing_payload["waitStartedAt"].as_i64().unwrap(),
+            pacing_payload["waitSeconds"].as_i64().unwrap()
+        );
+    }
+
+    #[test]
+    fn video_pacing_is_bounded_and_varies_across_artifacts() {
+        let mut pacing = VideoPacingPolicy::new(20, 40, 7);
+        let waits = (0..100)
+            .map(|index| pacing.next_wait_seconds(&format!("artifact-video-{index}")))
+            .collect::<Vec<_>>();
+
+        assert!(waits.iter().all(|seconds| (20..=40).contains(seconds)));
+        assert!(waits.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn cancellation_during_video_pacing_stops_before_next_request() {
+        let connection = initialized_connection();
+        let output = tempdir().unwrap();
+        insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
+        let downloads = vec![
+            planned_url(
+                "artifact-video-1",
+                "job-1",
+                "video",
+                &output.path().join("first.mp4"),
+                "https://cdn/first.mp4",
+            ),
+            planned_url(
+                "artifact-video-2",
+                "job-1",
+                "video",
+                &output.path().join("second.mp4"),
+                "https://cdn/second.mp4",
+            ),
+        ];
+        let mut client = FakeArtifactClient::new(vec![("https://cdn/first.mp4", 200, b"first")]);
+        let mut pacing = VideoPacingPolicy::new(20, 40, 11);
+        let mut waiter = |_seconds: u32, _cancellation: &dyn CancellationFlag| false;
+
+        let summary = download_artifacts_for_active_job_with_pacing(
+            &connection,
+            &mut client,
+            &NeverCancelled,
+            "job-1",
+            &downloads,
+            200,
+            &mut pacing,
+            &mut waiter,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.cancelled, 1);
+        assert_eq!(
+            get_job(&connection, "job-1").unwrap().unwrap().status,
+            "cancelled"
+        );
+        assert!(!output.path().join("second.mp4").exists());
     }
 
     #[test]
