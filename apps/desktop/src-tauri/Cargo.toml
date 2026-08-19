@@ -1,6 +1,6 @@
 [package]
 name = "linkvault"
-version = "0.2.18"
+version = "0.2.19"
 description = "LinkVault desktop app"
 authors = ["LinkVault"]
 license-file = "../../../LICENSE"
