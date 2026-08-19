@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.19 - 2026-08-19
+
+- **Hardened the desktop shell against sidebar and window resizes.** Resizing the native window or the left navigation rail now keeps the LinkVault wordmark visually fixed, keeps controls inside their layout owners, and reflows provider content from the space it actually receives instead of from viewport assumptions. The LinkVault desktop shell now behaves like a stable desktop application under repeated resizing.
+- **Capped the sidebar at its layout owner so it can never scale the wordmark or push content out of its column.** The new `--sidebar-width-cap: 320px` and `--sidebar-effective-width: min(var(--sidebar-width, 220px), var(--sidebar-width-cap))` on `.lv-shell` ensure the rail stops growing once it reaches the cap. The LinkVault wordmark is also capped via `--brand-logo-max-width: 180px` on `.lv-brand-logo`, so widening the sidebar no longer scales the wordmark.
+- **Made the live sidebar drag have a single owner.** The imperative `--sidebar-width` mutation during mouse drag no longer races the React `style` prop, so concurrent React/Tauri state updates can no longer snap the rail backward mid-drag.
+- **Reflows before any `overflow: hidden` is allowed to mask controls.** New narrow-viewport rules in `index.css` reflow provider content first; controls that no longer fit are no longer hidden behind overflow. Provider views now adapt to the width they actually receive after sidebar and secondary-column allocation, not to the raw viewport.
+- **Added a no-explicit-`any` repository gate.** A new AST-based `verify-no-any` script plus the `verify:no-any` npm script fail the build if an explicit TypeScript `any` or `as any` lands in the frontend. Unknown external values now start as `unknown` and are narrowed or decoded, so the no-`any` rule is enforced at the gate level rather than by inspection.
+- **Extended the Playwright visual regression sweep to cover the new behavior.** `verify-visual.mjs` now exercises live sidebar dragging, wordmark invariance across the full 208-320 px rail range, LinkedIn/Coursera geometry with a wide sidebar, and concurrent React updates while a drag is in progress.
+- **Documented the frontend/Rust ownership boundary.** A new `docs/architecture/frontend-rust-ownership-boundary.md` codifies the split: pointer input, element geometry, focus, responsive state, theme, and other presentation-only concerns live in React/CSS; validation, scheduling, persistence, filesystem work, queue behavior, auth, provider rules, and durable application decisions live in Rust. Indexed from `docs/architecture/README.md`. The full rationale and the G-1..G-6 acceptance criteria are captured in `docs/specs/frontend-responsive-layout-hardening.md`.
+
 ## 0.2.15 - 2026-07-31
 
 - **Fixed the v0.2.13-v0.2.14 newspaper upgrade migration.** Existing databases were already marked as schema version 1, so the newly added `newspaper_batches.schedule_id` and `newspaper_schedules.date_mode` provider migrations were skipped even though fresh databases contained both columns. The global schema version now advances to 2, forcing a verified pre-migration backup and running the idempotent provider migrations before newspaper work starts.
