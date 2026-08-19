@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -395,6 +395,7 @@ export default function App() {
   const shellRef = useRef<HTMLDivElement>(null);
   const sidebarDragStart = useRef({ x: 0, width: SIDEBAR_DEFAULT_WIDTH });
   const sidebarDragWidth = useRef(SIDEBAR_DEFAULT_WIDTH);
+  const liveSidebarWidth = useRef(SIDEBAR_DEFAULT_WIDTH);
   const sidebarDragAnimationFrame = useRef<number | null>(null);
   const sidebarDragCleanup = useRef<(() => void) | null>(null);
   const wasSettingsOpen = useRef(false);
@@ -546,10 +547,19 @@ export default function App() {
   }, [hasSavedToken, delaySeconds]);
 
   useEffect(() => {
-    const storedWidth = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
-    if (Number.isFinite(storedWidth)) {
-      setSidebarWidth(clampSidebarWidth(storedWidth));
+    const storedRaw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
+    let initialWidth = SIDEBAR_DEFAULT_WIDTH;
+    if (storedRaw !== null) {
+      const parsed = Number(storedRaw);
+      // Sanitize: only accept finite numbers within a reasonable range
+      // Extremely large values (> 10000) or non-finite values are treated as invalid
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= 10000) {
+        initialWidth = clampSidebarWidth(parsed);
+      }
+      // If invalid, keep the default SIDEBAR_DEFAULT_WIDTH
     }
+    setSidebarWidth(initialWidth);
+    liveSidebarWidth.current = initialWidth;
     setIsSidebarCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true");
   }, []);
 
@@ -559,6 +569,9 @@ export default function App() {
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
+    // Sync state to live ref and CSS variable for non-drag updates (e.g., keyboard resize)
+    liveSidebarWidth.current = sidebarWidth;
+    shellRef.current?.style.setProperty("--sidebar-width", `${sidebarWidth}px`);
   }, [sidebarWidth]);
 
   useEffect(() => {
@@ -658,20 +671,31 @@ export default function App() {
     };
   }, []);
 
-  function startSidebarResize(event: ReactMouseEvent<HTMLButtonElement>) {
+  function startSidebarResize(event: ReactPointerEvent<HTMLButtonElement>) {
     if (isSidebarCollapsed) return;
-    sidebarDragStart.current = { x: event.clientX, width: sidebarWidth };
-    sidebarDragWidth.current = sidebarWidth;
+    // Only handle primary button (left click or touch)
+    if (event.button !== 0 && event.pointerType === "mouse") return;
+    
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    
+    // Use liveSidebarWidth as the single source of truth for drag start
+    const currentWidth = liveSidebarWidth.current;
+    sidebarDragStart.current = { x: event.clientX, width: currentWidth };
+    sidebarDragWidth.current = currentWidth;
     setIsDraggingSidebar(true);
     sidebarDragCleanup.current?.();
 
-    function handleMouseMove(moveEvent: MouseEvent) {
+    function handlePointerMove(moveEvent: PointerEvent) {
       const nextWidth = sidebarDragStart.current.width + moveEvent.clientX - sidebarDragStart.current.x;
-      sidebarDragWidth.current = clampSidebarWidth(nextWidth);
+      const clampedWidth = clampSidebarWidth(nextWidth);
+      sidebarDragWidth.current = clampedWidth;
+      // Update live ref immediately for single source of truth
+      liveSidebarWidth.current = clampedWidth;
       if (sidebarDragAnimationFrame.current !== null) return;
       sidebarDragAnimationFrame.current = window.requestAnimationFrame(() => {
         sidebarDragAnimationFrame.current = null;
-        shellRef.current?.style.setProperty("--sidebar-width", `${sidebarDragWidth.current}px`);
+        shellRef.current?.style.setProperty("--sidebar-width", `${clampedWidth}px`);
       });
     }
 
@@ -680,15 +704,25 @@ export default function App() {
         window.cancelAnimationFrame(sidebarDragAnimationFrame.current);
         sidebarDragAnimationFrame.current = null;
       }
-      shellRef.current?.style.setProperty("--sidebar-width", `${sidebarDragWidth.current}px`);
+      const finalWidth = sidebarDragWidth.current;
+      liveSidebarWidth.current = finalWidth;
+      shellRef.current?.style.setProperty("--sidebar-width", `${finalWidth}px`);
       if (commit) {
-        setSidebarWidth(sidebarDragWidth.current);
+        // Only sync to React state on commit - this is the single writer for persistence
+        setSidebarWidth(finalWidth);
         setIsDraggingSidebar(false);
       }
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", finishDragging);
+      target.removeEventListener("pointermove", handlePointerMove);
+      target.removeEventListener("pointerup", finishDragging);
+      target.removeEventListener("pointercancel", cancelDragging);
+      target.removeEventListener("lostpointercapture", cancelDragging);
+      try {
+        target.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released
+      }
       sidebarDragCleanup.current = null;
     }
 
@@ -696,10 +730,16 @@ export default function App() {
       stopDragging(true);
     }
 
+    function cancelDragging() {
+      stopDragging(false);
+    }
+
     document.body.style.cursor = "ew-resize";
     document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", finishDragging);
+    target.addEventListener("pointermove", handlePointerMove);
+    target.addEventListener("pointerup", finishDragging);
+    target.addEventListener("pointercancel", cancelDragging);
+    target.addEventListener("lostpointercapture", cancelDragging);
     sidebarDragCleanup.current = () => stopDragging(false);
     event.preventDefault();
   }
@@ -1751,7 +1791,6 @@ export default function App() {
       className="lv-shell"
       data-sidebar-dragging={isDraggingSidebar || undefined}
       data-sidebar-state={isSidebarCollapsed ? "collapsed" : "expanded"}
-      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
       <aside className="lv-sidebar" aria-label="Primary navigation">
         <div className="lv-sidebar-trigger-wrap">
@@ -1976,9 +2015,42 @@ export default function App() {
         <button
           type="button"
           className="lv-sidebar-rail"
+          role="separator"
+          aria-orientation="vertical"
           aria-label="Resize sidebar"
-          tabIndex={-1}
-          onMouseDown={startSidebarResize}
+          aria-valuemin={SIDEBAR_MIN_WIDTH}
+          aria-valuemax={SIDEBAR_MAX_WIDTH}
+          aria-valuenow={sidebarWidth}
+          tabIndex={isSidebarCollapsed ? -1 : 0}
+          onPointerDown={startSidebarResize}
+          onKeyDown={(event) => {
+            if (isSidebarCollapsed) return;
+            const step = event.shiftKey ? 20 : 5;
+            const currentWidth = liveSidebarWidth.current;
+            let nextWidth = currentWidth;
+            switch (event.key) {
+              case "ArrowLeft":
+                nextWidth = clampSidebarWidth(currentWidth - step);
+                break;
+              case "ArrowRight":
+                nextWidth = clampSidebarWidth(currentWidth + step);
+                break;
+              case "Home":
+                nextWidth = SIDEBAR_MIN_WIDTH;
+                break;
+              case "End":
+                nextWidth = SIDEBAR_MAX_WIDTH;
+                break;
+              default:
+                return;
+            }
+            event.preventDefault();
+            // Update live ref immediately for single source of truth
+            liveSidebarWidth.current = nextWidth;
+            shellRef.current?.style.setProperty("--sidebar-width", `${nextWidth}px`);
+            // Sync to React state for persistence
+            setSidebarWidth(nextWidth);
+          }}
         />
       </aside>
       <main className="lv-main" data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>

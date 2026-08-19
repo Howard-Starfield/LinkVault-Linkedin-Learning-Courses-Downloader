@@ -8,6 +8,7 @@ design from whichever provider was implemented most recently.
 
 - [ADR-001: Unified workflow modular monolith](adr-001-unified-workflow-modular-monolith.md)
 - [ADR-002: Newspaper clippings as provider-owned managed assets](adr-002-newspaper-clippings-managed-assets.md)
+- [Frontend/Rust ownership boundary](frontend-rust-ownership-boundary.md)
 - [Newspaper Clippings V1 master PRD](../specs/newspaper-clippings-v1/README.md)
 - [Unified workflow migration plan](unified-workflow-migration-plan.md)
 - [Phase 0 source-layout migration spec](../specs/phase-0-source-layout-migration.md)

@@ -135,5 +135,167 @@ const narrowSettings = await page.locator(".newspaper-options").boundingBox();
 const narrowSchedule = await page.locator(".newspaper-scheduler").boundingBox();
 assert.ok(narrowEditions && narrowSettings && Math.abs(narrowEditions.y - narrowSettings.y) <= 1, "Editions and settings must share the first responsive row.");
 assert.ok(narrowSchedule && narrowSettings && narrowSchedule.y > narrowSettings.y, "Schedule must move below editions and settings at the responsive breakpoint.");
+
+// =============================================================================
+// Responsive Layout Hardening Tests (PRD: frontend-responsive-layout-hardening)
+// =============================================================================
+
+console.log("\n🔍 Running responsive layout hardening tests...");
+
+// Test 1: Brand logo invariance across sidebar widths
+console.log("  Testing brand logo invariance...");
+await page.setViewportSize({ width: 1720, height: 960 });
+await page.waitForTimeout(100);
+
+const brandLogoSelector = ".lv-brand-logo img";
+const sidebarWidthsToTest = [208, 220, 320];
+let baselineBrandBox = null;
+
+for (const targetWidth of sidebarWidthsToTest) {
+  // Set sidebar width via localStorage and reload to apply
+  await page.evaluate((width) => {
+    window.localStorage.setItem("linkvault.sidebarWidth", String(width));
+  }, targetWidth);
+  await page.reload();
+  await page.waitForFunction(() => Boolean(document.documentElement.dataset.theme));
+  await page.waitForTimeout(200);
+  
+  const brandBox = await page.locator(brandLogoSelector).boundingBox();
+  assert.ok(brandBox, `Brand logo must render at sidebar width ${targetWidth}px`);
+  
+  if (!baselineBrandBox) {
+    baselineBrandBox = brandBox;
+  } else {
+    // Brand size should be invariant within 1 CSS pixel
+    const widthDiff = Math.abs(brandBox.width - baselineBrandBox.width);
+    const heightDiff = Math.abs(brandBox.height - baselineBrandBox.height);
+    assert.ok(widthDiff <= 1, `Brand logo width varied by ${widthDiff}px at sidebar width ${targetWidth}px (max 1px allowed)`);
+    assert.ok(heightDiff <= 1, `Brand logo height varied by ${heightDiff}px at sidebar width ${targetWidth}px (max 1px allowed)`);
+  }
+}
+
+// Restore default sidebar width
+await page.evaluate(() => {
+  window.localStorage.setItem("linkvault.sidebarWidth", "220");
+});
+await page.reload();
+await page.waitForFunction(() => Boolean(document.documentElement.dataset.theme));
+
+// Test 2: No horizontal overflow at native floor (1280x720) with max sidebar
+console.log("  Testing 1280x720 native floor with max sidebar...");
+await page.evaluate(() => {
+  window.localStorage.setItem("linkvault.sidebarWidth", "320");
+});
+await page.reload();
+await page.waitForFunction(() => Boolean(document.documentElement.dataset.theme));
+await page.setViewportSize({ width: 1280, height: 720 });
+await page.waitForTimeout(200);
+
+const overflowCheck = await page.evaluate(() => ({
+  scrollWidth: document.documentElement.scrollWidth,
+  clientWidth: document.documentElement.clientWidth
+}));
+assert.ok(overflowCheck.scrollWidth <= overflowCheck.clientWidth + 1, 
+  `Document must not overflow horizontally at 1280x720 with 320px sidebar (scrollWidth=${overflowCheck.scrollWidth}, clientWidth=${overflowCheck.clientWidth})`);
+
+// Check that main content is within bounds
+const mainBounds = await page.locator(".lv-main").boundingBox();
+const shellBounds = await page.locator(".lv-shell").boundingBox();
+assert.ok(mainBounds && shellBounds, "Main and shell elements must render");
+assert.ok(mainBounds.x >= shellBounds.x, "Main must be within shell bounds");
+assert.ok(mainBounds.x + mainBounds.width <= shellBounds.x + shellBounds.width + 1, 
+  "Main must not exceed shell width");
+
+// Test 3: Viewport sweep with overflow checks
+console.log("  Testing viewport sweep for overflow...");
+const viewportsToTest = [
+  { width: 1280, height: 720 },
+  { width: 1366, height: 768 },
+  { width: 1400, height: 720 },
+  { width: 1600, height: 900 },
+  { width: 1720, height: 960 },
+  { width: 1920, height: 1080 }
+];
+
+for (const viewport of viewportsToTest) {
+  await page.setViewportSize(viewport);
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  
+  const sweepOverflow = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth
+  }));
+  assert.ok(sweepOverflow.scrollWidth <= sweepOverflow.clientWidth + 1, 
+    `No horizontal overflow at ${viewport.width}x${viewport.height} (scrollWidth=${sweepOverflow.scrollWidth}, clientWidth=${sweepOverflow.clientWidth})`);
+}
+
+// Test 4: Sidebar collapse/reopen after resize
+console.log("  Testing sidebar collapse/reopen after resize...");
+await page.setViewportSize({ width: 1720, height: 960 });
+await page.evaluate(() => {
+  window.localStorage.setItem("linkvault.sidebarWidth", "220");
+});
+await page.reload();
+await page.waitForFunction(() => Boolean(document.documentElement.dataset.theme));
+
+// Collapse sidebar
+await page.getByRole("button", { name: "Toggle sidebar" }).click();
+assert.equal(await page.locator(".lv-shell").getAttribute("data-sidebar-state"), "collapsed");
+
+// Resize while collapsed
+await page.setViewportSize({ width: 1400, height: 720 });
+await page.waitForTimeout(100);
+
+// Reopen sidebar
+await page.getByRole("button", { name: "Show sidebar" }).click();
+assert.equal(await page.locator(".lv-shell").getAttribute("data-sidebar-state"), "expanded");
+
+// Verify sidebar is visible and functional
+const reopenedSidebar = await page.locator(".lv-sidebar").boundingBox();
+assert.ok(reopenedSidebar && reopenedSidebar.width > 0, "Sidebar must be visible after reopen");
+
+// Test 5: Keyboard resize parity
+console.log("  Testing keyboard resize...");
+await page.setViewportSize({ width: 1720, height: 960 });
+await page.evaluate(() => {
+  window.localStorage.setItem("linkvault.sidebarWidth", "220");
+});
+await page.reload();
+await page.waitForFunction(() => Boolean(document.documentElement.dataset.theme));
+
+// Focus the separator
+const separator = page.locator('[role="separator"]');
+await separator.focus();
+
+// Test ArrowRight (should increase width)
+const initialWidth = await page.evaluate(() => {
+  return parseFloat(getComputedStyle(document.querySelector(".lv-shell")).getPropertyValue("--sidebar-width"));
+});
+
+await separator.press("ArrowRight");
+await page.waitForTimeout(50);
+const afterArrowRight = await page.evaluate(() => {
+  return parseFloat(getComputedStyle(document.querySelector(".lv-shell")).getPropertyValue("--sidebar-width"));
+});
+assert.ok(afterArrowRight > initialWidth, "ArrowRight should increase sidebar width");
+
+// Test Home (should go to minimum)
+await separator.press("Home");
+await page.waitForTimeout(50);
+const afterHome = await page.evaluate(() => {
+  return parseFloat(getComputedStyle(document.querySelector(".lv-shell")).getPropertyValue("--sidebar-width"));
+});
+assert.ok(Math.abs(afterHome - 208) <= 1, `Home should set sidebar to minimum width (got ${afterHome}, expected ~208)`);
+
+// Test End (should go to maximum)
+await separator.press("End");
+await page.waitForTimeout(50);
+const afterEnd = await page.evaluate(() => {
+  return parseFloat(getComputedStyle(document.querySelector(".lv-shell")).getPropertyValue("--sidebar-width"));
+});
+assert.ok(Math.abs(afterEnd - 320) <= 1, `End should set sidebar to maximum width (got ${afterEnd}, expected ~320)`);
+
+console.log("✅ Responsive layout hardening tests passed.");
+
 await browser.close();
-console.log("Visual geometry verification passed.");
+console.log("\n✅ Visual geometry verification passed.");
