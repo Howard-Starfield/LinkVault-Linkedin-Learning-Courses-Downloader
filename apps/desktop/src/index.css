@@ -2,6 +2,7 @@
 
 @theme {
   --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
+  --brand-logo-max-width: 180px;
   --color-background: #1b1b1b;
   --color-foreground: #f3f3f0;
   --color-muted: #a1a19a;
@@ -329,8 +330,10 @@ textarea {
 }
 
 .lv-shell {
+  --sidebar-width-cap: 320px;
+  --sidebar-effective-width: min(var(--sidebar-width, 220px), var(--sidebar-width-cap));
   display: grid;
-  grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-effective-width, 220px) minmax(0, 1fr);
   height: 100svh;
   width: 100vw;
   overflow: hidden;
@@ -347,12 +350,24 @@ textarea {
   grid-template-columns: 0 minmax(0, 1fr);
 }
 
+/* Narrow viewports: keep the rail side-by-side but shrink it to its minimum.
+   The user's preferred width stays stored; only the effective width is capped. */
+@media (max-width: 1100px) {
+  .lv-shell {
+    --sidebar-width-cap: 208px;
+  }
+
+  .lv-sidebar-rail {
+    display: none;
+  }
+}
+
 .lv-sidebar {
   position: relative;
   z-index: 50;
   display: flex;
   height: calc(100svh - 16px);
-  width: calc(var(--sidebar-width, 220px) - 8px);
+  width: calc(var(--sidebar-effective-width, 220px) - 8px);
   margin: 8px 0 8px 8px;
   min-width: 0;
   flex-direction: column;
@@ -502,7 +517,8 @@ textarea {
 
 .lv-brand-logo img {
   display: block;
-  width: 100%;
+  width: auto;
+  max-width: var(--brand-logo-max-width);
   height: auto;
   object-fit: contain;
 }
@@ -662,6 +678,8 @@ textarea {
   border: 0;
   background: var(--workspace-bg);
   box-shadow: var(--workspace-shadow);
+  container-type: inline-size;
+  container-name: lv-main;
 }
 
 .lv-header {
@@ -2144,7 +2162,7 @@ textarea {
   background: linear-gradient(145deg, rgb(37 139 78 / 0.82), rgb(22 92 56 / 0.92));
 }
 
-@media (max-width: 1200px) {
+@container lv-main (max-width: 1200px) {
   .lv-content {
     grid-template-columns: minmax(0, 1fr) 288px;
   }
@@ -2159,39 +2177,13 @@ textarea {
   }
 }
 
-@media (max-width: 980px) {
-  body {
-    overflow: auto;
-  }
-
-  .lv-shell {
-    display: block;
-    overflow: auto;
-  }
-
-  .lv-sidebar {
-    width: auto;
-    height: auto;
-    margin: 8px;
-  }
-
-  .lv-sidebar nav {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .lv-sidebar-rail {
-    display: none;
-  }
-
-  .lv-main {
-    min-height: 100svh;
-    margin: 0;
-    border-radius: 0;
-  }
-
+/* When the workspace can no longer coexist with the fixed activity rail, the
+   rail stacks below the Download Queue instead of starving/overlapping it.
+   The Active/Completed/Failed chips keep working as toggles in the flow. */
+@container lv-main (max-width: 900px) {
   .lv-content {
-    grid-template-columns: 1fr;
-    overflow: visible;
+    grid-template-columns: minmax(0, 1fr);
+    overflow-y: auto;
   }
 
   .lv-workspace {
@@ -2199,6 +2191,26 @@ textarea {
     border-bottom: 1px solid var(--border-soft);
   }
 
+  .lv-activity {
+    grid-template-rows: auto auto auto;
+    overflow: visible;
+    padding: 12px 16px 16px;
+  }
+}
+
+@container lv-main (max-width: 620px) {
+  .linkedin-dispatch-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .linkedin-options-panel {
+    grid-column: auto;
+  }
+}
+
+/* Narrow viewports keep the side-by-side shell: the sidebar rail shrinks to its
+   capped minimum (see --sidebar-width-cap) instead of stacking above the content. */
+@media (max-width: 980px) {
   .compact-field-row,
   .option-row {
     grid-template-columns: 1fr;
@@ -2227,7 +2239,7 @@ textarea {
   }
 }
 
-@media (max-width: 1300px) {
+@container lv-main (max-width: 1080px) {
   .linkedin-dispatch-grid {
     grid-template-columns: repeat(2, minmax(280px, 1fr));
   }
@@ -3243,7 +3255,7 @@ textarea {
   }
 }
 
-@media (max-width: 980px) {
+@container lv-main (max-width: 780px) {
   .newspaper-setup-grid {
     grid-template-columns: 1fr;
   }
@@ -3325,7 +3337,7 @@ textarea {
   }
 }
 
-@media (max-width: 700px) {
+@container lv-main (max-width: 500px) {
   .newspaper-schedule-control {
     grid-template-columns: 1fr 112px;
   }
@@ -4099,7 +4111,7 @@ textarea {
   box-shadow: 0 8px 24px rgb(0 0 0 / 0.26);
 }
 
-@media (max-width: 1450px) {
+@container lv-main (max-width: 1200px) {
   .newspaper-download {
     grid-template-rows: minmax(380px, 0.64fr) minmax(240px, 0.56fr) auto;
   }
@@ -4110,9 +4122,17 @@ textarea {
 
 }
 
-@media (max-width: 1120px) {
+@container lv-main (max-width: 900px) {
   .newspaper-download {
     grid-template-rows: auto minmax(240px, 0.5fr) auto;
+  }
+
+  /* Cap stacked/narrow dispatch panels at a proper height and let them scroll
+     internally instead of extending the page far down. */
+  .newspaper-dispatch-panel {
+    max-height: min(520px, 68vh);
+    overflow-x: hidden;
+    overflow-y: auto;
   }
 
   .newspaper-dispatch-grid {
@@ -4133,7 +4153,7 @@ textarea {
 
 }
 
-@media (max-width: 760px) {
+@container lv-main (max-width: 540px) {
   .newspaper-download {
     padding: 12px;
   }
@@ -4542,7 +4562,7 @@ textarea {
 .clipping-note-editor__link-actions { display: flex; gap: 7px; }
 .clipping-note-editor__notice { margin: 10px 2px 0; color: var(--warning); font-size: 11px; font-weight: 700; }
 
-@media (max-width: 680px) {
+@container lv-main (max-width: 680px) {
   .clipping-note-editor > .clipping-source-card[data-alignment] {
     float: none; width: 100%; margin: 0 0 24px;
   }
@@ -4599,7 +4619,7 @@ textarea {
 .snapshot-root-settings__actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .snapshot-root-settings__error { color: var(--danger); }
 
-@media (max-width: 820px) {
+@container lv-main (max-width: 820px) {
   .lv-global-search { grid-template-columns: 18px minmax(0, 1fr) auto; padding-inline: 10px; }
   .lv-global-search__context strong { display: none; }
   .clipping-gallery__scroll { padding-inline: 14px; }
