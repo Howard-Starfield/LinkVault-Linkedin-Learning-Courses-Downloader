@@ -32,7 +32,8 @@
     "verify:tauri-smoke": "node ./scripts/verify-tauri-smoke.mjs",
     "verify:release": "npm run verify:architecture && npm run verify:persistence && npm run verify:persistence-baseline && node ./scripts/verify-release.mjs",
     "verify:installer": "node ./scripts/verify-installer.mjs",
-    "verify:release-manifest": "node ./scripts/verify-release-manifest.mjs"
+    "verify:release-manifest": "node ./scripts/verify-release-manifest.mjs",
+    "verify:no-any": "node ./scripts/verify-no-any.mjs"
   },
   "dependencies": {
     "@tabler/icons-react": "^3.24.0",
