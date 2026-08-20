@@ -91,6 +91,7 @@ jobs:
             --path LLCD.DownloaderConfig/ \
             --path LLCD.DownloaderGUI/ \
             --path LLCD.DownloaderTUI/ \
+            --path LLCD.LinkVault/ \
             --path Linkedin-Learning-Courses-Downloader.sln
 
           after_tree="$(git rev-parse 'refs/heads/main^{tree}')"
@@ -119,8 +120,10 @@ jobs:
             exit 1
           fi
 
-          if git ls-tree -r --name-only "$new_root" | grep -Eq '^(LLCD\.|Linkedin-Learning-Courses-Downloader\.sln$)'; then
-            echo "Refusing to push: legacy C# project paths remain in the cleaned root." >&2
+          legacy_root_paths="$(git ls-tree -r --name-only "$new_root" | grep -E '^(LLCD\.|Linkedin-Learning-Courses-Downloader\.sln$)' || true)"
+          if [[ -n "$legacy_root_paths" ]]; then
+            echo "Refusing to push: legacy C# project paths remain in the cleaned root:" >&2
+            printf '%s\n' "$legacy_root_paths" >&2
             exit 1
           fi
 
