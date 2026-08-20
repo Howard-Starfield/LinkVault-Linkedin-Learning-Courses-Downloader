@@ -1,0 +1,142 @@
+name: One-time clean legacy C# history
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/one-time-clean-legacy-history.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    name: Preserve LinkVault history and remove legacy C# ancestry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Rewrite only the pre-Tauri legacy ancestry
+        shell: bash
+        env:
+          CLEAN_BOUNDARY: afdbc56b77eaf279f938978b9cc5e30a1721e683
+          LEGACY_PARENT: 4ce716de0e704096335391e829102471400eda35
+          EXPECTED_HEAD: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git checkout -B main "$EXPECTED_HEAD"
+          git fetch --force --tags origin
+
+          # This workflow is intentionally idempotent. If the legacy parent is
+          # no longer reachable from main, the cleanup has already succeeded.
+          if ! git merge-base --is-ancestor "$LEGACY_PARENT" refs/heads/main 2>/dev/null; then
+            echo "Legacy C# ancestry is already absent from main; nothing to do."
+            exit 0
+          fi
+
+          if ! git merge-base --is-ancestor "$CLEAN_BOUNDARY" refs/heads/main; then
+            echo "Refusing to rewrite: the verified Tauri boundary is not on main." >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$LEGACY_PARENT" "$CLEAN_BOUNDARY"; then
+            echo "Refusing to rewrite: expected legacy parent is not before the Tauri boundary." >&2
+            exit 1
+          fi
+
+          before_tree="$(git rev-parse 'refs/heads/main^{tree}')"
+
+          # Preserve LinkVault release tags that belong to the Tauri history.
+          # Older unrelated tags, if any, are deliberately left untouched.
+          declare -a rewrite_refs=(refs/heads/main)
+          : > /tmp/linkvault-tags.tsv
+          while IFS= read -r ref; do
+            commit="$(git rev-parse "${ref}^{commit}" 2>/dev/null || true)"
+            if [[ -n "$commit" ]] && git merge-base --is-ancestor "$CLEAN_BOUNDARY" "$commit"; then
+              old_ref="$(git rev-parse "$ref")"
+              printf '%s\t%s\n' "$ref" "$old_ref" >> /tmp/linkvault-tags.tsv
+              rewrite_refs+=("$ref")
+            fi
+          done < <(git for-each-ref --format='%(refname)' refs/tags)
+
+          python -m pip install --disable-pip-version-check --quiet git-filter-repo
+
+          # Use git-filter-repo's documented graft mechanism: keep the first
+          # dedicated Rust/Tauri migration checkpoint but make it a root commit.
+          # This preserves its tree, message, author, committer and dates while
+          # disconnecting the earlier hybrid/legacy C# ancestry.
+          git replace --graft "$CLEAN_BOUNDARY"
+
+          # Strip only the old C# project paths from the retained Tauri history.
+          # The current main tree contains none of these paths, so a byte-for-byte
+          # tree check below guarantees the application itself is unchanged.
+          git filter-repo --force \
+            --refs "${rewrite_refs[@]}" \
+            --invert-paths \
+            --path LLCD.CourseContent/ \
+            --path LLCD.CourseExtractor.Tests/ \
+            --path LLCD.CourseExtractor/ \
+            --path LLCD.DownloaderConfig/ \
+            --path LLCD.DownloaderGUI/ \
+            --path LLCD.DownloaderTUI/ \
+            --path Linkedin-Learning-Courses-Downloader.sln
+
+          after_tree="$(git rev-parse 'refs/heads/main^{tree}')"
+          if [[ "$before_tree" != "$after_tree" ]]; then
+            echo "Refusing to push: current main tree changed during history cleanup." >&2
+            echo "before=$before_tree" >&2
+            echo "after=$after_tree" >&2
+            exit 1
+          fi
+
+          root_count="$(git rev-list --max-parents=0 refs/heads/main | wc -l | tr -d ' ')"
+          if [[ "$root_count" != "1" ]]; then
+            echo "Refusing to push: cleaned main has $root_count root commits instead of 1." >&2
+            exit 1
+          fi
+
+          new_root="$(git rev-list --max-parents=0 refs/heads/main)"
+          root_subject="$(git log -1 --format='%s' "$new_root")"
+          if [[ "$root_subject" != "Add LinkVault Tauri migration checkpoint" ]]; then
+            echo "Refusing to push: unexpected cleaned root commit: $root_subject" >&2
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor "$LEGACY_PARENT" refs/heads/main 2>/dev/null; then
+            echo "Refusing to push: legacy C# ancestry is still reachable from main." >&2
+            exit 1
+          fi
+
+          if git ls-tree -r --name-only "$new_root" | grep -Eq '^(LLCD\.|Linkedin-Learning-Courses-Downloader\.sln$)'; then
+            echo "Refusing to push: legacy C# project paths remain in the cleaned root." >&2
+            exit 1
+          fi
+
+          remote_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$remote_url"
+          else
+            git remote add origin "$remote_url"
+          fi
+
+          declare -a lease_opts=("--force-with-lease=refs/heads/main:${EXPECTED_HEAD}")
+          declare -a refspecs=("refs/heads/main:refs/heads/main")
+          while IFS=$'\t' read -r ref old_ref; do
+            [[ -z "$ref" ]] && continue
+            lease_opts+=("--force-with-lease=${ref}:${old_ref}")
+            refspecs+=("${ref}:${ref}")
+          done < /tmp/linkvault-tags.tsv
+
+          # Update main and all LinkVault-era release tags atomically: either
+          # every verified ref moves to the cleaned history, or none do.
+          git push --atomic "${lease_opts[@]}" origin "${refspecs[@]}"
+
+          echo "Legacy C# ancestry removed while preserving the LinkVault/Tauri history."
+          echo "New root: $new_root"
