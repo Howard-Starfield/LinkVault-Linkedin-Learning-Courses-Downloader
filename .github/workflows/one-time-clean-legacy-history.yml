@@ -1,7 +1,7 @@
 name: One-time clean legacy C# history
 
 on:
-  push:
+  pull_request:
     branches:
       - main
     paths:
@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   rewrite:
+    if: github.head_ref == 'chore/run-legacy-history-cleanup'
     name: Preserve LinkVault history and remove legacy C# ancestry
     runs-on: ubuntu-latest
     steps:
@@ -26,13 +27,21 @@ jobs:
         env:
           CLEAN_BOUNDARY: afdbc56b77eaf279f938978b9cc5e30a1721e683
           LEGACY_PARENT: 4ce716de0e704096335391e829102471400eda35
-          EXPECTED_HEAD: ${{ github.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.base.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          git checkout -B main "$EXPECTED_HEAD"
           git fetch --force --tags origin
+          git checkout -B main "$EXPECTED_HEAD"
+
+          remote_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "$remote_main" != "$EXPECTED_HEAD" ]]; then
+            echo "Refusing to rewrite: main moved after this cleanup PR was opened." >&2
+            echo "expected=$EXPECTED_HEAD" >&2
+            echo "remote=$remote_main" >&2
+            exit 1
+          fi
 
           # This workflow is intentionally idempotent. If the legacy parent is
           # no longer reachable from main, the cleanup has already succeeded.
@@ -68,15 +77,11 @@ jobs:
 
           python -m pip install --disable-pip-version-check --quiet git-filter-repo
 
-          # Use git-filter-repo's documented graft mechanism: keep the first
-          # dedicated Rust/Tauri migration checkpoint but make it a root commit.
-          # This preserves its tree, message, author, committer and dates while
-          # disconnecting the earlier hybrid/legacy C# ancestry.
+          # Keep the first dedicated Rust/Tauri migration checkpoint but make it
+          # the new root. This preserves its tree, message, author and dates.
           git replace --graft "$CLEAN_BOUNDARY"
 
-          # Strip only the old C# project paths from the retained Tauri history.
-          # The current main tree contains none of these paths, so a byte-for-byte
-          # tree check below guarantees the application itself is unchanged.
+          # Strip only the inherited C# project paths from retained history.
           git filter-repo --force \
             --refs "${rewrite_refs[@]}" \
             --invert-paths \
@@ -134,9 +139,8 @@ jobs:
             refspecs+=("${ref}:${ref}")
           done < /tmp/linkvault-tags.tsv
 
-          # Update main and all LinkVault-era release tags atomically: either
-          # every verified ref moves to the cleaned history, or none do.
+          # Move main and all LinkVault-era release tags together or not at all.
           git push --atomic "${lease_opts[@]}" origin "${refspecs[@]}"
 
-          echo "Legacy C# ancestry removed while preserving the LinkVault/Tauri history."
+          echo "Legacy C# ancestry removed while preserving LinkVault/Tauri history."
           echo "New root: $new_root"
