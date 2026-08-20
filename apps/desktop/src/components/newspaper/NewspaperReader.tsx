@@ -142,6 +142,8 @@ export function NewspaperReader({
   const latestProgressRef = useRef<NewspaperReadingProgress | undefined>(undefined);
   const pendingPageRef = useRef<NewspaperReaderPage | null>(null);
   const initialScrollDoneRef = useRef(false);
+  const readerManifestKeyRef = useRef<string | null>(null);
+  const onCloseRef = useRef(onClose);
   const zoomingRef = useRef(false);
   const clickZoomRestoreRef = useRef<number | null>(null);
   const panGestureRef = useRef<PanGesture | null>(null);
@@ -154,11 +156,14 @@ export function NewspaperReader({
     initialNewspaperClippingInteraction
   );
   const clippingInteractionRef = useRef<NewspaperClippingInteraction>(clippingInteraction);
+  const sourceRevealKeyRef = useRef<string | null>(null);
   const [pages, setPages] = useState<NewspaperReaderPage[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const activeIndexRef = useRef(0);
   const [zoom, setZoom] = useState(baselineZoom);
-  const [containerWidth, setContainerWidth] = useState(900);
+  const [containerWidth, setContainerWidth] = useState(() => (
+    typeof window === "undefined" ? 900 : Math.max(320, window.innerWidth - 16)
+  ));
   const [loading, setLoading] = useState(true);
   const [failedImages, setFailedImages] = useState<Set<string>>(() => new Set());
   const [isClickZoomed, setIsClickZoomed] = useState(false);
@@ -172,9 +177,23 @@ export function NewspaperReader({
 
   activeIndexRef.current = activeIndex;
   clippingInteractionRef.current = clippingInteraction;
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    sourceRevealKeyRef.current = null;
+  }, [sourceTarget?.generation]);
 
   useEffect(() => {
     let stale = false;
+    const manifestKey = `${item.jobId}:${sourceTarget?.generation ?? "library"}`;
+    if (readerManifestKeyRef.current !== manifestKey) {
+      readerManifestKeyRef.current = manifestKey;
+      initialScrollDoneRef.current = false;
+      activeIndexRef.current = 0;
+      setActiveIndex(0);
+      setPages([]);
+      setFailedImages(new Set());
+    }
     setLoading(true);
     void getReaderManifest(item.jobId)
       .then((manifest) => {
@@ -187,7 +206,7 @@ export function NewspaperReader({
           toast.error("Original page is unavailable", {
             description: "Your clipping and note are still saved."
           });
-          void onClose();
+          void onCloseRef.current();
           return;
         }
         const savedIndex = item.lastPageId
@@ -214,7 +233,7 @@ export function NewspaperReader({
     return () => {
       stale = true;
     };
-  }, [item.jobId, item.lastPageId, onClose, sourceTarget]);
+  }, [item.jobId, sourceTarget?.generation]);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -810,9 +829,15 @@ export function NewspaperReader({
   );
   const revealSourceHighlight = useCallback((image: HTMLImageElement, pageId: string) => {
     if (!sourceTarget || pageId !== sourceTarget.pageId) return;
+    const revealKey = `${sourceTarget.generation}:${pageId}`;
+    if (sourceRevealKeyRef.current === revealKey) return;
+    sourceRevealKeyRef.current = revealKey;
     window.requestAnimationFrame(() => {
       const scroller = scrollRef.current;
-      if (!scroller) return;
+      if (!scroller || !image.isConnected) {
+        if (sourceRevealKeyRef.current === revealKey) sourceRevealKeyRef.current = null;
+        return;
+      }
       const imageRect = image.getBoundingClientRect();
       const scrollerRect = scroller.getBoundingClientRect();
       const highlightCenter = sourceTarget.highlight.y + sourceTarget.highlight.height / 2;

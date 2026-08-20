@@ -1,8 +1,16 @@
 # LinkVault
 
+## An open-source local archive workspace
+
 ![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)
 
-LinkVault helps you save LinkedIn Learning and Coursera courses you can access, plus World Journal newspaper editions, into organized local archives.
+LinkVault is a Windows-first desktop application for collecting, organizing,
+reading, and studying content you are allowed to access. It combines course
+archiving, newspaper retrieval and offline reading, and durable clipping notes
+in one local workspace.
+
+The product name is intentionally broader than the original repository slug:
+LinkVault is not limited to course downloads.
 
 ## What You Can Do
 
@@ -17,6 +25,20 @@ LinkVault helps you save LinkedIn Learning and Coursera courses you can access, 
 - Optimize newspaper pages as high-clarity WebP while safely retaining originals when needed.
 - Browse shallow front-page previews and read downloaded editions offline.
 - Register an existing Newspaper Extractor archive without moving its files.
+- Clip part of a newspaper page into a durable snapshot.
+- Write, format, search, and autosave Markdown notes attached to clippings.
+- Recover note edits across close, restart, and interrupted-save scenarios.
+
+## Supported providers
+
+- **LinkedIn Learning** — course videos, subtitles, exercise files, quizzes,
+  and study guides when the authenticated source makes them available.
+- **Coursera** — course downloads through the native Coursera workflow.
+- **World Journal** — edition discovery, scheduled retrieval, page
+  optimization, offline reading, and newspaper clippings.
+
+Provider integrations depend on upstream sites and may require maintenance as
+their authentication or delivery formats change.
 
 ## How To Use
 
@@ -26,6 +48,11 @@ LinkVault helps you save LinkedIn Learning and Coursera courses you can access, 
 4. Choose the download folder and quality.
 5. Paste your LinkedIn `li_at` cookie once, or use a supported browser session.
 6. Click **Start Download**.
+
+Queued courses are persisted independently of the current LinkedIn session. If
+the saved `li_at` cookie expires, LinkVault keeps the queue and shows a
+**Resume queue** action after you paste a fresh cookie. Right-click any queued
+course row to copy its normalized course URL for safekeeping or retrying later.
 
 For newspapers, open **World Journal → Download editions**, select editions and dates, then choose **Download now** or **Schedule downloads**. Completed and partial editions appear under **Newspaper library**.
 
@@ -37,6 +64,32 @@ Your downloads are saved into the folder you picked. Your saved session is prote
 - Rust toolchain
 - Microsoft C++ Build Tools or Visual Studio Build Tools
 - Microsoft WebView2 Runtime
+
+## Technology
+
+- Rust and Tauri for the native desktop shell, provider workflows, persistence,
+  scheduling, downloads, and Windows integration.
+- React, TypeScript, and Vite for the desktop interface.
+- SQLite for durable local application state.
+
+## Privacy and responsible use
+
+LinkVault is designed for local archives. Saved sessions are protected with
+Windows encryption and application data stays on the machine unless you copy
+it elsewhere. Do not use LinkVault to bypass DRM, paid access controls,
+robots.txt restrictions, rate limits, or a provider's terms. Only download,
+scrape, archive, or share material you have permission to access.
+
+The project is not affiliated with LinkedIn, Coursera, World Journal, or any
+other content provider.
+
+## Contributing
+
+Issues and pull requests are welcome. Before changing provider behavior, read
+the ownership and persistence contracts in
+[`docs/architecture`](docs/architecture/README.md). For newspaper clippings,
+the native Tauri window is required; the frontend-only preview cannot prove
+native persistence, window, tray, or input behavior.
 
 ## Run Locally
 
@@ -221,14 +274,10 @@ npm run verify:installer
 npm run verify:release-manifest
 ```
 
-## Responsible Use / Ownership
-
-Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions.
-
 ## License
 
-LinkVault is open source and licensed under the [MIT License](LICENSE).
-
-Third-party dependencies remain governed by their respective license terms. See `THIRD_PARTY_NOTICES.md` for details.
-
+LinkVault's original code is licensed under the MIT License. See
+[`LICENSE`](LICENSE) for the full text. Third-party dependencies retain their
+own licenses; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and the
+committed npm and Cargo lockfiles for dependency-specific information.
 Copyright (c) 2026 Howard Deng.

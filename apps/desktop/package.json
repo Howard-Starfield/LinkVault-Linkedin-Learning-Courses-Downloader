@@ -1,8 +1,8 @@
 {
   "name": "linkvault-desktop",
   "private": true,
-  "license": "UNLICENSED",
-  "version": "0.2.19",
+  "license": "MIT",
+  "version": "0.2.20",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
