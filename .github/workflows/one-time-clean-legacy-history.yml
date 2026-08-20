@@ -68,10 +68,15 @@ jobs:
 
           python -m pip install --disable-pip-version-check --quiet git-filter-repo
 
-          # Keep the dedicated Rust/Tauri migration checkpoint and every
-          # LinkVault commit after it. Sever its parent so unrelated C# commits
-          # are no longer ancestors, and strip only the old LLCD C# project
-          # paths from the retained history.
+          # Use git-filter-repo's documented graft mechanism: keep the first
+          # dedicated Rust/Tauri migration checkpoint but make it a root commit.
+          # This preserves its tree, message, author, committer and dates while
+          # disconnecting the earlier hybrid/legacy C# ancestry.
+          git replace --graft "$CLEAN_BOUNDARY"
+
+          # Strip only the old C# project paths from the retained Tauri history.
+          # The current main tree contains none of these paths, so a byte-for-byte
+          # tree check below guarantees the application itself is unchanged.
           git filter-repo --force \
             --refs "${rewrite_refs[@]}" \
             --invert-paths \
@@ -81,11 +86,7 @@ jobs:
             --path LLCD.DownloaderConfig/ \
             --path LLCD.DownloaderGUI/ \
             --path LLCD.DownloaderTUI/ \
-            --path Linkedin-Learning-Courses-Downloader.sln \
-            --commit-callback '
-          if commit.original_id == b"afdbc56b77eaf279f938978b9cc5e30a1721e683":
-              commit.parents = []
-          '
+            --path Linkedin-Learning-Courses-Downloader.sln
 
           after_tree="$(git rev-parse 'refs/heads/main^{tree}')"
           if [[ "$before_tree" != "$after_tree" ]]; then
@@ -102,9 +103,9 @@ jobs:
           fi
 
           new_root="$(git rev-list --max-parents=0 refs/heads/main)"
-          new_boundary="$(awk -v old="$CLEAN_BOUNDARY" '$1 == old {print $2}' .git/filter-repo/commit-map)"
-          if [[ -z "$new_boundary" || "$new_root" != "$new_boundary" ]]; then
-            echo "Refusing to push: the Tauri checkpoint did not become the single root." >&2
+          root_subject="$(git log -1 --format='%s' "$new_root")"
+          if [[ "$root_subject" != "Add LinkVault Tauri migration checkpoint" ]]; then
+            echo "Refusing to push: unexpected cleaned root commit: $root_subject" >&2
             exit 1
           fi
 
