@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LinkVault",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "identifier": "dev.linkvault.downloader",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -35,8 +35,8 @@
       "icons/icon-tray.png"
     ],
     "publisher": "LinkVault",
-    "shortDescription": "LinkVault offline learning archive",
-    "longDescription": "LinkVault saves accessible courses and World Journal editions into organized local learning and newspaper archives.",
+    "shortDescription": "LinkVault local archive workspace",
+    "longDescription": "LinkVault saves accessible courses and World Journal editions, then supports offline reading and durable clipping notes in a local archive workspace.",
     "windows": {
       "nsis": {
         "installMode": "currentUser",

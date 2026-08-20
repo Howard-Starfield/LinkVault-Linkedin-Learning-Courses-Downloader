@@ -4,9 +4,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
   CircleHelp,
+  Copy,
   Eye,
   EyeOff,
   Folder,
+  FolderOpen,
   History,
   KeyRound,
   Play,
@@ -16,7 +18,6 @@ import {
 } from "lucide-react";
 import { IconCertificate } from "@tabler/icons-react";
 import {
-  ActivityEventRow,
   Button,
   Checkbox,
   DataTable,
@@ -31,7 +32,6 @@ import {
   Progress,
   Select,
   StatusBadge,
-  SummaryChip,
   Textarea,
   Tooltip,
   guardedToast
@@ -59,7 +59,6 @@ import type {
   CourseraHistoryEntry,
   CourseraJob,
   ParsedCourseraClass,
-  PersistedCourseraEvent,
   ProcessCourseraResponse,
   SavedCourseraPreferences,
   SyllabusPreview
@@ -69,6 +68,7 @@ const SAVED_CAUTH_PLACEHOLDER = "•••••••••••••••�
 const COURSERA_PREFS_STORAGE_KEY = "linkvault.coursera.preferences";
 const COURSERA_RESOLUTIONS = ["360p", "540p", "720p"] as const;
 type CourseraResolution = (typeof COURSERA_RESOLUTIONS)[number];
+type CourseraQueueSection = "queue" | "active" | "completed" | "failed";
 
 const EMPTY_PREFS: SavedCourseraPreferences = {
   outputDir: "",
@@ -146,13 +146,12 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
 
   // --- run state ----------------------------------------------------------
   const [jobs, setJobs] = useState<CourseraJob[]>([]);
-  const [events, setEvents] = useState<PersistedCourseraEvent[]>([]);
   const [history, setHistory] = useState<CourseraHistoryEntry[]>([]);
   const [isStarting, setIsStarting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [clearingJobId, setClearingJobId] = useState<string | null>(null);
+  const [queueSection, setQueueSection] = useState<CourseraQueueSection>("queue");
   const [isSavingPrefs, setIsSavingPrefs] = useState(false);
-  const [, setProcessingSummary] = useState<ProcessCourseraResponse | null>(null);
   const [previewSyllabus, setPreviewSyllabus] = useState<SyllabusPreview | null>(null);
   const [previewSlug, setPreviewSlug] = useState<string | null>(null);
   const [isPreviewingSyllabus, setIsPreviewingSyllabus] = useState(false);
@@ -185,7 +184,6 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     const prefs = state.savedPrefs ?? state.defaultOptions ?? EMPTY_PREFS;
     applyPreferences(prefs);
     setJobs(state.persistedJobs ?? []);
-    setEvents(state.recentEvents ?? []);
     setHistory(state.downloadHistory ?? []);
     setHasSavedToken(Boolean(state.hasSavedToken));
   }
@@ -240,7 +238,18 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     () =>
       jobs
         .filter((job) => job.status.toLowerCase() === "completed")
-        .sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0)),
+        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)),
+    [jobs]
+  );
+  const activeJobs = useMemo(
+    () => jobs.filter((job) => job.status.toLowerCase() === "active"),
+    [jobs]
+  );
+  const failedJobs = useMemo(
+    () => jobs.filter((job) => {
+      const status = job.status.toLowerCase();
+      return status === "failed" || status === "cancelled";
+    }),
     [jobs]
   );
 
@@ -259,23 +268,11 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     return parts.length > 0 ? parts.join(" - ") : "0 active";
   }, [jobs]);
 
-  const activityEvents = useMemo(
-    () => buildActivityRows(events),
-    [events]
-  );
-
-  const activitySummary = useMemo(() => {
-    return jobs.reduce(
-      (acc, job) => {
-        const status = job.status.toLowerCase();
-        if (status === "active") acc.active += 1;
-        else if (status === "completed") acc.completed += 1;
-        else if (status === "failed" || status === "cancelled") acc.failed += 1;
-        return acc;
-      },
-      { active: 0, completed: 0, failed: 0 }
-    );
-  }, [jobs]);
+  const queueCounts = {
+    active: activeJobs.length,
+    completed: completedJobs.length,
+    failed: failedJobs.length
+  };
 
   const canStart = useMemo(() => {
     const hasContent =
@@ -348,7 +345,6 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     try {
       setIsStarting(true);
       cancellationRef.current = false;
-      setProcessingSummary(null);
 
       // Resolve the auth method we'll use for this run.
       const method = await ensureAuthBeforeRun();
@@ -396,7 +392,6 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
       });
 
       const processResponse = await processBatchWithLiveRefresh(prefs.downloadDelaySeconds);
-      setProcessingSummary(processResponse);
       await refreshAll();
       if (processResponse.processed) {
         showProcessedToast(processResponse);
@@ -463,7 +458,6 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
       if (cancellationRef.current) break;
       const response = await processQueuedCourseraBatch();
       summary = mergeProcessResponses(summary, response);
-      setProcessingSummary(summary);
       await refreshAll();
       if (!response.processed) break;
       if (delaySecs > 0) {
@@ -523,7 +517,6 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     try {
       await removeFailedCourseraJob(job.id);
       setJobs((previous) => previous.filter((candidate) => candidate.id !== job.id));
-      setEvents((previous) => previous.filter((event) => event.jobId !== job.id));
       toast.info("Failed attempt cleared", { description: job.className });
     } catch (error) {
       toast.error("Clear failed attempt", { description: String(error) });
@@ -616,324 +609,314 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     }
   }
 
+  async function copyCourseraUrl(job: CourseraJob) {
+    const url = `https://www.coursera.org/learn/${job.className}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success("Course URL copied", { description: url });
+    } catch (error) {
+      toast.error("Could not copy course URL", { description: String(error) });
+    }
+  }
+
   if (mode === "history") {
     return <CourseraHistoryPage entries={history} onOpenFolder={openJobFolder} />;
   }
 
   return (
     <>
-    <div className="lv-workspace coursera-workspace">
-      <Panel className="command-panel">
-        <div className="section-heading command-section-heading">
-          <div className="min-w-0">
-            <h3>Coursera Course</h3>
-            <p>Paste Coursera course slugs (or /learn/&lt;slug&gt; URLs) and choose what to download.</p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <StatusBadge tone={hasSavedToken ? "success" : "muted"} dotClassName={hasSavedToken ? "bg-success" : "bg-muted"}>
-              {hasSavedToken ? "Saved CAUTH active" : "Sign-in required"}
-            </StatusBadge>
-          </div>
-        </div>
-
-        <div className="command-grid">
-          <Field label="Course slugs / URLs">
-            <div className="course-url-field compact-url-field">
-              <Textarea
-                value={classInput}
-                onChange={(event) => {
-                  setClassInput(event.target.value);
-                  if (parsedClasses.length > 0) {
-                    setParsedClasses([]);
-                    setSelectedSlugs([]);
-                  }
-                }}
-                onBlur={() => parseInput()}
-                placeholder="One slug or https://www.coursera.org/learn/<slug> URL per line"
-                spellCheck={false}
-                className="course-url-textarea"
-                aria-label="Coursera course slugs"
-              />
+      <div className="lv-workspace coursera-workspace">
+        <Panel className="command-panel provider-command-board coursera-command-board">
+          <div className="provider-command-status coursera-command-status">
+            <div className="ml-auto flex shrink-0 items-center gap-2">
+              <StatusBadge tone={hasSavedToken ? "success" : "muted"} dotClassName={hasSavedToken ? "bg-success" : "bg-muted"}>
+                {hasSavedToken ? "Saved CAUTH active" : "Sign-in required"}
+              </StatusBadge>
             </div>
-          </Field>
+          </div>
 
-          {parsedClasses.length > 0 ? (
-            <div className="parsed-classes">
-              <span className="text-xs text-muted">Parsed {parsedClasses.length} class{parsedClasses.length === 1 ? "" : "es"}:</span>
-              <div className="parsed-classes-list">
-                {parsedClasses.map((course) => {
-                  const checked = selectedSlugs.includes(course.slug);
-                  return (
-                    <label key={`${course.slug}-${course.original}`} className="parsed-class-chip">
-                      <Checkbox
-                        checked={checked}
-                        onChange={(event) => {
-                          if (event.target.checked) {
-                            setSelectedSlugs((prev) => Array.from(new Set([...prev, course.slug])));
-                          } else {
-                            setSelectedSlugs((prev) => prev.filter((slug) => slug !== course.slug));
-                          }
-                        }}
-                        label={course.slug}
+          <div className="provider-dispatch-grid coursera-dispatch-grid">
+            <section className="provider-dispatch-group coursera-source-panel" aria-label="Coursera course slugs and URLs">
+              <Field label="Course slugs / URLs">
+                <div className="course-url-field compact-url-field">
+                  <Textarea
+                    value={classInput}
+                    onChange={(event) => {
+                      setClassInput(event.target.value);
+                      if (parsedClasses.length > 0) {
+                        setParsedClasses([]);
+                        setSelectedSlugs([]);
+                      }
+                    }}
+                    onBlur={() => parseInput()}
+                    placeholder="One slug or https://www.coursera.org/learn/<slug> URL per line"
+                    spellCheck={false}
+                    className="course-url-textarea"
+                    aria-label="Coursera course slugs"
+                  />
+                </div>
+              </Field>
+
+              {parsedClasses.length > 0 ? (
+                <div className="parsed-classes coursera-parsed-classes">
+                  <div className="parsed-classes-list">
+                    {parsedClasses.map((course) => {
+                      const checked = selectedSlugs.includes(course.slug);
+                      return (
+                        <label key={`${course.slug}-${course.original}`} className="parsed-class-chip">
+                          <Checkbox
+                            checked={checked}
+                            onChange={(event) => {
+                              if (event.target.checked) {
+                                setSelectedSlugs((prev) => Array.from(new Set([...prev, course.slug])));
+                              } else {
+                                setSelectedSlugs((prev) => prev.filter((slug) => slug !== course.slug));
+                              }
+                            }}
+                            label={course.slug}
+                          />
+                          <Tooltip label="Show syllabus preview">
+                            <IconButton
+                              size="icon-sm"
+                              aria-label={`Preview ${course.slug}`}
+                              onClick={() => previewSyllabusFor(course.slug)}
+                            >
+                              <IconCertificate aria-hidden="true" className="h-3.5 w-3.5" />
+                            </IconButton>
+                          </Tooltip>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </section>
+
+            <section className="provider-dispatch-group coursera-access-panel" aria-label="Coursera access and destination">
+              <Field label="Output folder">
+                <div className="field-action-grid">
+                  <Input
+                    value={outputDir}
+                    onChange={(event) => setOutputDir(event.target.value)}
+                    placeholder="C:\\Users\\you\\Downloads\\Coursera"
+                    aria-label="Coursera output folder"
+                  />
+                  <Button type="button" variant="outline" onClick={browseOutputFolder}>
+                    <Folder aria-hidden="true" className="h-3.5 w-3.5" />
+                    Browse
+                  </Button>
+                </div>
+              </Field>
+
+              <Field label="Auth">
+                <div className="auth-grid">
+                  <Select
+                    value={authMethod}
+                    onChange={(event) => setAuthMethod(event.target.value as AuthMethodKind)}
+                    aria-label="Coursera auth method"
+                  >
+                    <option value="saved_token">Use saved CAUTH</option>
+                    <option value="cauth">Paste CAUTH cookie</option>
+                    <option value="email_password">Email + password</option>
+                  </Select>
+                  {authMethod === "cauth" ? (
+                    <div className="auth-cauth-row">
+                      <Input
+                        value={cauthValue}
+                        onChange={(event) => setCauthValue(event.target.value)}
+                        placeholder={hasSavedToken ? SAVED_CAUTH_PLACEHOLDER : "CAUTH cookie value"}
+                        type={showCauth ? "text" : "password"}
+                        aria-label="Coursera CAUTH"
                       />
-                      <Tooltip label="Show syllabus preview">
-                        <IconButton
-                          size="icon-sm"
-                          aria-label={`Preview ${course.slug}`}
-                          onClick={() => previewSyllabusFor(course.slug)}
-                        >
-                          <IconCertificate aria-hidden="true" className="h-3.5 w-3.5" />
+                      <Tooltip label={showCauth ? "Hide CAUTH" : "Show CAUTH"}>
+                        <IconButton size="icon-sm" aria-label="Toggle CAUTH visibility" onClick={() => setShowCauth((v) => !v)}>
+                          {showCauth ? <EyeOff aria-hidden="true" className="h-3.5 w-3.5" /> : <Eye aria-hidden="true" className="h-3.5 w-3.5" />}
                         </IconButton>
                       </Tooltip>
-                    </label>
-                  );
-                })}
-              </div>
-            </div>
-          ) : null}
+                      <Tooltip label="How to find your CAUTH cookie">
+                        <IconButton size="icon-sm" aria-label="Open CAUTH help" onClick={() => setAuthHelpOpen(true)}>
+                          <CircleHelp aria-hidden="true" className="h-3.5 w-3.5" />
+                        </IconButton>
+                      </Tooltip>
+                      <Button type="button" variant="outline" onClick={clearCauth} disabled={!hasSavedToken && !cauthValue}>
+                        <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+                        Clear
+                      </Button>
+                    </div>
+                  ) : null}
+                  {authMethod === "email_password" ? (
+                    <div className="auth-credentials">
+                      <Input
+                        value={authEmail}
+                        onChange={(event) => setAuthEmail(event.target.value)}
+                        placeholder="email@example.com"
+                        type="email"
+                        aria-label="Coursera email"
+                      />
+                      <Input
+                        value={authPassword}
+                        onChange={(event) => setAuthPassword(event.target.value)}
+                        placeholder="password"
+                        type="password"
+                        aria-label="Coursera password"
+                      />
+                      <Button
+                        type="button"
+                        onClick={async () => {
+                          if (!authEmail.trim() || !authPassword) {
+                            toast.warning("Email and password required");
+                            return;
+                          }
+                          setIsAuthenticating(true);
+                          try {
+                            await invoke("coursera_login", {
+                              req: {
+                                kind: "email_password",
+                                email: authEmail.trim(),
+                                password: authPassword
+                              }
+                            });
+                            setHasSavedToken(true);
+                            setAuthStatus("signed_in");
+                            setAuthPassword("");
+                            toast.success("Signed in to Coursera");
+                          } catch (error) {
+                            toast.error("Sign-in failed", { description: String(error) });
+                            setAuthStatus("signed_out");
+                          } finally {
+                            setIsAuthenticating(false);
+                          }
+                        }}
+                        loading={isAuthenticating}
+                        loadingLabel="Signing in"
+                      >
+                        <KeyRound aria-hidden="true" className="h-3.5 w-3.5" />
+                        Sign in
+                      </Button>
+                    </div>
+                  ) : null}
+                </div>
+              </Field>
+              <Tooltip label={hasSavedToken ? "Encrypted CAUTH is available on this device." : "Paste a CAUTH cookie or choose an email sign-in method."}>
+                <span className="coursera-session-note" data-active={hasSavedToken ? "true" : "false"} role="img" tabIndex={0} aria-label={hasSavedToken ? "Encrypted CAUTH available" : "Sign-in required"}>
+                  <span className="status-dot" />
+                </span>
+              </Tooltip>
+            </section>
 
-          <div className="compact-field-row">
-            <Field label="Output folder">
-              <div className="field-action-grid">
-                <Input
-                  value={outputDir}
-                  onChange={(event) => setOutputDir(event.target.value)}
-                  placeholder="C:\\Users\\you\\Downloads\\Coursera"
-                  aria-label="Coursera output folder"
-                />
-                <Button type="button" onClick={browseOutputFolder}>
-                  <Folder aria-hidden="true" className="h-3.5 w-3.5" />
-                  Browse
+            <section className="provider-dispatch-group provider-options-panel coursera-options-panel" aria-label="Coursera download settings">
+              <div className="option-row">
+                <Field label="Resolution">
+                  <Select value={resolution} onChange={(event) => setResolution(asResolution(event.target.value))} aria-label="Coursera video resolution">
+                    {COURSERA_RESOLUTIONS.map((value) => (
+                      <option key={value} value={value}>{value}</option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field label="Subtitle lang">
+                  <Input value={subtitleLanguage} onChange={(event) => setSubtitleLanguage(event.target.value)} placeholder="all" aria-label="Coursera subtitle language" />
+                </Field>
+                <Field label="Parallel jobs">
+                  <Input value={parallelJobs} type="number" min={1} onChange={(event) => setParallelJobs(clampPositiveInt(Number(event.target.value), 1, 1))} aria-label="Coursera parallel jobs" />
+                </Field>
+                <Field label="Delay (s)">
+                  <Input value={delaySeconds} type="number" min={0} onChange={(event) => setDelaySeconds(clampPositiveInt(Number(event.target.value), 0, 0))} aria-label="Coursera download delay" />
+                </Field>
+              </div>
+
+              <div className="download-toggles">
+                <Checkbox checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Quizzes" />
+                <Checkbox checked={downloadNotebooks} onChange={(event) => setDownloadNotebooks(event.target.checked)} label="Notebooks" />
+                <Checkbox checked={downloadAbout} onChange={(event) => setDownloadAbout(event.target.checked)} label="About page" />
+                <Checkbox checked={resume} onChange={(event) => setResume(event.target.checked)} label="Resume" />
+                <Checkbox checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} label="Overwrite" />
+                <Checkbox checked={generatePlaylists} onChange={(event) => setGeneratePlaylists(event.target.checked)} label="Playlists" />
+              </div>
+
+              <div className="coursera-filter-row">
+                <Field label="Section filter (regex)">
+                  <Input value={sectionFilter} onChange={(event) => setSectionFilter(event.target.value)} placeholder="optional" aria-label="Coursera section filter" />
+                </Field>
+                <Field label="Lecture filter (regex)">
+                  <Input value={lectureFilter} onChange={(event) => setLectureFilter(event.target.value)} placeholder="optional" aria-label="Coursera lecture filter" />
+                </Field>
+                <Field label="Resource filter (regex)">
+                  <Input value={resourceFilter} onChange={(event) => setResourceFilter(event.target.value)} placeholder="optional" aria-label="Coursera resource filter" />
+                </Field>
+              </div>
+
+              <div className="coursera-format-row">
+                <Field label="Formats (whitelist)">
+                  <Input value={formatsText} onChange={(event) => setFormatsText(event.target.value)} placeholder="mp4 srt pdf" aria-label="Coursera formats whitelist" />
+                </Field>
+                <Field label="Ignored formats (blacklist)">
+                  <Input value={ignoredFormatsText} onChange={(event) => setIgnoredFormatsText(event.target.value)} placeholder="csv" aria-label="Coursera ignored formats" />
+                </Field>
+              </div>
+
+              <div className="command-actions">
+                <Button type="button" variant="primary" onClick={startDownload} disabled={!canStart || isStarting}>
+                  <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                  {isStarting ? "Processing" : "Start Download"}
+                </Button>
+                <Button type="button" variant="outline" onClick={cancelDownload} disabled={!isStarting || isCancelling}>
+                  <X aria-hidden="true" className="h-3.5 w-3.5" />
+                  {isCancelling ? "Cancelling" : "Cancel"}
+                </Button>
+                <Button type="button" variant="ghost" onClick={savePrefs} loading={isSavingPrefs} loadingLabel="Saving">
+                  <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
+                  Save preferences
                 </Button>
               </div>
-            </Field>
-
-            <Field label="Auth">
-              <div className="auth-grid">
-                <Select
-                  value={authMethod}
-                  onChange={(event) => setAuthMethod(event.target.value as AuthMethodKind)}
-                  aria-label="Coursera auth method"
-                >
-                  <option value="saved_token">Use saved CAUTH</option>
-                  <option value="cauth">Paste CAUTH cookie</option>
-                  <option value="email_password">Email + password</option>
-                </Select>
-                {authMethod === "cauth" ? (
-                  <div className="auth-cauth-row">
-                    <Input
-                      value={cauthValue}
-                      onChange={(event) => setCauthValue(event.target.value)}
-                      placeholder={hasSavedToken ? SAVED_CAUTH_PLACEHOLDER : "CAUTH cookie value"}
-                      type={showCauth ? "text" : "password"}
-                      aria-label="Coursera CAUTH"
-                    />
-                    <Tooltip label={showCauth ? "Hide CAUTH" : "Show CAUTH"}>
-                      <IconButton size="icon-sm" aria-label="Toggle CAUTH visibility" onClick={() => setShowCauth((v) => !v)}>
-                        {showCauth ? <EyeOff aria-hidden="true" className="h-3.5 w-3.5" /> : <Eye aria-hidden="true" className="h-3.5 w-3.5" />}
-                      </IconButton>
-                    </Tooltip>
-                    <Tooltip label="How to find your CAUTH cookie">
-                      <IconButton size="icon-sm" aria-label="Open CAUTH help" onClick={() => setAuthHelpOpen(true)}>
-                        <CircleHelp aria-hidden="true" className="h-3.5 w-3.5" />
-                      </IconButton>
-                    </Tooltip>
-                    <Button type="button" variant="outline" onClick={clearCauth} disabled={!hasSavedToken && !cauthValue}>
-                      <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
-                      Clear
-                    </Button>
-                  </div>
-                ) : null}
-                {authMethod === "email_password" ? (
-                  <div className="auth-credentials">
-                    <Input
-                      value={authEmail}
-                      onChange={(event) => setAuthEmail(event.target.value)}
-                      placeholder="email@example.com"
-                      type="email"
-                      aria-label="Coursera email"
-                    />
-                    <Input
-                      value={authPassword}
-                      onChange={(event) => setAuthPassword(event.target.value)}
-                      placeholder="password"
-                      type="password"
-                      aria-label="Coursera password"
-                    />
-                    <Button
-                      type="button"
-                      onClick={async () => {
-                        if (!authEmail.trim() || !authPassword) {
-                          toast.warning("Email and password required");
-                          return;
-                        }
-                        setIsAuthenticating(true);
-                        try {
-                          await invoke("coursera_login", {
-                            req: {
-                              kind: "email_password",
-                              email: authEmail.trim(),
-                              password: authPassword
-                            }
-                          });
-                          setHasSavedToken(true);
-                          setAuthStatus("signed_in");
-                          setAuthPassword("");
-                          toast.success("Signed in to Coursera");
-                        } catch (error) {
-                          toast.error("Sign-in failed", { description: String(error) });
-                          setAuthStatus("signed_out");
-                        } finally {
-                          setIsAuthenticating(false);
-                        }
-                      }}
-                      loading={isAuthenticating}
-                      loadingLabel="Signing in"
-                    >
-                      <KeyRound aria-hidden="true" className="h-3.5 w-3.5" />
-                      Sign in
-                    </Button>
-                  </div>
-                ) : null}
-              </div>
-            </Field>
+            </section>
           </div>
+        </Panel>
 
-          <div className="option-row">
-            <Field label="Resolution">
-              <Select value={resolution} onChange={(event) => setResolution(asResolution(event.target.value))} aria-label="Coursera video resolution">
-                {COURSERA_RESOLUTIONS.map((value) => (
-                  <option key={value} value={value}>{value}</option>
-                ))}
-              </Select>
-            </Field>
-            <Field label="Subtitle lang">
-              <Input
-                value={subtitleLanguage}
-                onChange={(event) => setSubtitleLanguage(event.target.value)}
-                placeholder="all"
-                aria-label="Coursera subtitle language"
-              />
-            </Field>
-            <Field label="Parallel jobs">
-              <Input
-                value={parallelJobs}
-                type="number"
-                min={1}
-                onChange={(event) => setParallelJobs(clampPositiveInt(Number(event.target.value), 1, 1))}
-                aria-label="Coursera parallel jobs"
-              />
-            </Field>
-            <Field label="Delay (s)">
-              <Input
-                value={delaySeconds}
-                type="number"
-                min={0}
-                onChange={(event) => setDelaySeconds(clampPositiveInt(Number(event.target.value), 0, 0))}
-                aria-label="Coursera download delay"
-              />
-            </Field>
+        <Panel className="table-panel queue-panel">
+          <div className="table-panel-header">
+            <h3>Download Queue</h3>
+            <div className="table-panel-header-status">
+              <span>{jobs.length > 0 ? queueSummary : parsedClasses.length > 0 ? `${parsedClasses.length} parsed` : "0 active"}</span>
+              <span className="queue-url-hint" title="Right-click a queued course to copy its URL">
+                <Copy aria-hidden="true" className="h-3 w-3" />
+                Right-click to copy URL
+              </span>
+              {queueCounts.failed > 0 ? (
+                <button type="button" className="queue-clear-button" aria-label="Clear failed queue items" onClick={clearFailed}>
+                  Clear
+                </button>
+              ) : null}
+            </div>
           </div>
-
-          <div className="download-toggles">
-            <Checkbox checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Quizzes" />
-            <Checkbox checked={downloadNotebooks} onChange={(event) => setDownloadNotebooks(event.target.checked)} label="Notebooks" />
-            <Checkbox checked={downloadAbout} onChange={(event) => setDownloadAbout(event.target.checked)} label="About page" />
-            <Checkbox checked={resume} onChange={(event) => setResume(event.target.checked)} label="Resume" />
-            <Checkbox checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} label="Overwrite" />
-            <Checkbox checked={generatePlaylists} onChange={(event) => setGeneratePlaylists(event.target.checked)} label="Playlists" />
+          <div className="queue-section-tabs" role="group" aria-label="Coursera download queue sections">
+            <CourseraQueueSectionTab section="queue" label="Queue" value={liveJobs.length > 0 ? liveJobs.length : parsedClasses.length} tone="queue" selected={queueSection === "queue"} onClick={() => setQueueSection("queue")} />
+            <CourseraQueueSectionTab section="active" label="Active" value={queueCounts.active} tone="primary" selected={queueSection === "active"} onClick={() => setQueueSection("active")} />
+            <CourseraQueueSectionTab section="completed" label="Completed" value={queueCounts.completed} tone="success" selected={queueSection === "completed"} onClick={() => setQueueSection("completed")} />
+            <CourseraQueueSectionTab section="failed" label="Failed" value={queueCounts.failed} tone="danger" selected={queueSection === "failed"} onClick={() => setQueueSection("failed")} />
           </div>
-
-          <div className="filter-row">
-            <Field label="Section filter (regex)">
-              <Input value={sectionFilter} onChange={(event) => setSectionFilter(event.target.value)} placeholder="optional" aria-label="Coursera section filter" />
-            </Field>
-            <Field label="Lecture filter (regex)">
-              <Input value={lectureFilter} onChange={(event) => setLectureFilter(event.target.value)} placeholder="optional" aria-label="Coursera lecture filter" />
-            </Field>
-            <Field label="Resource filter (regex)">
-              <Input value={resourceFilter} onChange={(event) => setResourceFilter(event.target.value)} placeholder="optional" aria-label="Coursera resource filter" />
-            </Field>
+          <div className={`queue-section-panel queue-section-panel-${queueSection}`} aria-label={`${queueSection} Coursera downloads`}>
+            <CourseraQueueTable
+              jobs={queueSection === "queue" ? liveJobs : queueSection === "active" ? activeJobs : queueSection === "completed" ? completedJobs : failedJobs}
+              parsedClasses={queueSection === "queue" ? parsedClasses : []}
+              emptyTitle={queueSection === "queue" ? "No active downloads" : `No ${queueSection} downloads`}
+              emptyDescription={queueSection === "queue"
+                ? "Parsed courses and queued jobs appear here after Start Download."
+                : queueSection === "active"
+                  ? "Active courses appear here while they are processing."
+                  : queueSection === "completed"
+                    ? "Completed courses appear here after processing."
+                    : "Failed or cancelled courses appear here for retry or removal."}
+              selectedSlugs={selectedSlugs}
+              onToggle={(slug) => setSelectedSlugs((prev) => prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug])}
+              onRetry={retryJob}
+              onClearFailed={clearFailedJob}
+              onCopyUrl={copyCourseraUrl}
+              onOpenFolder={queueSection === "completed" ? openJobFolder : undefined}
+              clearingJobId={clearingJobId}
+            />
           </div>
-
-          <div className="filter-row">
-            <Field label="Formats (whitelist)">
-              <Input value={formatsText} onChange={(event) => setFormatsText(event.target.value)} placeholder="mp4 srt pdf" aria-label="Coursera formats whitelist" />
-            </Field>
-            <Field label="Ignored formats (blacklist)">
-              <Input value={ignoredFormatsText} onChange={(event) => setIgnoredFormatsText(event.target.value)} placeholder="csv" aria-label="Coursera ignored formats" />
-            </Field>
-          </div>
-
-          <div className="command-actions">
-            <Button type="button" variant="primary" onClick={startDownload} disabled={!canStart || isStarting}>
-              <Play aria-hidden="true" className="h-3.5 w-3.5" />
-              {isStarting ? "Processing" : "Start Download"}
-            </Button>
-            <Button type="button" variant="outline" onClick={cancelDownload} disabled={!isStarting || isCancelling}>
-              <X aria-hidden="true" className="h-3.5 w-3.5" />
-              {isCancelling ? "Cancelling" : "Cancel"}
-            </Button>
-            <Button type="button" variant="ghost" onClick={savePrefs} loading={isSavingPrefs} loadingLabel="Saving">
-              <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
-              Save preferences
-            </Button>
-          </div>
-        </div>
-      </Panel>
-
-      <Panel className="table-panel">
-        <div className="table-panel-header">
-          <h3>Download Queue</h3>
-          <div className="table-panel-header-status">
-            <span>{jobs.length > 0 ? queueSummary : parsedClasses.length > 0 ? `${parsedClasses.length} parsed` : "0 active"}</span>
-            {activitySummary.failed > 0 ? (
-              <button
-                type="button"
-                className="queue-clear-button"
-                aria-label="Clear failed queue items"
-                onClick={clearFailed}
-              >
-                Clear
-              </button>
-            ) : null}
-          </div>
-        </div>
-        <CourseraQueueTable
-          jobs={liveJobs}
-          parsedClasses={parsedClasses}
-          selectedSlugs={selectedSlugs}
-          onToggle={(slug) => {
-            setSelectedSlugs((prev) =>
-              prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug]
-            );
-          }}
-          onRetry={retryJob}
-          onClearFailed={clearFailedJob}
-          clearingJobId={clearingJobId}
-        />
-      </Panel>
-    </div>
-
-    <Panel className="lv-activity">
-      <div className="activity-summary-grid">
-        <ActivitySummaryChip label="Active" value={activitySummary.active} tone="primary" />
-        <ActivitySummaryChip label="Completed" value={activitySummary.completed} tone="success" />
-        <ActivitySummaryChip label="Failed" value={activitySummary.failed} tone="danger" />
+        </Panel>
       </div>
-      <div className="activity-section">
-        <div className="activity-section-header">
-          <h4>Recent Activity</h4>
-        </div>
-        <ActivityLog events={activityEvents} />
-      </div>
-      <div className="activity-section completed-section">
-        <div className="activity-section-header">
-          <h4>Completed</h4>
-        </div>
-        <CourseraCompletedTable jobs={completedJobs} onOpenFolder={openJobFolder} />
-      </div>
-    </Panel>
 
       <Dialog
         open={authHelpOpen}
@@ -987,7 +970,7 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
 
 function isLiveStatus(status: string): boolean {
   const lower = status.toLowerCase();
-  return lower !== "completed";
+  return lower !== "completed" && lower !== "cancelled";
 }
 
 function splitList(input: string): string[] {
@@ -1056,9 +1039,10 @@ function formatEventTime(timestamp: number): string {
 }
 
 function eventTone(eventType: string): string | undefined {
-  if (eventType.includes("failed") || eventType.includes("error")) return "danger";
-  if (eventType.includes("completed") || eventType.includes("extracted")) return "success";
-  if (eventType.includes("cancelled") || eventType.includes("skipped")) return "muted";
+  const normalized = eventType.toLowerCase();
+  if (normalized.includes("failed") || normalized.includes("error")) return "danger";
+  if (normalized.includes("completed") || normalized.includes("extracted")) return "success";
+  if (normalized.includes("cancelled") || normalized.includes("skipped")) return "muted";
   return "primary";
 }
 
@@ -1067,44 +1051,6 @@ function activityDotClass(tone?: string): string {
   if (tone === "success") return "bg-success";
   if (tone === "muted") return "bg-muted";
   return "bg-primary";
-}
-
-type ActivityRow = [time: string, label: string, tone?: string];
-
-function buildActivityRows(events: PersistedCourseraEvent[]): ActivityRow[] {
-  return events.slice(0, 80).map((event) => {
-    let label = event.eventType;
-    try {
-      const payload = JSON.parse(event.payloadJson) as { message?: string };
-      if (payload && typeof payload.message === "string") {
-        label = payload.message;
-      }
-    } catch {
-      // ignore — use event type as fallback label
-    }
-    return [formatEventTime(event.createdAt), label, eventTone(event.eventType)] as ActivityRow;
-  });
-}
-
-function ActivitySummaryChip({ label, value, tone }: { label: string; value: number; tone: "primary" | "success" | "danger" }) {
-  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} tone={tone} />;
-}
-
-function ActivityLog({ events }: { events: ActivityRow[] }) {
-  return (
-    <ol className="activity-list">
-      {events.length > 0 ? events.map(([time, label, tone], index) => (
-        <ActivityEventRow
-          key={`${time}-${index}-${label}`}
-          time={time}
-          label={label}
-          dotClassName={activityDotClass(tone)}
-        />
-      )) : (
-        <li className="activity-empty-row">No persisted activity yet.</li>
-      )}
-    </ol>
-  );
 }
 
 function PreviewStat({ label, value }: { label: string; value: number | string }) {
@@ -1116,6 +1062,39 @@ function PreviewStat({ label, value }: { label: string; value: number | string }
   );
 }
 
+function CourseraQueueSectionTab({
+  section,
+  label,
+  value,
+  tone,
+  selected,
+  onClick
+}: {
+  section: CourseraQueueSection;
+  label: string;
+  value: number;
+  tone: "queue" | "primary" | "success" | "danger";
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`queue-section-tab${selected ? " is-selected" : ""}`}
+      data-section={section}
+      data-tone={tone}
+      aria-pressed={selected}
+      onClick={onClick}
+    >
+      <span className="queue-section-tab-label">
+        <span className="queue-section-tab-dot" aria-hidden="true" />
+        {label}
+      </span>
+      <strong>{value}</strong>
+    </button>
+  );
+}
+
 function CourseraQueueTable({
   jobs,
   parsedClasses,
@@ -1123,6 +1102,10 @@ function CourseraQueueTable({
   onToggle,
   onRetry,
   onClearFailed,
+  onCopyUrl,
+  onOpenFolder,
+  emptyTitle = "No active downloads",
+  emptyDescription,
   clearingJobId
 }: {
   jobs: CourseraJob[];
@@ -1131,6 +1114,10 @@ function CourseraQueueTable({
   onToggle: (slug: string) => void;
   onRetry: (job: CourseraJob) => void | Promise<void>;
   onClearFailed: (job: CourseraJob) => void | Promise<void>;
+  onCopyUrl: (job: CourseraJob) => void | Promise<void>;
+  onOpenFolder?: (job: CourseraJob) => void | Promise<void>;
+  emptyTitle?: string;
+  emptyDescription?: string;
   clearingJobId: string | null;
 }) {
   return (
@@ -1139,6 +1126,7 @@ function CourseraQueueTable({
         <span>Status</span>
         <span>Course</span>
         <span>Progress</span>
+        <span className="queue-actions-heading">Actions</span>
       </DataTableHeader>
       {jobs.length > 0 ? (
         jobs.map((job) => (
@@ -1147,6 +1135,8 @@ function CourseraQueueTable({
             job={job}
             onRetry={onRetry}
             onClearFailed={onClearFailed}
+            onCopyUrl={onCopyUrl}
+            onOpenFolder={onOpenFolder}
             clearing={clearingJobId === job.id}
           />
         ))
@@ -1163,7 +1153,8 @@ function CourseraQueueTable({
                   <div className="truncate text-soft" title={course.normalizedUrl}>{course.normalizedUrl}</div>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+              <span className="text-muted">Waiting</span>
+              <div className="queue-row-actions queue-selection-actions">
                 <Checkbox
                   checked={checked}
                   onChange={() => onToggle(course.slug)}
@@ -1175,8 +1166,8 @@ function CourseraQueueTable({
         })
       ) : (
         <EmptyRow
-          title="No active Coursera downloads"
-          description="Parse a course slug above and click Start Download to queue it."
+          title={emptyTitle}
+          description={emptyDescription ?? "Parsed courses and queued jobs appear here after Start Download."}
         />
       )}
     </DataTable>
@@ -1187,11 +1178,15 @@ function CourseraQueueJobRow({
   job,
   onRetry,
   onClearFailed,
+  onCopyUrl,
+  onOpenFolder,
   clearing
 }: {
   job: CourseraJob;
   onRetry: (job: CourseraJob) => void | Promise<void>;
   onClearFailed: (job: CourseraJob) => void | Promise<void>;
+  onCopyUrl: (job: CourseraJob) => void | Promise<void>;
+  onOpenFolder?: (job: CourseraJob) => void | Promise<void>;
   clearing: boolean;
 }) {
   const counts = parseCourseraArtifactCounts(job.countsJson);
@@ -1201,7 +1196,14 @@ function CourseraQueueJobRow({
   const tone = job.status.toLowerCase();
   const canClear = tone === "failed" || tone === "cancelled";
   return (
-    <DataTableRow className="queue-table-row">
+    <DataTableRow
+      className="queue-table-row"
+      title="Right-click to copy this course URL"
+      onContextMenu={(event) => {
+        event.preventDefault();
+        void onCopyUrl(job);
+      }}
+    >
       <StatusBadge
         tone={tone === "completed" ? "success" : tone === "failed" ? "danger" : tone === "cancelled" ? "muted" : "primary"}
         dotClassName={activityDotClass(eventTone(job.status))}
@@ -1232,21 +1234,34 @@ function CourseraQueueJobRow({
       <div className="table-progress-cell">
         <Progress value={percent} />
         <span>{percent}%</span>
+      </div>
+      <div className="queue-row-actions">
+        {tone === "completed" && onOpenFolder ? (
+          <Tooltip label="Open output folder">
+            <IconButton
+              type="button"
+              aria-label={`Open output folder for ${job.className}`}
+              onClick={() => void onOpenFolder(job)}
+              className="queue-open-folder-button"
+              disabled={!job.outputDir}
+            >
+              <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
+            </IconButton>
+          </Tooltip>
+        ) : null}
         {canClear ? (
-          <div className="queue-row-actions">
-            <Tooltip label="Clear failed attempt">
-              <IconButton
-                type="button"
-                aria-label={`Clear failed attempt for ${job.className}`}
-                onClick={() => onClearFailed(job)}
-                className="queue-remove-button"
-                loading={clearing}
-                disabled={clearing}
-              >
-                <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
-              </IconButton>
-            </Tooltip>
-          </div>
+          <Tooltip label="Clear failed attempt">
+            <IconButton
+              type="button"
+              aria-label={`Clear failed attempt for ${job.className}`}
+              onClick={() => onClearFailed(job)}
+              className="queue-remove-button"
+              loading={clearing}
+              disabled={clearing}
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+            </IconButton>
+          </Tooltip>
         ) : null}
       </div>
     </DataTableRow>
@@ -1260,37 +1275,6 @@ function derivedTotal(counts: ReturnType<typeof parseCourseraArtifactCounts>): n
     counts.quizTotal +
     counts.notebookTotal +
     counts.supplementTotal
-  );
-}
-
-function CourseraCompletedTable({ jobs, onOpenFolder }: { jobs: CourseraJob[]; onOpenFolder: (job: CourseraJob) => void | Promise<void> }) {
-  return (
-    <DataTable className="completed-list completed-table">
-      {jobs.length > 0 ? jobs.map((job) => (
-        <CourseraCompletedRow key={job.id} job={job} onOpenFolder={onOpenFolder} />
-      )) : (
-        <EmptyRow compact title="No completed Coursera courses" description="Finished courses will appear here after processing." />
-      )}
-    </DataTable>
-  );
-}
-
-function CourseraCompletedRow({ job, onOpenFolder }: { job: CourseraJob; onOpenFolder: (job: CourseraJob) => void | Promise<void> }) {
-  const counts = parseCourseraArtifactCounts(job.countsJson);
-  const total = counts.total > 0 ? counts.total : derivedTotal(counts);
-  return (
-    <div className="completed-row">
-      <span className={`status-dot ${activityDotClass(eventTone(job.status))}`} />
-      <div className="min-w-0">
-        <div className="truncate font-medium" title={job.className}>{job.className}</div>
-        <div className="truncate text-soft" title={job.outputDir}>
-          Completed - {formatEventTime(job.updatedAt)} - {total > 0 ? `${counts.completed} of ${total} files` : "0 files"}
-        </div>
-      </div>
-      <Button size="sm" variant="ghost" disabled={!job.outputDir} onClick={() => onOpenFolder(job)}>
-        Open Folder
-      </Button>
-    </div>
   );
 }
 

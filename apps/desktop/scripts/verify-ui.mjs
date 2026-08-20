@@ -39,6 +39,18 @@ for (const required of [
 }
 
 for (const required of [
+  "queueNeedsSessionRefresh",
+  "isLinkedInSessionError",
+  "copyQueuedCourseUrl",
+  "copyTextToClipboard",
+  "onContextMenu",
+  "Right-click to copy this course URL",
+  "Resume queue"
+]) {
+  assert.ok(app.includes(required), `LinkedIn queue recovery is missing: ${required}`);
+}
+
+for (const required of [
   "Select newspaper editions",
   "Regional",
   "Weekly",
@@ -144,6 +156,7 @@ assert.ok(app.indexOf('className="lv-sidebar-reopen"') < app.indexOf('className=
 assert.ok(app.includes('className="settings-dialog"'), "Settings must own a compact responsive dialog contract.");
 assert.ok(app.includes("lv-sidebar-optimization"), "Sidebar runtime status needs an intrinsic-width owner.");
 assert.ok(css.includes(".settings-dialog") && css.includes("overflow-x: hidden"), "Settings must not expose a horizontal scroll surface.");
+assert.ok(css.includes(".queue-url-hint") && css.includes(".queue-session-warning"), "LinkedIn queue recovery needs copy and session-refresh affordances.");
 assert.ok(css.includes(".lv-sidebar-optimization > span") && css.includes("text-overflow: ellipsis"), "Sidebar runtime text can widen the navigation rail.");
 assert.ok(!library.includes(">Read</Button>"), "Opening a newspaper must be owned by the whole library row.");
 assert.ok(!library.includes("Register archive") && !library.includes("Repair existing"), "Archive maintenance belongs in Settings, not the Library toolbar.");
@@ -157,7 +170,9 @@ assert.ok(css.includes("minmax(280px, 0.96fr) minmax(340px, 1.08fr) minmax(300px
 assert.ok(css.includes('grid-template-areas: "editions settings schedule"'), "Download settings must sit between editions and schedule.");
 assert.ok(css.includes("minmax(380px, 0.64fr) minmax(240px, 0.56fr)"), "Compact dispatch row must reserve useful height for Progress.");
 assert.ok(css.includes(".newspaper-progress-actions") && css.includes("opacity: 0"), "Queue actions must reveal on hover or focus.");
-assert.ok(css.includes("@media (max-width: 1120px)"), "Newspaper view needs the approved responsive collapse.");
+assert.ok(css.includes("@container lv-main (max-width: 900px)"), "Newspaper view needs the container-based responsive collapse.");
+assert.ok(css.includes("@container lv-main (max-width: 650px)"), "Newspaper view needs the narrow newspaper stack.");
+assert.ok(css.includes(".newspaper-dispatch-panel {\n    min-height: 380px;"), "Compact newspaper panels must retain usable height before the schedule row.");
 assert.ok(css.includes("width: 100vw") && css.includes("height: 100vh"), "Reader must occupy the full window.");
 assert.ok(css.includes("conic-gradient(var(--accent) var(--reading-progress)"), "Reading progress needs the circular library indicator.");
 assert.ok(css.includes(".newspaper-library-toolbar .newspaper-search input") && css.includes("height: 2.25rem"), "Library search must match adjacent control height.");

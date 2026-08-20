@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="470" height="95" viewBox="0 10 470 95" role="img" aria-labelledby="title desc">
-  <title id="title">LinkVault Course Downloader</title>
-  <desc id="desc">Transparent LinkVault Course Downloader wordmark.</desc>
+  <title id="title">LinkVault Archive Workspace</title>
+  <desc id="desc">Transparent LinkVault Archive Workspace wordmark.</desc>
   <defs>
     <linearGradient id="linkedin-box" x1="14" y1="14" x2="108" y2="100" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#1697e8"/>
@@ -14,11 +14,11 @@
       <stop offset="0" stop-color="#9ee954"/>
       <stop offset="1" stop-color="#35a525"/>
     </linearGradient>
-    <linearGradient id="course-text" x1="211" y1="18" x2="361" y2="58" gradientUnits="userSpaceOnUse">
+    <linearGradient id="archive-text" x1="211" y1="18" x2="361" y2="58" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#0d79d3"/>
       <stop offset="1" stop-color="#0a4ea7"/>
     </linearGradient>
-    <linearGradient id="download-text" x1="211" y1="66" x2="450" y2="97" gradientUnits="userSpaceOnUse">
+    <linearGradient id="workspace-text" x1="211" y1="66" x2="450" y2="97" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#80d13f"/>
       <stop offset="1" stop-color="#46aa2b"/>
     </linearGradient>
@@ -48,7 +48,7 @@
   </g>
 
   <g font-family="Arial, Helvetica, sans-serif" font-weight="800" letter-spacing="0">
-    <text x="209" y="52" fill="url(#course-text)" font-size="42">Course</text>
-    <text x="210" y="93" fill="url(#download-text)" font-size="34">Downloader</text>
+    <text x="209" y="52" fill="url(#archive-text)" font-size="42">Archive</text>
+    <text x="210" y="93" fill="url(#workspace-text)" font-size="34">Workspace</text>
   </g>
 </svg>
