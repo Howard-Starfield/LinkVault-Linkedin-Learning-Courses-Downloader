@@ -227,6 +227,8 @@ Only download content you are allowed to access and archive. LinkVault does not 
 
 ## License
 
-LinkVault's original code is proprietary and all rights are reserved. Third-party dependencies retain their own licenses. See `LICENSE` and `THIRD_PARTY_NOTICES.md` for details.
+LinkVault is open source and licensed under the [MIT License](LICENSE).
 
-Copyright (c) 2026 Howard Deng. All rights reserved.
+Third-party dependencies remain governed by their respective license terms. See `THIRD_PARTY_NOTICES.md` for details.
+
+Copyright (c) 2026 Howard Deng.
