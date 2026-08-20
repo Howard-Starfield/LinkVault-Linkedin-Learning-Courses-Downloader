@@ -2,7 +2,21 @@
 
 ## An open-source local archive workspace
 
-![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)
+## Screenshots
+
+Click any screenshot to open the full-size image.
+
+### Course download queue
+
+[![LinkVault course download queue](docs/images/linkvault-download-queue.webp)](docs/images/linkvault-download-queue.webp)
+
+### Newspaper library
+
+[![LinkVault World Journal newspaper library](docs/images/linkvault-newspaper-library.webp)](docs/images/linkvault-newspaper-library.webp)
+
+### LinkedIn session guide
+
+[![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)](apps/desktop/src/assets/guide.png)
 
 LinkVault is a Windows-first desktop application for collecting, organizing,
 reading, and studying content you are allowed to access. It combines course
