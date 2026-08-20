@@ -2,7 +2,9 @@
 
 ![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)
 
-LinkVault helps you save LinkedIn Learning and Coursera courses you can access, plus World Journal newspaper editions, into organized local archives.
+LinkVault is a local-first desktop application for organizing and archiving learning materials and publications that users are authorized to access and save. It can work with supported sources such as LinkedIn Learning, Coursera, and World Journal to create organized local archives for offline study and personal knowledge management.
+
+LinkVault is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by LinkedIn, Coursera, World Journal, or their respective owners.
 
 ## What You Can Do
 
@@ -221,13 +223,23 @@ npm run verify:installer
 npm run verify:release-manifest
 ```
 
-## Responsible Use / Ownership
+## Responsible Use / Third-Party Services
 
-Only download content you are allowed to access and archive. LinkVault does not bypass DRM, paid access controls, or site restrictions.
+LinkVault is intended for personal archiving, offline study, and knowledge management of material that you are legally and contractually permitted to access, download, or export.
+
+- You are responsible for complying with applicable laws, copyright rules, licenses, and the terms of service of any third-party provider you use with LinkVault.
+- Access to a service or possession of valid account credentials does not automatically grant permission to copy, redistribute, or retain its content.
+- LinkVault does not grant any license or other rights to third-party content, services, trademarks, or APIs.
+- LinkVault is not intended to bypass DRM, authentication, paywalls, access controls, or other technical restrictions.
+- Do not use LinkVault to redistribute copyrighted material or content you do not have permission to save.
+
+Third-party services can change their rules, APIs, authentication methods, and technical restrictions at any time. Users should confirm that their intended use is permitted by the relevant provider.
 
 ## License
 
 LinkVault is open source and licensed under the [MIT License](LICENSE).
+
+The MIT License applies to LinkVault's original source code and documentation. It does not grant rights to third-party content, services, trademarks, APIs, or other materials accessed through the software.
 
 Third-party dependencies remain governed by their respective license terms. See `THIRD_PARTY_NOTICES.md` for details.
 
