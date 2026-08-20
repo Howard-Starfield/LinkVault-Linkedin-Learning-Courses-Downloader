@@ -246,6 +246,25 @@ try {
     await page.locator('[data-testid="newspaper-reader-page-image"]').first().waitFor();
     assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "100%");
     assert.equal(await page.getByLabel("Newspaper page tone").inputValue(), "soft");
+    const manifestCallsBeforePreferenceRerender = await page.evaluate(
+      () => window.__NEWSPAPER_PERF__.commandCounts.get_newspaper_reader_manifest ?? 0
+    );
+    await page.evaluate(() => {
+      window.dispatchEvent(new CustomEvent("linkvault:newspaper-reader-preferences", {
+        detail: { defaultZoom: 1, clickZoom: 1.2, pageTone: "soft" }
+      }));
+    });
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(
+      await page.evaluate(() => window.__NEWSPAPER_PERF__.commandCounts.get_newspaper_reader_manifest ?? 0),
+      manifestCallsBeforePreferenceRerender,
+      "A parent-only Reader preference rerender reloaded the manifest"
+    );
+    assert.equal(
+      await page.locator(".newspaper-reader-loading").count(),
+      0,
+      "A parent-only Reader preference rerender showed a loading flash"
+    );
     await page.waitForFunction(() => {
       const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
       const image = document.querySelector('[data-testid="newspaper-reader-page-image"]');

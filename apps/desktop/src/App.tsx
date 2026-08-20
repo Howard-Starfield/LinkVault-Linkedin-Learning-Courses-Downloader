@@ -10,6 +10,7 @@ import {
   ChevronDown,
   CircleHelp,
   Clock3,
+  Copy,
   Download,
   Folder,
   FolderOpen,
@@ -32,7 +33,6 @@ import { IconBrandLinkedin, IconCertificate, IconMovie } from "@tabler/icons-rea
 import liAtCookieGuide from "./assets/guide.png";
 import linkvaultLogo from "./assets/linkvault-wordmark.png";
 import {
-  ActivityEventRow,
   Button,
   Checkbox,
   DataTable,
@@ -49,7 +49,6 @@ import {
   Select,
   SidebarItem,
   StatusBadge,
-  SummaryChip,
   Switch,
   Textarea,
   Tooltip,
@@ -124,11 +123,6 @@ type VideoDownloadArtifact = {
   updated_at: number;
 };
 
-type VideoActivityItem = {
-  artifact: VideoDownloadArtifact;
-  job: QueuedDownloadJob;
-};
-
 type ArtifactProgressCounts = {
   total: number;
   completed: number;
@@ -158,8 +152,8 @@ type PersistedJobEvent = {
   created_at: number;
 };
 
-type ActivityRow = [time: string, label: string, tone?: string];
 type ActivityFilter = "active" | "completed" | "failed";
+type DownloadQueueSection = "queue" | ActivityFilter;
 
 type StartDownloadResponse = {
   jobs: QueuedDownloadJob[];
@@ -253,9 +247,7 @@ const DOWNLOAD_DELAY_STORAGE_KEY = "linkvault.downloadDelaySeconds";
 const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
-const COMPLETED_DOWNLOAD_PAGE_SIZE = 6;
-const VIDEO_ACTIVITY_PAGE_SIZE = 12;
-const APP_VERSION = "0.2.18";
+const APP_VERSION = "0.2.20";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings";
 
@@ -321,6 +313,7 @@ export default function App() {
   const [downloadQuizzes, setDownloadQuizzes] = useState(true);
   const [parsedCourses, setParsedCourses] = useState<ParsedCourse[]>([]);
   const [hasSavedToken, setHasSavedToken] = useState(false);
+  const [queueNeedsSessionRefresh, setQueueNeedsSessionRefresh] = useState(false);
   const [isValidatingToken, setIsValidatingToken] = useState(false);
   const [isQueueingDownload, setIsQueueingDownload] = useState(false);
   const [isProcessingDownload, setIsProcessingDownload] = useState(false);
@@ -366,11 +359,9 @@ export default function App() {
   const [pendingUpdate, setPendingUpdate] = useState<UpdateMetadata | null>(null);
   const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
   const [queuedJobs, setQueuedJobs] = useState<QueuedDownloadJob[]>([]);
-  const [persistedEvents, setPersistedEvents] = useState<PersistedJobEvent[]>([]);
   const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
   const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
-  const [activityFilter, setActivityFilter] = useState<ActivityFilter | null>("active");
-  const [clearingTaskId, setClearingTaskId] = useState<string | null>(null);
+  const [queueSection, setQueueSection] = useState<DownloadQueueSection>("queue");
   const [activeView, setActiveView] = useState<AppView>("downloads");
   const [clippingGallerySummary, setClippingGallerySummary] = useState<{
     total: number;
@@ -383,7 +374,6 @@ export default function App() {
   const [isCourseraExpanded, setIsCourseraExpanded] = useState(true);
   const [isNewspaperExpanded, setIsNewspaperExpanded] = useState(true);
   const [theme, setTheme] = useState<AppTheme>(readInitialTheme);
-  const [processingSummary, setProcessingSummary] = useState<ProcessQueuedDownloadResponse | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
@@ -533,7 +523,7 @@ export default function App() {
     async function checkDueSchedules() {
       const state = await refreshBootstrapState();
       if (disposed || !state) return;
-      if (hasReadyQueuedJobs(state.persisted_jobs)) {
+      if (!queueNeedsSessionRefresh && hasReadyQueuedJobs(state.persisted_jobs)) {
         ensureDownloadProcessing(true);
       }
     }
@@ -544,7 +534,7 @@ export default function App() {
       disposed = true;
       window.clearInterval(intervalId);
     };
-  }, [hasSavedToken, delaySeconds]);
+  }, [hasSavedToken, delaySeconds, queueNeedsSessionRefresh]);
 
   useEffect(() => {
     const storedRaw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
@@ -764,7 +754,6 @@ export default function App() {
       if (previewState) {
         setQueuedJobs(previewState.jobs);
         setHasSavedToken(hasPreviewSavedToken());
-        setPersistedEvents(previewState.events);
         setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
         setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
@@ -798,9 +787,7 @@ export default function App() {
 
       setQueuedJobs((previous) => serializedStateEqual(previous, state.persisted_jobs) ? previous : state.persisted_jobs);
       setHasSavedToken(state.has_saved_token);
-      const nextEvents = state.recent_events ?? [];
       const nextHistory = state.download_history ?? [];
-      setPersistedEvents((previous) => serializedStateEqual(previous, nextEvents) ? previous : nextEvents);
       setDownloadHistory((previous) => serializedStateEqual(previous, nextHistory) ? previous : nextHistory);
       setDownloadHistoryFilePath(state.download_history_file_path ?? "");
       return state;
@@ -810,7 +797,6 @@ export default function App() {
       if (previewState) {
         setQueuedJobs(previewState.jobs);
         setHasSavedToken(hasPreviewSavedToken());
-        setPersistedEvents(previewState.events);
         setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
         setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
@@ -886,7 +872,10 @@ export default function App() {
 
   const liveQueueJobs = queuedJobs.filter((job) => shouldShowInLiveQueue(job.status));
   const completedJobs = completedCourseJobs(queuedJobs);
+  const activeJobs = jobsForActivityFilter(queuedJobs, "active");
+  const failedJobs = jobsForActivityFilter(queuedJobs, "failed");
   const displayedQueueJobs = liveQueueJobs;
+  const queueSectionCount = displayedQueueJobs.length > 0 ? displayedQueueJobs.length : parsedCourses.length;
   const pausableQueueJobs = liveQueueJobs.filter((job) => job.status === "active" || job.status === "queued");
   const activeDownloadJob = pausableQueueJobs.find((job) => job.status === "active") ?? null;
   const allPausableJobsPaused = pausableQueueJobs.length > 0 && pausableQueueJobs.every((job) => job.paused);
@@ -894,19 +883,6 @@ export default function App() {
   const immediateQueuedCount = queuedJobs.filter((job) => job.status === "queued" && !job.paused && !job.scheduled_at).length;
   const scheduledCount = queuedJobs.filter(isScheduledJob).length;
   const pausedCount = pausableQueueJobs.filter((job) => job.paused).length;
-  const persistedActivityEvents = coalesceActivityEvents(persistedEvents);
-  const videoActivityItems = queuedJobs.flatMap((job) =>
-    (job.video_artifacts ?? []).map((artifact) => ({ artifact, job }))
-  );
-  const activeVideoItems = videoActivityItems.filter(({ artifact, job }) =>
-    job.status === "active" && (artifact.status === "pending" || artifact.status === "active")
-  );
-  const completedVideoItems = videoActivityItems
-    .filter(({ artifact }) => artifact.status === "completed")
-    .sort((left, right) => right.artifact.updated_at - left.artifact.updated_at);
-  const failedVideoItems = videoActivityItems
-    .filter(({ artifact }) => artifact.status === "failed" || artifact.status === "cancelled")
-    .sort((left, right) => right.artifact.updated_at - left.artifact.updated_at);
 
   const queueSummary = queuedJobs.length > 0
     ? ([
@@ -919,36 +895,18 @@ export default function App() {
       ].filter(Boolean).join(" - ") || "0 active")
     : "No persisted jobs";
 
-  const activityEvents = processingSummary?.processed
-    ? [
-        [
-          "Now",
-          `Processed queued job: ${processingSummary.completed_artifacts} completed, ${processingSummary.failed_artifacts} failed, ${processingSummary.cancelled_artifacts} cancelled`,
-          processingSummary.failed_artifacts > 0 ? "danger" : "success"
-        ],
-        ...persistedActivityEvents
-      ] satisfies ActivityRow[]
-    : persistedActivityEvents;
-
   const activitySummary = {
-    active: activeVideoItems.length,
-    completed: completedVideoItems.length,
-    failed: failedVideoItems.length + queuedJobs.filter((job) =>
-      (job.status === "failed" || job.status === "cancelled") && (job.video_artifacts?.length ?? 0) === 0
-    ).length
+    active: activeJobs.length,
+    completed: completedJobs.length,
+    failed: failedJobs.length
   };
-  const failedCourseJobsWithoutVideos = jobsForActivityFilter(queuedJobs, "failed").filter(
-    (job) => (job.video_artifacts?.length ?? 0) === 0
-  );
 
   async function clearFailedQueueItems() {
     if (activitySummary.failed === 0) return;
     try {
       const state = await clearFailedDownloadJobs();
       setQueuedJobs(state.persisted_jobs);
-      setPersistedEvents(state.recent_events ?? []);
       setHasSavedToken(state.has_saved_token);
-      setProcessingSummary(null);
       toast.info("Failed queue cleared", {
         description: "Failed and cancelled items were removed from the queue."
       });
@@ -959,69 +917,6 @@ export default function App() {
 
   function updateDelaySeconds(value: string) {
     setDelaySeconds(normalizeDelaySeconds(value));
-  }
-
-  async function clearStatusTask(job: QueuedDownloadJob) {
-    if (clearingTaskId) return;
-    const title = courseDisplayName(job);
-    let confirmationMessage: string;
-
-    if (job.status === "active") {
-      confirmationMessage = `Cancel ${title}?\n\nThe active download will stop at the next safe boundary. Other queued and scheduled courses will remain in the queue.`;
-    } else if (job.status === "completed") {
-      confirmationMessage = `Delete ${title}?\n\nThis permanently deletes the completed course folder and removes its task record. This cannot be undone.`;
-    } else {
-      confirmationMessage = `Remove ${title} from LinkVault?\n\nOnly the failed task record will be removed. Any partial files will stay on disk.`;
-    }
-
-    if (!window.confirm(confirmationMessage)) return;
-    setClearingTaskId(job.id);
-
-    try {
-      if (job.status === "active") {
-        cancellationRequestedRef.current = true;
-        setIsCancellingDownload(true);
-        const response = await requestActiveDownloadCancellation(job.id);
-        if (response.cancellation_requested) {
-          toast.info("Cancellation requested", {
-            description: `${title} will stop at the next safe cancellation boundary.`
-          });
-        }
-        await refreshBootstrapState();
-        return;
-      }
-
-      const state = job.status === "completed"
-        ? await deleteCompletedDownload(job.id)
-        : await removeDownloadQueueItem(job.id);
-      setQueuedJobs(state.persisted_jobs);
-      setPersistedEvents(state.recent_events ?? []);
-      setDownloadHistory(state.download_history ?? []);
-      setHasSavedToken(state.has_saved_token);
-      setProcessingSummary(null);
-
-      if (job.status === "completed") {
-        toast.success("Completed course deleted", {
-          description: `${title}'s course folder and task record were removed.`
-        });
-      } else {
-        toast.info("Failed task removed", {
-          description: "The task record was removed. Partial files were left on disk."
-        });
-      }
-    } catch (error) {
-      const action = job.status === "active"
-        ? "Cancellation failed"
-        : job.status === "completed"
-          ? "Course deletion failed"
-          : "Task removal failed";
-      toast.error(action, { description: String(error) });
-    } finally {
-      if (job.status === "active") {
-        setIsCancellingDownload(false);
-      }
-      setClearingTaskId(null);
-    }
   }
 
   async function removeQueueItem(job: QueuedDownloadJob) {
@@ -1038,9 +933,7 @@ export default function App() {
     try {
       const state = await removeDownloadQueueItem(job.id);
       setQueuedJobs(state.persisted_jobs);
-      setPersistedEvents(state.recent_events ?? []);
       setHasSavedToken(state.has_saved_token);
-      setProcessingSummary(null);
       toast.info("Queue item removed", {
         description: courseDisplayName(job)
       });
@@ -1049,12 +942,21 @@ export default function App() {
     }
   }
 
+  async function copyQueuedCourseUrl(job: QueuedDownloadJob) {
+    const url = job.source_url.trim() || `https://www.linkedin.com/learning/${job.course_slug}`;
+    try {
+      await copyTextToClipboard(url);
+      toast.success("Course URL copied", { description: url });
+    } catch (error) {
+      toast.error("Could not copy course URL", { description: String(error) });
+    }
+  }
+
   async function downloadScheduledNow(job: QueuedDownloadJob) {
     if (!isScheduledJob(job)) return;
     try {
       const state = await downloadScheduledJobNow(job.id);
       setQueuedJobs(state.persisted_jobs);
-      setPersistedEvents(state.recent_events ?? []);
       setDownloadHistory(state.download_history ?? []);
       toast.info("Moved to immediate queue", { description: courseDisplayName(job) });
       ensureDownloadProcessing(state.has_saved_token);
@@ -1152,6 +1054,7 @@ export default function App() {
           setHasSavedToken(true);
           shouldUseSavedToken = true;
           setToken("");
+          setQueueNeedsSessionRefresh(false);
         } catch (error) {
           toast.error("Token validation failed", { description: String(error) });
           return;
@@ -1233,14 +1136,13 @@ export default function App() {
 
     cancellationRequestedRef.current = false;
     setIsProcessingDownload(true);
-    setProcessingSummary(null);
     let processingFailed = false;
     const processPromise = processQueuedDownloadBatchWithLiveRefresh(normalizeDelaySeconds(delaySeconds), useSavedToken);
     downloadProcessingPromiseRef.current = processPromise;
 
     void processPromise
       .then((processResponse) => {
-        setProcessingSummary(processResponse);
+        setQueueNeedsSessionRefresh(false);
         if (processResponse.processed) {
           showProcessedDownloadToast(processResponse);
         } else {
@@ -1252,7 +1154,14 @@ export default function App() {
       .catch(async (error) => {
         processingFailed = true;
         await refreshBootstrapState();
-        toast.error("Download processing failed", { description: String(error) });
+        if (isLinkedInSessionError(error)) {
+          setQueueNeedsSessionRefresh(true);
+          toast.warning("LinkedIn session needs refreshing", {
+            description: "Queued courses are still safe. Paste a fresh li_at cookie above, then choose Resume queue."
+          });
+        } else {
+          toast.error("Download processing failed", { description: String(error) });
+        }
       })
       .finally(async () => {
         if (downloadProcessingPromiseRef.current === processPromise) {
@@ -1266,7 +1175,38 @@ export default function App() {
           return;
         }
         setIsProcessingDownload(false);
-      });
+    });
+  }
+
+  async function resumeQueuedDownloads() {
+    if (downloadProcessingPromiseRef.current) return;
+
+    const enteredToken = token.trim();
+    let shouldUseSavedToken = Boolean(hasSavedToken);
+
+    try {
+      if (enteredToken) {
+        setIsValidatingToken(true);
+        await saveLinkedInToken(enteredToken);
+        setHasSavedToken(true);
+        setToken("");
+        shouldUseSavedToken = true;
+      } else if (!shouldUseSavedToken && !isTauriRuntime()) {
+        toast.info("LinkedIn session required", {
+          description: "Paste a fresh li_at cookie before resuming the queued courses."
+        });
+        return;
+      }
+
+      setQueueNeedsSessionRefresh(false);
+      cancellationRequestedRef.current = false;
+      ensureDownloadProcessing(shouldUseSavedToken);
+    } catch (error) {
+      setQueueNeedsSessionRefresh(true);
+      toast.error("Session refresh failed", { description: String(error) });
+    } finally {
+      setIsValidatingToken(false);
+    }
   }
 
   async function processQueuedDownloadWithLiveRefresh(processOperation: () => Promise<ProcessQueuedDownloadResponse>) {
@@ -1304,7 +1244,6 @@ export default function App() {
         useSavedToken ? processNextQueuedDownloadWithSavedToken() : processNextQueuedDownloadWithBrowserSource(browserSource)
       );
       summary = mergeProcessQueuedDownloadResponses(summary, response);
-      setProcessingSummary(summary);
 
       const state = await refreshBootstrapState();
       if (!response.processed || response.cancelled_artifacts > 0 || cancellationRequestedRef.current) {
@@ -1502,7 +1441,6 @@ export default function App() {
     try {
       const state = await setDownloadJobPause(job.id, nextPaused);
       setQueuedJobs(state.persisted_jobs);
-      setPersistedEvents(state.recent_events ?? []);
       toast.info(nextPaused ? "Download paused" : "Download resumed", {
         description: nextPaused
           ? `${courseDisplayName(job)} will pause at the next safe boundary.`
@@ -1526,7 +1464,6 @@ export default function App() {
     try {
       const state = await setAllDownloadsPaused(nextPaused);
       setQueuedJobs(state.persisted_jobs);
-      setPersistedEvents(state.recent_events ?? []);
       toast.info(nextPaused ? "All downloads paused" : "All downloads resumed", {
         description: nextPaused
           ? "Active work will pause at the next safe boundary. Queued and scheduled courses will wait."
@@ -1623,7 +1560,6 @@ export default function App() {
         if (pausableQueueJobs.length === 0) return false;
         const state = await setAllDownloadsPaused(true);
         setQueuedJobs(state.persisted_jobs);
-        setPersistedEvents(state.recent_events ?? []);
         return true;
       }
       if (provider === "coursera") {
@@ -1700,12 +1636,12 @@ export default function App() {
 
     try {
       setIsProcessingDownload(true);
-      setProcessingSummary(null);
       if (enteredToken) {
         await saveLinkedInToken(enteredToken);
         setHasSavedToken(true);
         shouldUseSavedToken = true;
         setToken("");
+        setQueueNeedsSessionRefresh(false);
       } else if (!shouldUseSavedToken) {
         toast.info("Using browser session", {
           description: `LinkVault will read the ${browserSource} LinkedIn session for this retry.`
@@ -1724,7 +1660,6 @@ export default function App() {
       cancellationRequestedRef.current = false;
       const processResponse = await processQueuedDownloadBatchWithLiveRefresh(delaySeconds, shouldUseSavedToken);
 
-      setProcessingSummary(processResponse);
       await refreshBootstrapState();
       if (processResponse.processed) {
         showProcessedDownloadToast(processResponse);
@@ -1735,7 +1670,14 @@ export default function App() {
       }
     } catch (error) {
       await refreshBootstrapState();
-      toast.error("Retry failed", { description: String(error) });
+      if (isLinkedInSessionError(error)) {
+        setQueueNeedsSessionRefresh(true);
+        toast.warning("LinkedIn session needs refreshing", {
+          description: "The failed course was kept available for retry. Paste a fresh li_at cookie above, then retry it."
+        });
+      } else {
+        toast.error("Retry failed", { description: String(error) });
+      }
     } finally {
       setIsProcessingDownload(false);
     }
@@ -1801,7 +1743,7 @@ export default function App() {
           </Tooltip>
         </div>
         <div className="lv-sidebar-brand border-b border-sidebar-border">
-          <div className="lv-brand-logo" aria-label="LinkVault Course Downloader">
+          <div className="lv-brand-logo" aria-label="LinkVault Archive Workspace">
             <img src={linkvaultLogo} alt="" />
           </div>
           <h1 className="sr-only">LinkVault</h1>
@@ -2100,7 +2042,7 @@ export default function App() {
             )}
           </div>
         ) : null}
-        <div className="lv-content">
+        <div className="lv-content" data-active-view={activeView}>
           {pendingUpdate && !updateBannerDismissed && (
             <div className="update-banner" role="status" aria-live="polite">
               <span className="update-banner-text">
@@ -2172,12 +2114,8 @@ export default function App() {
           ) : (
           <>
           <div className="lv-workspace">
-            <Panel className="command-panel linkedin-command-board">
-              <div className="section-heading command-section-heading">
-                <div className="min-w-0">
-                  <h3>LinkedIn course dispatch</h3>
-                  <p>Build the course queue, confirm access, then choose the files to keep.</p>
-                </div>
+            <Panel className="command-panel provider-command-board linkedin-command-board">
+              <div className="provider-command-status linkedin-command-status">
                 <div className="ml-auto flex shrink-0 items-center gap-2">
                   <StatusBadge tone={hasSavedToken ? "success" : "muted"}>
                     {hasSavedToken ? "Saved session active" : "Session required"}
@@ -2185,12 +2123,8 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="linkedin-dispatch-grid">
-                <section className="linkedin-dispatch-panel linkedin-source-panel" aria-label="LinkedIn course list">
-                  <div className="linkedin-panel-heading">
-                    <div><strong>Course list</strong><span>One LinkedIn Learning URL per line</span></div>
-                    <span>{parsedCourses.length > 0 ? `${parsedCourses.length} ready` : "Paste URLs"}</span>
-                  </div>
+              <div className="provider-dispatch-grid linkedin-dispatch-grid">
+                <section className="provider-dispatch-group linkedin-dispatch-group linkedin-source-panel" aria-label="LinkedIn course URLs">
                   <Field label="Course URLs">
                   <div className="course-url-field compact-url-field">
                     <Textarea
@@ -2207,15 +2141,9 @@ export default function App() {
                     />
                   </div>
                   </Field>
-                  <div className="linkedin-panel-footnote">
-                    Valid courses are normalized locally before anything enters the queue.
-                  </div>
                 </section>
 
-                <section className="linkedin-dispatch-panel linkedin-access-panel" aria-label="LinkedIn access and destination">
-                  <div className="linkedin-panel-heading">
-                    <div><strong>Access &amp; destination</strong><span>Local folder and saved LinkedIn session</span></div>
-                  </div>
+                <section className="provider-dispatch-group linkedin-dispatch-group linkedin-access-panel" aria-label="LinkedIn access and destination">
                   <Field label="Download folder">
                     <div className="field-action-grid linkedin-folder-grid">
                       <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Download folder" />
@@ -2246,16 +2174,20 @@ export default function App() {
                       </Button>
                     </div>
                   </Field>
-                  <div className="linkedin-session-note" data-active={hasSavedToken ? "true" : "false"}>
-                    <span className="status-dot" />
-                    {hasSavedToken ? "Encrypted session available on this device" : "Paste a valid session or use a supported browser session"}
-                  </div>
+                  <Tooltip label={hasSavedToken ? "Encrypted session available on this device." : "Paste a valid li_at cookie or use a supported browser session."}>
+                    <span
+                      className="linkedin-session-note"
+                      data-active={hasSavedToken ? "true" : "false"}
+                      role="img"
+                      tabIndex={0}
+                      aria-label={hasSavedToken ? "Encrypted session available" : "Session required"}
+                    >
+                      <span className="status-dot" />
+                    </span>
+                  </Tooltip>
                 </section>
 
-                <section className="linkedin-dispatch-panel linkedin-options-panel" aria-label="LinkedIn download settings">
-                  <div className="linkedin-panel-heading">
-                    <div><strong>Download settings</strong><span>Quality, course pacing, and file types</span></div>
-                  </div>
+                <section className="provider-dispatch-group linkedin-dispatch-group provider-options-panel linkedin-options-panel" aria-label="LinkedIn download settings">
                   <div className="linkedin-quality-row">
                     <Field label="Quality">
                       <Select value={resolution} onChange={(event) => setResolution(event.target.value)} aria-label="Video resolution">
@@ -2332,11 +2264,15 @@ export default function App() {
               </div>
             </Panel>
 
-            <Panel className="table-panel">
+            <Panel className="table-panel queue-panel">
               <div className="table-panel-header">
-                <h3>Download Queue</h3>
+                <h3 id="download-queue-heading">Download Queue</h3>
                 <div className="table-panel-header-status">
                   <span>{queuedJobs.length > 0 ? queueSummary : parsedCourses.length > 0 ? `${parsedCourses.length} validated` : "0 active"}</span>
+                  <span className="queue-url-hint" title="Right-click a queued course to copy its URL">
+                    <Copy aria-hidden="true" className="h-3 w-3" />
+                    Right-click to copy URL
+                  </span>
                   {activitySummary.failed > 0 ? (
                     <button
                       type="button"
@@ -2349,81 +2285,87 @@ export default function App() {
                   ) : null}
                 </div>
               </div>
-              <DownloadQueueTable
-                jobs={displayedQueueJobs}
-                parsedCourses={parsedCourses}
-                hasPersistedJobs={queuedJobs.length > 0}
-                onRetry={retryDownloadJob}
-                onRemove={removeQueueItem}
-                onDownloadNow={downloadScheduledNow}
-                onPause={toggleDownloadPause}
-                pauseUpdatingTaskId={pauseUpdatingTaskId}
-                bulkPauseUpdating={isPausingAll}
-              />
+              <div className="queue-section-tabs" role="group" aria-label="Download queue sections">
+                <QueueSectionTab
+                  section="queue"
+                  label="Queue"
+                  value={queueSectionCount}
+                  tone="queue"
+                  selected={queueSection === "queue"}
+                  onClick={() => setQueueSection("queue")}
+                />
+                <QueueSectionTab
+                  section="active"
+                  label="Active"
+                  value={activitySummary.active}
+                  tone="primary"
+                  selected={queueSection === "active"}
+                  onClick={() => setQueueSection("active")}
+                />
+                <QueueSectionTab
+                  section="completed"
+                  label="Completed"
+                  value={activitySummary.completed}
+                  tone="success"
+                  selected={queueSection === "completed"}
+                  onClick={() => setQueueSection("completed")}
+                />
+                <QueueSectionTab
+                  section="failed"
+                  label="Failed"
+                  value={activitySummary.failed}
+                  tone="danger"
+                  selected={queueSection === "failed"}
+                  onClick={() => setQueueSection("failed")}
+                />
+              </div>
+              <div
+                className={`queue-section-panel queue-section-panel-${queueSection}`}
+                aria-label={queueSection === "queue" ? "Download queue" : activityFilterLabel(queueSection)}
+              >
+                {queueSection === "queue" && queueNeedsSessionRefresh && (hasReadyQueuedJobs(queuedJobs) || failedJobs.length > 0) ? (
+                  <div className="queue-session-warning" role="alert">
+                    <div>
+                      <strong>LinkedIn session needs refreshing.</strong>
+                      <span>Queued courses are preserved. Paste a fresh li_at cookie above, then resume the queue.</span>
+                    </div>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="outline"
+                      onClick={() => void resumeQueuedDownloads()}
+                      disabled={isProcessingDownload || isValidatingToken}
+                    >
+                      <RotateCcw aria-hidden="true" className="h-3 w-3" />
+                      {isValidatingToken ? "Validating" : "Resume queue"}
+                    </Button>
+                  </div>
+                ) : null}
+                <DownloadQueueTable
+                  jobs={queueSection === "queue" ? displayedQueueJobs : queueSection === "active" ? activeJobs : queueSection === "completed" ? completedJobs : failedJobs}
+                  parsedCourses={queueSection === "queue" ? parsedCourses : []}
+                  hasPersistedJobs={queuedJobs.length > 0}
+                  emptyTitle={queueSection === "queue" ? "No active downloads" : `No ${queueSection} downloads`}
+                  emptyDescription={queueSection === "queue"
+                    ? undefined
+                    : queueSection === "active"
+                      ? "Active courses appear here after Start Download."
+                      : queueSection === "completed"
+                        ? "Completed courses appear here after processing."
+                        : "Failed or cancelled courses appear here for retry or removal."
+                  }
+                  onRetry={retryDownloadJob}
+                  onCopyUrl={copyQueuedCourseUrl}
+                  onRemove={removeQueueItem}
+                  onOpenFolder={queueSection === "completed" ? openCompletedFolder : undefined}
+                  onDownloadNow={downloadScheduledNow}
+                  onPause={toggleDownloadPause}
+                  pauseUpdatingTaskId={pauseUpdatingTaskId}
+                  bulkPauseUpdating={isPausingAll}
+                />
+              </div>
             </Panel>
           </div>
-
-          <Panel className={`lv-activity${activityFilter ? " activity-filtered" : ""}`}>
-            <div className="activity-summary-grid">
-              <ActivitySummaryChip label="Active" value={activitySummary.active} tone="primary" selected={activityFilter === "active"} onClick={() => setActivityFilter((current) => current === "active" ? null : "active")} />
-              <ActivitySummaryChip label="Completed" value={activitySummary.completed} tone="success" selected={activityFilter === "completed"} onClick={() => setActivityFilter((current) => current === "completed" ? null : "completed")} />
-              <ActivitySummaryChip label="Failed" value={activitySummary.failed} tone="danger" selected={activityFilter === "failed"} onClick={() => setActivityFilter((current) => current === "failed" ? null : "failed")} />
-            </div>
-            {activityFilter ? (
-              <div className="activity-section activity-filter-section">
-                <div className="activity-section-header">
-                  <h4>{activityFilterLabel(activityFilter)}</h4>
-                  <button type="button" onClick={() => setActivityFilter(null)}>Show overview</button>
-                </div>
-                {activityFilter === "active" ? (
-                  <VideoArtifactActivityList
-                    items={activeVideoItems}
-                    mode="active"
-                    events={persistedEvents}
-                  />
-                ) : activityFilter === "completed" ? (
-                  <VideoArtifactActivityList
-                    items={completedVideoItems}
-                    mode="completed"
-                    events={persistedEvents}
-                  />
-                ) : (
-                  <div className="failed-activity-stack">
-                    <VideoArtifactActivityList
-                      items={failedVideoItems}
-                      mode="failed"
-                      events={persistedEvents}
-                    />
-                    {failedCourseJobsWithoutVideos.length > 0 ? (
-                      <FilteredTaskList
-                        jobs={failedCourseJobsWithoutVideos}
-                        filter="failed"
-                        onOpenFolder={openCompletedFolder}
-                        onRetry={retryDownloadJob}
-                        onClear={clearStatusTask}
-                        clearingTaskId={clearingTaskId}
-                      />
-                    ) : null}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <>
-                <div className="activity-section">
-                  <div className="activity-section-header">
-                    <h4>Recent Activity</h4>
-                  </div>
-                  <ActivityLog events={activityEvents} />
-                </div>
-                <div className="activity-section completed-section">
-                  <div className="activity-section-header">
-                    <h4>Completed</h4>
-                  </div>
-                  <CompletedDownloadsTable jobs={completedJobs} onOpenFolder={openCompletedFolder} />
-                </div>
-              </>
-            )}
-          </Panel>
           </>
           )}
         </div>
@@ -3001,237 +2943,49 @@ function activityDotClass(tone?: string) {
   return "bg-primary";
 }
 
-function coalesceActivityEvents(events: PersistedJobEvent[]): ActivityRow[] {
-  const rows: ActivityRow[] = [];
-  let groupedType: string | null = null;
-  let groupedRows: ActivityRow[] = [];
-
-  function flushGroup() {
-    if (!groupedType || groupedRows.length === 0) return;
-    if (groupedRows.length < 8) {
-      rows.push(...groupedRows);
-      groupedType = null;
-      groupedRows = [];
-      return;
-    }
-
-    const [time, , tone] = groupedRows[0];
-    const label = groupedType === "artifact.active"
-      ? `${groupedRows.length} artifact downloads started`
-      : `${groupedRows.length} artifacts completed`;
-    rows.push([time, label, tone]);
-    groupedType = null;
-    groupedRows = [];
-  }
-
-  for (const event of events.slice(0, 80)) {
-    if (event.event_type === "artifact.source.diagnostic") continue;
-
-    const groupable = event.event_type === "artifact.active" || event.event_type === "artifact.completed";
-    if (groupable) {
-      if (groupedType === event.event_type) {
-        groupedRows.push([formatEventTime(event.created_at), event.message, eventTone(event.event_type)]);
-        continue;
-      }
-      flushGroup();
-      groupedType = event.event_type;
-      groupedRows = [[formatEventTime(event.created_at), event.message, eventTone(event.event_type)]];
-      continue;
-    }
-
-    flushGroup();
-    rows.push([formatEventTime(event.created_at), event.message, eventTone(event.event_type)]);
-  }
-
-  flushGroup();
-  return rows;
-}
-
-function ActivitySummaryChip({
+function QueueSectionTab({
+  section,
   label,
   value,
   tone,
   selected,
   onClick
 }: {
+  section: DownloadQueueSection;
   label: string;
   value: number;
-  tone: "primary" | "success" | "danger";
+  tone: "queue" | "primary" | "success" | "danger";
   selected: boolean;
   onClick: () => void;
 }) {
-  return <SummaryChip label={label} value={value} dotClassName={activityDotClass(tone)} tone={tone} selected={selected} onClick={onClick} />;
-}
-
-function ActivityLog({ events }: { events: ActivityRow[] }) {
   return (
-    <ol className="activity-list">
-      {events.length > 0 ? events.map(([time, label, tone], index) => (
-        <ActivityEventRow key={`${time}-${label}-${index}`} time={time} label={label} dotClassName={activityDotClass(tone)} />
-      )) : (
-        <li className="activity-empty-row">No persisted activity yet.</li>
-      )}
-    </ol>
+    <button
+      type="button"
+      className={`queue-section-tab${selected ? " is-selected" : ""}`}
+      data-section={section}
+      data-tone={tone}
+      aria-pressed={selected}
+      onClick={onClick}
+    >
+      <span className="queue-section-tab-label">
+        <span className="queue-section-tab-dot" aria-hidden="true" />
+        {label}
+      </span>
+      <strong>{value}</strong>
+    </button>
   );
-}
-
-function VideoArtifactActivityList({
-  items,
-  mode,
-  events
-}: {
-  items: VideoActivityItem[];
-  mode: ActivityFilter;
-  events: PersistedJobEvent[];
-}) {
-  const [visibleCount, setVisibleCount] = useState(VIDEO_ACTIVITY_PAGE_SIZE);
-  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
-  const loadMoreRef = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    setVisibleCount(VIDEO_ACTIVITY_PAGE_SIZE);
-  }, [mode]);
-
-  useEffect(() => {
-    if (mode !== "active") return;
-    const intervalId = window.setInterval(
-      () => setNowSeconds(Math.floor(Date.now() / 1000)),
-      1_000
-    );
-    return () => window.clearInterval(intervalId);
-  }, [mode]);
-
-  const orderedItems = useMemo(() => {
-    if (mode !== "active") return items;
-    return [...items].sort((left, right) => {
-      const leftRank = videoActivityRank(left, events, nowSeconds);
-      const rightRank = videoActivityRank(right, events, nowSeconds);
-      return leftRank - rightRank || left.artifact.created_at - right.artifact.created_at;
-    });
-  }, [events, items, mode, nowSeconds]);
-  const visibleItems = orderedItems.slice(0, visibleCount);
-  const remainingCount = Math.max(0, orderedItems.length - visibleItems.length);
-
-  useEffect(() => {
-    setVisibleCount((current) => Math.max(
-      VIDEO_ACTIVITY_PAGE_SIZE,
-      Math.min(current, orderedItems.length || VIDEO_ACTIVITY_PAGE_SIZE)
-    ));
-  }, [orderedItems.length]);
-
-  useEffect(() => {
-    const loadMoreButton = loadMoreRef.current;
-    if (!loadMoreButton || remainingCount === 0 || typeof IntersectionObserver === "undefined") return;
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (!entry?.isIntersecting) return;
-        setVisibleCount((current) => Math.min(current + VIDEO_ACTIVITY_PAGE_SIZE, orderedItems.length));
-      },
-      { threshold: 0.15 }
-    );
-    observer.observe(loadMoreButton);
-    return () => observer.disconnect();
-  }, [orderedItems.length, remainingCount]);
-
-  if (orderedItems.length === 0) {
-    const message = mode === "active"
-      ? "Videos appear here after the active course finishes planning."
-      : mode === "completed"
-        ? "Completed course videos will appear here."
-        : "No failed video downloads.";
-    return <div className="video-activity-empty">{message}</div>;
-  }
-
-  return (
-    <div className="video-activity-list" data-mode={mode}>
-      {visibleItems.map((item) => {
-        const waitUntil = mode === "active"
-          ? pacingWaitUntil(events, item.job.id, item.artifact.id)
-          : null;
-        const remainingSeconds = waitUntil ? Math.max(0, waitUntil - nowSeconds) : 0;
-        const isWaitingNext = !item.job.paused && item.artifact.status === "pending" && remainingSeconds > 0;
-        const statusLabel = item.job.paused
-          ? "Paused"
-          : item.artifact.status === "active"
-          ? "Downloading"
-          : isWaitingNext
-            ? `Next in ${formatCountdown(remainingSeconds)}`
-            : mode === "completed"
-              ? formatArtifactBytes(item.artifact.size_bytes)
-              : mode === "failed"
-                ? item.artifact.status === "cancelled" ? "Cancelled" : "Failed"
-                : "Waiting";
-        return (
-          <article
-            className={`video-activity-row${isWaitingNext ? " is-next" : ""}`}
-            data-status={item.artifact.status}
-            key={`${item.job.id}-${item.artifact.id}`}
-          >
-            <span className="video-activity-state" aria-hidden="true">
-              {item.artifact.status === "active" ? <Download /> : isWaitingNext ? <Clock3 /> : <span className="status-dot" />}
-            </span>
-            <div className="video-activity-copy">
-              <strong title={item.artifact.display_name}>{item.artifact.display_name}</strong>
-              <span title={courseDisplayName(item.job)}>{courseDisplayName(item.job)}</span>
-            </div>
-            <span className="video-activity-status" aria-live={isWaitingNext ? "polite" : undefined}>{statusLabel}</span>
-          </article>
-        );
-      })}
-      {remainingCount > 0 ? (
-        <button
-          ref={loadMoreRef}
-          type="button"
-          className="video-activity-load-more"
-          onClick={() => setVisibleCount((current) => Math.min(current + VIDEO_ACTIVITY_PAGE_SIZE, orderedItems.length))}
-        >
-          Show {Math.min(VIDEO_ACTIVITY_PAGE_SIZE, remainingCount)} more
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-function videoActivityRank(item: VideoActivityItem, events: PersistedJobEvent[], nowSeconds: number) {
-  if (item.artifact.status === "active") return 0;
-  const waitUntil = pacingWaitUntil(events, item.job.id, item.artifact.id);
-  if (waitUntil && waitUntil > nowSeconds) return 1;
-  return 2;
-}
-
-function pacingWaitUntil(events: PersistedJobEvent[], jobId: string, artifactId: string) {
-  for (const event of events) {
-    if (event.job_id !== jobId || event.event_type !== "video.pacing.wait" || !event.payload_json) continue;
-    try {
-      const payload = JSON.parse(event.payload_json) as { artifactId?: unknown; waitUntil?: unknown };
-      if (payload.artifactId === artifactId && typeof payload.waitUntil === "number") {
-        return payload.waitUntil;
-      }
-    } catch {
-      // Ignore malformed diagnostic payloads; artifact state remains authoritative.
-    }
-  }
-  return null;
-}
-
-function formatCountdown(seconds: number) {
-  const safeSeconds = Math.max(0, Math.ceil(seconds));
-  const minutes = Math.floor(safeSeconds / 60);
-  return `${String(minutes).padStart(2, "0")}:${String(safeSeconds % 60).padStart(2, "0")}`;
-}
-
-function formatArtifactBytes(bytes: number | null | undefined) {
-  if (!bytes || bytes <= 0) return "Completed";
-  if (bytes < 1_048_576) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-  return `${(bytes / 1_048_576).toFixed(bytes >= 10_485_760 ? 0 : 1)} MB`;
 }
 
 function DownloadQueueTable({
   jobs,
   parsedCourses,
   hasPersistedJobs,
+  emptyTitle = "No active downloads",
+  emptyDescription,
   onRetry,
+  onCopyUrl,
   onRemove,
+  onOpenFolder,
   onDownloadNow,
   onPause,
   pauseUpdatingTaskId,
@@ -3240,8 +2994,12 @@ function DownloadQueueTable({
   jobs: QueuedDownloadJob[];
   parsedCourses: ParsedCourse[];
   hasPersistedJobs: boolean;
+  emptyTitle?: string;
+  emptyDescription?: string;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+  onCopyUrl: (job: QueuedDownloadJob) => void | Promise<void>;
   onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
+  onOpenFolder?: (job: QueuedDownloadJob) => void | Promise<void>;
   onDownloadNow: (job: QueuedDownloadJob) => void | Promise<void>;
   onPause: (job: QueuedDownloadJob) => void | Promise<void>;
   pauseUpdatingTaskId: string | null;
@@ -3261,7 +3019,9 @@ function DownloadQueueTable({
             key={job.id}
             job={job}
             onRetry={onRetry}
+            onCopyUrl={onCopyUrl}
             onRemove={onRemove}
+            onOpenFolder={onOpenFolder}
             onDownloadNow={onDownloadNow}
             onPause={onPause}
             pauseUpdatingTaskId={pauseUpdatingTaskId}
@@ -3272,8 +3032,8 @@ function DownloadQueueTable({
         parsedCourses.map((course, index) => <ValidatedQueueRow key={`${course.slug}-${index}`} course={course} />)
       ) : (
         <EmptyRow
-          title="No active downloads"
-          description={hasPersistedJobs ? "Finished courses are in Completed. Failed jobs stay here until handled." : "Active jobs and items needing attention appear here after Start Download."}
+          title={emptyTitle}
+          description={emptyDescription ?? (hasPersistedJobs ? "Finished courses are in Completed. Failed jobs stay here until handled." : "Active jobs and items needing attention appear here after Start Download.")}
         />
       )}
     </DataTable>
@@ -3283,7 +3043,9 @@ function DownloadQueueTable({
 function QueueJobRow({
   job,
   onRetry,
+  onCopyUrl,
   onRemove,
+  onOpenFolder,
   onDownloadNow,
   onPause,
   pauseUpdatingTaskId,
@@ -3291,7 +3053,9 @@ function QueueJobRow({
 }: {
   job: QueuedDownloadJob;
   onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
+  onCopyUrl: (job: QueuedDownloadJob) => void | Promise<void>;
   onRemove: (job: QueuedDownloadJob) => void | Promise<void>;
+  onOpenFolder?: (job: QueuedDownloadJob) => void | Promise<void>;
   onDownloadNow: (job: QueuedDownloadJob) => void | Promise<void>;
   onPause: (job: QueuedDownloadJob) => void | Promise<void>;
   pauseUpdatingTaskId: string | null;
@@ -3308,7 +3072,14 @@ function QueueJobRow({
     : "Remove from queue";
 
   return (
-    <DataTableRow className="queue-table-row">
+    <DataTableRow
+      className="queue-table-row"
+      title="Right-click to copy this course URL"
+      onContextMenu={(event) => {
+        event.preventDefault();
+        void onCopyUrl(job);
+      }}
+    >
       <QueueStatusBadge job={job} title={title} onRetry={onRetry} />
       <div className="table-course-cell">
         {job.thumbnail_url ? <MiniCourseArt title={title} thumbnailUrl={job.thumbnail_url} /> : <span className={`course-status-mark ${activityDotClass(eventTone(job.status))}`} />}
@@ -3323,6 +3094,19 @@ function QueueJobRow({
         {scheduled ? <span className="scheduled-time-compact">{formatScheduledTime(job.scheduled_at ?? 0)}</span> : <><Progress value={progress} /><span>{progress}%</span></>}
       </div>
       <div className="queue-row-actions">
+          {job.status === "completed" && onOpenFolder ? (
+            <Tooltip label="Open output folder">
+              <IconButton
+                type="button"
+                aria-label={`Open output folder for ${title}`}
+                onClick={() => void onOpenFolder(job)}
+                className="queue-open-folder-button"
+                disabled={!job.output_dir}
+              >
+                <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
+              </IconButton>
+            </Tooltip>
+          ) : null}
           {scheduled && !job.paused ? (
             <Tooltip label="Download now">
               <IconButton
@@ -3365,73 +3149,6 @@ function QueueJobRow({
           ) : null}
       </div>
     </DataTableRow>
-  );
-}
-
-function FilteredTaskList({
-  jobs,
-  filter,
-  onOpenFolder,
-  onRetry,
-  onClear,
-  clearingTaskId
-}: {
-  jobs: QueuedDownloadJob[];
-  filter: ActivityFilter;
-  onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void>;
-  onRetry: (job: QueuedDownloadJob) => void | Promise<void>;
-  onClear: (job: QueuedDownloadJob) => void | Promise<void>;
-  clearingTaskId: string | null;
-}) {
-  if (jobs.length === 0) {
-    return <div className="status-task-empty">No {filter} downloads.</div>;
-  }
-
-  return (
-    <div className="status-task-list">
-      {jobs.map((job) => {
-        const counts = artifactCounts(job);
-        const title = courseDisplayName(job);
-        const progress = courseOverallProgress(job, counts);
-        const clearLabel = filter === "active"
-          ? "Cancel download"
-          : filter === "completed"
-            ? "Delete downloaded files"
-            : "Remove failed task";
-        return (
-          <div className="status-task-row" key={job.id}>
-            <span className={`status-dot ${activityDotClass(eventTone(job.status))}`} />
-            <div className="min-w-0">
-              <div className="truncate font-medium" title={title}>{title}</div>
-              <div className="truncate text-soft">
-                {filter === "active" ? `${job.paused ? "Paused" : `${progress}%`} · ${filesSummaryText(counts, job.status)}` : `${jobStatusLabel(job.status, job.paused)} · ${formatEventTime(job.updated_at ?? 0)}`}
-              </div>
-            </div>
-            <div className="status-task-actions">
-              {filter === "completed" ? (
-                <Button size="xs" variant="ghost" onClick={() => onOpenFolder(job)}>Open</Button>
-              ) : filter === "failed" && job.status === "failed" ? (
-                <Button size="xs" variant="ghost" onClick={() => onRetry(job)}>Retry</Button>
-              ) : null}
-              <Tooltip label={clearLabel}>
-                <IconButton
-                  type="button"
-                  aria-label={`${clearLabel}: ${title}`}
-                  className="status-task-clear-action"
-                  loading={clearingTaskId === job.id}
-                  disabled={clearingTaskId !== null}
-                  onClick={() => void onClear(job)}
-                >
-                  {filter === "active"
-                    ? <X aria-hidden="true" className="h-3.5 w-3.5" />
-                    : <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />}
-                </IconButton>
-              </Tooltip>
-            </div>
-          </div>
-        );
-      })}
-    </div>
   );
 }
 
@@ -3487,53 +3204,6 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
   );
 }
 
-function CompletedDownloadsTable({ jobs, onOpenFolder }: { jobs: QueuedDownloadJob[]; onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void> }) {
-  const [visibleCount, setVisibleCount] = useState(COMPLETED_DOWNLOAD_PAGE_SIZE);
-  const loadMoreRef = useRef<HTMLButtonElement>(null);
-  const visibleJobs = jobs.slice(0, visibleCount);
-  const remainingCount = Math.max(0, jobs.length - visibleJobs.length);
-
-  useEffect(() => {
-    setVisibleCount((current) => Math.max(
-      COMPLETED_DOWNLOAD_PAGE_SIZE,
-      Math.min(current, jobs.length || COMPLETED_DOWNLOAD_PAGE_SIZE)
-    ));
-  }, [jobs.length]);
-
-  useEffect(() => {
-    const loadMoreButton = loadMoreRef.current;
-    if (!loadMoreButton || remainingCount === 0 || typeof IntersectionObserver === "undefined") return;
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (!entry?.isIntersecting) return;
-        setVisibleCount((current) => Math.min(current + COMPLETED_DOWNLOAD_PAGE_SIZE, jobs.length));
-      },
-      { threshold: 0.15 }
-    );
-    observer.observe(loadMoreButton);
-    return () => observer.disconnect();
-  }, [jobs.length, remainingCount]);
-
-  return (
-    <DataTable className="completed-list completed-table">
-      {jobs.length > 0 ? visibleJobs.map((job) => <CompletedDownloadRow key={job.id} job={job} onOpenFolder={onOpenFolder} />) : (
-        <EmptyRow compact title="No completed jobs" description="Finished courses will appear here after processing." />
-      )}
-      {remainingCount > 0 ? (
-        <button
-          ref={loadMoreRef}
-          type="button"
-          className="completed-load-more"
-          onClick={() => setVisibleCount((current) => Math.min(current + COMPLETED_DOWNLOAD_PAGE_SIZE, jobs.length))}
-        >
-          Show {Math.min(COMPLETED_DOWNLOAD_PAGE_SIZE, remainingCount)} more
-        </button>
-      ) : null}
-    </DataTable>
-  );
-}
-
 function HistoryPage({
   entries,
   historyFilePath,
@@ -3573,29 +3243,6 @@ function HistoryPage({
         )}
       </DataTable>
     </Panel>
-  );
-}
-
-function CompletedDownloadRow({ job, onOpenFolder }: { job: QueuedDownloadJob; onOpenFolder: (job: QueuedDownloadJob) => void | Promise<void> }) {
-  const counts = artifactCounts(job);
-  const title = courseDisplayName(job);
-  const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
-  const time = formatEventTime(job.updated_at ?? 0);
-  const outputDir = job.output_dir ?? "";
-
-  return (
-    <div className="completed-row">
-      <span className={`status-dot ${activityDotClass(eventTone(job.status))}`} />
-      <div className="min-w-0">
-        <div className="truncate font-medium" title={title}>{title}</div>
-        <div className="truncate text-soft" title={outputDir}>
-          {statusText} - {time} - {filesSummaryText(counts, job.status)}
-        </div>
-      </div>
-      <Button size="sm" variant="ghost" disabled={!outputDir} onClick={() => onOpenFolder(job)}>
-        Open Folder
-      </Button>
-    </div>
   );
 }
 
@@ -3762,6 +3409,45 @@ async function parseLinkedInCourseUrls(input: string) {
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function isLinkedInSessionError(error: unknown) {
+  const message = String(error).toLowerCase();
+  return [
+    "failed to fetch linkedin learning home",
+    "linkedin did not accept this session",
+    "linkedin session did not include jsessionid",
+    "no valid browser token candidates",
+    "csrf check failed",
+    "linkedin session expired",
+    "rejected the saved session",
+    "http 401",
+    "http 403",
+    "status 401",
+    "status 403"
+  ].some((marker) => message.includes(marker));
+}
+
+async function copyTextToClipboard(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("Clipboard access is unavailable.");
+    }
+  } finally {
+    textarea.remove();
+  }
 }
 
 async function saveLinkedInToken(token: string) {
@@ -3962,22 +3648,6 @@ async function removeDownloadQueueItem(jobId: string) {
     download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
-}
-
-async function deleteCompletedDownload(jobId: string) {
-  if (isTauriRuntime()) {
-    return invoke<BootstrapState>("delete_completed_download", { jobId });
-  }
-
-  const currentJobs = readPreviewJobs();
-  const target = currentJobs.find((job) => job.id === jobId);
-  if (!target || target.status !== "completed") {
-    throw new Error("Completed download was not found.");
-  }
-  const jobs = currentJobs.filter((job) => job.id !== jobId);
-  const events = readPreviewEvents().filter((event) => event.job_id !== jobId);
-  writePreviewState(jobs, events);
-  return previewBootstrapState(jobs, events);
 }
 
 async function checkForAppUpdate() {

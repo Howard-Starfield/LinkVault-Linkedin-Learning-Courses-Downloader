@@ -1,6 +1,7 @@
 {
   "name": "linkvault",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "npm --prefix apps/desktop run tauri -- dev",
     "web:dev": "npm --prefix apps/desktop run dev",
@@ -11,6 +12,7 @@
     "verify:persistence": "npm --prefix apps/desktop run verify:persistence",
     "verify:persistence-baseline": "npm --prefix apps/desktop run verify:persistence-baseline",
     "verify:ui": "npm --prefix apps/desktop run verify:ui",
+    "verify:no-any": "npm --prefix apps/desktop run verify:no-any",
     "verify:visual": "npm --prefix apps/desktop run verify:visual",
     "verify:tauri-smoke": "npm --prefix apps/desktop run verify:tauri-smoke",
     "verify:release": "npm --prefix apps/desktop run verify:release",

@@ -705,6 +705,38 @@ textarea {
   padding: 0;
 }
 
+.lv-content[data-active-view="downloads"] {
+  grid-template-columns: minmax(0, 1fr);
+  overflow-y: auto;
+}
+
+.lv-content[data-active-view="downloads"] .lv-workspace {
+  min-height: max-content;
+  border-right: 0;
+  overflow: visible;
+}
+
+.lv-content[data-active-view="downloads"] .queue-panel,
+.lv-content[data-active-view="downloads"] .queue-section-panel {
+  min-height: max-content;
+}
+
+.lv-content[data-active-view="coursera"] {
+  grid-template-columns: minmax(0, 1fr);
+  overflow-y: auto;
+}
+
+.lv-content[data-active-view="coursera"] .lv-workspace {
+  min-height: max-content;
+  border-right: 0;
+  overflow: visible;
+}
+
+.lv-content[data-active-view="coursera"] .queue-panel,
+.lv-content[data-active-view="coursera"] .queue-section-panel {
+  min-height: max-content;
+}
+
 .lv-workspace {
   display: grid;
   min-height: 0;
@@ -777,88 +809,152 @@ textarea {
   gap: 10px;
 }
 
-.linkedin-command-board {
-  border-bottom: 0;
-  padding-bottom: 12px;
-}
-
-.linkedin-dispatch-grid {
-  display: grid;
-  grid-template-columns: minmax(260px, 1.08fr) minmax(270px, 1fr) minmax(280px, 0.98fr);
-  align-items: stretch;
-  gap: 10px;
-}
-
-.linkedin-dispatch-panel {
-  display: flex;
-  min-width: 0;
-  min-height: 242px;
-  flex-direction: column;
-  gap: 10px;
-  overflow: hidden;
-  contain: layout paint;
+.provider-command-board {
   border: 1px solid var(--border-soft);
   border-radius: 11px;
   background:
     linear-gradient(145deg, rgb(255 255 255 / 0.025), transparent 48%),
     var(--section-bg);
-  padding: 11px;
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.025), 0 10px 24px rgb(0 0 0 / 0.08);
+  padding: 12px;
 }
 
-.linkedin-panel-heading {
+.provider-command-status {
   display: flex;
-  min-height: 34px;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  border-bottom: 1px solid var(--border-soft);
-  padding-bottom: 8px;
+  min-height: 22px;
+  align-items: center;
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 
-.linkedin-panel-heading > div {
+.provider-dispatch-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.08fr) minmax(270px, 1fr) minmax(280px, 0.98fr);
+  align-items: start;
+  gap: 14px;
+}
+
+.provider-dispatch-group {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.provider-dispatch-group + .provider-dispatch-group {
+  border-left: 1px solid var(--border-soft);
+  padding-left: 14px;
+}
+
+.coursera-source-panel .compact-url-field {
+  height: 88px;
+}
+
+.coursera-source-panel .course-url-textarea {
+  height: 86px;
+  max-height: 86px;
+  min-height: 86px !important;
+}
+
+.coursera-parsed-classes {
+  gap: 5px;
+}
+
+.parsed-classes-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.parsed-class-chip {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-faint);
+  padding: 3px 4px 3px 7px;
+}
+
+.coursera-access-panel .auth-grid {
+  display: grid;
+  gap: 7px;
+}
+
+.auth-cauth-row,
+.auth-credentials {
   display: grid;
   min-width: 0;
-  gap: 2px;
+  align-items: center;
+  gap: 6px;
 }
 
-.linkedin-panel-heading strong {
-  color: var(--text-main);
-  font-size: 11px;
-  font-weight: 680;
+.auth-cauth-row {
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
 }
 
-.linkedin-panel-heading span,
-.linkedin-panel-footnote,
-.linkedin-session-note {
-  color: var(--text-soft);
-  font-size: 9px;
-  line-height: 14px;
+.auth-credentials {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
 }
 
-.linkedin-panel-heading > span {
-  flex: 0 0 auto;
-  border: 1px solid var(--border-soft);
+.coursera-session-note {
+  display: inline-flex;
+  height: 16px;
+  width: 16px;
+  align-items: center;
+  justify-content: center;
+  margin-top: auto;
   border-radius: 999px;
-  padding: 2px 7px;
-  color: var(--accent);
-  font-weight: 650;
+  cursor: help;
+  padding: 2px;
+}
+
+.coursera-session-note .status-dot {
+  background: var(--text-soft);
+}
+
+.coursera-session-note[data-active="true"] .status-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 13%, transparent);
+}
+
+.coursera-options-panel .download-toggles {
+  display: grid;
+  min-height: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px 10px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 9px;
+}
+
+.coursera-filter-row,
+.coursera-format-row {
+  display: grid;
+  gap: 8px;
+}
+
+.coursera-filter-row {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.coursera-format-row {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.coursera-options-panel .command-actions {
+  margin-top: auto;
 }
 
 .linkedin-source-panel .compact-url-field {
-  height: 126px;
+  height: 88px;
 }
 
 .linkedin-source-panel .course-url-textarea {
-  height: 124px;
-  max-height: 124px;
-  min-height: 124px !important;
-}
-
-.linkedin-panel-footnote {
-  margin-top: auto;
-  border-top: 1px dashed var(--border-soft);
-  padding-top: 7px;
+  height: 86px;
+  max-height: 86px;
+  min-height: 86px !important;
 }
 
 .linkedin-access-panel > label {
@@ -880,12 +976,23 @@ textarea {
 }
 
 .linkedin-session-note {
-  display: flex;
+  display: inline-flex;
+  height: 16px;
+  width: 16px;
   align-items: center;
-  gap: 7px;
+  justify-content: center;
   margin-top: auto;
-  border-top: 1px dashed var(--border-soft);
-  padding-top: 8px;
+  border-radius: 999px;
+  color: var(--text-soft);
+  cursor: help;
+  font-size: 9px;
+  line-height: 14px;
+  padding: 2px;
+}
+
+.linkedin-session-note:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
 }
 
 .linkedin-session-note .status-dot {
@@ -979,6 +1086,10 @@ textarea {
   gap: 10px;
 }
 
+.coursera-options-panel .option-row {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .download-toggles {
   display: flex;
   min-height: 36px;
@@ -1037,6 +1148,21 @@ textarea {
   padding-top: 4px;
 }
 
+.queue-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow: visible;
+}
+
+.queue-section-panel {
+  display: flex;
+  min-height: 0;
+  flex: 0 0 auto;
+  flex-direction: column;
+  overflow: visible;
+}
+
 .table-panel-header,
 .activity-section-header {
   display: flex;
@@ -1050,11 +1176,146 @@ textarea {
   padding: 0;
 }
 
+.queue-section-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 10px 0 8px;
+}
+
+.queue-section-tab {
+  --queue-tab-tone: var(--text-muted);
+  display: flex;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-faint);
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 8px 10px;
+  text-align: left;
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.queue-section-tab[data-tone="queue"] {
+  --queue-tab-tone: var(--accent);
+}
+
+.queue-section-tab[data-tone="primary"] {
+  --queue-tab-tone: var(--accent);
+}
+
+.queue-section-tab[data-tone="success"] {
+  --queue-tab-tone: var(--success);
+}
+
+.queue-section-tab[data-tone="danger"] {
+  --queue-tab-tone: var(--danger);
+}
+
+.queue-section-tab:hover,
+.queue-section-tab.is-selected {
+  border-color: color-mix(in srgb, var(--queue-tab-tone) 42%, var(--border-soft));
+  background: color-mix(in srgb, var(--queue-tab-tone) 8%, var(--surface-faint));
+  color: var(--text-main);
+}
+
+.queue-section-tab.is-selected {
+  box-shadow: inset 0 -2px 0 var(--queue-tab-tone);
+}
+
+.queue-section-tab:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--queue-tab-tone) 60%, transparent);
+  outline-offset: 2px;
+}
+
+.queue-section-tab-label {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-section-tab-dot {
+  flex: 0 0 auto;
+  height: 7px;
+  width: 7px;
+  border-radius: 999px;
+  background: var(--queue-tab-tone);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--queue-tab-tone) 10%, transparent);
+}
+
+.queue-section-tab[data-tone="queue"] .queue-section-tab-dot {
+  background: var(--text-soft);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-soft) 10%, transparent);
+}
+
+.queue-section-tab strong {
+  flex: 0 0 auto;
+  color: var(--queue-tab-tone);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .table-panel-header-status {
   display: inline-flex;
   min-width: 0;
   align-items: center;
   gap: 8px;
+}
+
+.queue-url-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-soft);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.queue-session-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0 4px;
+  border: 1px solid rgb(224 178 81 / 0.28);
+  border-radius: 8px;
+  background: rgb(224 178 81 / 0.08);
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 8px 10px;
+}
+
+.queue-session-warning > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.queue-session-warning strong {
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.queue-session-warning span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .table-panel-header span,
@@ -1311,6 +1572,16 @@ textarea {
   background: linear-gradient(180deg, var(--surface-faint), transparent);
 }
 
+.queue-selection-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+
+.queue-section-panel > .lv-table {
+  flex: 0 1 min(34vh, 300px);
+}
+
 .summary-chip {
   --summary-tone: var(--text-muted);
   position: relative;
@@ -1419,235 +1690,6 @@ textarea {
 
 .lv-activity.activity-filtered {
   grid-template-rows: auto minmax(0, 1fr);
-}
-
-.activity-filter-section {
-  border-bottom: 0;
-}
-
-.activity-filter-section .activity-section-header button {
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  font-size: 10px;
-  outline: none;
-  padding: 4px 0;
-}
-
-.activity-filter-section .activity-section-header button:hover,
-.activity-filter-section .activity-section-header button:focus-visible {
-  color: var(--text-main);
-}
-
-.status-task-list {
-  min-height: 0;
-  overflow-y: auto;
-  padding: 0 12px 12px;
-  scrollbar-gutter: stable;
-}
-
-.status-task-row {
-  display: grid;
-  min-height: 48px;
-  grid-template-columns: 8px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--border-soft);
-  padding: 0 4px;
-  color: var(--text-muted);
-  font-size: 11px;
-  transition: background-color 140ms ease;
-}
-
-.status-task-row:hover,
-.status-task-row:focus-within {
-  background: var(--surface-faint);
-}
-
-.status-task-row .font-medium {
-  color: var(--text-main);
-  font-size: 12px;
-}
-
-.status-task-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.status-task-clear-action {
-  color: var(--danger);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateX(3px);
-  transition: color 140ms ease, opacity 140ms ease, transform 140ms ease;
-}
-
-.status-task-row:hover .status-task-clear-action,
-.status-task-row:focus-within .status-task-clear-action,
-.status-task-clear-action:focus-visible {
-  opacity: 1;
-  pointer-events: auto;
-  transform: translateX(0);
-}
-
-.status-task-clear-action:hover {
-  color: #ff9b9b;
-}
-
-.status-task-empty {
-  padding: 14px 12px;
-  color: var(--text-soft);
-  font-size: 12px;
-}
-
-.video-activity-list {
-  min-height: 0;
-  overflow-y: auto;
-  padding: 0 10px 12px;
-  scrollbar-gutter: stable;
-}
-
-.video-activity-row {
-  display: grid;
-  min-height: 52px;
-  grid-template-columns: 28px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--border-soft);
-  padding: 5px 3px;
-  transition: background-color 140ms ease, border-color 140ms ease;
-}
-
-.video-activity-row:hover,
-.video-activity-row:focus-within {
-  background: var(--surface-faint);
-}
-
-.video-activity-row.is-next {
-  border-bottom-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
-  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 72%);
-}
-
-.video-activity-state {
-  display: grid;
-  height: 25px;
-  width: 25px;
-  place-items: center;
-  border: 1px solid var(--border-soft);
-  border-radius: 7px;
-  background: var(--surface-faint);
-  color: var(--text-soft);
-}
-
-.video-activity-state svg {
-  height: 13px;
-  width: 13px;
-}
-
-.video-activity-row[data-status="active"] .video-activity-state,
-.video-activity-row.is-next .video-activity-state {
-  border-color: color-mix(in srgb, var(--accent) 34%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface-faint));
-  color: var(--accent);
-}
-
-.video-activity-list[data-mode="completed"] .video-activity-state .status-dot {
-  background: var(--success);
-}
-
-.video-activity-list[data-mode="failed"] .video-activity-state .status-dot {
-  background: var(--danger);
-}
-
-.video-activity-copy {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.video-activity-copy strong,
-.video-activity-copy span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.video-activity-copy strong {
-  color: var(--text-main);
-  font-size: 11px;
-  font-weight: 620;
-}
-
-.video-activity-copy span {
-  color: var(--text-soft);
-  font-size: 9px;
-}
-
-.video-activity-status {
-  max-width: 82px;
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 9px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 650;
-  text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.video-activity-row[data-status="active"] .video-activity-status,
-.video-activity-row.is-next .video-activity-status {
-  color: var(--accent);
-}
-
-.video-activity-list[data-mode="completed"] .video-activity-status {
-  color: var(--success);
-}
-
-.video-activity-list[data-mode="failed"] .video-activity-status {
-  color: var(--danger);
-}
-
-.video-activity-empty {
-  padding: 16px 12px;
-  color: var(--text-soft);
-  font-size: 11px;
-  line-height: 17px;
-}
-
-.video-activity-load-more {
-  display: flex;
-  min-height: 32px;
-  width: 100%;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  font: inherit;
-  font-size: 10px;
-  font-weight: 620;
-  margin-top: 6px;
-}
-
-.video-activity-load-more:hover,
-.video-activity-load-more:focus-visible {
-  background: var(--surface-hover);
-  color: var(--text-main);
-  outline: none;
-}
-
-.failed-activity-stack {
-  min-height: 0;
-  overflow-y: auto;
-}
-
-.failed-activity-stack .video-activity-list,
-.failed-activity-stack .status-task-list {
-  overflow: visible;
 }
 
 .activity-section-header {
@@ -2177,9 +2219,8 @@ textarea {
   }
 }
 
-/* When the workspace can no longer coexist with the fixed activity rail, the
-   rail stacks below the Download Queue instead of starving/overlapping it.
-   The Active/Completed/Failed chips keep working as toggles in the flow. */
+/* The remaining two-column views stack their activity rail when space gets
+   tight. LinkedIn keeps its activity stream inside the Download Queue. */
 @container lv-main (max-width: 900px) {
   .lv-content {
     grid-template-columns: minmax(0, 1fr);
@@ -2199,12 +2240,16 @@ textarea {
 }
 
 @container lv-main (max-width: 620px) {
-  .linkedin-dispatch-grid {
+  .provider-dispatch-grid {
     grid-template-columns: 1fr;
   }
 
-  .linkedin-options-panel {
+  .provider-options-panel {
     grid-column: auto;
+  }
+
+  .queue-section-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -2231,26 +2276,58 @@ textarea {
     pointer-events: auto;
     transform: none;
   }
-
-  .status-task-clear-action {
-    opacity: 1;
-    pointer-events: auto;
-    transform: none;
-  }
 }
 
 @container lv-main (max-width: 1080px) {
-  .linkedin-dispatch-grid {
+  .provider-dispatch-grid {
     grid-template-columns: repeat(2, minmax(280px, 1fr));
   }
 
-  .linkedin-options-panel {
+  .provider-options-panel {
     grid-column: 1 / -1;
-    min-height: 210px;
+    border-top: 1px solid var(--border-soft);
+    border-left: 0;
+    padding-top: 14px;
   }
 
   .linkedin-options-panel .download-toggles {
     grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .coursera-options-panel .download-toggles {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@container lv-main (max-width: 620px) {
+  .provider-dispatch-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-dispatch-group + .provider-dispatch-group {
+    border-top: 1px solid var(--border-soft);
+    border-left: 0;
+    padding-top: 12px;
+    padding-left: 0;
+  }
+
+  .provider-options-panel {
+    grid-column: auto;
+  }
+
+  .coursera-filter-row,
+  .coursera-format-row,
+  .auth-cauth-row,
+  .auth-credentials {
+    grid-template-columns: 1fr;
+  }
+
+  .coursera-options-panel .download-toggles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .coursera-options-panel .option-row {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -2274,7 +2351,7 @@ textarea {
   .lv-sidebar nav,
   .field-action-grid,
   .token-grid,
-  .linkedin-dispatch-grid,
+    .provider-dispatch-grid,
   .linkedin-quality-row,
   .linkedin-primary-actions,
   .linkedin-queue-controls,
@@ -2284,12 +2361,27 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .linkedin-options-panel {
+  .provider-options-panel {
     grid-column: auto;
   }
 
   .linkedin-options-panel .download-toggles {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .coursera-filter-row,
+  .coursera-format-row,
+  .auth-cauth-row,
+  .auth-credentials {
+    grid-template-columns: 1fr;
+  }
+
+  .coursera-options-panel .download-toggles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .coursera-options-panel .option-row {
+    grid-template-columns: 1fr;
   }
 
   .schedule-field-grid,
@@ -4130,13 +4222,14 @@ textarea {
   /* Cap stacked/narrow dispatch panels at a proper height and let them scroll
      internally instead of extending the page far down. */
   .newspaper-dispatch-panel {
+    min-height: 380px;
     max-height: min(520px, 68vh);
     overflow-x: hidden;
     overflow-y: auto;
   }
 
   .newspaper-dispatch-grid {
-    grid-template-columns: repeat(2, minmax(300px, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     grid-template-areas:
       "editions settings"
       "schedule schedule";
@@ -4153,7 +4246,7 @@ textarea {
 
 }
 
-@container lv-main (max-width: 540px) {
+@container lv-main (max-width: 650px) {
   .newspaper-download {
     padding: 12px;
   }
