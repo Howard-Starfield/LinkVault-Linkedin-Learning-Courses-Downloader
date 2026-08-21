@@ -2,7 +2,7 @@
 
 **Branch:** `spec/youtube-downloader-v1`
 
-**Updated:** 2026-08-20
+**Updated:** 2026-08-21
 
 **Status:** Internal non-executing scaffold under active hardening; real helper execution, packaging, native UAT, and public release remain blocked.
 
@@ -17,40 +17,55 @@
 - Internal owner-risk acceptance for Y0-Y3 implementation/testing. It does not authorize public packaging, distribution, release, restricted-content access, cookie/account use, or bypass behavior.
 - Branch-only `.github/workflows/youtube-v1-internal-hardening.yml` automation that runs non-publishing Windows source/fixture gates and explicitly proves the unpopulated helper lock still fails closed. It does not fetch helpers, package an installer, publish artifacts, or exercise network YouTube content.
 
-## Current continuation audit
+## Continuation audit
 
-The authorized branch head was confirmed as `7866fe5636b2b6c314276b78c6ff11ed054e3345` before continuation work began; the branch had not advanced beyond the expected handoff commit.
+The authorized repository and branch were verified again before the current continuation. The remote branch head was `4e6884f3a73000678af1f8994e84f0f7615f2402` (`docs(youtube): add GPT execution prompt`), one commit ahead of the earlier `19b6aaff89840cbdf95fa6d615b680598c199790` hardening handoff. The newer prompt-only commit was inspected and preserved; no force update, rebase, reset, merge, tag, release, or other branch change was made.
 
-The fresh source audit confirmed the previously recorded enablement blockers are still present and must not be hidden by removing the execution gate:
+The fresh source audit confirmed the enablement blockers must not be hidden by removing the execution gate:
 
-1. The current managed-process adapter uses an ordinary direct-child spawn and kill path, not suspended `CreateProcessW` plus verified kill-on-close Job Object containment.
-2. The current cooperative-exit coordinator resolves renderer durability only; YouTube cleanup happens after exit authorization, and updater installation does not yet enter the same barrier.
-3. Helper validation is path/hash based rather than identity-held through process creation and delegated-helper lifetime.
+1. The existing managed-process adapter used an ordinary direct-child spawn and kill path, not suspended `CreateProcessW` plus verified kill-on-close Job Object containment.
+2. The cooperative-exit coordinator resolves renderer durability only; YouTube cleanup still happens after exit authorization, and updater installation does not yet enter the same barrier.
+3. Helper validation remains path/hash based rather than identity-held through process creation and delegated-helper lifetime.
 4. Submission receipts are evicted, worker-spawn failure does not roll back admission, and shutdown signals cancellation without joining active work.
 5. Playlist discovery accepts one whole JSON object and may accept the first parseable line while ignoring trailing garbage.
 6. Output verification remains path based and does not yet close every reparse/TOCTOU window with stable handles.
 7. Transcript inspection, normalized transcript JSON, FFprobe verification, exact manifest reuse, and mounted pause/resume/transcript controls remain incomplete.
 
-## Where work stopped
+## Current slice: Windows process-containment foundation
+
+The current change introduces the first bounded Slice 1 implementation increment while deliberately keeping production helper execution disabled:
+
+- Replaces the production Windows launch path with a workflow-owned native supervisor based on suspended `CreateProcessW`.
+- Creates a kill-on-close Job Object, assigns and verifies the suspended process before resume, and sets no breakaway permission.
+- Uses an explicit absolute application path, a dedicated Windows argv serializer, an inherited-handle allowlist, empty `PATH`, and a minimal helper environment.
+- Drains stdout and stderr through separate bounded readers with explicit truncation reporting.
+- Terminates and drains the whole Job on cancellation or timeout, then verifies the Job reports no active processes before returning.
+- Adds fail-closed cleanup paths for pre-assignment, reader-startup, and resume failures.
+- Adds a feature-gated hostile Windows fixture and focused tests for argv round trips, noisy output, invalid UTF-8, direct-child/grandchild cancellation and timeout, injected startup failures, and cancellation/completion races.
+- Extends the branch-only Windows workflow with the focused managed-process test target.
+
+This is a containment foundation, not enablement. `EXECUTION_HARDENING_COMPLETE` remains `false`. The new test-only executable is compiled only with `youtube-process-test`; it is not a packaged helper or release artifact.
+
+## Where work remains blocked
 
 Real helper execution is deliberately disabled in `workflow/transient/managed_process.rs` by `EXECUTION_HARDENING_COMPLETE = false`. The committed helper lock also remains `status: "unpopulated"`. Either condition fails closed, so populating the lock alone cannot accidentally enable execution.
 
-Independent adversarial review found no active P0 while those blocks remain in place. It identified these enablement blockers:
+Remaining P1 enablement blockers:
 
-1. Implement a Windows suspended-process supervisor with kill-on-close Job Object containment, descendant cleanup, bounded reader joining, and ordered Quit/updater shutdown.
-2. Hold stable executable/file identities from validation through process creation; verify and pin yt-dlp, Deno, FFmpeg, FFprobe, and loaded assets; remove inherited PATH/config/cache/runtime selection.
-3. Strengthen output-root, staging, and leaf operations with stable file/volume identities and no-follow handles to close remaining junction/reparse TOCTOU windows.
-4. Make submission IDs process-lifetime non-evicting (or durably retired), roll back admission on worker-thread creation failure, and make accepted cancellation win terminal races.
+1. Integrate managed-tree ownership with a native cooperative-exit participant so Cancel, true Quit, and updater restart use one ordered cleanup path after renderer note durability.
+2. Hold stable executable/file identities from validation through process creation; verify and pin yt-dlp, Deno, FFmpeg, FFprobe, and loaded assets; remove every remaining inherited/config/cache/runtime ambiguity.
+3. Strengthen output-root, staging, and leaf operations with stable file/volume identities and no-follow handles to close junction/reparse TOCTOU windows.
+4. Make submission IDs process-lifetime non-evicting (or durably retired), roll back admission on worker-thread creation failure, join shutdown work, and make accepted cancellation win terminal races.
 5. Bind manifests/fingerprints to the canonical helper-lock digest and semantic transcript selection, and implement verified `skipped_existing` reuse.
-6. Complete transcript inspection/selection, raw VTT plus normalized JSON, source-drift revalidation, FFprobe media verification, and deterministic delegated-helper arguments.
+6. Complete bounded per-occurrence discovery, source revalidation, transcript inspection/selection, raw VTT plus normalized JSON, FFprobe media verification, and deterministic delegated-helper arguments.
 7. Mount native transcript-inspection and pause/resume controls, then add native WebView coverage beyond the browser fixture.
 8. Resolve and test the exact Tauri sidecar source filename versus installed runtime filename contract before packaging.
 
 Public release additionally requires the separate `Y-PUBLIC-REVIEW` decision and exact packaged/native UAT evidence.
 
-## Last verified evidence
+## Verification evidence
 
-Evidence inherited from the starting commit:
+Evidence inherited from the earlier scaffold commit:
 
 - `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --lib` passed.
 - Complete Rust library suite: 583 passed, 0 failed, 4 ignored.
@@ -60,19 +75,19 @@ Evidence inherited from the starting commit:
 - Helper verification failed closed as intended because authoritative lock metadata is absent.
 - `git diff --check` passed.
 
-Continuation evidence:
+Current-slice evidence at authoring time:
 
-- The repository and authorized branch names were verified exactly.
-- The starting remote head matched `7866fe5636b2b6c314276b78c6ff11ed054e3345` with no newer branch commits to preserve.
-- The required handoff, PRD, bridge ADR, migration plan, legal decision, helper-lock/notices, managed-process/runtime, safe-output, provider, and mounted frontend/IPC files were read in full before editing.
-- The branch-only Windows internal-hardening workflow has been added; its first run must complete before its commands are recorded here as current-commit evidence.
+- Repository, branch, prompt commit, and parent relationship were verified through the GitHub connector.
+- The required prompt, handoff, PRD, bridge ADR, migration plan, legal decision, helper-lock/notices, managed-process/runtime, safe-output, provider, and mounted frontend/IPC files were inspected before editing.
+- Source review confirms the execution constant is still `false` and the helper lock is still unpopulated.
+- The current commit must pass the branch-only `YouTube V1 Internal Hardening` workflow before the new managed-process implementation or tests are recorded as passing evidence. No such result is claimed in this paragraph.
 
 No packaged/native YouTube download UAT has been claimed.
 
 ## Next safe slice
 
-Implement the workflow-owned Windows managed-process supervisor and hostile-process tests under the new branch-only Windows gate. Keep `EXECUTION_HARDENING_COMPLETE` false and the lock unpopulated. Pair process containment with the native cooperative-exit participant so Cancel, true Quit, and updater restart cannot take divergent cleanup paths. Then complete identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
+First, resolve every compile, format, and hostile-fixture finding from the branch-only Windows workflow and record exact current-commit evidence. Then pair the managed supervisor with the tokenized native cooperative-exit participant and updater path while keeping `EXECUTION_HARDENING_COMPLETE` false. After cancellation and ordered true-exit tests pass, proceed to identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
 
-After those gates pass, implement transcript-only execution as the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
+After those gates pass, transcript-only execution remains the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
 
-The local Rust `target` and frontend `dist` directories used for prior validation were removed before the original handoff because they are regenerable and were not committed. Continuation work must retain the same no-generated-artifacts rule.
+Generated Rust `target`, frontend `dist`, helper binaries, installers, caches, logs, screenshots, and UAT downloads are not committed.

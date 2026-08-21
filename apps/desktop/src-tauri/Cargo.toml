@@ -16,10 +16,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 crop-baseline = []
 durability-baseline = []
+youtube-process-test = []
 
 [[bin]]
 name = "linkvault"
 path = "src/main.rs"
+
+[[bin]]
+name = "youtube_process_fixture"
+path = "tests/fixtures/youtube_process_fixture.rs"
+required-features = ["youtube-process-test"]
 
 [[example]]
 name = "newspaper_clipping_crop_baseline"
@@ -59,8 +65,12 @@ unicode-normalization = "0.1.25"
 webp = "0.3"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Security",
   "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
   "Win32_System_ProcessStatus",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",

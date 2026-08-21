@@ -1,9 +1,10 @@
 //! Workflow-owned managed process port for transient external helpers.
 //!
-//! Provider code can select only a typed helper kind and typed arguments.  It
-//! cannot submit an executable path, shell string, or generic command.  The
-//! helper path and digest are resolved here from packaged resources and an
-//! approved helper lock; missing or mismatched lock data fails closed.
+//! Provider code can select only a typed helper kind and typed arguments. It
+//! cannot submit an executable path, shell string, or generic command. Helper
+//! paths are resolved from packaged resources and verified against the embedded
+//! lock. Windows launches are suspended, assigned to a kill-on-close Job Object,
+//! connected to bounded readers, and only then resumed.
 
 use super::TransientRunControl;
 use serde_json::Value;
@@ -12,12 +13,9 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 const EMBEDDED_HELPER_LOCK: &[u8] = include_bytes!(concat!(
@@ -26,9 +24,8 @@ const EMBEDDED_HELPER_LOCK: &[u8] = include_bytes!(concat!(
 ));
 
 // Defense in depth: a populated supply-chain lock must not silently enable
-// execution before the Windows supervisor and identity-held verification land.
-// Flip only with the corresponding containment, delegated-helper, and hostile
-// replacement tests in the same reviewed change.
+// execution before identity-held delegated-helper verification and the complete
+// hostile-process/native shutdown suite pass review.
 const EXECUTION_HARDENING_COMPLETE: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +58,7 @@ impl ManagedProcessSpec {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "youtube-process-test")]
     pub fn for_test(
         executable: PathBuf,
         args: Vec<OsString>,
@@ -72,20 +69,39 @@ impl ManagedProcessSpec {
         TestManagedProcessSpec {
             executable,
             spec: Self::youtube_ytdlp(args, stdout_limit, stderr_limit, timeout),
+            fault: TestManagedProcessFault::None,
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "youtube-process-test")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestManagedProcessFault {
+    None,
+    BeforeJobAssignment,
+    ReaderStartup,
+    Resume,
+}
+
+#[cfg(feature = "youtube-process-test")]
 #[derive(Clone, Debug)]
 pub struct TestManagedProcessSpec {
     pub executable: PathBuf,
     pub spec: ManagedProcessSpec,
+    pub fault: TestManagedProcessFault,
+}
+
+#[cfg(feature = "youtube-process-test")]
+impl TestManagedProcessSpec {
+    pub fn with_fault(mut self, fault: TestManagedProcessFault) -> Self {
+        self.fault = fault;
+        self
+    }
 }
 
 #[derive(Debug)]
 pub struct ManagedProcessOutput {
-    pub status: ExitStatus,
+    pub status: std::process::ExitStatus,
     pub stdout: String,
     pub stderr: String,
     pub stdout_truncated: bool,
@@ -98,14 +114,18 @@ pub struct ManagedProcessOutput {
 pub enum ManagedProcessError {
     #[error("helper integrity validation failed: {0}")]
     Integrity(String),
+    #[error("helper process containment failed: {0}")]
+    ProcessContainment(String),
     #[error("failed to start trusted helper: {0}")]
-    Spawn(String),
+    Start(String),
     #[error("helper output was not valid UTF-8")]
     InvalidUtf8,
     #[error("helper output reader failed: {0}")]
     Reader(String),
     #[error("helper process wait failed: {0}")]
     Wait(String),
+    #[error("managed helper execution is unsupported on this platform")]
+    UnsupportedPlatform,
 }
 
 #[derive(Clone, Debug)]
@@ -127,7 +147,13 @@ pub fn run(
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     ensure_execution_hardened()?;
     let (executable, _) = resolve_and_verify(spec.helper)?;
-    run_resolved(executable, spec, control, discovery_cancel)
+    run_resolved(
+        executable,
+        spec,
+        control,
+        discovery_cancel,
+        TestFaultSelection::None,
+    )
 }
 
 fn ensure_execution_hardened() -> Result<(), ManagedProcessError> {
@@ -135,23 +161,38 @@ fn ensure_execution_hardened() -> Result<(), ManagedProcessError> {
         return Ok(());
     }
     Err(ManagedProcessError::Integrity(
-        "managed helper execution is disabled until Windows Job Object containment, identity-held verification, and delegated-helper pinning pass review"
+        "managed helper execution is disabled until identity-held verification, delegated-helper pinning, and native shutdown tests pass review"
             .to_string(),
     ))
 }
 
-#[cfg(test)]
+#[cfg(feature = "youtube-process-test")]
 pub fn run_test(
     test_spec: TestManagedProcessSpec,
     control: Option<&TransientRunControl>,
     discovery_cancel: Option<&AtomicBool>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+    let fault = match test_spec.fault {
+        TestManagedProcessFault::None => TestFaultSelection::None,
+        TestManagedProcessFault::BeforeJobAssignment => TestFaultSelection::BeforeJobAssignment,
+        TestManagedProcessFault::ReaderStartup => TestFaultSelection::ReaderStartup,
+        TestManagedProcessFault::Resume => TestFaultSelection::Resume,
+    };
     run_resolved(
         test_spec.executable,
         test_spec.spec,
         control,
         discovery_cancel,
+        fault,
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestFaultSelection {
+    None,
+    BeforeJobAssignment,
+    ReaderStartup,
+    Resume,
 }
 
 fn run_resolved(
@@ -159,87 +200,17 @@ fn run_resolved(
     spec: ManagedProcessSpec,
     control: Option<&TransientRunControl>,
     discovery_cancel: Option<&AtomicBool>,
+    fault: TestFaultSelection,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
-    let mut command = Command::new(&executable);
-    command.args(&spec.args);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    for variable in [
-        "YTDLP_HOME",
-        "XDG_CONFIG_HOME",
-        "APPDATA",
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "YOUTUBE_DL_CONFIG",
-    ] {
-        command.env_remove(variable);
+    #[cfg(windows)]
+    {
+        windows_supervisor::run(executable, spec, control, discovery_cancel, fault)
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| ManagedProcessError::Spawn(error.to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ManagedProcessError::Reader("helper stdout was not piped".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ManagedProcessError::Reader("helper stderr was not piped".to_string()))?;
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    let (stderr_tx, stderr_rx) = mpsc::channel();
-    let stdout_limit = spec.stdout_limit;
-    let stderr_limit = spec.stderr_limit;
-    thread::spawn(move || {
-        let _ = stdout_tx.send(read_bounded(stdout, stdout_limit));
-    });
-    thread::spawn(move || {
-        let _ = stderr_tx.send(read_bounded(stderr, stderr_limit));
-    });
-
-    let started = Instant::now();
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let status = loop {
-        if control.is_some_and(TransientRunControl::is_cancelled)
-            || discovery_cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
-            cancelled = true;
-            terminate_process(&mut child);
-            break child
-                .wait()
-                .map_err(|error| ManagedProcessError::Wait(error.to_string()))?;
-        }
-        if started.elapsed() >= spec.timeout {
-            timed_out = true;
-            terminate_process(&mut child);
-            break child
-                .wait()
-                .map_err(|error| ManagedProcessError::Wait(error.to_string()))?;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(ManagedProcessError::Wait(error.to_string())),
-        }
-    };
-    let (stdout_bytes, stdout_truncated) = stdout_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|error| ManagedProcessError::Reader(error.to_string()))?;
-    let (stderr_bytes, stderr_truncated) = stderr_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|error| ManagedProcessError::Reader(error.to_string()))?;
-    let stdout = String::from_utf8(stdout_bytes).map_err(|_| ManagedProcessError::InvalidUtf8)?;
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-    Ok(ManagedProcessOutput {
-        status,
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
-        timed_out,
-        cancelled,
-    })
+    #[cfg(not(windows))]
+    {
+        let _ = (executable, spec, control, discovery_cancel, fault);
+        Err(ManagedProcessError::UnsupportedPlatform)
+    }
 }
 
 fn resolve_and_verify(kind: HelperKind) -> Result<(PathBuf, String), ManagedProcessError> {
@@ -261,8 +232,8 @@ fn resolve_and_verify(kind: HelperKind) -> Result<(PathBuf, String), ManagedProc
                 .to_string(),
         )
     })?;
-    let actual = digest_file(&candidate)
-        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    let actual =
+        digest_file(&candidate).map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
     if !actual.eq_ignore_ascii_case(&expected) {
         return Err(ManagedProcessError::Integrity(
             "helper digest does not match the approved helper lock".to_string(),
@@ -284,10 +255,11 @@ fn packaged_candidate() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn lock_digest_for(path: &std::path::Path) -> Option<String> {
+fn lock_digest_for(path: &Path) -> Option<String> {
     let value = serde_json::from_slice::<Value>(EMBEDDED_HELPER_LOCK).ok()?;
     if value.get("schemaVersion").and_then(Value::as_u64) != Some(1)
-        || value.get("targetTriple").and_then(Value::as_str) != Some("x86_64-pc-windows-msvc")
+        || value.get("targetTriple").and_then(Value::as_str)
+            != Some("x86_64-pc-windows-msvc")
         || value.get("status").and_then(Value::as_str) != Some("ready")
     {
         return None;
@@ -355,7 +327,7 @@ fn lock_digest_for(path: &std::path::Path) -> Option<String> {
     })
 }
 
-fn digest_file(path: &std::path::Path) -> std::io::Result<String> {
+fn digest_file(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -369,33 +341,27 @@ fn digest_file(path: &std::path::Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn terminate_process(child: &mut std::process::Child) {
-    // This slice owns and joins the direct helper child.  Descendant Job
-    // Object containment remains a release-blocking follow-up until the
-    // Windows native supervisor is added; do not claim tree containment yet.
-    let _ = child.kill();
-}
-
-fn read_bounded<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
+fn read_bounded<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 16 * 1024];
     let mut truncated = false;
     loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                if bytes.len() < limit {
-                    let keep = (limit - bytes.len()).min(read);
-                    bytes.extend_from_slice(&buffer[..keep]);
-                    if keep < read {
-                        truncated = true;
-                    }
-                } else {
-                    truncated = true;
-                }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len() < limit {
+            let keep = (limit - bytes.len()).min(read);
+            bytes.extend_from_slice(&buffer[..keep]);
+            if keep < read {
+                truncated = true;
             }
-            Err(_) => break,
+        } else {
+            truncated = true;
         }
     }
-    (bytes, truncated)
+    Ok((bytes, truncated))
 }
+
+#[cfg(windows)]
+mod windows_supervisor;
