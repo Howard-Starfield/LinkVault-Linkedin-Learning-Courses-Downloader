@@ -13,6 +13,7 @@ pub mod database_writer;
 pub mod newspaper_clipping_crop_baseline;
 #[cfg(feature = "durability-baseline")]
 pub mod newspaper_clipping_note_durability_baseline;
+pub mod safe_output_filesystem;
 pub mod security;
 pub mod storage;
 pub(crate) mod updates;

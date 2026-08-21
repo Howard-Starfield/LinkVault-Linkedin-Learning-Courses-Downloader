@@ -7,7 +7,7 @@ const library = await readFile(new URL("../src/components/newspaper/NewspaperLib
 const reader = await readFile(new URL("../src/components/newspaper/NewspaperReader.tsx", import.meta.url), "utf8");
 const readerPreferences = await readFile(new URL("../src/components/newspaper/newspaper-reader-preferences.ts", import.meta.url), "utf8");
 const newspaperApi = await readFile(new URL("../src/components/newspaper/newspaper-api.ts", import.meta.url), "utf8");
-const css = await readFile(new URL("../src/index.css", import.meta.url), "utf8");
+const css = (await readFile(new URL("../src/index.css", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 
 for (const required of [
   "Download editions",

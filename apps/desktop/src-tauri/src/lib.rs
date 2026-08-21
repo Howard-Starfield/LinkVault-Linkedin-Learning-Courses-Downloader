@@ -16,7 +16,7 @@ pub use providers::linkedin::{
     live_clients, quality, quiz_hints, token_store,
 };
 use providers::linkedin::{commands, linkedin};
-pub use providers::{coursera, newspaper};
+pub use providers::{coursera, newspaper, youtube};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::{Emitter, Manager};
@@ -141,6 +141,15 @@ pub fn run() {
             commands::set_all_downloads_paused,
             commands::set_download_job_pause,
             commands::start_download_jobs,
+            youtube::commands::get_youtube_helper_status,
+            youtube::commands::scan_youtube_source,
+            youtube::commands::inspect_youtube_transcripts,
+            youtube::commands::cancel_youtube_discovery,
+            youtube::commands::start_youtube_download,
+            youtube::commands::get_youtube_download_state,
+            youtube::commands::pause_youtube_download,
+            youtube::commands::resume_youtube_download,
+            youtube::commands::cancel_youtube_download,
             coursera::commands::bootstrap_coursera_state,
             coursera::commands::parse_coursera_class_input,
             coursera::commands::coursera_login,
@@ -266,6 +275,15 @@ pub fn run() {
             app.manage(clipping_service);
             app.manage(commands::LinkVaultState::new(db_path.clone()));
             app.manage(coursera::commands::CourseraState::new(db_path.clone()));
+            let youtube_handle = app.handle().clone();
+            let youtube_events: workflow::transient::EventSink =
+                std::sync::Arc::new(move |snapshot| {
+                    let _ = youtube_handle.emit(workflow::transient::EVENT_NAME, snapshot);
+                });
+            app.manage(workflow::transient::TransientWorkflowState::new(Some(
+                youtube_events,
+            )));
+            app.manage(youtube::commands::YouTubePlanStore::default());
             app.manage(newspaper::thumbnails::ThumbnailCoordinator::new(
                 db_path.clone(),
             ));
@@ -332,6 +350,9 @@ pub fn run() {
             }
         }
         tauri::RunEvent::Exit => {
+            handle
+                .state::<workflow::transient::TransientWorkflowState>()
+                .shutdown();
             handle
                 .state::<newspaper::clipping_service::ClippingService>()
                 .shutdown_crop_service();

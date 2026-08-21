@@ -55,6 +55,7 @@ import {
   guardedToast
 } from "./components/primitives";
 import { CourseraView } from "./components/coursera/CourseraView";
+import { YouTubeView } from "./components/youtube/YouTubeView";
 import { NewspaperView } from "./components/newspaper/NewspaperView";
 import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
@@ -249,7 +250,7 @@ const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const APP_VERSION = "0.2.20";
 type AppTheme = "light" | "dark";
-type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings";
+type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings" | "youtube";
 
 function readInitialTheme(): AppTheme {
   if (typeof window === "undefined") return "dark";
@@ -1882,7 +1883,14 @@ export default function App() {
               </SidebarItem>
             </div>
           </div>
-          <SidebarItem disabled title="Unavailable in the LinkedIn Learning MVP" icon={<IconMovie aria-hidden="true" size={18} />}>Generic Video</SidebarItem>
+          <SidebarItem
+            active={activeView === "youtube"}
+            icon={<IconMovie aria-hidden="true" size={18} />}
+            aria-label="Open YouTube archive"
+            onClick={() => void requestNavigation("youtube")}
+          >
+            YouTube archive
+          </SidebarItem>
           <div
             className="lv-sidebar-optimization mt-4 flex min-w-0 flex-col gap-1.5 border-t border-sidebar-border pt-3 text-xs text-sidebar-muted"
             aria-label="Newspaper optimization performance"
@@ -1947,9 +1955,9 @@ export default function App() {
                 </Tooltip>
               }
             >
-              <div className="text-xs font-semibold text-muted-strong">LinkedIn Courses MVP</div>
+              <div className="text-xs font-semibold text-muted-strong">LinkVault archive workspace</div>
               <p className="mt-2 text-xs leading-5 text-muted">
-                Generic Video and LinkedIn Scraper are visible for context only. Course downloads use a saved local LinkedIn session after you paste li_at once.
+                Course downloads use a saved local LinkedIn session after you paste li_at once. YouTube archive work is restricted to the internal authorized-content scope shown in its view.
               </p>
             </Popover>
           </div>
@@ -2076,6 +2084,8 @@ export default function App() {
           )}
           {activeView === "newspaper-clippings" && activeSearchQuery && !isClippingDetailOpen && !clippingNavigation.pendingClippingId ? (
             <NewspaperClippingSearch query={activeSearchQuery} onOpen={(id) => void clippingNavigation.openClipping(id)} />
+          ) : activeView === "youtube" ? (
+            <YouTubeView />
           ) : activeView === "coursera" ? (
             <CourseraView />
           ) : activeView === "coursera-history" ? (

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "targetTriple": "x86_64-pc-windows-msvc",
+  "status": "unpopulated",
+  "lockDigest": null,
+  "components": []
+}

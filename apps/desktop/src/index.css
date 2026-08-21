@@ -737,6 +737,619 @@ textarea {
   min-height: max-content;
 }
 
+.lv-content[data-active-view="youtube"] {
+  grid-template-columns: minmax(0, 1fr);
+  overflow-y: auto;
+}
+
+.youtube-view {
+  display: grid;
+  width: min(100%, 1240px);
+  min-width: 0;
+  align-content: start;
+  gap: 14px;
+  margin: 0 auto;
+  padding: 18px 20px 32px;
+}
+
+.youtube-view-heading,
+.youtube-command-heading,
+.youtube-panel-heading,
+.youtube-progress-meta,
+.youtube-progress-detail,
+.youtube-scan-summary,
+.youtube-run-note,
+.youtube-run-error,
+.youtube-run-warnings,
+.youtube-helper-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.youtube-view-heading {
+  min-height: 42px;
+}
+
+.youtube-view-heading h2,
+.youtube-command-heading h3,
+.youtube-panel-heading h3 {
+  margin: 0;
+  color: var(--text-main);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.youtube-view-heading h2 {
+  font-size: 18px;
+  line-height: 22px;
+}
+
+.youtube-view-heading p {
+  margin: 3px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.youtube-view-heading > .status-pill {
+  margin-left: auto;
+}
+
+.youtube-view-mark {
+  display: grid;
+  height: 38px;
+  width: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  border-radius: 10px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.youtube-guidance {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border-soft));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--warning) 7%, var(--section-bg));
+  padding: 11px 12px;
+}
+
+.youtube-guidance-icon {
+  display: grid;
+  height: 20px;
+  width: 20px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--warning);
+}
+
+.youtube-guidance-icon svg {
+  height: 16px;
+  width: 16px;
+}
+
+.youtube-guidance-copy {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.youtube-guidance-copy strong {
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.youtube-guidance-copy p {
+  max-width: 980px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.youtube-acknowledgement,
+.youtube-option-check {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.youtube-acknowledgement input,
+.youtube-option-check input {
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  margin-top: 2px;
+}
+
+.youtube-helper-status {
+  min-height: 28px;
+  border-left: 2px solid var(--border-soft);
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.youtube-helper-status svg {
+  height: 14px;
+  width: 14px;
+  flex: 0 0 auto;
+}
+
+.youtube-helper-status-ready {
+  border-left-color: var(--success);
+  color: var(--success);
+}
+
+.youtube-helper-status-failed {
+  border-left-color: var(--danger);
+  color: var(--danger);
+}
+
+.youtube-command-panel,
+.youtube-reel-panel,
+.youtube-run-panel {
+  min-width: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--section-bg);
+  box-shadow: none;
+  padding: 14px;
+}
+
+.youtube-command-heading,
+.youtube-panel-heading {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-soft);
+  padding-bottom: 10px;
+}
+
+.youtube-command-heading h3,
+.youtube-panel-heading h3 {
+  font-size: 13px;
+  line-height: 17px;
+}
+
+.youtube-kicker {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+}
+
+.youtube-command-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.18fr) minmax(250px, 0.82fr);
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.youtube-url-row,
+.youtube-output-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.youtube-output-row .lv-button {
+  min-width: 86px;
+}
+
+.youtube-options-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(130px, 0.65fr) minmax(150px, 1fr) minmax(180px, 1.2fr);
+  align-items: end;
+  gap: 10px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.youtube-options-row .lv-select-shell,
+.youtube-options-row select {
+  width: 100%;
+}
+
+.youtube-stage-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr);
+  align-items: start;
+  gap: 14px;
+}
+
+.youtube-panel-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+
+.youtube-panel-actions .lv-button {
+  min-width: 0;
+}
+
+.youtube-count-label,
+.youtube-scan-summary span,
+.youtube-progress-detail,
+.youtube-run-note {
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.youtube-count-label {
+  white-space: nowrap;
+}
+
+.youtube-scan-summary {
+  align-items: flex-start;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 11px 0;
+}
+
+.youtube-scan-summary > svg {
+  height: 15px;
+  width: 15px;
+  flex: 0 0 auto;
+  color: var(--accent);
+  margin-top: 1px;
+}
+
+.youtube-scan-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.youtube-scan-summary strong {
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.youtube-scan-id {
+  overflow: hidden;
+  max-width: 160px;
+  margin-left: auto;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.youtube-source-reel {
+  position: relative;
+  display: grid;
+  gap: 0;
+  list-style: none;
+  margin: 0;
+  padding: 4px 0 0;
+}
+
+.youtube-source-reel::before {
+  position: absolute;
+  top: 17px;
+  bottom: 17px;
+  left: 22px;
+  width: 1px;
+  background: var(--border-soft);
+  content: "";
+}
+
+.youtube-reel-item {
+  position: relative;
+  min-width: 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.youtube-reel-item:last-child {
+  border-bottom: 0;
+}
+
+.youtube-reel-select {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 20px 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 58px;
+  cursor: pointer;
+  padding: 7px 0;
+}
+
+.youtube-reel-select > input {
+  position: absolute;
+  height: 1px;
+  width: 1px;
+  opacity: 0;
+}
+
+.youtube-reel-check {
+  display: grid;
+  height: 16px;
+  width: 16px;
+  place-items: center;
+  border: 1px solid var(--color-input);
+  border-radius: 4px;
+  background: var(--color-field);
+  color: var(--primary-foreground);
+}
+
+.youtube-reel-check svg {
+  display: none;
+  height: 12px;
+  width: 12px;
+}
+
+.youtube-reel-select > input:checked + .youtube-reel-check {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.youtube-reel-select > input:checked + .youtube-reel-check svg {
+  display: block;
+}
+
+.youtube-reel-select > input:focus-visible + .youtube-reel-check {
+  outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  outline-offset: 3px;
+}
+
+.youtube-reel-ordinal {
+  z-index: 1;
+  display: grid;
+  height: 30px;
+  width: 30px;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--section-bg);
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.youtube-reel-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.youtube-reel-copy strong {
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.youtube-reel-copy span {
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.youtube-reel-item[data-unavailable="true"] .youtube-reel-select {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.youtube-run-panel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.youtube-live-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.youtube-progress-block {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-faint);
+  padding: 11px;
+}
+
+.youtube-progress-meta {
+  justify-content: space-between;
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.youtube-progress-meta span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.youtube-progress-detail {
+  justify-content: space-between;
+  gap: 8px;
+  line-height: 14px;
+}
+
+.youtube-run-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr);
+  gap: 7px;
+}
+
+.youtube-run-actions .lv-button {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.youtube-run-error,
+.youtube-run-warnings {
+  align-items: flex-start;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 16px;
+  padding: 8px 9px;
+}
+
+.youtube-run-error {
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 8%, var(--section-bg));
+  color: var(--danger);
+}
+
+.youtube-run-warnings {
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 8%, var(--section-bg));
+  color: var(--warning);
+}
+
+.youtube-run-error svg,
+.youtube-run-warnings svg,
+.youtube-run-note svg {
+  height: 14px;
+  width: 14px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.youtube-run-note {
+  align-items: flex-start;
+  border-top: 1px solid var(--border-soft);
+  line-height: 15px;
+  padding-top: 10px;
+}
+
+@container lv-main (max-width: 980px) {
+  .youtube-stage-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .youtube-run-panel {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .youtube-run-panel .youtube-panel-heading,
+  .youtube-run-panel .youtube-live-announcer,
+  .youtube-run-panel .youtube-progress-block,
+  .youtube-run-panel .youtube-run-actions,
+  .youtube-run-panel .youtube-run-error,
+  .youtube-run-panel .youtube-run-warnings,
+  .youtube-run-panel .youtube-run-note,
+  .youtube-run-panel .lv-table-empty {
+    grid-column: 1 / -1;
+  }
+}
+
+@container lv-main (max-width: 720px) {
+  .youtube-command-grid,
+  .youtube-options-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .youtube-options-row {
+    align-items: start;
+  }
+
+  .youtube-run-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .youtube-run-panel .youtube-panel-heading,
+  .youtube-run-panel .youtube-live-announcer,
+  .youtube-run-panel .youtube-progress-block,
+  .youtube-run-panel .youtube-run-actions,
+  .youtube-run-panel .youtube-run-error,
+  .youtube-run-panel .youtube-run-warnings,
+  .youtube-run-panel .youtube-run-note,
+  .youtube-run-panel .lv-table-empty {
+    grid-column: auto;
+  }
+}
+
+@container lv-main (max-width: 520px) {
+  .youtube-view {
+    padding: 12px 10px 24px;
+  }
+
+  .youtube-view-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .youtube-view-heading > .status-pill {
+    width: 100%;
+    margin-left: 48px;
+  }
+
+  .youtube-url-row,
+  .youtube-output-row,
+  .youtube-run-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .youtube-panel-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .youtube-panel-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .youtube-reel-select {
+    grid-template-columns: 20px 30px minmax(0, 1fr);
+  }
+
+  .youtube-reel-select > .status-pill {
+    grid-column: 3;
+    justify-self: start;
+  }
+
+  .youtube-scan-id {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .youtube-view *,
+  .youtube-view *::before,
+  .youtube-view *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
 .lv-workspace {
   display: grid;
   min-height: 0;

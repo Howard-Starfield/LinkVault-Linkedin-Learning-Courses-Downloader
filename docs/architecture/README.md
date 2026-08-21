@@ -8,6 +8,7 @@ design from whichever provider was implemented most recently.
 
 - [ADR-001: Unified workflow modular monolith](adr-001-unified-workflow-modular-monolith.md)
 - [ADR-002: Newspaper clippings as provider-owned managed assets](adr-002-newspaper-clippings-managed-assets.md)
+- [ADR-003: YouTube V1 transient workflow bridge](adr-003-youtube-transient-workflow-bridge.md)
 - [Frontend/Rust ownership boundary](frontend-rust-ownership-boundary.md)
 - [Newspaper Clippings V1 master PRD](../specs/newspaper-clippings-v1/README.md)
 - [Unified workflow migration plan](unified-workflow-migration-plan.md)
@@ -24,7 +25,10 @@ may still be Proposed and therefore does not authorize implementation.
 ```text
 apps/desktop/src-tauri/src/
   app/                    Tauri lifecycle, shared database and application services
+    cooperative_exit.rs   App-owned renderer/native shutdown barrier
+    safe_output_filesystem.rs Opaque validated output/staging capabilities
   workflow/               Shared durable workflow kernel
+    transient/            Temporary ADR-003 non-durable YouTube V1 bridge
     domain/               State and transition rules
     application/          Planning, supervision, retry and cancellation
     ports/                Repository and external-service contracts
@@ -33,6 +37,7 @@ apps/desktop/src-tauri/src/
     linkedin/             LinkedIn-specific discovery and artifact behavior
     coursera/             Coursera-specific discovery and artifact behavior
     newspaper/            Newspaper-specific catalog, download and reader behavior
+    youtube/              YouTube-specific discovery, planning and artifact behavior
   lib.rs                  Composition root only
   main.rs                 Executable entry point only
 ```
@@ -56,3 +61,7 @@ does not imply that its future behavior has already been implemented.
 Temporary crate-root compatibility exports are permitted only during the
 strangler migration. Each compatibility export must point into one of the
 owned modules above and must be removed after its consumers migrate.
+
+ADR-003's bridge is workflow-owned and non-durable; it does not relax the rule
+against provider-local cancellation runtimes. Its scope and removal gates are
+authoritative for YouTube V1.

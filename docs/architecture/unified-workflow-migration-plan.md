@@ -178,6 +178,13 @@ A built-in provider adds one provider module, planner, executor registrations,
 contract tests and optional provider UI. It must not add another scheduler,
 generic job/event table, cancellation runtime or React processing loop.
 
+[ADR-003](adr-003-youtube-transient-workflow-bridge.md) permits a temporary
+workflow-owned, non-durable bridge for YouTube V1 while Phase 2 is absent. The
+exception does not authorize provider-local lifecycle ownership, durable
+tables, retry scheduling or reuse by another provider. Phase 2 migration routes
+new YouTube submissions to exactly one runtime and removes the bridge after
+packaged/native parity and rollback gates pass.
+
 ## Frontend contract
 
 Generic workflow commands will eventually be:
@@ -225,6 +232,8 @@ restoration tests pass.
 - Add domain types, transition matrix and persistence repositories.
 - Add supervisor, leases, retry, cancellation and resource governance.
 - Add a synthetic workflow used only for recovery and fault-injection tests.
+- Adapt ADR-003 transient lifecycle and managed-process contracts behind the
+  durable runtime without dual-writing transient state.
 
 Gate: restart, duplicate claim, cancellation, disk failure and retry tests pass.
 
