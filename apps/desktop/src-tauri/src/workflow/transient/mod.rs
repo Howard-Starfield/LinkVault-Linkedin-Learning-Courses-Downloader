@@ -6,17 +6,17 @@
 //! reconstructable snapshot emitted to the renderer.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub mod managed_process;
 
 pub const EVENT_NAME: &str = "linkvault://youtube-run-changed";
 pub const MAX_SELECTED_ITEMS: usize = 100;
-pub const MAX_SUBMISSION_RECEIPTS: usize = 256;
 pub const MAX_DISCOVERY_TOMBSTONES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -38,6 +38,19 @@ impl TransientRunState {
             self,
             Self::Completed | Self::CompletedWithWarnings | Self::Failed | Self::Cancelled
         )
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::PauseRequested => "pause_requested",
+            Self::Paused => "paused",
+            Self::Cancelling => "cancelling",
+            Self::Completed => "completed",
+            Self::CompletedWithWarnings => "completed_with_warnings",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
     }
 }
 
@@ -344,6 +357,8 @@ impl Default for Admission {
 struct DiscoveryGuard {
     admission: Arc<Admission>,
     operation_id: String,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_signal: Arc<ShutdownSignal>,
 }
 
 impl DiscoveryGuard {
@@ -370,8 +385,31 @@ impl Drop for DiscoveryGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if matches!(&*state, AdmissionState::Discovering { operation_id, .. } if operation_id == &self.operation_id)
         {
-            *state = AdmissionState::Idle;
+            *state = if self.shutting_down.load(Ordering::Acquire) {
+                AdmissionState::ShuttingDown
+            } else {
+                AdmissionState::Idle
+            };
         }
+        drop(state);
+        self.shutdown_signal.notify();
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShutdownSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl ShutdownSignal {
+    fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.saturating_add(1);
+        self.changed.notify_all();
     }
 }
 
@@ -395,21 +433,26 @@ pub struct TransientWorkflowRuntime {
 struct TransientRuntimeInner {
     admission: Arc<Admission>,
     active: Mutex<Option<ActiveRun>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
     most_recent: Mutex<Option<TransientRunSnapshot>>,
+    terminal_snapshots: Mutex<HashMap<String, TransientRunSnapshot>>,
     event_sink: Option<EventSink>,
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_signal: Arc<ShutdownSignal>,
     submission_receipts: Mutex<SubmissionReplayCache>,
+    #[cfg(test)]
+    fail_next_worker_spawn: AtomicBool,
 }
 
 #[derive(Debug, Default)]
 struct SubmissionReplayCache {
     receipts: HashMap<String, TransientSubmissionReceipt>,
-    order: VecDeque<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TransientSubmissionReceipt {
     pub client_submission_id: String,
+    pub request_fingerprint: String,
     pub plan_fingerprint: String,
     pub run_id: String,
     pub revision: u64,
@@ -438,6 +481,10 @@ impl TransientWorkflowState {
     pub fn shutdown(&self) {
         self.runtime.shutdown();
     }
+
+    pub fn shutdown_and_wait(&self, timeout: Duration) -> bool {
+        self.runtime.shutdown_and_wait(timeout)
+    }
 }
 
 impl TransientWorkflowRuntime {
@@ -446,10 +493,15 @@ impl TransientWorkflowRuntime {
             inner: Arc::new(TransientRuntimeInner {
                 admission: Arc::new(Admission::default()),
                 active: Mutex::new(None),
+                worker: Mutex::new(None),
                 most_recent: Mutex::new(None),
+                terminal_snapshots: Mutex::new(HashMap::new()),
                 event_sink,
-                shutting_down: AtomicBool::new(false),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                shutdown_signal: Arc::new(ShutdownSignal::default()),
                 submission_receipts: Mutex::new(SubmissionReplayCache::default()),
+                #[cfg(test)]
+                fail_next_worker_spawn: AtomicBool::new(false),
             }),
         }
     }
@@ -457,7 +509,7 @@ impl TransientWorkflowRuntime {
     pub fn find_submission(
         &self,
         client_submission_id: &str,
-        plan_fingerprint: &str,
+        request_fingerprint: &str,
     ) -> Result<Option<TransientSubmissionReceipt>, TransientRuntimeError> {
         let receipts = self
             .inner
@@ -465,7 +517,7 @@ impl TransientWorkflowRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(receipt) = receipts.receipts.get(client_submission_id) {
-            if receipt.plan_fingerprint == plan_fingerprint {
+            if receipt.request_fingerprint == request_fingerprint {
                 return Ok(Some(receipt.clone()));
             }
             return Err(TransientRuntimeError::SubmissionConflict);
@@ -480,17 +532,7 @@ impl TransientWorkflowRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = receipt.client_submission_id.clone();
-        if receipts.receipts.contains_key(&key) {
-            receipts.order.retain(|entry| entry != &key);
-        }
-        while receipts.receipts.len() >= MAX_SUBMISSION_RECEIPTS {
-            let Some(evicted) = receipts.order.pop_front() else {
-                break;
-            };
-            receipts.receipts.remove(&evicted);
-        }
-        receipts.order.push_back(key.clone());
-        receipts.receipts.insert(key, receipt);
+        receipts.receipts.entry(key).or_insert(receipt);
     }
 
     pub fn begin_discovery(
@@ -540,6 +582,8 @@ impl TransientWorkflowRuntime {
             guard: Some(DiscoveryGuard {
                 admission: Arc::clone(&self.inner.admission),
                 operation_id,
+                shutting_down: Arc::clone(&self.inner.shutting_down),
+                shutdown_signal: Arc::clone(&self.inner.shutdown_signal),
             }),
         })
     }
@@ -589,6 +633,7 @@ impl TransientWorkflowRuntime {
                 _ => TransientRuntimeError::Busy,
             });
         }
+        self.reap_worker();
         let selected = work_items.len() as u32;
         let items = work_items
             .iter()
@@ -645,13 +690,67 @@ impl TransientWorkflowRuntime {
             record: Arc::clone(&record),
         });
         drop(active);
-        self.emit(&snapshot);
 
         let inner = Arc::clone(&self.inner);
-        thread::Builder::new()
-            .name("linkvault-youtube-run".to_string())
-            .spawn(move || execute_run(inner, record, control, executor))
-            .map_err(|_| TransientRuntimeError::InvalidTransition)?;
+        let start_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&start_gate);
+        #[cfg(test)]
+        let force_spawn_failure = self
+            .inner
+            .fail_next_worker_spawn
+            .swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let force_spawn_failure = false;
+        let worker = if force_spawn_failure {
+            Err(std::io::Error::other("injected worker spawn failure"))
+        } else {
+            thread::Builder::new()
+                .name("linkvault-youtube-run".to_string())
+                .spawn(move || {
+                    let (ready, changed) = &*worker_gate;
+                    let ready = ready
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let ready = changed
+                        .wait_while(ready, |ready| !*ready)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    drop(ready);
+                    execute_run(inner, record, control, executor);
+                })
+        };
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(_) => {
+                *self
+                    .inner
+                    .active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                let mut admission = self
+                    .inner
+                    .admission
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *admission = if self.inner.shutting_down.load(Ordering::Acquire) {
+                    AdmissionState::ShuttingDown
+                } else {
+                    AdmissionState::Idle
+                };
+                return Err(TransientRuntimeError::InvalidTransition);
+            }
+        };
+        *self
+            .inner
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
+        self.emit(&snapshot);
+        let (ready, changed) = &*start_gate;
+        *ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_one();
         Ok(snapshot)
     }
 
@@ -674,15 +773,12 @@ impl TransientWorkflowRuntime {
                     .clone();
                 return Ok(Some(snapshot));
             }
-            let most_recent = self
+            let terminal_snapshots = self
                 .inner
-                .most_recent
+                .terminal_snapshots
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            return Ok(most_recent
-                .as_ref()
-                .filter(|snapshot| snapshot.run_id == run_id)
-                .cloned());
+            return Ok(terminal_snapshots.get(run_id).cloned());
         }
         if let Some(active) = self
             .inner
@@ -783,8 +879,14 @@ impl TransientWorkflowRuntime {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(&*admission, AdmissionState::Idle) {
-            *admission = AdmissionState::ShuttingDown;
+        match &*admission {
+            AdmissionState::Idle => {
+                *admission = AdmissionState::ShuttingDown;
+            }
+            AdmissionState::Discovering { cancel, .. } => {
+                cancel.store(true, Ordering::Release);
+            }
+            AdmissionState::Running | AdmissionState::ShuttingDown => {}
         }
         drop(admission);
         if let Some(active) = self
@@ -796,6 +898,75 @@ impl TransientWorkflowRuntime {
         {
             active.control.request_cancel();
         }
+    }
+
+    pub fn shutdown_and_wait(&self, timeout: Duration) -> bool {
+        self.shutdown();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let generation = self
+                .inner
+                .shutdown_signal
+                .generation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.is_quiescent() {
+                self.reap_worker();
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let observed = *generation;
+            let (generation, wait) = self
+                .inner
+                .shutdown_signal
+                .changed
+                .wait_timeout_while(generation, remaining, |current| *current == observed)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(generation);
+            if wait.timed_out() && !self.is_quiescent() {
+                return false;
+            }
+        }
+    }
+
+    fn is_quiescent(&self) -> bool {
+        let admission = self
+            .inner
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(&*admission, AdmissionState::ShuttingDown) {
+            return false;
+        }
+        drop(admission);
+        self.inner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+    }
+
+    fn reap_worker(&self) {
+        let worker = self
+            .inner
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_worker_spawn_failure(&self) {
+        self.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::Release);
     }
 
     fn active_run(&self, run_id: &str) -> Result<ActiveRun, TransientRuntimeError> {
@@ -881,14 +1052,14 @@ fn execute_run(
     for (index, item) in work_items.iter().enumerate() {
         if control.is_cancelled() {
             mark_remaining_cancelled(&inner, &record, index);
-            finish_run(&inner, &record, TransientRunState::Cancelled);
+            finish_run(&inner, &record, &control, TransientRunState::Cancelled);
             return;
         }
         if control.pause_requested() && index > 0 {
             set_paused(&inner, &record, &control);
             if control.is_cancelled() {
                 mark_remaining_cancelled(&inner, &record, index);
-                finish_run(&inner, &record, TransientRunState::Cancelled);
+                finish_run(&inner, &record, &control, TransientRunState::Cancelled);
                 return;
             }
         }
@@ -900,12 +1071,18 @@ fn execute_run(
         if control.is_cancelled() {
             mark_item_cancelled(&inner, &record, item);
             mark_remaining_cancelled(&inner, &record, index.saturating_add(1));
-            finish_run(&inner, &record, TransientRunState::Cancelled);
+            finish_run(&inner, &record, &control, TransientRunState::Cancelled);
             return;
         }
-        match result {
-            Ok(outcome) => commit_item_outcome(&inner, &record, item, outcome),
-            Err(error) => commit_item_failure(&inner, &record, item, error),
+        let committed = match result {
+            Ok(outcome) => commit_item_outcome(&inner, &record, &control, item, outcome),
+            Err(error) => commit_item_failure(&inner, &record, &control, item, error),
+        };
+        if !committed {
+            mark_item_cancelled(&inner, &record, item);
+            mark_remaining_cancelled(&inner, &record, index.saturating_add(1));
+            finish_run(&inner, &record, &control, TransientRunState::Cancelled);
+            return;
         }
         if control.pause_requested() && index + 1 < work_items.len() {
             set_paused(&inner, &record, &control);
@@ -924,6 +1101,7 @@ fn execute_run(
     finish_run(
         &inner,
         &record,
+        &control,
         if has_warnings {
             TransientRunState::CompletedWithWarnings
         } else {
@@ -1006,13 +1184,17 @@ fn update_progress(
 fn commit_item_outcome(
     inner: &Arc<TransientRuntimeInner>,
     record: &Arc<Mutex<RunRecord>>,
+    control: &TransientRunControl,
     item: &TransientWorkItem,
     outcome: TransientExecutionOutcome,
-) {
+) -> bool {
     let snapshot = {
         let mut record = record
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if control.is_cancelled() {
+            return false;
+        }
         if let Some(candidate) = record
             .snapshot
             .items
@@ -1048,18 +1230,23 @@ fn commit_item_outcome(
         commit_revision(&mut record.snapshot)
     };
     emit_inner(inner, &snapshot);
+    true
 }
 
 fn commit_item_failure(
     inner: &Arc<TransientRuntimeInner>,
     record: &Arc<Mutex<RunRecord>>,
+    control: &TransientRunControl,
     item: &TransientWorkItem,
     error: TransientError,
-) {
+) -> bool {
     let snapshot = {
         let mut record = record
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if control.is_cancelled() {
+            return false;
+        }
         if let Some(candidate) = record
             .snapshot
             .items
@@ -1081,6 +1268,7 @@ fn commit_item_failure(
         commit_revision(&mut record.snapshot)
     };
     emit_inner(inner, &snapshot);
+    true
 }
 
 fn mark_item_cancelled(
@@ -1185,13 +1373,18 @@ fn set_paused(
 fn finish_run(
     inner: &Arc<TransientRuntimeInner>,
     record: &Arc<Mutex<RunRecord>>,
+    control: &TransientRunControl,
     state: TransientRunState,
 ) {
     let snapshot = {
         let mut record = record
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        record.snapshot.state = state;
+        record.snapshot.state = if control.is_cancelled() {
+            TransientRunState::Cancelled
+        } else {
+            state
+        };
         record.snapshot.item = None;
         record.snapshot.progress = TransientProgress::default();
         commit_revision(&mut record.snapshot)
@@ -1200,6 +1393,11 @@ fn finish_run(
         .most_recent
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
+    inner
+        .terminal_snapshots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(snapshot.run_id.clone(), snapshot.clone());
     *inner
         .active
         .lock()
@@ -1217,6 +1415,7 @@ fn finish_run(
         };
     }
     drop(admission);
+    inner.shutdown_signal.notify();
     emit_inner(inner, &snapshot);
 }
 
@@ -1234,6 +1433,15 @@ mod tests {
 
     struct FakeExecutor {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct BlockingExecutor {
+        started: Arc<AtomicBool>,
+    }
+
+    struct SuccessAfterReleaseExecutor {
+        started: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
     }
 
     impl TransientExecutor for FakeExecutor {
@@ -1257,6 +1465,46 @@ mod tests {
                     message: "cancelled".to_string(),
                 });
             }
+            Ok(TransientExecutionOutcome::completed(vec![
+                "media".to_string()
+            ]))
+        }
+    }
+
+    impl TransientExecutor for BlockingExecutor {
+        fn execute(
+            &self,
+            _item: &TransientWorkItem,
+            control: &TransientRunControl,
+            _progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            self.started.store(true, Ordering::Release);
+            while !control.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TransientError {
+                code: "CANCELLED".to_string(),
+                message: "cancelled".to_string(),
+            })
+        }
+    }
+
+    impl TransientExecutor for SuccessAfterReleaseExecutor {
+        fn execute(
+            &self,
+            _item: &TransientWorkItem,
+            _control: &TransientRunControl,
+            _progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            self.started.store(true, Ordering::Release);
+            let (released, changed) = &*self.release;
+            let released = released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let released = changed
+                .wait_while(released, |released| !*released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(released);
             Ok(TransientExecutionOutcome::completed(vec![
                 "media".to_string()
             ]))
@@ -1349,5 +1597,213 @@ mod tests {
         }
         assert!(calls.load(Ordering::Relaxed) <= 1);
         assert_eq!(snapshot.counts.selected, 2);
+    }
+
+    #[test]
+    fn shutdown_cancels_an_active_run_and_waits_for_quiescence() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        let started = Arc::new(AtomicBool::new(false));
+        runtime
+            .start_run(
+                "shutdown-run".to_string(),
+                "shutdown-submission".to_string(),
+                "shutdown-plan".to_string(),
+                vec![item("one", 0)],
+                Arc::new(BlockingExecutor {
+                    started: Arc::clone(&started),
+                }),
+            )
+            .unwrap();
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        assert!(runtime.shutdown_and_wait(Duration::from_secs(1)));
+        let snapshot = runtime
+            .get_state(Some("shutdown-run"))
+            .unwrap()
+            .expect("cancelled run snapshot");
+        assert_eq!(snapshot.state, TransientRunState::Cancelled);
+        assert_eq!(
+            runtime
+                .start_run(
+                    "late-run".to_string(),
+                    "late-submission".to_string(),
+                    "late-plan".to_string(),
+                    vec![item("late", 0)],
+                    Arc::new(FakeExecutor {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                )
+                .unwrap_err(),
+            TransientRuntimeError::ShuttingDown
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_discovery_and_waits_for_its_guard() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        let operation = runtime.begin_discovery("shutdown-discovery").unwrap();
+        let waiter_runtime = runtime.clone();
+        let waiter =
+            thread::spawn(move || waiter_runtime.shutdown_and_wait(Duration::from_secs(1)));
+
+        for _ in 0..100 {
+            if operation.cancellation_requested() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(operation.cancellation_requested());
+        drop(operation);
+        assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn worker_spawn_failure_rolls_back_admission() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        runtime.inject_worker_spawn_failure();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failed = runtime.start_run(
+            "failed-spawn".to_string(),
+            "failed-submission".to_string(),
+            "failed-plan".to_string(),
+            vec![item("failed", 0)],
+            Arc::new(FakeExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        assert_eq!(
+            failed.unwrap_err(),
+            TransientRuntimeError::InvalidTransition
+        );
+
+        runtime
+            .start_run(
+                "retry-spawn".to_string(),
+                "retry-submission".to_string(),
+                "retry-plan".to_string(),
+                vec![item("retry", 0)],
+                Arc::new(FakeExecutor {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+        for _ in 0..100 {
+            if runtime
+                .get_state(Some("retry-spawn"))
+                .unwrap()
+                .is_some_and(|snapshot| snapshot.state.is_terminal())
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn submission_ids_remain_retired_for_the_process_lifetime() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        for index in 0..300 {
+            runtime.record_submission(TransientSubmissionReceipt {
+                client_submission_id: format!("submission-{index}"),
+                request_fingerprint: format!("request-{index}"),
+                plan_fingerprint: format!("plan-{index}"),
+                run_id: format!("run-{index}"),
+                revision: 1,
+                scan_plan_id: format!("scan-{index}"),
+            });
+        }
+
+        let first = runtime
+            .find_submission("submission-0", "request-0")
+            .unwrap()
+            .expect("first submission remains retired");
+        assert_eq!(first.run_id, "run-0");
+        assert_eq!(
+            runtime
+                .find_submission("submission-0", "different-request")
+                .unwrap_err(),
+            TransientRuntimeError::SubmissionConflict
+        );
+    }
+
+    #[test]
+    fn accepted_cancellation_wins_over_later_executor_success() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        runtime
+            .start_run(
+                "cancel-race".to_string(),
+                "cancel-race-submission".to_string(),
+                "cancel-race-plan".to_string(),
+                vec![item("race", 0)],
+                Arc::new(SuccessAfterReleaseExecutor {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .unwrap();
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let cancelling = runtime.cancel("cancel-race").unwrap();
+        assert_eq!(cancelling.state, TransientRunState::Cancelling);
+        let (released, changed) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_one();
+
+        for _ in 0..100 {
+            if let Some(snapshot) = runtime.get_state(Some("cancel-race")).unwrap() {
+                if snapshot.state.is_terminal() {
+                    assert_eq!(snapshot.state, TransientRunState::Cancelled);
+                    assert_eq!(snapshot.counts.cancelled, 1);
+                    assert_eq!(snapshot.counts.completed, 0);
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("cancelled terminal snapshot was not observed");
+    }
+
+    #[test]
+    fn older_terminal_run_state_remains_available_for_exact_replay() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for run in ["first-terminal", "second-terminal"] {
+            runtime
+                .start_run(
+                    run.to_string(),
+                    format!("{run}-submission"),
+                    format!("{run}-plan"),
+                    vec![item(run, 0)],
+                    Arc::new(FakeExecutor {
+                        calls: Arc::clone(&calls),
+                    }),
+                )
+                .unwrap();
+            for _ in 0..100 {
+                if runtime
+                    .get_state(Some(run))
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.state.is_terminal())
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        let first = runtime
+            .get_state(Some("first-terminal"))
+            .unwrap()
+            .expect("older terminal state");
+        assert_eq!(first.state, TransientRunState::Completed);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 }

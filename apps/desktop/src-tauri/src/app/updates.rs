@@ -23,8 +23,15 @@ pub async fn check_for_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingUpdate>,
 ) -> Result<Option<UpdateMetadata>, String> {
+    let before_exit_handle = app.clone();
     let update = app
-        .updater()
+        .updater_builder()
+        .on_before_exit(move || {
+            if crate::shutdown_transient_workflow(&before_exit_handle) {
+                crate::authorize_cooperative_exit(&before_exit_handle);
+            }
+        })
+        .build()
         .map_err(|error| format!("Updater unavailable: {error}"))?
         .check()
         .await
@@ -44,7 +51,21 @@ pub async fn check_for_app_update(
 }
 
 #[tauri::command]
-pub async fn install_app_update(pending_update: State<'_, PendingUpdate>) -> Result<(), String> {
+pub async fn install_app_update(
+    app: AppHandle,
+    pending_update: State<'_, PendingUpdate>,
+) -> Result<(), String> {
+    let prepare_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::prepare_renderer_for_update(&prepare_handle)
+    })
+    .await
+    .map_err(|error| format!("Update preparation failed: {error}"))??;
+
+    if !crate::shutdown_transient_workflow(&app) {
+        return Err("Timed out while stopping active YouTube work".to_string());
+    }
+
     let update = pending_update
         .0
         .lock()

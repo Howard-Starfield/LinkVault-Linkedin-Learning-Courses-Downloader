@@ -160,6 +160,26 @@ pub fn start_youtube_download(
     request: StartYouTubeDownloadRequest,
 ) -> Result<StartYouTubeDownloadResponse, YouTubeError> {
     validate_submission_id(&request.client_submission_id)?;
+    let request_fingerprint = submission_fingerprint(&request);
+    if let Some(receipt) = workflow
+        .runtime()
+        .find_submission(&request.client_submission_id, &request_fingerprint)
+        .map_err(YouTubeError::from)?
+    {
+        let snapshot = workflow
+            .runtime()
+            .get_state(Some(&receipt.run_id))
+            .map_err(YouTubeError::from)?
+            .ok_or_else(|| YouTubeError::new("RUN_NOT_FOUND", "download state is unavailable"))?;
+        return Ok(StartYouTubeDownloadResponse {
+            client_submission_id: receipt.client_submission_id,
+            run_id: receipt.run_id,
+            revision: snapshot.revision,
+            scan_plan_id: receipt.scan_plan_id,
+            plan_fingerprint: receipt.plan_fingerprint,
+            state: snapshot.state.as_str().to_string(),
+        });
+    }
     let plan = get_plan(&state, &request.scan_plan_id)?;
     if plan.expires_at <= Instant::now() {
         return Err(YouTubeError::from(YouTubeInternalError::PlanExpired));
@@ -193,20 +213,6 @@ pub fn start_youtube_download(
     let helper = helper_identity(helper_kind())
         .map_err(|error| YouTubeError::new("HELPER_INTEGRITY_FAILED", error.to_string()))?;
     let plan_fingerprint = fingerprint(&request, &plan, &helper.digest);
-    if let Some(receipt) = workflow
-        .runtime()
-        .find_submission(&request.client_submission_id, &plan_fingerprint)
-        .map_err(YouTubeError::from)?
-    {
-        return Ok(StartYouTubeDownloadResponse {
-            client_submission_id: receipt.client_submission_id,
-            run_id: receipt.run_id,
-            revision: receipt.revision,
-            scan_plan_id: receipt.scan_plan_id,
-            plan_fingerprint: receipt.plan_fingerprint,
-            state: "running".to_string(),
-        });
-    }
     let run_id = opaque_id("run");
     let work_items = selected_items
         .into_iter()
@@ -242,6 +248,7 @@ pub fn start_youtube_download(
         .runtime()
         .record_submission(TransientSubmissionReceipt {
             client_submission_id: request.client_submission_id,
+            request_fingerprint,
             plan_fingerprint,
             run_id: response.run_id.clone(),
             revision: response.revision,
@@ -339,6 +346,24 @@ fn validate_operation_id(id: &str) -> Result<(), YouTubeError> {
 fn validate_submission_id(id: &str) -> Result<(), YouTubeError> {
     validate_operation_id(id)
         .map_err(|_| YouTubeError::new("INVALID_SUBMISSION_ID", "submission id is malformed"))
+}
+
+fn submission_fingerprint(request: &StartYouTubeDownloadRequest) -> String {
+    let encoded = serde_json::to_vec(&(
+        &request.scan_plan_id,
+        &request.selected_occurrence_ids,
+        &request.output_dir,
+        &request.mode,
+        request.max_height,
+        &request.preferred_language,
+        &request.fallback_languages,
+        request.allow_automatic_captions,
+        request.continue_without_transcript,
+    ))
+    .expect("YouTube submission fields are infallibly serializable");
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    format!("{:x}", hasher.finalize())
 }
 
 fn fingerprint(

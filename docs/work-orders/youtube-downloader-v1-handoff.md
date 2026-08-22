@@ -52,16 +52,28 @@ Real helper execution is deliberately disabled in `workflow/transient/managed_pr
 
 Remaining P1 enablement blockers:
 
-1. Integrate managed-tree ownership with a native cooperative-exit participant so Cancel, true Quit, and updater restart use one ordered cleanup path after renderer note durability.
-2. Hold stable executable/file identities from validation through process creation; verify and pin yt-dlp, Deno, FFmpeg, FFprobe, and loaded assets; remove every remaining inherited/config/cache/runtime ambiguity.
-3. Strengthen output-root, staging, and leaf operations with stable file/volume identities and no-follow handles to close junction/reparse TOCTOU windows.
-4. Make submission IDs process-lifetime non-evicting (or durably retired), roll back admission on worker-thread creation failure, join shutdown work, and make accepted cancellation win terminal races.
-5. Bind manifests/fingerprints to the canonical helper-lock digest and semantic transcript selection, and implement verified `skipped_existing` reuse.
-6. Complete bounded per-occurrence discovery, source revalidation, transcript inspection/selection, raw VTT plus normalized JSON, FFprobe media verification, and deterministic delegated-helper arguments.
-7. Mount native transcript-inspection and pause/resume controls, then add native WebView coverage beyond the browser fixture.
-8. Resolve and test the exact Tauri sidecar source filename versus installed runtime filename contract before packaging.
+1. Hold stable executable/file identities from validation through process creation; verify and pin yt-dlp, Deno, FFmpeg, FFprobe, and loaded assets; remove every remaining inherited/config/cache/runtime ambiguity.
+2. Strengthen output-root, staging, and leaf operations with stable file/volume identities and no-follow handles to close junction/reparse TOCTOU windows.
+3. Bind manifests/fingerprints to the canonical helper-lock digest and semantic transcript selection, and implement verified `skipped_existing` reuse.
+4. Complete bounded per-occurrence discovery, source revalidation, transcript inspection/selection, raw VTT plus normalized JSON, FFprobe media verification, and deterministic delegated-helper arguments.
+5. Mount native transcript-inspection and pause/resume controls, then add native WebView coverage beyond the browser fixture.
+6. Resolve and test the exact Tauri sidecar source filename versus installed runtime filename contract before packaging.
 
 Public release additionally requires the separate `Y-PUBLIC-REVIEW` decision and exact packaged/native UAT evidence.
+
+## Current slice: ordered exit and workflow correctness
+
+The next bounded slice completes the process-lifecycle and transient-runtime blockers without enabling helpers:
+
+- True Quit waits for renderer note durability, requests cancellation of active YouTube discovery or execution, waits for workflow quiescence, joins the worker, and only then authorizes application exit.
+- Updater installation enters the same renderer-durability and native-workflow barrier; its Windows pre-exit hook grants the single-use exit authorization only after cleanup.
+- Shutdown cancels discovery as well as runs and permanently closes new workflow admission.
+- Worker startup is gated until ownership is recorded, and injected spawn failure rolls admission back instead of leaving a ghost running state.
+- Accepted cancellation wins over a later executor success, including the final-item race.
+- Submission IDs and terminal run snapshots remain retired for process lifetime. Exact replay is checked before scan-plan lookup and returns the real current or terminal revision/state rather than a hard-coded `running` response.
+- A Windows-only Newspaper test now compares canonical directory identities instead of textual short-name versus long-name path spellings; this is a test-only correction for the full branch gate.
+
+`EXECUTION_HARDENING_COMPLETE` remains `false`, and no helper lock or executable was changed.
 
 ## Verification evidence
 
@@ -85,12 +97,15 @@ Current-slice evidence at authoring time:
 - Architecture, repository UI, YouTube UI, no-explicit-`any`, production frontend build and `git diff --check` passed on the repaired tree.
 - Helper verification still fails closed as required while the authoritative lock is unpopulated.
 - The repaired commit still requires a green branch-only `YouTube V1 Internal Hardening` workflow before this slice is closed as remote CI evidence.
+- Workflow run `32541987104` proved formatting and library compilation, then exposed one unrelated full-suite Windows assertion comparing an 8.3 temp path spelling with its canonical spelling. The resolved directory identity matched; the current slice corrects only that assertion and requires a new full workflow run.
+- Current lifecycle/runtime evidence: Rust formatting and `cargo check --lib` passed; the complete library suite passed with 590 passed, 0 failed, and 4 ignored; all 7 hostile managed-process tests passed; and the focused transient-runtime tests cover shutdown/join, discovery cancellation, worker-spawn rollback, process-lifetime submission retirement, retained terminal replay, and accepted-cancellation precedence.
+- Architecture, repository UI, YouTube UI, no-explicit-`any`, frontend production build, and `git diff --check` passed. Helper verification still fails closed exactly because the authoritative lock remains unpopulated.
 
 No packaged/native YouTube download UAT has been claimed.
 
 ## Next safe slice
 
-Push the verified formatting/ABI repair and require a green branch-only Windows workflow. Then pair the managed supervisor with the tokenized native cooperative-exit participant and updater path while keeping `EXECUTION_HARDENING_COMPLETE` false. After cancellation and ordered true-exit tests pass, proceed to identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
+Push this ordered-exit/workflow slice and require a green branch-only Windows workflow. Then proceed to identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
 
 After those gates pass, transcript-only execution remains the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
 

@@ -967,7 +967,12 @@ mod tests {
 
         let reconnected = registry.reconnect(&root.id, &moved_root, 200).unwrap();
         assert_eq!(reconnected.status, ClippingRootStatus::Connected);
-        assert_eq!(reconnected.display_path, moved_root.to_string_lossy());
+        assert_eq!(
+            PathBuf::from(&reconnected.display_path)
+                .canonicalize()
+                .unwrap(),
+            moved_root.canonicalize().unwrap()
+        );
         assert_eq!(
             registry.resolve(&root.id).unwrap().root(),
             moved_root.canonicalize().unwrap()

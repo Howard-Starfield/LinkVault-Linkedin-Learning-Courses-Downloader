@@ -21,6 +21,8 @@ pub use providers::{coursera, newspaper, youtube};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::{Emitter, Manager};
 
+const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[tauri::command]
 fn resolve_cooperative_exit(
     state: tauri::State<'_, CooperativeExit>,
@@ -31,7 +33,6 @@ fn resolve_cooperative_exit(
 }
 
 fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
-    const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     let coordinator = app.state::<CooperativeExit>().inner().clone();
     let request = coordinator.request(reason);
     if !request.started {
@@ -62,8 +63,12 @@ fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
                 }
             }
             WaitOutcome::Durable(ExitReason::Exit) => {
-                coordinator.authorize_exit();
-                handle.exit(0);
+                if shutdown_transient_workflow(&handle) {
+                    coordinator.authorize_exit();
+                    handle.exit(0);
+                } else {
+                    restore_main_window(&handle, ExitReason::Exit);
+                }
             }
             WaitOutcome::Blocked(reason) | WaitOutcome::TimedOut(reason) => {
                 restore_main_window(&handle, reason);
@@ -71,6 +76,44 @@ fn request_cooperative_exit(app: &tauri::AppHandle, reason: ExitReason) {
             WaitOutcome::Stale => {}
         },
     );
+}
+
+pub(crate) fn shutdown_transient_workflow(app: &tauri::AppHandle) -> bool {
+    app.state::<workflow::transient::TransientWorkflowState>()
+        .shutdown_and_wait(EXIT_TIMEOUT)
+}
+
+pub(crate) fn prepare_renderer_for_update(app: &tauri::AppHandle) -> Result<(), String> {
+    let coordinator = app.state::<CooperativeExit>().inner().clone();
+    let request = coordinator.request(ExitReason::Exit);
+    if !request.started {
+        return Err("Another close or exit request is already in progress".to_string());
+    }
+    if app
+        .emit(
+            "linkvault://prepare-exit",
+            serde_json::json!({
+                "token": request.token,
+                "reason": ExitReason::Exit,
+                "deadlineMs": EXIT_TIMEOUT.as_millis()
+            }),
+        )
+        .is_err()
+    {
+        coordinator.resolve(request.token, false);
+    }
+    match coordinator.wait(request.token, EXIT_TIMEOUT) {
+        WaitOutcome::Durable(ExitReason::Exit) => Ok(()),
+        WaitOutcome::Durable(ExitReason::Close) | WaitOutcome::Stale => {
+            Err("Update preparation became stale".to_string())
+        }
+        WaitOutcome::Blocked(_) => Err("Unsaved work blocked the update".to_string()),
+        WaitOutcome::TimedOut(_) => Err("Timed out while saving work for the update".to_string()),
+    }
+}
+
+pub(crate) fn authorize_cooperative_exit(app: &tauri::AppHandle) {
+    app.state::<CooperativeExit>().authorize_exit();
 }
 
 pub fn run() {
