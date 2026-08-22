@@ -80,3 +80,4 @@ jobs:
             throw "The unpopulated YouTube helper lock unexpectedly passed verification."
           }
           Write-Host "Helper verification failed closed as required while the authoritative lock is unavailable."
+          exit 0
