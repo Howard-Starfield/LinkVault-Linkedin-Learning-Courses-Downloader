@@ -8,6 +8,7 @@ import {
   CircleHelp,
   Folder,
   ListVideo,
+  Pause,
   Play,
   RefreshCw,
   ScanLine,
@@ -28,13 +29,17 @@ import {
   cancelYouTubeDownload,
   getYouTubeDownloadState,
   getYouTubeHelperStatus,
+  inspectYouTubeTranscripts,
   isTauriRuntime,
+  pauseYouTubeDownload,
+  resumeYouTubeDownload,
   scanYouTubeSource,
   startYouTubeDownload,
   subscribeYouTubeRunChanged
 } from "../../lib/youtube/ipc";
 import {
   isYouTubeRunTerminal,
+  type InspectYouTubeTranscriptsResponse,
   type ScanYouTubeSourceResponse,
   type StartYouTubeDownloadRequest,
   type YouTubeDownloadMode,
@@ -150,6 +155,7 @@ export function YouTubeView() {
   const [acknowledged, setAcknowledged] = useState(readAcknowledgement);
   const [sourceUrl, setSourceUrl] = useState("");
   const [scan, setScan] = useState<ScanYouTubeSourceResponse | null>(null);
+  const [transcriptInspection, setTranscriptInspection] = useState<InspectYouTubeTranscriptsResponse | null>(null);
   const [selectedOccurrenceIds, setSelectedOccurrenceIds] = useState<Set<string>>(() => new Set());
   const [outputDir, setOutputDir] = useState("");
   const [mode, setMode] = useState<YouTubeDownloadMode>("video_and_transcript");
@@ -157,9 +163,13 @@ export function YouTubeView() {
   const [allowAutomaticCaptions, setAllowAutomaticCaptions] = useState(true);
   const [continueWithoutTranscript, setContinueWithoutTranscript] = useState(true);
   const [isScanning, setIsScanning] = useState(false);
+  const [isInspectingTranscripts, setIsInspectingTranscripts] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [isPausing, setIsPausing] = useState(false);
+  const [isResuming, setIsResuming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [runSnapshot, setRunSnapshot] = useState<YouTubeRunSnapshot | null>(null);
+  const transcriptInspectionGenerationRef = useRef(0);
   const latestRunIdRef = useRef<string | null>(null);
   const latestRevisionRef = useRef(0);
 
@@ -188,9 +198,11 @@ export function YouTubeView() {
     };
   }, [nativeRuntime]);
 
-  const applyRunSnapshot = useCallback((snapshot: YouTubeRunSnapshot | null) => {
+  const applyRunSnapshot = useCallback((snapshot: YouTubeRunSnapshot | null, allowRunSwitch = false) => {
     if (!snapshot) return;
-    const sameRun = latestRunIdRef.current === snapshot.runId;
+    const currentRunId = latestRunIdRef.current;
+    const sameRun = currentRunId === snapshot.runId;
+    if (currentRunId !== null && !sameRun && !allowRunSwitch) return;
     if (sameRun && snapshot.revision <= latestRevisionRef.current) return;
     latestRunIdRef.current = snapshot.runId;
     latestRevisionRef.current = snapshot.revision;
@@ -205,6 +217,8 @@ export function YouTubeView() {
         // Subscribe before the state request so a revision cannot land between them.
         const cleanup = await subscribeYouTubeRunChanged((event) => {
           if (disposed) return;
+          const currentRunId = latestRunIdRef.current;
+          if (currentRunId !== null && currentRunId !== event.runId) return;
           void getYouTubeDownloadState({ runId: event.runId })
             .then((snapshot) => {
               if (!disposed) applyRunSnapshot(snapshot);
@@ -214,7 +228,7 @@ export function YouTubeView() {
         if (disposed) cleanup();
         else unlisten = cleanup;
         const snapshot = await getYouTubeDownloadState({ runId: null });
-        if (!disposed) applyRunSnapshot(snapshot);
+        if (!disposed) applyRunSnapshot(snapshot, true);
       } catch (error) {
         if (!disposed && nativeRuntime) {
           toast.error("YouTube runtime state unavailable", { description: String(error) });
@@ -241,6 +255,8 @@ export function YouTubeView() {
     [runSnapshot]
   );
   const activeRun = runSnapshot !== null && !isYouTubeRunTerminal(runSnapshot.state);
+  const canPauseRun = activeRun && runSnapshot?.state === "running";
+  const canResumeRun = activeRun && (runSnapshot?.state === "paused" || runSnapshot?.state === "pause_requested");
   const currentProgress = runSnapshot?.progress.fraction === null || runSnapshot?.progress.fraction === undefined
     ? 0
     : Math.max(0, Math.min(1, runSnapshot.progress.fraction)) * 100;
@@ -260,6 +276,8 @@ export function YouTubeView() {
 
   function toggleOccurrence(item: YouTubeScanItem): void {
     if (item.availability === "unavailable") return;
+    transcriptInspectionGenerationRef.current += 1;
+    setTranscriptInspection(null);
     setSelectedOccurrenceIds((current) => {
       const next = new Set(current);
       if (next.has(item.occurrenceId)) next.delete(item.occurrenceId);
@@ -270,6 +288,8 @@ export function YouTubeView() {
 
   function selectAllOccurrences(): void {
     if (!scan) return;
+    transcriptInspectionGenerationRef.current += 1;
+    setTranscriptInspection(null);
     const available = scan.items.filter((item) => item.availability !== "unavailable");
     const allSelected = available.length > 0 && available.every((item) => selectedOccurrenceIds.has(item.occurrenceId));
     setSelectedOccurrenceIds(allSelected ? new Set() : new Set(available.map((item) => item.occurrenceId)));
@@ -288,12 +308,15 @@ export function YouTubeView() {
       toast.error("Enter a YouTube URL first");
       return;
     }
+    transcriptInspectionGenerationRef.current += 1;
+    setTranscriptInspection(null);
     setIsScanning(true);
     try {
       const nextScan = await scanYouTubeSource({
         clientOperationId: createClientId("youtube-operation"),
         url: sourceUrl.trim()
       });
+      transcriptInspectionGenerationRef.current += 1;
       setScan(nextScan);
       setSelectedOccurrenceIds(new Set(nextScan.items.filter((item) => item.availability !== "unavailable").map((item) => item.occurrenceId)));
       toast.success("Source scanned", { description: `${nextScan.items.length} occurrence${nextScan.items.length === 1 ? "" : "s"} in source order.` });
@@ -301,6 +324,32 @@ export function YouTubeView() {
       toast.error("YouTube scan failed", { description: String(error) });
     } finally {
       setIsScanning(false);
+    }
+  }
+
+  async function handleInspectTranscripts(): Promise<void> {
+    if (!scan || selectedItems.length === 0 || !helperReady) return;
+    const requestedOccurrenceIds = selectedItems.map((item) => item.occurrenceId);
+    const requestGeneration = transcriptInspectionGenerationRef.current + 1;
+    transcriptInspectionGenerationRef.current = requestGeneration;
+    setIsInspectingTranscripts(true);
+    try {
+      const response = await inspectYouTubeTranscripts({
+        clientOperationId: createClientId("youtube-transcript-operation"),
+        scanPlanId: scan.scanPlanId,
+        occurrenceIds: requestedOccurrenceIds
+      });
+      if (requestGeneration !== transcriptInspectionGenerationRef.current) return;
+      const responseMatchesRequest = response.occurrences.length === requestedOccurrenceIds.length
+        && response.occurrences.every((occurrence, index) => occurrence.occurrenceId === requestedOccurrenceIds[index]);
+      if (!responseMatchesRequest) throw new Error("Transcript inspection response did not match the current occurrence selection.");
+      setTranscriptInspection(response);
+      toast.success("Transcript tracks inspected", { description: `${response.occurrences.length} selected occurrence${response.occurrences.length === 1 ? "" : "s"}.` });
+    } catch (error) {
+      if (requestGeneration !== transcriptInspectionGenerationRef.current) return;
+      toast.error("Transcript inspection failed", { description: String(error) });
+    } finally {
+      setIsInspectingTranscripts(false);
     }
   }
 
@@ -333,8 +382,11 @@ export function YouTubeView() {
         allowAutomaticCaptions,
         continueWithoutTranscript
       });
+      latestRunIdRef.current = response.runId;
+      latestRevisionRef.current = 0;
+      setRunSnapshot(null);
       const snapshot = await getYouTubeDownloadState({ runId: response.runId });
-      applyRunSnapshot(snapshot);
+      applyRunSnapshot(snapshot, true);
     } catch (error) {
       toast.error("YouTube download could not start", { description: String(error) });
     } finally {
@@ -355,8 +407,36 @@ export function YouTubeView() {
     }
   }
 
+  async function handlePause(): Promise<void> {
+    if (!runSnapshot || !canPauseRun) return;
+    setIsPausing(true);
+    try {
+      const snapshot = await pauseYouTubeDownload({ runId: runSnapshot.runId, expectedRevision: runSnapshot.revision });
+      applyRunSnapshot(snapshot);
+    } catch (error) {
+      toast.error("Could not pause YouTube run", { description: String(error) });
+    } finally {
+      setIsPausing(false);
+    }
+  }
+
+  async function handleResume(): Promise<void> {
+    if (!runSnapshot || !canResumeRun) return;
+    setIsResuming(true);
+    try {
+      const snapshot = await resumeYouTubeDownload({ runId: runSnapshot.runId, expectedRevision: runSnapshot.revision });
+      applyRunSnapshot(snapshot);
+    } catch (error) {
+      toast.error("Could not resume YouTube run", { description: String(error) });
+    } finally {
+      setIsResuming(false);
+    }
+  }
+
   function clearScan(): void {
+    transcriptInspectionGenerationRef.current += 1;
     setScan(null);
+    setTranscriptInspection(null);
     setSelectedOccurrenceIds(new Set());
   }
 
@@ -477,6 +557,9 @@ export function YouTubeView() {
             </div>
             <div className="youtube-panel-actions">
               {scan ? <span className="youtube-count-label">{selectedCount} / {scan.items.length} selected</span> : null}
+              <Button type="button" size="xs" variant="ghost" onClick={() => void handleInspectTranscripts()} loading={isInspectingTranscripts} loadingLabel="Inspecting" disabled={!scan || selectedCount === 0 || isScanning || activeRun}>
+                Inspect transcripts
+              </Button>
               <Button type="button" size="xs" variant="ghost" onClick={selectAllOccurrences} disabled={!scan || activeRun}>{scan && availableCount > 0 && selectedCount === availableCount ? "Clear" : "Select all"}</Button>
               <Button type="button" size="xs" variant="ghost" onClick={clearScan} disabled={!scan || activeRun} aria-label="Clear scanned source"><X aria-hidden="true" /></Button>
             </div>
@@ -506,6 +589,40 @@ export function YouTubeView() {
                   );
                 })}
               </ol>
+              {transcriptInspection ? (
+                <section className="youtube-transcript-inspection" aria-label="Transcript inspection">
+                  <div className="youtube-transcript-heading">
+                    <div>
+                      <strong>Transcript availability</strong>
+                      <span>{transcriptInspection.occurrences.length} selected occurrence{transcriptInspection.occurrences.length === 1 ? "" : "s"}</span>
+                    </div>
+                    <StatusBadge tone="muted">Inspection result</StatusBadge>
+                  </div>
+                  <ul className="youtube-transcript-list">
+                    {transcriptInspection.occurrences.map((occurrence) => {
+                      const item = scan.items.find((candidate) => candidate.occurrenceId === occurrence.occurrenceId);
+                      return (
+                        <li key={occurrence.occurrenceId} className="youtube-transcript-item">
+                          <div className="youtube-transcript-item-heading">
+                            <strong>{item?.title ?? occurrence.videoId}</strong>
+                            <span>{occurrence.videoId}</span>
+                          </div>
+                          {occurrence.tracks.length > 0 ? (
+                            <ul className="youtube-transcript-track-list">
+                              {occurrence.tracks.map((track) => (
+                                <li key={track.trackKey}>
+                                  <span>{track.displayLanguage} · {track.source === "uploader" ? "Uploader" : "Automatic"}</span>
+                                  <span>{track.formats.join(" · ")}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : <span className="youtube-transcript-empty">No transcript tracks reported.</span>}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              ) : null}
             </>
           ) : <EmptyRow title="No source scanned" description="Paste a public YouTube URL above, then scan to build the ordered reel." />}
         </Panel>
@@ -530,6 +647,10 @@ export function YouTubeView() {
             <Button type="button" variant="primary" onClick={() => void handleStart()} loading={isStarting} loadingLabel="Starting" disabled={!scan || selectedCount === 0 || !outputDir.trim() || !helperReady || !acknowledged || activeRun}>
               <Play aria-hidden="true" />
               Start selected ({selectedCount})
+            </Button>
+            <Button type="button" variant="outline" onClick={() => void (canResumeRun ? handleResume() : handlePause())} loading={isPausing || isResuming} loadingLabel={canResumeRun ? "Resuming" : "Pausing"} disabled={(!canPauseRun && !canResumeRun) || isCancelling}>
+              {canResumeRun ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
+              {canResumeRun ? "Resume run" : "Pause after current"}
             </Button>
             <Button type="button" variant="outline" onClick={() => void handleCancel()} loading={isCancelling} loadingLabel="Cancelling" disabled={!activeRun}>
               <Square aria-hidden="true" />

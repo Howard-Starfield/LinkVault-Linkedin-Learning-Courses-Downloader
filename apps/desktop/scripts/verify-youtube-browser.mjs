@@ -81,15 +81,28 @@ try {
     "Select all did not select every available occurrence"
   );
 
+  await page.getByRole("button", { name: "Inspect transcripts", exact: true }).click();
+  const transcriptInspection = page.getByRole("region", { name: "Transcript inspection" });
+  await transcriptInspection.waitFor();
+  assert.equal(await transcriptInspection.locator(".youtube-transcript-item").count(), 4, "Preview transcript inspection did not preserve occurrence identity");
+  assert.equal(await transcriptInspection.locator(".youtube-transcript-track-list li").count(), 8, "Preview transcript inspection did not render deterministic track metadata");
+  assert.match(await transcriptInspection.innerText(), /English.*Uploader/is, "Uploader transcript track is missing");
+  assert.match(await transcriptInspection.innerText(), /English \(automatic\).*Automatic/is, "Automatic transcript track is missing");
+
   await page.getByRole("button", { name: "Start selected (4)", exact: true }).click();
   await page.locator(".youtube-progress-block").waitFor();
+  await page.locator(".youtube-run-panel .status-pill").filter({ hasText: "Running" }).waitFor();
+  await page.getByRole("button", { name: "Pause after current", exact: true }).click();
+  await page.locator(".youtube-run-panel .status-pill").filter({ hasText: "Finishing current item" }).waitFor();
+  await page.locator(".youtube-run-panel .status-pill").filter({ hasText: "Paused" }).waitFor();
+  await page.getByRole("button", { name: "Resume run", exact: true }).click();
   await page.locator(".youtube-run-panel .status-pill").filter({ hasText: "Running" }).waitFor();
   await page.getByRole("button", { name: "Cancel run", exact: true }).click();
   await page.locator(".youtube-run-panel .status-pill").filter({ hasText: "Cancelled" }).waitFor();
   await assertNoHorizontalLoss("post-cancel wide");
 
   assert.deepEqual(consoleErrors, [], `Browser emitted console/page errors: ${consoleErrors.join(" | ")}`);
-  console.log("YouTube browser fixture passed at narrow, compact, and wide widths with scan, occurrence selection, progress, cancellation, and accessibility checks.");
+  console.log("YouTube browser fixture passed at narrow, compact, and wide widths with scan, transcript inspection, occurrence selection, progress, pause/resume, cancellation, and accessibility checks.");
 } finally {
   await browser.close();
 }

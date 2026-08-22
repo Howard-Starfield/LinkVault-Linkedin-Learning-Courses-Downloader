@@ -976,6 +976,7 @@ textarea {
   display: flex;
   min-width: 0;
   align-items: center;
+  flex-wrap: wrap;
   gap: 5px;
 }
 
@@ -1154,6 +1155,78 @@ textarea {
   opacity: 0.58;
 }
 
+.youtube-transcript-inspection {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 11px;
+}
+
+.youtube-transcript-heading,
+.youtube-transcript-item-heading,
+.youtube-transcript-track-list li {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.youtube-transcript-heading > div,
+.youtube-transcript-item-heading {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.youtube-transcript-heading strong,
+.youtube-transcript-item-heading strong {
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.youtube-transcript-heading span,
+.youtube-transcript-item-heading span,
+.youtube-transcript-track-list,
+.youtube-transcript-empty {
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.youtube-transcript-list,
+.youtube-transcript-track-list {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.youtube-transcript-item {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-faint);
+  padding: 8px;
+}
+
+.youtube-transcript-track-list {
+  gap: 3px;
+  padding-left: 8px;
+}
+
+.youtube-transcript-track-list li {
+  line-height: 14px;
+}
+
 .youtube-run-panel {
   display: grid;
   align-content: start;
@@ -1199,7 +1272,7 @@ textarea {
 
 .youtube-run-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.8fr);
   gap: 7px;
 }
 

@@ -270,12 +270,16 @@ impl TransientRunControl {
         self.pause_requested.load(Ordering::Acquire)
     }
 
-    fn mark_paused(&self) {
+    fn mark_paused_if_requested(&self) -> bool {
         let mut paused = self
             .paused
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.pause_requested.load(Ordering::Acquire) {
+            return false;
+        }
         *paused = true;
+        true
     }
 
     fn resume(&self) {
@@ -1084,7 +1088,7 @@ fn execute_run(
             finish_run(&inner, &record, &control, TransientRunState::Cancelled);
             return;
         }
-        if control.pause_requested() && index + 1 < work_items.len() {
+        if index + 1 < work_items.len() {
             set_paused(&inner, &record, &control);
         }
     }
@@ -1338,15 +1342,13 @@ fn set_paused(
     record: &Arc<Mutex<RunRecord>>,
     control: &Arc<TransientRunControl>,
 ) {
-    control.mark_paused();
     let snapshot = {
         let mut record = record
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !matches!(
-            record.snapshot.state,
-            TransientRunState::PauseRequested | TransientRunState::Running
-        ) {
+        if !matches!(record.snapshot.state, TransientRunState::PauseRequested)
+            || !control.mark_paused_if_requested()
+        {
             return;
         }
         record.snapshot.state = TransientRunState::Paused;
@@ -1553,6 +1555,156 @@ mod tests {
         assert!(last > 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(runtime.get_state(Some("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn pause_finishes_current_item_rejects_stale_revision_and_resumes() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let snapshot = runtime
+            .start_run(
+                "pause-run".to_string(),
+                "pause-submission".to_string(),
+                "pause-plan".to_string(),
+                vec![item("one", 0), item("two", 1)],
+                Arc::new(SuccessAfterReleaseExecutor {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .unwrap();
+
+        let running = (0..100)
+            .find_map(|_| {
+                let current = runtime.get_state(Some("pause-run")).unwrap()?;
+                if current.item.is_some() {
+                    Some(current)
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    None
+                }
+            })
+            .unwrap_or(snapshot);
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        let pause_requested = runtime.pause("pause-run", running.revision).unwrap();
+        assert_eq!(pause_requested.state, TransientRunState::PauseRequested);
+        assert_eq!(
+            runtime
+                .pause("pause-run", pause_requested.revision.saturating_sub(1))
+                .unwrap_err(),
+            TransientRuntimeError::StaleRevision
+        );
+
+        let (released, changed) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+
+        let paused = (0..200)
+            .find_map(|_| {
+                let current = runtime.get_state(Some("pause-run")).unwrap()?;
+                if current.state == TransientRunState::Paused {
+                    Some(current)
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    None
+                }
+            })
+            .expect("run should pause after the current item completes");
+        assert_eq!(paused.counts.completed, 1);
+        assert_eq!(paused.items[0].state, TransientItemState::Completed);
+        assert_eq!(paused.items[1].state, TransientItemState::Pending);
+        assert!(paused.item.is_none());
+
+        assert_eq!(
+            runtime
+                .resume("pause-run", paused.revision.saturating_sub(1))
+                .unwrap_err(),
+            TransientRuntimeError::StaleRevision
+        );
+        let resumed = runtime.resume("pause-run", paused.revision).unwrap();
+        assert_eq!(resumed.state, TransientRunState::Running);
+
+        let completed = (0..200)
+            .find_map(|_| {
+                let current = runtime.get_state(Some("pause-run")).unwrap()?;
+                if current.state.is_terminal() {
+                    Some(current)
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    None
+                }
+            })
+            .expect("resumed run should settle");
+        assert_eq!(completed.state, TransientRunState::Completed);
+        assert_eq!(completed.counts.completed, 2);
+    }
+
+    #[test]
+    fn resume_withdraws_pause_request_before_current_item_finishes() {
+        let runtime = TransientWorkflowRuntime::new(None);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let snapshot = runtime
+            .start_run(
+                "withdraw-pause-run".to_string(),
+                "withdraw-pause-submission".to_string(),
+                "withdraw-pause-plan".to_string(),
+                vec![item("one", 0), item("two", 1)],
+                Arc::new(SuccessAfterReleaseExecutor {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .unwrap();
+
+        let running = (0..100)
+            .find_map(|_| {
+                let current = runtime.get_state(Some("withdraw-pause-run")).unwrap()?;
+                if current.item.is_some() {
+                    Some(current)
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    None
+                }
+            })
+            .unwrap_or(snapshot);
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        let pause_requested = runtime
+            .pause("withdraw-pause-run", running.revision)
+            .unwrap();
+        let resumed = runtime
+            .resume("withdraw-pause-run", pause_requested.revision)
+            .unwrap();
+        assert_eq!(resumed.state, TransientRunState::Running);
+
+        let (released, changed) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+
+        let completed = (0..200)
+            .find_map(|_| {
+                let current = runtime.get_state(Some("withdraw-pause-run")).unwrap()?;
+                if current.state.is_terminal() {
+                    Some(current)
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    None
+                }
+            })
+            .expect("withdrawn pause request must not strand the worker");
+        assert_eq!(completed.state, TransientRunState::Completed);
+        assert_eq!(completed.counts.completed, 2);
     }
 
     #[test]

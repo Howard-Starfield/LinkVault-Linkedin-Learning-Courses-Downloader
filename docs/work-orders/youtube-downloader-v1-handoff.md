@@ -52,12 +52,12 @@ Real helper execution is deliberately disabled in `workflow/transient/managed_pr
 
 Remaining P1 enablement blockers:
 
-1. Select and populate an authoritative mutually compatible yt-dlp, EJS, Deno, FFmpeg and FFprobe inventory, including exact source archives, loaded assets, build configuration, licenses and corresponding-source obligations. No version or digest may be inferred or invented.
+1. Finish the authoritative helper inventory. The compatible yt-dlp `2026.08.19`, bundled EJS `0.8.0`, and Deno `2.9.5` candidates are now recorded from tagged upstream evidence, but FFmpeg/FFprobe extracted identities, build configuration, notices, and corresponding-source/redistribution treatment remain unselected. No version or digest may be inferred or invented.
 2. Strengthen output-root, staging, and leaf operations with stable file/volume identities and no-follow handles to close junction/reparse TOCTOU windows.
 3. Bind manifests/fingerprints to the canonical helper-lock digest and semantic transcript selection, and implement verified `skipped_existing` reuse.
 4. Complete bounded per-occurrence discovery, source revalidation, transcript inspection/selection, raw VTT plus normalized JSON, FFprobe media verification, and deterministic delegated-helper arguments.
-5. Mount native transcript-inspection and pause/resume controls, then add native WebView coverage beyond the browser fixture.
-6. Resolve and test the exact Tauri sidecar source filename versus installed runtime filename contract before packaging.
+5. Replace the native transcript-inspection placeholder with bounded real track parsing/selection, then add native WebView coverage beyond the deterministic browser fixture. Typed inspection and revision-aware pause/resume controls are mounted.
+6. Prove the exact Tauri sidecar source filename versus installed runtime filename contract in a helper-enabled package. The source/runtime naming contract is fixed and statically checked, but no helper-enabled package exists yet.
 
 Public release additionally requires the separate `Y-PUBLIC-REVIEW` decision and exact packaged/native UAT evidence.
 
@@ -90,6 +90,19 @@ The helper boundary now fails closed around one exact Tauri sidecar contract rat
 
 The authoritative lock is still deliberately unpopulated. Current upstream evidence confirms yt-dlp distributes signed checksum assets, Deno distributes per-target checksum assets, and yt-dlp requires a compatible EJS package/version; FFmpeg itself links to third-party Windows builders. Exact compatible selections and corresponding-source/license records are the next supply-chain decision, not a value to guess in code.
 
+## Current slice: mounted transcript inspection and run controls
+
+The next bounded UI/runtime contract is complete without enabling helpers:
+
+- TypeScript now mirrors the existing native transcript occurrence/track contract and revision-aware run mutation request.
+- The IPC adapter invokes the registered native transcript inspection, pause, and resume commands with typed responses.
+- The mounted YouTube view can inspect selected occurrences and render reported language/source/format metadata. The current native provider still returns an honest empty-track placeholder until bounded real extraction is implemented.
+- Pause requests are revision-guarded, finish the current item, and settle paused before the next occurrence; resume is also revision-guarded. Deterministic preview behavior matches those transitions and rejects stale mutations.
+- Browser coverage now exercises transcript metadata plus pause/resume/cancel behavior at narrow, compact, and wide widths.
+- The helper research note freezes tagged yt-dlp/EJS/Deno candidate evidence but deliberately leaves the lock unpopulated while FFmpeg/FFprobe redistribution and extracted-file identity remain unresolved.
+
+This slice does not download a helper, parse live YouTube subtitle metadata, launch a native helper, populate the lock, package an installer, or claim native WebView/download UAT.
+
 ## Verification evidence
 
 Evidence inherited from the earlier scaffold commit:
@@ -117,12 +130,15 @@ Current-slice evidence at authoring time:
 - Architecture, repository UI, YouTube UI, no-explicit-`any`, frontend production build, and `git diff --check` passed. Helper verification still fails closed exactly because the authoritative lock remains unpopulated.
 - Lifecycle commit workflow `32542986222` passed the full Rust suite, hostile managed-process suite, architecture, repository UI, YouTube UI, no-explicit-`any`, and frontend build. Its only red step was the expected helper-verifier failure being promoted to a terminating PowerShell error before the assertion wrapper ran; the current workflow correction captures that exit code explicitly.
 - Current identity-slice evidence: Rust formatting and `cargo check --lib` passed; the complete library suite passed with 593 passed, 0 failed, and 4 ignored; all 8 hostile managed-process tests passed, including handle-held tamper/replacement denial; architecture, repository UI, YouTube UI, no-explicit-`any`, frontend production build, JS syntax checks, fail-closed helper verification, and `git diff --check` passed.
+- Current mounted-controls evidence: Rust formatting and `cargo check --lib` passed; the complete Rust library suite passed with 595 passed, 0 failed, and 4 ignored; the focused pause-after-current/stale-revision/resume tests include withdrawing a pause request before the current item finishes; architecture, repository UI, YouTube UI, no-explicit-`any`, TypeScript production build, and `git diff --check` passed. The real browser fixture passed transcript inspection, revision-aware pause/resume, cancellation, accessibility, and no-horizontal-loss checks at narrow, compact, and wide widths.
 
 No packaged/native YouTube download UAT has been claimed.
 
 ## Next safe slice
 
-Push this identity-held helper slice and require a green branch-only Windows workflow. Then freeze one authoritative compatible helper/EJS/FFmpeg inventory and its license/source evidence before downloading assets. Do not enable execution merely because binaries can be acquired.
+Implement Windows output-root and attempt-directory identity leases, no-follow leaf verification, handle-safe manifest I/O, and race-free publication/cleanup as one reviewed filesystem slice. Do not wire `skipped_existing` reuse onto the current path-based output layer.
+
+After that slice is proven by hostile Windows replacement/junction tests, implement the canonical manifest/fingerprint/transcript-selection projection and exact verified reuse. In parallel, finish one FFmpeg/FFprobe build's extracted identities, build/license notices, and corresponding-source evidence before populating the helper lock. Do not enable execution merely because binaries can be acquired.
 
 After those gates pass, transcript-only execution remains the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
 

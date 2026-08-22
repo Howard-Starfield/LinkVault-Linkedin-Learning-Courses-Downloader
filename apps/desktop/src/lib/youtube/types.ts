@@ -95,6 +95,33 @@ export interface ScanYouTubeSourceResponse {
   items: YouTubeScanItem[];
 }
 
+export type YouTubeTranscriptSource = "uploader" | "automatic";
+
+export interface InspectYouTubeTranscriptsRequest {
+  clientOperationId: string;
+  scanPlanId: string;
+  occurrenceIds: string[];
+}
+
+export interface YouTubeTranscriptTrack {
+  trackKey: string;
+  languageTag: string;
+  displayLanguage: string;
+  source: YouTubeTranscriptSource;
+  isLikelyTranslated: boolean;
+  formats: string[];
+}
+
+export interface YouTubeTranscriptOccurrence {
+  occurrenceId: string;
+  videoId: string;
+  tracks: YouTubeTranscriptTrack[];
+}
+
+export interface InspectYouTubeTranscriptsResponse {
+  occurrences: YouTubeTranscriptOccurrence[];
+}
+
 export interface StartYouTubeDownloadRequest {
   clientSubmissionId: string;
   scanPlanId: string;
@@ -123,6 +150,11 @@ export interface GetYouTubeDownloadStateRequest {
 
 export interface CancelYouTubeRunRequest {
   runId: string;
+}
+
+export interface MutateYouTubeRunRequest {
+  runId: string;
+  expectedRevision: number;
 }
 
 export interface YouTubeProgressItem {

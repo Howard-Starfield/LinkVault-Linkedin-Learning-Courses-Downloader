@@ -43,11 +43,17 @@ for (const command of [
   '"start_youtube_download"',
   '"get_youtube_download_state"',
   '"cancel_youtube_download"',
+  '"inspect_youtube_transcripts"',
+  '"pause_youtube_download"',
+  '"resume_youtube_download"',
   '"get_youtube_helper_status"'
 ]) includes(ipc, command, `YouTube IPC adapter omits ${command}`);
 matches(ipc, /invoke<ScanYouTubeSourceResponse>\("scan_youtube_source"/, "Source scan IPC is not typed");
 matches(ipc, /invoke<StartYouTubeDownloadResponse>\("start_youtube_download"/, "Download start IPC is not typed");
 matches(ipc, /invoke<GetYouTubeHelperStatusResponse>\("get_youtube_helper_status"/, "Helper status IPC is not typed");
+matches(ipc, /invoke<InspectYouTubeTranscriptsResponse>\("inspect_youtube_transcripts"/, "Transcript inspection IPC is not typed");
+matches(ipc, /invoke<YouTubeRunSnapshot>\("pause_youtube_download"/, "Pause IPC is not typed");
+matches(ipc, /invoke<YouTubeRunSnapshot>\("resume_youtube_download"/, "Resume IPC is not typed");
 matches(ipc, /return \{ status: "ready", code: null, message: "" \}/, "Browser preview does not remain helper-ready");
 matches(ipc, /listen<YouTubeProgressEvent>\(/, "Run-change listener is not typed");
 matches(view, /subscribeYouTubeRunChanged/, "YouTube view does not subscribe to run events");
@@ -63,6 +69,10 @@ assert.doesNotMatch(ipc, /\bsetInterval\s*\(/, "YouTube IPC adapter introduced p
 matches(ipc, /window\.dispatchEvent\(new CustomEvent<YouTubeProgressEvent>/, "Preview progress does not use the typed event shape");
 matches(view, /latestRevisionRef\.current/, "Run reconciliation does not guard against stale revisions");
 matches(view, /snapshot\.revision <= latestRevisionRef\.current/, "Run reconciliation accepts stale revisions");
+matches(view, /currentRunId !== null && !sameRun && !allowRunSwitch/, "Run reconciliation accepts an event-driven snapshot from a different run");
+matches(view, /currentRunId !== null && currentRunId !== event\.runId/, "Run events are not scoped to the accepted run");
+matches(view, /applyRunSnapshot\(snapshot, true\)/, "Authoritative reconciliation cannot explicitly switch runs");
+matches(view, /latestRunIdRef\.current = response\.runId[\s\S]*?getYouTubeDownloadState\(\{ runId: response\.runId \}\)/, "Start does not claim successor-run events before state reconciliation");
 
 // Typed source/reel selection is occurrence-based, including playlist duplicates.
 for (const type of [
@@ -70,6 +80,10 @@ for (const type of [
   "ScanYouTubeSourceResponse",
   "StartYouTubeDownloadRequest",
   "StartYouTubeDownloadResponse",
+  "InspectYouTubeTranscriptsRequest",
+  "InspectYouTubeTranscriptsResponse",
+  "YouTubeTranscriptTrack",
+  "MutateYouTubeRunRequest",
   "GetYouTubeHelperStatusResponse",
   "YouTubeScanItem",
   "YouTubeProgressEvent",
@@ -115,6 +129,15 @@ for (const fragment of [
 matches(view, /onKeyDown=\{\(event\) => \{[\s\S]*?event\.key === "Enter"/, "Source scan cannot be keyboard submitted");
 matches(view, /disabled=\{!scan \|\| selectedCount === 0/, "Start action is not gated on a selected occurrence");
 matches(view, /disabled=\{!activeRun\}/, "Cancel action is not gated on an active run");
+matches(view, /inspectYouTubeTranscripts\(/, "Transcript inspection is not mounted through the typed adapter");
+matches(view, /transcriptInspectionGenerationRef\.current/, "Transcript inspection does not correlate responses with the active selection");
+matches(view, /requestGeneration !== transcriptInspectionGenerationRef\.current/, "Stale transcript inspection responses are accepted");
+matches(view, /response\.occurrences\.every\(\(occurrence, index\) => occurrence\.occurrenceId === requestedOccurrenceIds\[index\]\)/, "Transcript response identities are not checked against the request");
+matches(view, /scanYouTubeSource\([\s\S]*?transcriptInspectionGenerationRef\.current \+= 1;[\s\S]*?setScan\(nextScan\)/, "A committed rescan does not invalidate overlapping transcript inspection");
+matches(view, /aria-label="Transcript inspection"/, "Transcript inspection lacks an accessible region");
+matches(view, /expectedRevision: runSnapshot\.revision/, "Pause/resume actions are not revision-aware");
+matches(view, /Pause after current/, "Pause-after-current control is not mounted");
+matches(view, /Resume run/, "Resume control is not mounted");
 
 // Layout contracts are container-based and honor reduced-motion preferences.
 for (const fragment of [
