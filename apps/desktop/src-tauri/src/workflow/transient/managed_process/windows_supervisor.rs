@@ -16,20 +16,19 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+    CloseHandle, GetLastError, SetHandleInformation, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
-    OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
@@ -39,6 +38,7 @@ use windows_sys::Win32::System::Threading::{
     EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 
 const CANCEL_EXIT_CODE: u32 = 0xC000_013A;
 const START_FAILURE_EXIT_CODE: u32 = 0xC000_0142;
@@ -106,7 +106,7 @@ impl AttributeList {
             UpdateProcThreadAttribute(
                 list,
                 0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 handles.as_mut_ptr().cast::<c_void>(),
                 std::mem::size_of_val(handles),
                 null_mut(),
@@ -206,32 +206,27 @@ pub(super) fn run(
         return Err(last_start_error("CreateProcessW"));
     }
 
-    let process = match OwnedHandle::new(
-        process_info.hProcess,
-        "CreateProcessW process handle",
-    ) {
+    let process = match OwnedHandle::new(process_info.hProcess, "CreateProcessW process handle") {
         Ok(process) => process,
         Err(error) => {
             close_if_valid(process_info.hThread);
             return Err(error);
         }
     };
-    let thread_handle = match OwnedHandle::new(
-        process_info.hThread,
-        "CreateProcessW primary thread handle",
-    ) {
-        Ok(thread_handle) => thread_handle,
-        Err(error) => {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(
-                    process.raw(),
-                    START_FAILURE_EXIT_CODE,
-                );
-                WaitForSingleObject(process.raw(), 5_000);
+    let thread_handle =
+        match OwnedHandle::new(process_info.hThread, "CreateProcessW primary thread handle") {
+            Ok(thread_handle) => thread_handle,
+            Err(error) => {
+                unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(
+                        process.raw(),
+                        START_FAILURE_EXIT_CODE,
+                    );
+                    WaitForSingleObject(process.raw(), 5_000);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
 
     if fault == TestFaultSelection::BeforeJobAssignment {
         terminate_suspended_child(&job, &process);
@@ -362,8 +357,7 @@ pub(super) fn run(
     let (stderr_bytes, stderr_truncated) = stderr_result?;
 
     let mut exit_code = 0u32;
-    if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } == 0
-        && terminal_error.is_none()
+    if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } == 0 && terminal_error.is_none()
     {
         terminal_error = Some(last_wait_error("GetExitCodeProcess"));
     }
@@ -371,8 +365,7 @@ pub(super) fn run(
         return Err(error);
     }
 
-    let stdout =
-        String::from_utf8(stdout_bytes).map_err(|_| ManagedProcessError::InvalidUtf8)?;
+    let stdout = String::from_utf8(stdout_bytes).map_err(|_| ManagedProcessError::InvalidUtf8)?;
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     Ok(ManagedProcessOutput {
         status: std::process::ExitStatus::from_raw(exit_code),
@@ -426,9 +419,9 @@ fn finish_reader(task: ReaderTask) -> Result<(Vec<u8>, bool), ManagedProcessErro
             })
         }
     };
-    thread.join().map_err(|_| {
-        ManagedProcessError::Reader(format!("{label} reader thread panicked"))
-    })?;
+    thread
+        .join()
+        .map_err(|_| ManagedProcessError::Reader(format!("{label} reader thread panicked")))?;
     let result = received?;
     result.map_err(|error| ManagedProcessError::Reader(format!("{label}: {error}")))
 }
@@ -451,9 +444,11 @@ fn ensure_absolute_executable(path: &Path) -> Result<(), ManagedProcessError> {
 }
 
 fn create_kill_on_close_job() -> Result<OwnedHandle, ManagedProcessError> {
-    let job =
-        OwnedHandle::new(unsafe { CreateJobObjectW(null(), null()) }, "CreateJobObjectW")
-            .map_err(|error| ManagedProcessError::ProcessContainment(error.to_string()))?;
+    let job = OwnedHandle::new(
+        unsafe { CreateJobObjectW(null(), null()) },
+        "CreateJobObjectW",
+    )
+    .map_err(|error| ManagedProcessError::ProcessContainment(error.to_string()))?;
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     let applied = unsafe {
@@ -500,9 +495,7 @@ fn create_child_pipes() -> Result<ChildPipes, ManagedProcessError> {
     })
 }
 
-fn create_inheritable_pipe(
-    label: &str,
-) -> Result<(File, OwnedHandle), ManagedProcessError> {
+fn create_inheritable_pipe(label: &str) -> Result<(File, OwnedHandle), ManagedProcessError> {
     let mut security = inheritable_security_attributes();
     let mut read_handle: HANDLE = null_mut();
     let mut write_handle: HANDLE = null_mut();
@@ -547,10 +540,7 @@ fn terminate_job(job: &OwnedHandle, exit_code: u32) -> Result<(), ManagedProcess
     Ok(())
 }
 
-fn wait_for_job_empty(
-    job: &OwnedHandle,
-    timeout: Duration,
-) -> Result<(), ManagedProcessError> {
+fn wait_for_job_empty(job: &OwnedHandle, timeout: Duration) -> Result<(), ManagedProcessError> {
     let started = Instant::now();
     loop {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
@@ -559,8 +549,7 @@ fn wait_for_job_empty(
             QueryInformationJobObject(
                 job.raw(),
                 JobObjectBasicAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)
-                    .cast::<c_void>(),
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast::<c_void>(),
                 size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
                 &mut returned,
             )
@@ -604,10 +593,7 @@ fn build_environment_block(temp_directory: &Path) -> Vec<u16> {
         "TEMP".to_string(),
         temp_directory.as_os_str().to_os_string(),
     );
-    environment.insert(
-        "TMP".to_string(),
-        temp_directory.as_os_str().to_os_string(),
-    );
+    environment.insert("TMP".to_string(), temp_directory.as_os_str().to_os_string());
     environment.insert("NO_COLOR".to_string(), OsString::from("1"));
     environment.insert("PATH".to_string(), OsString::new());
     let mut block = Vec::new();
@@ -700,10 +686,7 @@ mod tests {
     #[test]
     fn windows_argv_quoting_handles_empty_spaces_quotes_and_trailing_slashes() {
         assert_eq!(decode(quote_windows_argument(OsStr::new(""))), "\"\"");
-        assert_eq!(
-            decode(quote_windows_argument(OsStr::new("plain"))),
-            "plain"
-        );
+        assert_eq!(decode(quote_windows_argument(OsStr::new("plain"))), "plain");
         assert_eq!(
             decode(quote_windows_argument(OsStr::new("two words"))),
             "\"two words\""

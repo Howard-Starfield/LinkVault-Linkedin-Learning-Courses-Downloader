@@ -80,13 +80,17 @@ Current-slice evidence at authoring time:
 - Repository, branch, prompt commit, and parent relationship were verified through the GitHub connector.
 - The required prompt, handoff, PRD, bridge ADR, migration plan, legal decision, helper-lock/notices, managed-process/runtime, safe-output, provider, and mounted frontend/IPC files were inspected before editing.
 - Source review confirms the execution constant is still `false` and the helper lock is still unpopulated.
-- The current commit must pass the branch-only `YouTube V1 Internal Hardening` workflow before the new managed-process implementation or tests are recorded as passing evidence. No such result is claimed in this paragraph.
+- The initial `694cae6` workflow run failed at Rust formatting before compilation. The formatting and three resulting `windows-sys` ABI/import compile findings were corrected without changing the supervisor design.
+- Current local Windows evidence after that repair: Rust formatting passed; `cargo check --lib` passed; the complete Rust library suite passed with 584 passed, 0 failed and 4 ignored; and all 7 focused managed-process hostile-fixture tests passed.
+- Architecture, repository UI, YouTube UI, no-explicit-`any`, production frontend build and `git diff --check` passed on the repaired tree.
+- Helper verification still fails closed as required while the authoritative lock is unpopulated.
+- The repaired commit still requires a green branch-only `YouTube V1 Internal Hardening` workflow before this slice is closed as remote CI evidence.
 
 No packaged/native YouTube download UAT has been claimed.
 
 ## Next safe slice
 
-First, resolve every compile, format, and hostile-fixture finding from the branch-only Windows workflow and record exact current-commit evidence. Then pair the managed supervisor with the tokenized native cooperative-exit participant and updater path while keeping `EXECUTION_HARDENING_COMPLETE` false. After cancellation and ordered true-exit tests pass, proceed to identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
+Push the verified formatting/ABI repair and require a green branch-only Windows workflow. Then pair the managed supervisor with the tokenized native cooperative-exit participant and updater path while keeping `EXECUTION_HARDENING_COMPLETE` false. After cancellation and ordered true-exit tests pass, proceed to identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
 
 After those gates pass, transcript-only execution remains the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
 

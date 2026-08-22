@@ -27,13 +27,7 @@ fn fixture_spec(args: &[&str], timeout: Duration) -> TestManagedProcessSpec {
 }
 
 fn fixture_spec_os(args: Vec<OsString>, timeout: Duration) -> TestManagedProcessSpec {
-    ManagedProcessSpec::for_test(
-        fixture_path(),
-        args,
-        256 * 1024,
-        256 * 1024,
-        timeout,
-    )
+    ManagedProcessSpec::for_test(fixture_path(), args, 256 * 1024, 256 * 1024, timeout)
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) {
@@ -55,12 +49,8 @@ fn windows_argv_serializer_round_trips_real_process_arguments() {
     ];
     let mut args = vec![OsString::from("echo_args")];
     args.extend(expected.iter().map(OsString::from));
-    let output = run_test(
-        fixture_spec_os(args, Duration::from_secs(10)),
-        None,
-        None,
-    )
-    .expect("quoted fixture process should complete");
+    let output = run_test(fixture_spec_os(args, Duration::from_secs(10)), None, None)
+        .expect("quoted fixture process should complete");
     assert!(output.status.success());
     let actual = output
         .stdout
@@ -168,11 +158,7 @@ fn injected_pre_assignment_reader_and_resume_failures_never_execute_child_code()
             "reader-startup.txt",
             "reader",
         ),
-        (
-            TestManagedProcessFault::Resume,
-            "resume.txt",
-            "resume",
-        ),
+        (TestManagedProcessFault::Resume, "resume.txt", "resume"),
     ];
     let temp = tempdir().expect("temporary directory should be available");
     for (fault, name, label) in cases {
@@ -185,8 +171,8 @@ fn injected_pre_assignment_reader_and_resume_failures_never_execute_child_code()
             Duration::from_secs(10),
         )
         .with_fault(fault);
-        let error = run_test(spec, None, None)
-            .expect_err("injected supervisor failure must fail closed");
+        let error =
+            run_test(spec, None, None).expect_err("injected supervisor failure must fail closed");
         match fault {
             TestManagedProcessFault::BeforeJobAssignment => {
                 assert!(matches!(error, ManagedProcessError::ProcessContainment(_)));

@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -232,8 +232,8 @@ fn resolve_and_verify(kind: HelperKind) -> Result<(PathBuf, String), ManagedProc
                 .to_string(),
         )
     })?;
-    let actual =
-        digest_file(&candidate).map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    let actual = digest_file(&candidate)
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
     if !actual.eq_ignore_ascii_case(&expected) {
         return Err(ManagedProcessError::Integrity(
             "helper digest does not match the approved helper lock".to_string(),
@@ -258,8 +258,7 @@ fn packaged_candidate() -> Option<PathBuf> {
 fn lock_digest_for(path: &Path) -> Option<String> {
     let value = serde_json::from_slice::<Value>(EMBEDDED_HELPER_LOCK).ok()?;
     if value.get("schemaVersion").and_then(Value::as_u64) != Some(1)
-        || value.get("targetTriple").and_then(Value::as_str)
-            != Some("x86_64-pc-windows-msvc")
+        || value.get("targetTriple").and_then(Value::as_str) != Some("x86_64-pc-windows-msvc")
         || value.get("status").and_then(Value::as_str) != Some("ready")
     {
         return None;
