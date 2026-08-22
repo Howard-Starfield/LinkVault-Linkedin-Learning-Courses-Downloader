@@ -8,5 +8,7 @@ pub mod commands;
 mod error;
 mod executor;
 mod helper;
+pub mod manifest_contract;
 pub mod models;
 mod scan;
+pub mod transcript_normalizer;

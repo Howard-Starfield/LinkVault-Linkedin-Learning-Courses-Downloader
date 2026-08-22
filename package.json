@@ -10,6 +10,7 @@
     "tauri": "npm --prefix apps/desktop run tauri --",
     "verify:architecture": "npm --prefix apps/desktop run verify:architecture",
     "fetch:youtube-helpers": "npm --prefix apps/desktop run fetch:youtube-helpers",
+    "verify:youtube-helper-lock": "npm --prefix apps/desktop run verify:youtube-helper-lock",
     "verify:youtube-helpers": "npm --prefix apps/desktop run verify:youtube-helpers",
     "build:youtube-internal": "npm --prefix apps/desktop run build:youtube-internal",
     "verify:youtube-ui": "npm --prefix apps/desktop run verify:youtube-ui",

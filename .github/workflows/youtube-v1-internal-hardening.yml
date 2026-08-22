@@ -64,6 +64,9 @@ jobs:
       - name: YouTube UI contract gate
         run: npm --prefix apps/desktop run verify:youtube-ui
 
+      - name: YouTube helper-lock contract gate
+        run: npm --prefix apps/desktop run verify:youtube-helper-lock
+
       - name: No explicit TypeScript any gate
         run: npm --prefix apps/desktop run verify:no-any
 

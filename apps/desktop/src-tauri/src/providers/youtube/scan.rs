@@ -1,7 +1,5 @@
 use crate::providers::youtube::error::YouTubeInternalError;
-use crate::providers::youtube::helper::{
-    invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES, MAX_RECORD_STDOUT_BYTES,
-};
+use crate::providers::youtube::helper::{invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES};
 use crate::providers::youtube::models::{
     ScanYouTubeSourceRequest, ScanYouTubeSourceResponse, YouTubeAvailability, YouTubePlaylistMode,
     YouTubeScanItem,
@@ -28,6 +26,7 @@ pub struct PlannedYouTubeItem {
 pub struct YouTubeScanPlan {
     pub response: ScanYouTubeSourceResponse,
     pub items: Vec<PlannedYouTubeItem>,
+    pub source_snapshot_digest: String,
     pub expires_at: Instant,
 }
 
@@ -182,6 +181,8 @@ fn discovery_args(source: &ValidatedSource) -> Vec<String> {
     ];
     if matches!(source.kind, YouTubePlaylistMode::Playlist) {
         args.push("--flat-playlist".to_string());
+        args.push("--playlist-end".to_string());
+        args.push((MAX_SCAN_ENTRIES + 1).to_string());
     } else {
         args.push("--no-playlist".to_string());
     }
@@ -280,6 +281,7 @@ fn parse_scan_plan(
             "yt-dlp returned no usable video entries".to_string(),
         ));
     }
+    let source_snapshot_digest = snapshot_digest(&source, &items);
     let scan_plan_id = opaque_id("plan");
     let response = ScanYouTubeSourceResponse {
         scan_plan_id,
@@ -300,8 +302,30 @@ fn parse_scan_plan(
     Ok(YouTubeScanPlan {
         response,
         items,
+        source_snapshot_digest,
         expires_at: Instant::now() + PLAN_TTL,
     })
+}
+
+fn snapshot_digest(source: &ValidatedSource, items: &[PlannedYouTubeItem]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update([1]);
+    update_digest_part(&mut hasher, &source.canonical_url);
+    update_digest_part(
+        &mut hasher,
+        source.playlist_id.as_deref().unwrap_or("single"),
+    );
+    for item in items {
+        update_digest_part(&mut hasher, &item.public.occurrence_id);
+        update_digest_part(&mut hasher, &item.public.video_id);
+        update_digest_part(&mut hasher, &item.public.ordinal.to_string());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn update_digest_part(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn parse_json(stdout: &str) -> Result<serde_json::Value, YouTubeInternalError> {
@@ -310,20 +334,11 @@ fn parse_json(stdout: &str) -> Result<serde_json::Value, YouTubeInternalError> {
             "discovery output exceeded the safety limit".to_string(),
         ));
     }
-    if let Ok(value) = serde_json::from_str(stdout) {
-        return Ok(value);
-    }
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.len() <= MAX_RECORD_STDOUT_BYTES && line.starts_with('{') {
-            if let Ok(value) = serde_json::from_str(line) {
-                return Ok(value);
-            }
-        }
-    }
-    Err(YouTubeInternalError::Helper(
-        "yt-dlp returned malformed machine-readable output".to_string(),
-    ))
+    serde_json::from_str(stdout).map_err(|_| {
+        YouTubeInternalError::Helper(
+            "yt-dlp returned malformed machine-readable output".to_string(),
+        )
+    })
 }
 
 fn value_string(value: &serde_json::Value) -> Option<String> {
@@ -401,11 +416,38 @@ mod tests {
         );
         assert_eq!(plan.items[0].public.ordinal, 1);
         assert_eq!(plan.items[1].public.ordinal, 2);
+        assert_eq!(plan.source_snapshot_digest.len(), 64);
+        let same_source =
+            validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let repeated = parse_scan_plan(same_source, payload).unwrap();
+        assert_eq!(plan.source_snapshot_digest, repeated.source_snapshot_digest);
+
+        let reversed_source =
+            validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let reversed = parse_scan_plan(
+            reversed_source,
+            r#"{"id":"PL_12345","title":"Playlist","entries":[{"id":"def456_ZZ","title":"B"},{"id":"abc123_XY","title":"A"}]}"#,
+        )
+        .unwrap();
+        assert_ne!(plan.source_snapshot_digest, reversed.source_snapshot_digest);
     }
 
     #[test]
     fn oversized_or_invalid_machine_output_is_rejected() {
         assert!(parse_json("not-json").is_err());
         assert!(parse_json(&"x".repeat(MAX_DISCOVERY_STDOUT_BYTES + 1)).is_err());
+        assert!(parse_json("{\"id\":\"abc123_XY\"}\ntrailing garbage").is_err());
+        assert!(parse_json("{\"id\":\"abc123_XY\"}\n{\"id\":\"def456_ZZ\"}").is_err());
+    }
+
+    #[test]
+    fn playlist_discovery_is_bounded_one_past_the_visible_limit() {
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let args = discovery_args(&source);
+        let index = args
+            .iter()
+            .position(|argument| argument == "--playlist-end")
+            .unwrap();
+        assert_eq!(args[index + 1], (MAX_SCAN_ENTRIES + 1).to_string());
     }
 }

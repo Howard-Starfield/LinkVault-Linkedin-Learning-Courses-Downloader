@@ -56,7 +56,10 @@ async function verifyLicense(asset, label) {
 await verifySidecarConfig();
 const { lock, validation } = await readLock(repositoryRoot);
 if (!validation.populated) {
-  fail("lock is intentionally unpopulated; helper execution and packaging remain blocked until authoritative metadata is reviewed");
+  if (lock.status === "unpopulated") {
+    fail("lock is intentionally unpopulated; helper execution and packaging remain blocked until authoritative metadata is reviewed");
+  }
+  fail(`lock status ${lock.status} is non-executable; helper execution and packaging require status ready`);
 }
 
 for (const component of lock.components) {

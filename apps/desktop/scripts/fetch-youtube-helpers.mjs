@@ -101,8 +101,17 @@ async function stageAsset(asset, stagingRoot, label) {
   const outputPath = resolveInside(stagingRoot, relativePath, `${label} output path`);
   await mkdir(path.dirname(outputPath), { recursive: true });
   const sourceDownload = path.join(stagingRoot, `.download-${randomSuffix()}`);
-  const sourceHash = await downloadToFile(asset.sourceUrl, sourceDownload, asset.sizeBytes, label);
-  if (sourceHash !== asset.sha256 && asset.archiveMember === null) fail(`${label} SHA-256 mismatch`);
+  const sourceSize = asset.archiveMember === null ? asset.sizeBytes : asset.distributionArchiveSizeBytes;
+  const sourceHash = await downloadToFile(
+    asset.sourceUrl,
+    sourceDownload,
+    sourceSize,
+    asset.archiveMember === null ? label : `${label} distribution archive`,
+  );
+  if (asset.archiveMember === null && sourceHash !== asset.sha256) fail(`${label} SHA-256 mismatch`);
+  if (asset.archiveMember !== null && sourceHash !== asset.distributionArchiveSha256) {
+    fail(`${label} distribution archive SHA-256 mismatch`);
+  }
   let executablePath = sourceDownload;
   if (asset.archiveMember !== null) {
     executablePath = await extractArchiveMember(sourceDownload, asset.archiveMember, path.join(stagingRoot, `.extract-${randomSuffix()}`), label);
@@ -126,7 +135,10 @@ async function stageAsset(asset, stagingRoot, label) {
 
 const { lock, validation } = await readLock(repositoryRoot);
 if (!validation.populated) {
-  fail("lock is intentionally unpopulated; populate it from reviewed authoritative release metadata before fetching helpers");
+  if (lock.status === "unpopulated") {
+    fail("lock is intentionally unpopulated; populate it from reviewed authoritative release metadata before fetching helpers");
+  }
+  fail(`lock status ${lock.status} is non-executable; helper fetching requires status ready`);
 }
 
 try {

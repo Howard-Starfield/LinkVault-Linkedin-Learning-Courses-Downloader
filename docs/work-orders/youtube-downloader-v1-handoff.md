@@ -134,12 +134,20 @@ Current-slice evidence at authoring time:
 
 No packaged/native YouTube download UAT has been claimed.
 
-## Next safe slice
+## Current stopping point and next safe slice
 
-Implement Windows output-root and attempt-directory identity leases, no-follow leaf verification, handle-safe manifest I/O, and race-free publication/cleanup as one reviewed filesystem slice. Do not wire `skipped_existing` reuse onto the current path-based output layer.
+The bounded filesystem/contract slice is implemented locally on this branch:
 
-After that slice is proven by hostile Windows replacement/junction tests, implement the canonical manifest/fingerprint/transcript-selection projection and exact verified reuse. In parallel, finish one FFmpeg/FFprobe build's extracted identities, build/license notices, and corresponding-source evidence before populating the helper lock. Do not enable execution merely because binaries can be acquired.
+- output-root and managed staging ancestors are held by stable no-follow directory handles;
+- attempt creation is guard-chained and cleanup is limited to direct regular files in the exact service-owned attempt shape;
+- Windows publication uses a no-replace rename of the held attempt handle and immediately rechecks published names and hashes;
+- scan parsing rejects trailing machine-output garbage, playlist discovery is bounded one item past the visible limit, and plans carry an order-sensitive source snapshot digest;
+- canonical artifact fingerprints/manifest projection and deterministic semantic transcript selection are implemented as pure contracts;
+- a bounded WebVTT normalizer emits deterministic versioned transcript JSON; and
+- the helper-lock scripts distinguish non-executable evidence from a ready lock and keep the authoritative unpopulated lock fail-closed.
 
-After those gates pass, transcript-only execution remains the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
+This is not native downloader completion. Execution remains disabled and no helper package, live YouTube download, FFprobe verification, normalized transcript executor wiring, exact `skipped_existing` reuse, partial import, or packaged/native UAT is claimed.
+
+The next safe slice is transcript-only fixture execution: wire verified transcript inspection/selection and the WebVTT normalizer into the executor, publish raw VTT plus normalized JSON through the proven attempt capability, then add exact manifest reuse. After that, select and document exact FFmpeg/FFprobe distribution identities and implement FFprobe media validation before any Y3 media candidate. Keep `EXECUTION_HARDENING_COMPLETE = false` and the helper lock non-ready until every helper identity/license/source and native containment gate passes.
 
 Generated Rust `target`, frontend `dist`, helper binaries, installers, caches, logs, screenshots, and UAT downloads are not committed.

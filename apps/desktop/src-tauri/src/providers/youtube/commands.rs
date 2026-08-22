@@ -2,6 +2,9 @@ use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::error::{YouTubeError, YouTubeInternalError};
 use crate::providers::youtube::executor::YouTubeExecutor;
 use crate::providers::youtube::helper::helper_kind;
+use crate::providers::youtube::manifest_contract::{
+    artifact_fingerprint, ArtifactFingerprintInput, ManifestContractError, FORMAT_POLICY_VERSION,
+};
 use crate::providers::youtube::models::{
     CancelYouTubeRunRequest, GetYouTubeDownloadStateRequest, GetYouTubeDownloadStateResponse,
     GetYouTubeHelperStatusResponse, InspectYouTubeTranscriptsRequest,
@@ -212,19 +215,21 @@ pub fn start_youtube_download(
     // closed until Y0 supplies a reviewed ready lock and packaged executable.
     let helper = helper_identity(helper_kind())
         .map_err(|error| YouTubeError::new("HELPER_INTEGRITY_FAILED", error.to_string()))?;
-    let plan_fingerprint = fingerprint(&request, &plan, &helper.digest);
+    let plan_fingerprint = fingerprint(&request, &plan, &helper.digest)?;
     let run_id = opaque_id("run");
     let work_items = selected_items
         .into_iter()
-        .map(|item| TransientWorkItem {
-            occurrence_id: item.public.occurrence_id.clone(),
-            artifact_fingerprint: fingerprint_item(item, &request, &helper.digest),
-            video_id: item.public.video_id.clone(),
-            ordinal: item.public.ordinal,
-            title: item.public.title.clone(),
-            source_url: item.source_url.clone(),
+        .map(|item| {
+            Ok(TransientWorkItem {
+                occurrence_id: item.public.occurrence_id.clone(),
+                artifact_fingerprint: fingerprint_item(item, &request, &helper.digest)?,
+                video_id: item.public.video_id.clone(),
+                ordinal: item.public.ordinal,
+                title: item.public.title.clone(),
+                source_url: item.source_url.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, YouTubeError>>()?;
     let executor = YouTubeExecutor::new(output_root, &request)?;
     let snapshot = workflow
         .runtime()
@@ -370,59 +375,60 @@ fn fingerprint(
     request: &StartYouTubeDownloadRequest,
     plan: &YouTubeScanPlan,
     helper_digest: &str,
-) -> String {
-    let mut input = format!(
-        "1|{}|{}|{}|{:?}|{:?}|{}|{}|{}|{}|{}",
-        plan.response.scan_plan_id,
-        plan.response.canonical_url,
-        request.mode.clone() as u8,
-        request.max_height,
-        request.preferred_language,
-        request.fallback_languages.join(","),
+) -> Result<String, YouTubeError> {
+    let encoded = serde_json::to_vec(&(
+        &plan.source_snapshot_digest,
+        &request.selected_occurrence_ids,
+        &request.mode,
+        FORMAT_POLICY_VERSION,
+        effective_max_height(request),
+        &request.preferred_language,
+        &request.fallback_languages,
         request.allow_automatic_captions,
         request.continue_without_transcript,
         helper_digest,
-        request.selected_occurrence_ids.join(",")
-    );
-    input.push('|');
-    input.push_str(&request.output_dir);
-    digest(&input)
+    ))
+    .map_err(|error| YouTubeError::new("MANIFEST_CONTRACT_INVALID", error.to_string()))?;
+    Ok(digest_bytes(&encoded))
 }
 
 fn fingerprint_item(
     item: &crate::providers::youtube::scan::PlannedYouTubeItem,
     request: &StartYouTubeDownloadRequest,
     helper_digest: &str,
-) -> String {
-    digest(&format!(
-        "1|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        item.public.occurrence_id,
-        item.public.video_id,
-        mode_key(&request.mode),
-        request
-            .max_height
-            .map_or_else(|| "best".to_string(), |height| height.to_string()),
-        request.preferred_language.as_deref().unwrap_or_default(),
-        request.fallback_languages.join(","),
-        request.allow_automatic_captions,
-        request.continue_without_transcript,
-        helper_digest,
-    ))
+) -> Result<String, YouTubeError> {
+    // Transcript inspection is still an honest empty-track placeholder. Do
+    // not derive a semantic selection from language preferences alone.
+    artifact_fingerprint(&ArtifactFingerprintInput {
+        occurrence_id: item.public.occurrence_id.clone(),
+        video_id: item.public.video_id.clone(),
+        mode: request.mode.clone(),
+        format_policy_version: FORMAT_POLICY_VERSION,
+        max_height: effective_max_height(request),
+        selected_transcript: None,
+        helper_lock_digest: helper_digest.to_string(),
+    })
+    .map_err(manifest_contract_error)
 }
 
-fn mode_key(mode: &crate::providers::youtube::models::YouTubeDownloadMode) -> &'static str {
-    match mode {
-        crate::providers::youtube::models::YouTubeDownloadMode::VideoAndTranscript => {
-            "video_and_transcript"
-        }
-        crate::providers::youtube::models::YouTubeDownloadMode::VideoOnly => "video_only",
-        crate::providers::youtube::models::YouTubeDownloadMode::TranscriptOnly => "transcript_only",
+fn effective_max_height(request: &StartYouTubeDownloadRequest) -> Option<u16> {
+    match &request.mode {
+        crate::providers::youtube::models::YouTubeDownloadMode::TranscriptOnly => None,
+        _ => request.max_height,
     }
 }
 
+fn manifest_contract_error(error: ManifestContractError) -> YouTubeError {
+    YouTubeError::new("MANIFEST_CONTRACT_INVALID", error.to_string())
+}
+
 fn digest(input: &str) -> String {
+    digest_bytes(input.as_bytes())
+}
+
+fn digest_bytes(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
+    hasher.update(input);
     format!("{:x}", hasher.finalize())
 }
 

@@ -115,6 +115,16 @@ function validateAsset(asset, label, { requireFilename = true } = {}) {
     fail(`${label}.archiveMember must be null or a string`);
   }
   if (typeof asset.archiveMember === "string") safeRelativePath(asset.archiveMember, `${label}.archiveMember`);
+  if (asset.archiveMember === null) {
+    if (asset.distributionArchiveSizeBytes !== undefined || asset.distributionArchiveSha256 !== undefined) {
+      fail(`${label}.distributionArchive* is only valid when archiveMember is set`);
+    }
+  } else {
+    requirePositiveInteger(asset, "distributionArchiveSizeBytes", label);
+    if (!sha256Hex(asset.distributionArchiveSha256)) {
+      fail(`${label}.distributionArchiveSha256 must be lowercase SHA-256`);
+    }
+  }
   requireString(asset, "licenseId", label);
   safeRelativePath(asset.licenseFile, `${label}.licenseFile`);
   return relativePath;
@@ -132,11 +142,13 @@ export function validateLock(lock, repositoryRoot) {
     return { populated: false, components: [] };
   }
 
-  if (lock.status !== "ready") fail("status must be either unpopulated or ready");
-  if (!sha256Hex(lock.lockDigest)) fail("ready lockDigest must be lowercase SHA-256");
+  if (lock.status !== "evidence" && lock.status !== "ready") {
+    fail("status must be unpopulated, evidence, or ready");
+  }
+  if (!sha256Hex(lock.lockDigest)) fail(`${lock.status} lockDigest must be lowercase SHA-256`);
   if (lock.lockDigest !== digestLock(lock)) fail("lockDigest does not match canonical lock contents");
   if (lock.components.length !== REQUIRED_COMPONENTS.length) {
-    fail(`ready lock must contain exactly ${REQUIRED_COMPONENTS.length} components`);
+    fail(`${lock.status} lock must contain exactly ${REQUIRED_COMPONENTS.length} components`);
   }
 
   const names = new Set();
@@ -173,7 +185,7 @@ export function validateLock(lock, repositoryRoot) {
       void loadedLicensePath;
     }
   }
-  return { populated: true, components: lock.components };
+  return { populated: lock.status === "ready", components: lock.components };
 }
 
 export async function readLock(repositoryRoot) {

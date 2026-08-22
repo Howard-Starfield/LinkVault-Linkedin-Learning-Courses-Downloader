@@ -4,10 +4,13 @@
 //! a helper path or an output filename.  This module validates the selected
 //! root once and only exposes constrained descendants to provider code.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -23,6 +26,8 @@ pub enum SafeOutputError {
     InvalidChildName,
     #[error("output child escaped the validated root")]
     EscapedRoot,
+    #[error("validated output identity changed: {path}")]
+    IdentityChanged { path: PathBuf },
     #[error("output contains an unsafe descendant: {path}")]
     UnsafeDescendant { path: PathBuf },
     #[error("a verified output already exists at {path}")]
@@ -37,96 +42,91 @@ pub enum SafeOutputError {
 pub struct ValidatedOutputRoot {
     path: PathBuf,
     canonical_path: PathBuf,
+    leases: Arc<Vec<DirectoryLease>>,
 }
+
+#[derive(Debug)]
+struct DirectoryLease {
+    path: PathBuf,
+    handle: File,
+    identity: StableIdentity,
+}
+
+/// An attempt-directory capability held across helper execution and
+/// publication.  The directory handle is opened without following reparse
+/// points and retains the directory identity observed at admission.
+///
+/// Callers keep this lease alive until verification and publication complete.
+#[derive(Debug)]
+pub struct OutputAttemptLease {
+    root: ValidatedOutputRoot,
+    path: PathBuf,
+    ancestor_leases: Vec<DirectoryLease>,
+    identity: StableIdentity,
+    handle: File,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StableIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StableIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(any(windows, unix)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StableIdentity;
 
 impl ValidatedOutputRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Create a provider-owned descendant directory beneath the validated
-    /// root.  Every existing component is checked for symlink/reparse-point
-    /// substitution before the path is returned.
-    pub fn child_dir(&self, name: &str) -> Result<PathBuf, SafeOutputError> {
-        validate_component(name)?;
-        let child = self.path.join(name);
-        match fs::symlink_metadata(&child) {
-            Ok(metadata) => {
-                if is_untrusted_directory(&metadata) {
-                    return Err(SafeOutputError::UntrustedDirectory { path: child });
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&child).map_err(|error| SafeOutputError::NotWritable {
-                    path: child.clone(),
-                    message: error.to_string(),
-                })?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = fs::symlink_metadata(&child)?;
-        if is_untrusted_directory(&metadata) {
-            return Err(SafeOutputError::UntrustedDirectory { path: child });
-        }
-        let canonical_child = child.canonicalize()?;
-        if !canonical_child.starts_with(&self.canonical_path)
-            || canonical_child == self.canonical_path
-        {
-            return Err(SafeOutputError::EscapedRoot);
-        }
-        Ok(child)
+    fn root_lease(&self) -> Result<&DirectoryLease, SafeOutputError> {
+        self.leases
+            .last()
+            .ok_or_else(|| SafeOutputError::IdentityChanged {
+                path: self.path.clone(),
+            })
     }
 
-    /// Create a staging directory beneath `.linkvault-staging`.  Staging is
-    /// kept separate from published item directories so a failed helper never
-    /// becomes a visible completed artifact.
-    pub fn staging_dir(
+    /// Re-open the selected root without following a Windows reparse point
+    /// and compare its stable identity with the admission lease.  Callers
+    /// should perform this check before and after helper-visible mutations.
+    pub fn revalidate(&self) -> Result<(), SafeOutputError> {
+        for lease in self.leases.iter() {
+            revalidate_directory_lease(lease)?;
+        }
+        let canonical = self
+            .path
+            .canonicalize()
+            .map_err(|_| SafeOutputError::IdentityChanged {
+                path: self.path.clone(),
+            })?;
+        if canonical != self.canonical_path {
+            return Err(SafeOutputError::IdentityChanged {
+                path: self.path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Create and immediately lease a unique attempt directory.
+    #[allow(dead_code)]
+    pub fn staging_attempt_lease(
         &self,
         occurrence_id: &str,
         artifact_fingerprint: &str,
-    ) -> Result<PathBuf, SafeOutputError> {
+    ) -> Result<OutputAttemptLease, SafeOutputError> {
         validate_component(occurrence_id)?;
         validate_component(artifact_fingerprint)?;
-        let staging_root = self.child_dir(".linkvault-staging")?;
-        let youtube_root = staging_root.join("youtube");
-        ensure_directory(&youtube_root)?;
-        let staging = youtube_root.join(occurrence_id).join(artifact_fingerprint);
-        let occurrence_root = youtube_root.join(occurrence_id);
-        ensure_directory(&occurrence_root)?;
-        if path_utf16_len(&staging) > 240 {
-            return Err(SafeOutputError::PathTooLong);
-        }
-        match fs::symlink_metadata(&staging) {
-            Ok(metadata) => {
-                if is_untrusted_directory(&metadata) {
-                    return Err(SafeOutputError::UntrustedDirectory { path: staging });
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&staging).map_err(|error| SafeOutputError::NotWritable {
-                    path: staging.clone(),
-                    message: error.to_string(),
-                })?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = fs::symlink_metadata(&staging)?;
-        if is_untrusted_directory(&metadata) {
-            return Err(SafeOutputError::UntrustedDirectory { path: staging });
-        }
-        let canonical_staging = staging.canonicalize()?;
-        if !canonical_staging.starts_with(&self.canonical_path) {
-            return Err(SafeOutputError::EscapedRoot);
-        }
-        Ok(staging)
-    }
-
-    pub fn staging_attempt_dir(
-        &self,
-        occurrence_id: &str,
-        artifact_fingerprint: &str,
-    ) -> Result<PathBuf, SafeOutputError> {
-        let staging = self.staging_dir(occurrence_id, artifact_fingerprint)?;
         static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
         let attempt_name = format!(
             "attempt-{}-{}-{}",
@@ -135,31 +135,227 @@ impl ValidatedOutputRoot {
             NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
         );
         validate_component(&attempt_name)?;
-        let attempt = staging.join(attempt_name);
-        if path_utf16_len(&attempt) > 240 {
-            return Err(SafeOutputError::PathTooLong);
+        let names = [
+            ".linkvault-staging",
+            "youtube",
+            occurrence_id,
+            artifact_fingerprint,
+            attempt_name.as_str(),
+        ];
+        self.revalidate()?;
+        let mut current = self.path.clone();
+        let mut ancestor_leases = Vec::with_capacity(names.len() - 1);
+        let mut final_handle = None;
+        for (index, name) in names.iter().enumerate() {
+            current.push(name);
+            if path_utf16_len(&current) > 240 {
+                return Err(SafeOutputError::PathTooLong);
+            }
+            let is_final = index + 1 == names.len();
+            match fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(error) if !is_final && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let handle = open_directory_guard(&current, is_final, false)?;
+            let metadata = handle.metadata()?;
+            if is_untrusted_directory(&metadata) {
+                return Err(SafeOutputError::UntrustedDirectory {
+                    path: current.clone(),
+                });
+            }
+            let identity = stable_identity(&handle)?;
+            if is_final {
+                final_handle = Some((handle, identity));
+            } else {
+                ancestor_leases.push(DirectoryLease {
+                    path: current.clone(),
+                    handle,
+                    identity,
+                });
+            }
         }
-        fs::create_dir(&attempt).map_err(|error| SafeOutputError::NotWritable {
-            path: attempt.clone(),
-            message: error.to_string(),
-        })?;
-        let metadata = fs::symlink_metadata(&attempt)?;
-        if is_untrusted_directory(&metadata) {
-            return Err(SafeOutputError::UntrustedDirectory { path: attempt });
-        }
-        let canonical_attempt = attempt.canonicalize()?;
-        if !canonical_attempt.starts_with(&self.canonical_path) {
-            return Err(SafeOutputError::EscapedRoot);
-        }
-        Ok(attempt)
+        let (handle, identity) = final_handle.ok_or(SafeOutputError::EscapedRoot)?;
+        self.revalidate()?;
+        Ok(OutputAttemptLease {
+            root: self.clone(),
+            path: current,
+            ancestor_leases,
+            identity,
+            handle,
+        })
     }
 
-    /// Verify that the helper-visible attempt contains only direct regular
-    /// files below the validated root. A helper is not allowed to create a
-    /// nested directory, symlink, junction, device or other reparse entry.
-    pub fn validate_attempt_contents(&self, attempt: &Path) -> Result<(), SafeOutputError> {
-        self.validate_descendant(attempt)?;
-        for entry in fs::read_dir(attempt)? {
+    /// Verify and publish a leased attempt. Windows renames the held source
+    /// handle without replacement. Every destination ancestor remains guarded,
+    /// so the absolute destination namespace cannot be redirected mid-rename.
+    pub fn publish_attempt_lease(
+        &self,
+        attempt: OutputAttemptLease,
+        final_name: &str,
+    ) -> Result<PathBuf, SafeOutputError> {
+        validate_component(final_name)?;
+        if path_utf16_len(&self.path.join(final_name)) > 240 {
+            return Err(SafeOutputError::PathTooLong);
+        }
+        if attempt.root.path != self.path
+            || attempt.root.root_lease()?.identity != self.root_lease()?.identity
+        {
+            return Err(SafeOutputError::IdentityChanged {
+                path: attempt.path().to_path_buf(),
+            });
+        }
+        self.revalidate()?;
+        attempt.revalidate()?;
+        attempt.validate_contents()?;
+        let destination = self.path.join(final_name);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(SafeOutputError::OutputCollision { path: destination });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        #[cfg(windows)]
+        {
+            rename_directory_without_replace(&attempt.handle, &destination).map_err(|error| {
+                if is_destination_collision(&error) {
+                    SafeOutputError::OutputCollision {
+                        path: destination.clone(),
+                    }
+                } else {
+                    SafeOutputError::Io(error)
+                }
+            })?;
+        }
+
+        #[cfg(not(windows))]
+        fs::rename(attempt.path(), &destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                SafeOutputError::OutputCollision {
+                    path: destination.clone(),
+                }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+
+        self.revalidate()?;
+        let published_handle = open_directory_nofollow(&destination, false).map_err(|error| {
+            SafeOutputError::IdentityChanged {
+                path: if error.kind() == std::io::ErrorKind::NotFound {
+                    destination.clone()
+                } else {
+                    destination.clone()
+                },
+            }
+        })?;
+        let published_metadata = published_handle.metadata()?;
+        if is_untrusted_directory(&published_metadata)
+            || stable_identity(&published_handle)? != attempt.identity
+        {
+            return Err(SafeOutputError::IdentityChanged { path: destination });
+        }
+        Ok(destination)
+    }
+
+    pub fn discard_attempt_lease(
+        &self,
+        attempt: OutputAttemptLease,
+    ) -> Result<(), SafeOutputError> {
+        if attempt.root.path != self.path
+            || attempt.root.root_lease()?.identity != self.root_lease()?.identity
+        {
+            return Err(SafeOutputError::IdentityChanged {
+                path: attempt.path.clone(),
+            });
+        }
+        attempt.validate_contents()?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(attempt.path())? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| SafeOutputError::UnsafeDescendant { path: entry.path() })?;
+            validate_component(&name)?;
+            names.push(name);
+        }
+
+        #[cfg(windows)]
+        {
+            for name in &names {
+                let file = open_regular_leaf_for_delete(attempt.path(), name)?;
+                mark_delete_by_handle(&file)?;
+            }
+            attempt.revalidate()?;
+            mark_delete_by_handle(&attempt.handle)?;
+        }
+
+        #[cfg(not(windows))]
+        {
+            for name in &names {
+                fs::remove_file(attempt.path().join(name))?;
+            }
+            fs::remove_dir(attempt.path())?;
+        }
+        Ok(())
+    }
+}
+
+impl OutputAttemptLease {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Re-open the attempt directory without following reparse points and
+    /// compare its stable identity with the identity held by this lease.
+    pub fn revalidate(&self) -> Result<(), SafeOutputError> {
+        for lease in &self.ancestor_leases {
+            revalidate_directory_lease(lease)?;
+        }
+        let held_metadata = self.handle.metadata()?;
+        if is_untrusted_directory(&held_metadata) {
+            return Err(SafeOutputError::UnsafeDescendant {
+                path: self.path.clone(),
+            });
+        }
+        self.root.revalidate()?;
+        let handle = open_directory_nofollow(&self.path, false).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) {
+                SafeOutputError::IdentityChanged {
+                    path: self.path.clone(),
+                }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+        let metadata = handle.metadata()?;
+        if is_untrusted_directory(&metadata) {
+            return Err(SafeOutputError::UnsafeDescendant {
+                path: self.path.clone(),
+            });
+        }
+        if stable_identity(&handle)? != self.identity {
+            return Err(SafeOutputError::IdentityChanged {
+                path: self.path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate direct regular-file children through no-follow leaf handles.
+    /// Nested directories and reparse points are rejected before publication.
+    pub fn validate_contents(&self) -> Result<(), SafeOutputError> {
+        self.revalidate()?;
+        for entry in fs::read_dir(&self.path)? {
             let entry = entry?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
@@ -171,91 +367,30 @@ impl ValidatedOutputRoot {
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| SafeOutputError::UnsafeDescendant { path: path.clone() })?;
             validate_component(name)?;
-            self.validate_descendant(&path)?;
+            let _file = self.open_leaf(name)?;
         }
-        Ok(())
+        self.revalidate()
     }
 
-    /// Atomically publish the complete attempt directory. The destination is
-    /// never created in advance, so an existing item is a hard collision and
-    /// no individual artifact can become visible as a partial item.
-    pub fn publish_attempt(
-        &self,
-        attempt: &Path,
-        final_name: &str,
-    ) -> Result<PathBuf, SafeOutputError> {
-        validate_component(final_name)?;
-        let destination = self.path.join(final_name);
-        if path_utf16_len(&destination) > 240 {
-            return Err(SafeOutputError::PathTooLong);
-        }
-        let canonical_attempt = attempt.canonicalize()?;
-        if !canonical_attempt.starts_with(&self.canonical_path)
-            || canonical_attempt == self.canonical_path
-        {
-            return Err(SafeOutputError::EscapedRoot);
-        }
-        let attempt_metadata = fs::symlink_metadata(attempt)?;
-        if is_untrusted_directory(&attempt_metadata) {
-            return Err(SafeOutputError::UntrustedDirectory {
-                path: attempt.to_path_buf(),
-            });
-        }
-        self.validate_attempt_contents(attempt)?;
-        if fs::symlink_metadata(&destination).is_ok() {
-            return Err(SafeOutputError::OutputCollision { path: destination });
-        }
-        let fingerprint_staging = attempt.parent().map(Path::to_path_buf);
-        let occurrence_staging = fingerprint_staging
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        match fs::rename(attempt, &destination) {
-            Ok(()) => {
-                if let Some(path) = fingerprint_staging {
-                    let _ = fs::remove_dir(path);
-                }
-                if let Some(path) = occurrence_staging {
-                    let _ = fs::remove_dir(path);
-                }
-                Ok(destination)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(SafeOutputError::OutputCollision { path: destination })
-            }
-            Err(error) => {
-                if fs::symlink_metadata(&destination).is_ok() {
-                    Err(SafeOutputError::OutputCollision { path: destination })
-                } else {
-                    Err(error.into())
-                }
-            }
-        }
+    /// Open one direct regular-file child without following a reparse point.
+    /// The returned handle is suitable for bounded manifest or artifact reads.
+    pub fn open_leaf(&self, name: &str) -> Result<File, SafeOutputError> {
+        validate_component(name)?;
+        self.revalidate()?;
+        let file = open_regular_leaf(&self.path, name, false)?;
+        self.revalidate()?;
+        Ok(file)
     }
 
-    pub fn discard_attempt(&self, attempt: &Path) -> Result<(), SafeOutputError> {
-        let canonical_attempt = attempt.canonicalize()?;
-        if !canonical_attempt.starts_with(&self.canonical_path)
-            || canonical_attempt == self.canonical_path
-        {
-            return Err(SafeOutputError::EscapedRoot);
-        }
-        fs::remove_dir_all(attempt)?;
-        Ok(())
-    }
-
-    fn validate_descendant(&self, path: &Path) -> Result<(), SafeOutputError> {
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(&self.canonical_path) || canonical == self.canonical_path {
-            return Err(SafeOutputError::EscapedRoot);
-        }
-        let metadata = fs::symlink_metadata(path)?;
-        if is_reparse_point(&metadata) {
-            return Err(SafeOutputError::UnsafeDescendant {
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(())
+    /// Create one direct regular-file child with create-new semantics and a
+    /// no-follow leaf check.  This is intended for handle-safe manifest writes.
+    #[allow(dead_code)]
+    pub fn create_leaf(&self, name: &str) -> Result<File, SafeOutputError> {
+        validate_component(name)?;
+        self.revalidate()?;
+        let file = open_regular_leaf(&self.path, name, true)?;
+        self.revalidate()?;
+        Ok(file)
     }
 }
 
@@ -279,12 +414,15 @@ pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutp
         });
     }
     reject_reparse_components(path)?;
+    let leases = guard_root_chain(path)?;
     let canonical_path = path.canonicalize()?;
     let root = ValidatedOutputRoot {
         path: path.to_path_buf(),
         canonical_path,
+        leases: Arc::new(leases),
     };
     probe_writable_dir(root.path())?;
+    root.revalidate()?;
     Ok(root)
 }
 
@@ -310,24 +448,315 @@ fn validate_component(name: &str) -> Result<(), SafeOutputError> {
     validate_output_component(name)
 }
 
-fn ensure_directory(path: &Path) -> Result<(), SafeOutputError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if is_untrusted_directory(&metadata) {
-                return Err(SafeOutputError::UntrustedDirectory {
-                    path: path.to_path_buf(),
-                });
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| SafeOutputError::NotWritable {
-                path: path.to_path_buf(),
+fn guard_root_chain(path: &Path) -> Result<Vec<DirectoryLease>, SafeOutputError> {
+    let mut paths = path
+        .ancestors()
+        .filter(|ancestor| ancestor.is_absolute())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.reverse();
+    let path_count = paths.len();
+    let mut leases = Vec::with_capacity(path_count);
+    for (index, current) in paths.into_iter().enumerate() {
+        let is_selected_root = index + 1 == path_count;
+        let handle = open_directory_guard(&current, false, is_selected_root).map_err(|error| {
+            SafeOutputError::NotWritable {
+                path: current.clone(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
+        let metadata = handle.metadata()?;
+        if is_untrusted_directory(&metadata) {
+            return Err(SafeOutputError::UntrustedDirectory { path: current });
         }
-        Err(error) => return Err(error.into()),
+        let identity = stable_identity(&handle)?;
+        leases.push(DirectoryLease {
+            path: current,
+            handle,
+            identity,
+        });
+    }
+    if leases.is_empty() {
+        return Err(SafeOutputError::UntrustedDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(leases)
+}
+
+fn revalidate_directory_lease(lease: &DirectoryLease) -> Result<(), SafeOutputError> {
+    if is_untrusted_directory(&lease.handle.metadata()?) {
+        return Err(SafeOutputError::UnsafeDescendant {
+            path: lease.path.clone(),
+        });
+    }
+    let observer = open_directory_nofollow(&lease.path, false).map_err(|_| {
+        SafeOutputError::IdentityChanged {
+            path: lease.path.clone(),
+        }
+    })?;
+    if is_untrusted_directory(&observer.metadata()?)
+        || stable_identity(&observer)? != lease.identity
+    {
+        return Err(SafeOutputError::IdentityChanged {
+            path: lease.path.clone(),
+        });
     }
     Ok(())
+}
+
+fn open_directory_guard(
+    path: &Path,
+    delete_access: bool,
+    add_child_access: bool,
+) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+        options
+            .access_mode(
+                FILE_LIST_DIRECTORY
+                    | FILE_READ_ATTRIBUTES
+                    | if delete_access { DELETE } else { 0 }
+                    | if add_child_access {
+                        FILE_ADD_SUBDIRECTORY
+                    } else {
+                        0
+                    },
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let _ = (delete_access, add_child_access);
+    options.open(path)
+}
+
+fn open_directory_nofollow(path: &Path, for_rename: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+        options
+            .access_mode(
+                FILE_LIST_DIRECTORY
+                    | FILE_READ_ATTRIBUTES
+                    | if for_rename {
+                        DELETE | FILE_ADD_SUBDIRECTORY
+                    } else {
+                        0
+                    },
+            )
+            .share_mode(if for_rename {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            })
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let _ = for_rename;
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn open_regular_leaf_for_delete(directory: &Path, name: &str) -> Result<File, SafeOutputError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let path = directory.join(name);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_READ_ATTRIBUTES | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(SafeOutputError::UnsafeDescendant { path });
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn mark_delete_by_handle(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let result = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .expect("disposition metadata size fits u32"),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn open_regular_leaf(
+    directory: &Path,
+    name: &str,
+    create_new: bool,
+) -> Result<File, SafeOutputError> {
+    let path = directory.join(name);
+    let mut options = OpenOptions::new();
+    options
+        .read(!create_new)
+        .write(create_new)
+        .create_new(create_new);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE,
+            FILE_SHARE_READ,
+        };
+        options
+            // Parent-directory publication requires children to share delete.
+            // Write sharing remains denied, so a verified handle cannot be
+            // modified in place while the caller retains it through publish.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+    }
+    let file = options.open(&path).map_err(|error| {
+        if create_new && error.kind() == std::io::ErrorKind::AlreadyExists {
+            SafeOutputError::OutputCollision { path: path.clone() }
+        } else {
+            SafeOutputError::Io(error)
+        }
+    })?;
+    let metadata = file.metadata()?;
+    if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(SafeOutputError::UnsafeDescendant { path });
+    }
+    Ok(file)
+}
+
+fn stable_identity(file: &File) -> std::io::Result<StableIdentity> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe {
+            GetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                &mut information as *mut BY_HANDLE_FILE_INFORMATION,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(StableIdentity {
+            volume_serial_number: information.dwVolumeSerialNumber,
+            file_index: ((information.nFileIndexHigh as u64) << 32)
+                | information.nFileIndexLow as u64,
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        return Ok(StableIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        Ok(StableIdentity)
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn rename_directory_without_replace(attempt: &File, destination: &Path) -> std::io::Result<()> {
+    use std::alloc::{alloc, dealloc, Layout};
+    use std::mem::{align_of, offset_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+    };
+
+    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let offset = offset_of!(FILE_RENAME_INFO, FileName);
+    let size = offset
+        .checked_add(
+            name.len()
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<u16>()),
+        )
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name too long"))?;
+    let size_u32 = u32::try_from(size)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name too long"))?;
+    let layout = Layout::from_size_align(size, align_of::<FILE_RENAME_INFO>()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rename layout")
+    })?;
+    let info = unsafe { alloc(layout).cast::<FILE_RENAME_INFO>() };
+    if info.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "rename metadata allocation failed",
+        ));
+    }
+    unsafe {
+        ptr::write_bytes(info.cast::<u8>(), 0, size);
+        (*info).Anonymous = FILE_RENAME_INFO_0 {
+            ReplaceIfExists: false,
+        };
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = u32::try_from(name.len() * std::mem::size_of::<u16>())
+            .expect("validated output component length fits u32");
+        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+    }
+    let result = unsafe {
+        SetFileInformationByHandle(
+            attempt.as_raw_handle().cast(),
+            FileRenameInfo,
+            info.cast(),
+            size_u32,
+        )
+    };
+    unsafe { dealloc(info.cast::<u8>(), layout) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn is_destination_collision(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(80) | Some(183) // ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+    ) || error.kind() == std::io::ErrorKind::AlreadyExists
 }
 
 fn path_utf16_len(path: &Path) -> usize {
@@ -444,20 +873,16 @@ mod tests {
     fn validates_root_and_confines_children() {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
-        let child = root.child_dir("validated-child").unwrap();
-        assert!(child.starts_with(temp.path()));
-        assert!(root
-            .staging_dir("occurrence-1", "artifact-1")
-            .unwrap()
-            .starts_with(temp.path()));
         let attempt = root
-            .staging_attempt_dir("occurrence-1", "artifact-1")
+            .staging_attempt_lease("occurrence-1", "artifact-1")
             .unwrap();
-        let published = root.publish_attempt(&attempt, "video").unwrap();
+        assert!(attempt.path().starts_with(temp.path()));
+        let published = root.publish_attempt_lease(attempt, "video").unwrap();
         assert!(published.is_dir());
-        assert!(root.publish_attempt(&attempt, "video").is_err());
-        assert!(root.child_dir("..").is_err());
-        assert!(root.child_dir("nested/name").is_err());
+        assert!(root.staging_attempt_lease("..", "artifact-1").is_err());
+        assert!(root
+            .staging_attempt_lease("nested/name", "artifact-1")
+            .is_err());
     }
 
     #[test]
@@ -489,16 +914,17 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
         let attempt = root
-            .staging_attempt_dir("occurrence-1", "artifact-1")
+            .staging_attempt_lease("occurrence-1", "artifact-1")
             .unwrap();
-        fs::create_dir(attempt.join("nested")).unwrap();
-        let result = root.publish_attempt(&attempt, "video");
+        let attempt_path = attempt.path().to_path_buf();
+        fs::create_dir(attempt.path().join("nested")).unwrap();
+        let result = root.publish_attempt_lease(attempt, "video");
         assert!(matches!(
             result,
             Err(SafeOutputError::UnsafeDescendant { .. })
         ));
         assert!(!temp.path().join("video").exists());
-        assert!(attempt.exists());
+        assert!(attempt_path.exists());
     }
 
     #[test]
@@ -506,22 +932,104 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
         let first = root
-            .staging_attempt_dir("occurrence-1", "artifact-1")
+            .staging_attempt_lease("occurrence-1", "artifact-1")
             .unwrap();
-        fs::write(first.join("artifact.mp4"), b"complete").unwrap();
-        root.publish_attempt(&first, "video").unwrap();
+        fs::write(first.path().join("artifact.mp4"), b"complete").unwrap();
+        root.publish_attempt_lease(first, "video").unwrap();
         let second = root
-            .staging_attempt_dir("occurrence-1", "artifact-1")
+            .staging_attempt_lease("occurrence-1", "artifact-1")
             .unwrap();
-        fs::write(second.join("artifact.mp4"), b"complete").unwrap();
+        fs::write(second.path().join("artifact.mp4"), b"complete").unwrap();
         assert!(matches!(
-            root.publish_attempt(&second, "video"),
+            root.publish_attempt_lease(second, "video"),
             Err(SafeOutputError::OutputCollision { .. })
         ));
         assert_eq!(
             fs::read(temp.path().join("video").join("artifact.mp4")).unwrap(),
             b"complete"
         );
+    }
+
+    #[test]
+    fn leased_attempt_uses_stable_identity_and_no_follow_leaf_handles() {
+        use std::io::{Read, Write};
+
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let attempt = root
+            .staging_attempt_lease("occurrence-1", "artifact-1")
+            .unwrap();
+        fs::write(attempt.path().join("artifact.txt"), b"complete").unwrap();
+        {
+            let mut manifest = attempt.create_leaf("manifest.json").unwrap();
+            manifest.write_all(br#"{"schemaVersion":1}"#).unwrap();
+            manifest.sync_all().unwrap();
+        }
+        let mut manifest = attempt.open_leaf("manifest.json").unwrap();
+        let mut bytes = Vec::new();
+        manifest.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, br#"{"schemaVersion":1}"#);
+        drop(manifest);
+        attempt.validate_contents().unwrap();
+        let published = root.publish_attempt_lease(attempt, "leased-video").unwrap();
+        assert_eq!(
+            fs::read(published.join("artifact.txt")).unwrap(),
+            b"complete"
+        );
+    }
+
+    #[test]
+    fn discard_removes_only_a_validated_flat_attempt() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let attempt = root
+            .staging_attempt_lease("occurrence-1", "artifact-1")
+            .unwrap();
+        let attempt_path = attempt.path().to_path_buf();
+        fs::write(attempt.path().join("artifact.txt"), b"partial").unwrap();
+        root.discard_attempt_lease(attempt).unwrap();
+        assert!(!attempt_path.exists());
+    }
+
+    #[test]
+    fn discard_fails_closed_on_nested_content() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let attempt = root
+            .staging_attempt_lease("occurrence-1", "artifact-1")
+            .unwrap();
+        let attempt_path = attempt.path().to_path_buf();
+        fs::create_dir(attempt.path().join("nested")).unwrap();
+        let outside = temp.path().join("outside.txt");
+        fs::write(&outside, b"keep").unwrap();
+        assert!(matches!(
+            root.discard_attempt_lease(attempt),
+            Err(SafeOutputError::UnsafeDescendant { .. })
+        ));
+        assert!(attempt_path.exists());
+        assert_eq!(fs::read(outside).unwrap(), b"keep");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_root_and_attempt_chain_deny_namespace_renames() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        let root = validate_output_root(&output).unwrap();
+        assert!(fs::rename(&output, temp.path().join("moved-output")).is_err());
+
+        let attempt = root
+            .staging_attempt_lease("occurrence-1", "artifact-1")
+            .unwrap();
+        let staging = output.join(".linkvault-staging");
+        assert!(fs::rename(&staging, output.join("swapped-staging")).is_err());
+        assert!(fs::rename(
+            attempt.path(),
+            attempt.path().with_file_name("replaced-attempt")
+        )
+        .is_err());
+        attempt.revalidate().unwrap();
     }
 
     #[cfg(unix)]
@@ -532,11 +1040,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
         let attempt = root
-            .staging_attempt_dir("occurrence-1", "artifact-1")
+            .staging_attempt_lease("occurrence-1", "artifact-1")
             .unwrap();
-        symlink(temp.path(), attempt.join("link")).unwrap();
+        symlink(temp.path(), attempt.path().join("link")).unwrap();
         assert!(matches!(
-            root.validate_attempt_contents(&attempt),
+            attempt.validate_contents(),
             Err(SafeOutputError::UnsafeDescendant { .. })
         ));
     }
