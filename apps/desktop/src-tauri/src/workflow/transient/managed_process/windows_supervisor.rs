@@ -1,6 +1,6 @@
 use super::{
     read_bounded, ManagedProcessError, ManagedProcessOutput, ManagedProcessSpec,
-    TestFaultSelection, TransientRunControl,
+    TestFaultSelection, TransientRunControl, VerifiedExecutable,
 };
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
@@ -154,6 +154,7 @@ struct ReaderTask {
 
 pub(super) fn run(
     executable: PathBuf,
+    verified: &[&VerifiedExecutable],
     spec: ManagedProcessSpec,
     control: Option<&TransientRunControl>,
     discovery_cancel: Option<&AtomicBool>,
@@ -251,6 +252,12 @@ pub(super) fn run(
         return Err(ManagedProcessError::ProcessContainment(
             "the suspended helper was not present in its Job Object".to_string(),
         ));
+    }
+    for verified in verified {
+        if let Err(error) = verified.revalidate() {
+            terminate_suspended_child(&job, &process);
+            return Err(error);
+        }
     }
 
     let ChildPipes {
@@ -579,6 +586,16 @@ fn process_temp_directory() -> Result<PathBuf, ManagedProcessError> {
         .join(std::process::id().to_string());
     fs::create_dir_all(&directory)
         .map_err(|error| ManagedProcessError::Start(error.to_string()))?;
+    for child in [
+        "cache",
+        "deno",
+        "home",
+        "local-app-data",
+        "roaming-app-data",
+    ] {
+        fs::create_dir_all(directory.join(child))
+            .map_err(|error| ManagedProcessError::Start(error.to_string()))?;
+    }
     Ok(directory)
 }
 
@@ -596,6 +613,30 @@ fn build_environment_block(temp_directory: &Path) -> Vec<u16> {
     environment.insert("TMP".to_string(), temp_directory.as_os_str().to_os_string());
     environment.insert("NO_COLOR".to_string(), OsString::from("1"));
     environment.insert("PATH".to_string(), OsString::new());
+    environment.insert(
+        "DENO_DIR".to_string(),
+        temp_directory.join("deno").into_os_string(),
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".to_string(),
+        temp_directory.join("cache").into_os_string(),
+    );
+    environment.insert(
+        "HOME".to_string(),
+        temp_directory.join("home").clone().into_os_string(),
+    );
+    environment.insert(
+        "USERPROFILE".to_string(),
+        temp_directory.join("home").into_os_string(),
+    );
+    environment.insert(
+        "LOCALAPPDATA".to_string(),
+        temp_directory.join("local-app-data").into_os_string(),
+    );
+    environment.insert(
+        "APPDATA".to_string(),
+        temp_directory.join("roaming-app-data").into_os_string(),
+    );
     let mut block = Vec::new();
     for (key, value) in environment {
         block.extend(OsStr::new(&key).encode_wide());

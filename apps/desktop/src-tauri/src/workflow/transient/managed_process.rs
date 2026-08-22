@@ -9,10 +9,11 @@
 use super::TransientRunControl;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -99,6 +100,26 @@ impl TestManagedProcessSpec {
     }
 }
 
+#[cfg(feature = "youtube-process-test")]
+pub struct TestVerifiedExecutable {
+    _verified: VerifiedExecutable,
+}
+
+#[cfg(feature = "youtube-process-test")]
+pub fn lock_test_executable(
+    executable: PathBuf,
+    expected_digest: &str,
+) -> Result<TestVerifiedExecutable, ManagedProcessError> {
+    let expected_size = fs::metadata(&executable)
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?
+        .len();
+    open_verified_executable(executable, expected_digest, expected_digest, expected_size).map(
+        |verified| TestVerifiedExecutable {
+            _verified: verified,
+        },
+    )
+}
+
 #[derive(Debug)]
 pub struct ManagedProcessOutput {
     pub status: std::process::ExitStatus,
@@ -133,22 +154,106 @@ pub struct HelperIdentity {
     pub digest: String,
 }
 
+pub(super) struct VerifiedExecutable {
+    path: PathBuf,
+    _file: File,
+    digest: String,
+    lock_digest: String,
+    size: u64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+impl VerifiedExecutable {
+    pub(super) fn revalidate(&self) -> Result<(), ManagedProcessError> {
+        let metadata = self
+            ._file
+            .metadata()
+            .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+        if metadata_is_reparse(&metadata) || !metadata.is_file() || metadata.len() != self.size {
+            return Err(ManagedProcessError::Integrity(
+                "verified helper identity changed before launch".to_string(),
+            ));
+        }
+        let mut recheck = self
+            ._file
+            .try_clone()
+            .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+        let digest = digest_reader(&mut recheck)
+            .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+        if digest != self.digest {
+            return Err(ManagedProcessError::Integrity(
+                "verified helper contents changed before launch".to_string(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let (volume_serial_number, file_index) = windows_file_identity(&self._file)?;
+            if volume_serial_number != self.volume_serial_number || file_index != self.file_index {
+                return Err(ManagedProcessError::Integrity(
+                    "verified helper file identity changed before launch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct VerifiedHelperSet {
+    ytdlp: VerifiedExecutable,
+    deno: VerifiedExecutable,
+    ffmpeg: VerifiedExecutable,
+    ffprobe: VerifiedExecutable,
+}
+
+impl VerifiedHelperSet {
+    fn lock_digest(&self) -> &str {
+        &self.ytdlp.lock_digest
+    }
+
+    fn identities(&self) -> [&VerifiedExecutable; 4] {
+        [&self.ytdlp, &self.deno, &self.ffmpeg, &self.ffprobe]
+    }
+
+    fn apply_delegated_paths(&self, spec: &mut ManagedProcessSpec) {
+        let ffmpeg_directory = self
+            .ffmpeg
+            .path
+            .parent()
+            .expect("packaged FFmpeg has an install directory");
+        let controlled = [
+            OsString::from("--js-runtimes"),
+            OsString::from(format!("deno:{}", self.deno.path.display())),
+            OsString::from("--ffmpeg-location"),
+            ffmpeg_directory.as_os_str().to_os_string(),
+        ];
+        spec.args.splice(0..0, controlled);
+    }
+}
+
 pub fn helper_identity(kind: HelperKind) -> Result<HelperIdentity, ManagedProcessError> {
     ensure_execution_hardened()?;
-    let (path, digest) = resolve_and_verify(kind)?;
-    let _ = path;
-    Ok(HelperIdentity { digest })
+    let verified = resolve_and_verify(kind)?;
+    Ok(HelperIdentity {
+        digest: verified.lock_digest().to_string(),
+    })
 }
 
 pub fn run(
-    spec: ManagedProcessSpec,
+    mut spec: ManagedProcessSpec,
     control: Option<&TransientRunControl>,
     discovery_cancel: Option<&AtomicBool>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     ensure_execution_hardened()?;
-    let (executable, _) = resolve_and_verify(spec.helper)?;
+    let verified = resolve_and_verify(spec.helper)?;
+    verified.apply_delegated_paths(&mut spec);
+    let executable = verified.ytdlp.path.clone();
+    let identities = verified.identities();
     run_resolved(
         executable,
+        &identities,
         spec,
         control,
         discovery_cancel,
@@ -180,6 +285,7 @@ pub fn run_test(
     };
     run_resolved(
         test_spec.executable,
+        &[],
         test_spec.spec,
         control,
         discovery_cancel,
@@ -197,6 +303,7 @@ enum TestFaultSelection {
 
 fn run_resolved(
     executable: PathBuf,
+    verified: &[&VerifiedExecutable],
     spec: ManagedProcessSpec,
     control: Option<&TransientRunControl>,
     discovery_cancel: Option<&AtomicBool>,
@@ -204,59 +311,71 @@ fn run_resolved(
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     #[cfg(windows)]
     {
-        windows_supervisor::run(executable, spec, control, discovery_cancel, fault)
+        windows_supervisor::run(executable, verified, spec, control, discovery_cancel, fault)
     }
     #[cfg(not(windows))]
     {
-        let _ = (executable, spec, control, discovery_cancel, fault);
+        let _ = (executable, verified, spec, control, discovery_cancel, fault);
         Err(ManagedProcessError::UnsupportedPlatform)
     }
 }
 
-fn resolve_and_verify(kind: HelperKind) -> Result<(PathBuf, String), ManagedProcessError> {
-    let candidate = match kind {
-        HelperKind::YouTubeYtDlp => packaged_candidate().ok_or_else(|| {
-            ManagedProcessError::Integrity("the packaged yt-dlp helper is not present".to_string())
-        })?,
-    };
-    let metadata = fs::symlink_metadata(&candidate)
-        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProcessError> {
+    if !matches!(kind, HelperKind::YouTubeYtDlp) {
         return Err(ManagedProcessError::Integrity(
-            "helper is not a trusted regular file".to_string(),
+            "unsupported helper set".to_string(),
         ));
     }
-    let expected = lock_digest_for(&candidate).ok_or_else(|| {
+    let mut locked = locked_helpers().ok_or_else(|| {
         ManagedProcessError::Integrity(
             "the helper lock is absent; Y0 helper validation is required before execution"
                 .to_string(),
         )
     })?;
-    let actual = digest_file(&candidate)
-        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
-    if !actual.eq_ignore_ascii_case(&expected) {
-        return Err(ManagedProcessError::Integrity(
-            "helper digest does not match the approved helper lock".to_string(),
-        ));
-    }
-    Ok((candidate, actual))
+    let install_dir = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .ok_or_else(|| {
+            ManagedProcessError::Integrity(
+                "the packaged helper directory is unavailable".to_string(),
+            )
+        })?;
+    let lock_digest = locked.lock_digest.clone();
+    let mut open = |name: &str| {
+        let expected = locked.components.remove(name).ok_or_else(|| {
+            ManagedProcessError::Integrity(format!("the {name} lock entry is unavailable"))
+        })?;
+        open_verified_executable(
+            install_dir.join(format!("{name}.exe")),
+            &expected.asset_digest,
+            &lock_digest,
+            expected.size_bytes,
+        )
+    };
+    Ok(VerifiedHelperSet {
+        ytdlp: open("yt-dlp")?,
+        deno: open("deno")?,
+        ffmpeg: open("ffmpeg")?,
+        ffprobe: open("ffprobe")?,
+    })
 }
 
-fn packaged_candidate() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("binaries/yt-dlp.exe"));
-            candidates.push(parent.join("resources/binaries/yt-dlp.exe"));
-            candidates.push(parent.join("yt-dlp.exe"));
-            candidates.push(parent.join("youtube/yt-dlp.exe"));
-        }
-    }
-    candidates.into_iter().find(|path| path.is_file())
+struct LockedHelperDigest {
+    asset_digest: String,
+    size_bytes: u64,
 }
 
-fn lock_digest_for(path: &Path) -> Option<String> {
+struct LockedHelpers {
+    lock_digest: String,
+    components: HashMap<String, LockedHelperDigest>,
+}
+
+fn locked_helpers() -> Option<LockedHelpers> {
     let value = serde_json::from_slice::<Value>(EMBEDDED_HELPER_LOCK).ok()?;
+    parse_locked_helpers(&value)
+}
+
+fn parse_locked_helpers(value: &Value) -> Option<LockedHelpers> {
     if value.get("schemaVersion").and_then(Value::as_u64) != Some(1)
         || value.get("targetTriple").and_then(Value::as_str) != Some("x86_64-pc-windows-msvc")
         || value.get("status").and_then(Value::as_str) != Some("ready")
@@ -265,6 +384,7 @@ fn lock_digest_for(path: &Path) -> Option<String> {
     }
     let lock_digest = value.get("lockDigest").and_then(Value::as_str)?;
     if lock_digest.len() != 64
+        || lock_digest != lock_digest.to_ascii_lowercase()
         || !lock_digest
             .chars()
             .all(|character| character.is_ascii_hexdigit())
@@ -273,17 +393,10 @@ fn lock_digest_for(path: &Path) -> Option<String> {
     }
     let mut without_digest = value.clone();
     without_digest.as_object_mut()?.remove("lockDigest");
-    let canonical = serde_json::to_vec(&without_digest).ok()?;
+    let canonical = canonical_json(&without_digest)?;
     let mut lock_hasher = Sha256::new();
     lock_hasher.update(canonical);
     if !format!("{:x}", lock_hasher.finalize()).eq_ignore_ascii_case(lock_digest) {
-        return None;
-    }
-    let runtime_filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if runtime_filename != "yt-dlp.exe" {
         return None;
     }
     let components = value.get("components").and_then(Value::as_array)?;
@@ -302,32 +415,223 @@ fn lock_digest_for(path: &Path) -> Option<String> {
     }) {
         return None;
     }
-    components.iter().find_map(|component| {
-        if component.get("name").and_then(Value::as_str) != Some("yt-dlp") {
-            return None;
-        }
-        let target_filename = component
-            .get("targetFilename")
-            .or_else(|| component.get("filename"))
-            .and_then(Value::as_str)?;
-        if target_filename != "yt-dlp-x86_64-pc-windows-msvc.exe" {
-            return None;
-        }
-        ["sha256", "assetSha256", "digest"]
+    let mut locked = HashMap::new();
+    for name in required {
+        let component = components
             .iter()
-            .find_map(|key| component.get(*key).and_then(Value::as_str))
-            .filter(|digest| {
-                digest.len() == 64
-                    && digest
-                        .chars()
-                        .all(|character| character.is_ascii_hexdigit())
-            })
-            .map(str::to_string)
+            .find(|component| component.get("name").and_then(Value::as_str) == Some(name))?;
+        let expected_filename = format!("{name}-x86_64-pc-windows-msvc.exe");
+        if component.get("filename").and_then(Value::as_str) != Some(expected_filename.as_str()) {
+            return None;
+        }
+        let asset_digest = component.get("sha256").and_then(Value::as_str)?;
+        if asset_digest.len() != 64
+            || asset_digest != asset_digest.to_ascii_lowercase()
+            || !asset_digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let size_bytes = component.get("sizeBytes").and_then(Value::as_u64)?;
+        if size_bytes == 0 {
+            return None;
+        }
+        locked.insert(
+            name.to_string(),
+            LockedHelperDigest {
+                asset_digest: asset_digest.to_string(),
+                size_bytes,
+            },
+        );
+    }
+    Some(LockedHelpers {
+        lock_digest: lock_digest.to_string(),
+        components: locked,
     })
 }
 
-fn digest_file(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
+fn canonical_json(value: &Value) -> Option<Vec<u8>> {
+    fn write(value: &Value, output: &mut String) -> Option<()> {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                output.push_str(&serde_json::to_string(value).ok()?);
+            }
+            Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    write(value, output)?;
+                }
+                output.push(']');
+            }
+            Value::Object(values) => {
+                output.push('{');
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(&serde_json::to_string(key).ok()?);
+                    output.push(':');
+                    write(values.get(key)?, output)?;
+                }
+                output.push('}');
+            }
+        }
+        Some(())
+    }
+
+    let mut output = String::new();
+    write(value, &mut output)?;
+    Some(output.into_bytes())
+}
+
+fn open_verified_executable(
+    path: PathBuf,
+    expected_digest: &str,
+    lock_digest: &str,
+    expected_size: u64,
+) -> Result<VerifiedExecutable, ManagedProcessError> {
+    if !path.is_absolute() {
+        return Err(ManagedProcessError::Integrity(
+            "helper path is not absolute".to_string(),
+        ));
+    }
+    let path_metadata = fs::symlink_metadata(&path)
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    if metadata_is_reparse(&path_metadata) || !path_metadata.file_type().is_file() {
+        return Err(ManagedProcessError::Integrity(
+            "helper is not a trusted regular file".to_string(),
+        ));
+    }
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    if metadata_is_reparse(&metadata) || !metadata.is_file() || metadata.len() != expected_size {
+        return Err(ManagedProcessError::Integrity(
+            "helper handle size does not match the approved helper lock".to_string(),
+        ));
+    }
+    let post_open_path = path
+        .canonicalize()
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    if post_open_path != canonical_path {
+        return Err(ManagedProcessError::Integrity(
+            "helper path identity changed while it was opened".to_string(),
+        ));
+    }
+    let actual = digest_reader(&mut file)
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    if !actual.eq_ignore_ascii_case(expected_digest) {
+        return Err(ManagedProcessError::Integrity(
+            "helper digest does not match the approved helper lock".to_string(),
+        ));
+    }
+    verify_pe_x86_64(&mut file)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    #[cfg(windows)]
+    let (volume_serial_number, file_index) = windows_file_identity(&file)?;
+    Ok(VerifiedExecutable {
+        path: canonical_path,
+        _file: file,
+        digest: actual,
+        lock_digest: lock_digest.to_string(),
+        size: metadata.len(),
+        #[cfg(windows)]
+        volume_serial_number,
+        #[cfg(windows)]
+        file_index,
+    })
+}
+
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Result<(u32, u64), ManagedProcessError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            &mut information as *mut BY_HANDLE_FILE_INFORMATION,
+        )
+    } == 0
+    {
+        return Err(ManagedProcessError::Integrity(
+            "helper file identity is unavailable".to_string(),
+        ));
+    }
+    let file_index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+fn verify_pe_x86_64(file: &mut File) -> Result<(), ManagedProcessError> {
+    let mut dos_header = [0u8; 64];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut dos_header))
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    if &dos_header[..2] != b"MZ" {
+        return Err(ManagedProcessError::Integrity(
+            "helper is not a Windows PE executable".to_string(),
+        ));
+    }
+    let pe_offset = u32::from_le_bytes(
+        dos_header[0x3c..0x40]
+            .try_into()
+            .expect("fixed DOS header slice"),
+    ) as u64;
+    let mut pe_header = [0u8; 6];
+    file.seek(SeekFrom::Start(pe_offset))
+        .and_then(|_| file.read_exact(&mut pe_header))
+        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+    if &pe_header[..4] != b"PE\0\0" || u16::from_le_bytes([pe_header[4], pe_header[5]]) != 0x8664 {
+        return Err(ManagedProcessError::Integrity(
+            "helper architecture is not x86_64 PE".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn digest_reader(file: &mut File) -> std::io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -360,6 +664,99 @@ fn read_bounded<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8
         }
     }
     Ok((bytes, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_json, parse_locked_helpers};
+    use sha2::{Digest, Sha256};
+
+    fn seal_lock(value: &mut serde_json::Value) {
+        let mut without_digest = value.clone();
+        without_digest.as_object_mut().unwrap().remove("lockDigest");
+        value["lockDigest"] = serde_json::Value::String(format!(
+            "{:x}",
+            Sha256::digest(canonical_json(&without_digest).unwrap())
+        ));
+    }
+
+    #[test]
+    fn canonical_lock_json_sorts_nested_object_keys() {
+        let value = serde_json::json!({
+            "z": [{ "b": 2, "a": 1 }],
+            "a": "value"
+        });
+        assert_eq!(
+            canonical_json(&value).unwrap(),
+            br#"{"a":"value","z":[{"a":1,"b":2}]}"#
+        );
+    }
+
+    #[test]
+    fn ready_lock_requires_all_exact_sidecar_source_names() {
+        let components = ["yt-dlp", "deno", "ffmpeg", "ffprobe"]
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "filename": format!("{name}-x86_64-pc-windows-msvc.exe"),
+                    "sha256": "a".repeat(64),
+                    "sizeBytes": 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut value = serde_json::json!({
+            "schemaVersion": 1,
+            "targetTriple": "x86_64-pc-windows-msvc",
+            "status": "ready",
+            "lockDigest": null,
+            "components": components
+        });
+        seal_lock(&mut value);
+        let locked = parse_locked_helpers(&value).expect("valid ready lock");
+        assert_eq!(locked.components.len(), 4);
+
+        value["components"][0]["filename"] = serde_json::json!("yt-dlp.exe");
+        seal_lock(&mut value);
+        assert!(parse_locked_helpers(&value).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delegated_helper_paths_are_app_owned_and_deterministic() {
+        use super::{open_verified_executable, ManagedProcessSpec, VerifiedHelperSet};
+        use std::ffi::OsString;
+        use std::fs;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let bytes = fs::read(&source).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let open = |name: &str| {
+            let path = temp.path().join(format!("{name}.exe"));
+            fs::write(&path, &bytes).unwrap();
+            open_verified_executable(path, &digest, &"b".repeat(64), bytes.len() as u64).unwrap()
+        };
+        let helpers = VerifiedHelperSet {
+            ytdlp: open("yt-dlp"),
+            deno: open("deno"),
+            ffmpeg: open("ffmpeg"),
+            ffprobe: open("ffprobe"),
+        };
+        let mut spec = ManagedProcessSpec::youtube_ytdlp(
+            vec![OsString::from("--ignore-config")],
+            1024,
+            1024,
+            Duration::from_secs(1),
+        );
+        helpers.apply_delegated_paths(&mut spec);
+        assert_eq!(spec.args[0], "--js-runtimes");
+        assert!(spec.args[1].to_string_lossy().starts_with("deno:"));
+        assert_eq!(spec.args[2], "--ffmpeg-location");
+        assert_eq!(spec.args[4], "--ignore-config");
+    }
 }
 
 #[cfg(windows)]

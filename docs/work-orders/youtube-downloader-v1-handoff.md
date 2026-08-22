@@ -52,7 +52,7 @@ Real helper execution is deliberately disabled in `workflow/transient/managed_pr
 
 Remaining P1 enablement blockers:
 
-1. Hold stable executable/file identities from validation through process creation; verify and pin yt-dlp, Deno, FFmpeg, FFprobe, and loaded assets; remove every remaining inherited/config/cache/runtime ambiguity.
+1. Select and populate an authoritative mutually compatible yt-dlp, EJS, Deno, FFmpeg and FFprobe inventory, including exact source archives, loaded assets, build configuration, licenses and corresponding-source obligations. No version or digest may be inferred or invented.
 2. Strengthen output-root, staging, and leaf operations with stable file/volume identities and no-follow handles to close junction/reparse TOCTOU windows.
 3. Bind manifests/fingerprints to the canonical helper-lock digest and semantic transcript selection, and implement verified `skipped_existing` reuse.
 4. Complete bounded per-occurrence discovery, source revalidation, transcript inspection/selection, raw VTT plus normalized JSON, FFprobe media verification, and deterministic delegated-helper arguments.
@@ -74,6 +74,21 @@ The next bounded slice completes the process-lifecycle and transient-runtime blo
 - A Windows-only Newspaper test now compares canonical directory identities instead of textual short-name versus long-name path spellings; this is a test-only correction for the full branch gate.
 
 `EXECUTION_HARDENING_COMPLETE` remains `false`, and no helper lock or executable was changed.
+
+## Current slice: identity-held helper contract
+
+The helper boundary now fails closed around one exact Tauri sidecar contract rather than searching several runtime locations:
+
+- Source-side sidecars must be exactly `binaries/<name>-x86_64-pc-windows-msvc.exe`; Tauri installs them beside the application as `<name>.exe`. The optional helper config is checked against exactly `yt-dlp`, `deno`, `ffmpeg`, and `ffprobe` in that order.
+- Rust and Node now compute the same recursively key-sorted canonical helper-lock digest. Runtime item fingerprints receive the complete lock digest rather than only the yt-dlp executable digest.
+- Every ready-lock component must have one exact target-triple filename, positive locked size, lowercase SHA-256, and one matching installed runtime filename.
+- Each installed executable is opened through a non-reparse regular-file handle that denies write/delete sharing, then validated for locked size, SHA-256, x86-64 PE structure, volume identity, and file identity.
+- All four handles remain held across process creation and the complete yt-dlp/delegated-helper lifetime. They are revalidated after suspended `CreateProcessW` and before resume.
+- yt-dlp receives app-owned absolute Deno and FFmpeg locations. `PATH` stays empty; yt-dlp config, plugins, updates, and cache are disabled; Deno/home/cache/app-data locations are app-owned temporary directories.
+- Hostile Windows coverage now proves wrong-digest rejection and that write/rename replacement is denied while the verified handle is held.
+- The branch workflow now treats the intentionally nonzero unpopulated-lock verifier as a passing fail-closed assertion under current PowerShell behavior.
+
+The authoritative lock is still deliberately unpopulated. Current upstream evidence confirms yt-dlp distributes signed checksum assets, Deno distributes per-target checksum assets, and yt-dlp requires a compatible EJS package/version; FFmpeg itself links to third-party Windows builders. Exact compatible selections and corresponding-source/license records are the next supply-chain decision, not a value to guess in code.
 
 ## Verification evidence
 
@@ -100,12 +115,14 @@ Current-slice evidence at authoring time:
 - Workflow run `32541987104` proved formatting and library compilation, then exposed one unrelated full-suite Windows assertion comparing an 8.3 temp path spelling with its canonical spelling. The resolved directory identity matched; the current slice corrects only that assertion and requires a new full workflow run.
 - Current lifecycle/runtime evidence: Rust formatting and `cargo check --lib` passed; the complete library suite passed with 590 passed, 0 failed, and 4 ignored; all 7 hostile managed-process tests passed; and the focused transient-runtime tests cover shutdown/join, discovery cancellation, worker-spawn rollback, process-lifetime submission retirement, retained terminal replay, and accepted-cancellation precedence.
 - Architecture, repository UI, YouTube UI, no-explicit-`any`, frontend production build, and `git diff --check` passed. Helper verification still fails closed exactly because the authoritative lock remains unpopulated.
+- Lifecycle commit workflow `32542986222` passed the full Rust suite, hostile managed-process suite, architecture, repository UI, YouTube UI, no-explicit-`any`, and frontend build. Its only red step was the expected helper-verifier failure being promoted to a terminating PowerShell error before the assertion wrapper ran; the current workflow correction captures that exit code explicitly.
+- Current identity-slice evidence: Rust formatting and `cargo check --lib` passed; the complete library suite passed with 593 passed, 0 failed, and 4 ignored; all 8 hostile managed-process tests passed, including handle-held tamper/replacement denial; architecture, repository UI, YouTube UI, no-explicit-`any`, frontend production build, JS syntax checks, fail-closed helper verification, and `git diff --check` passed.
 
 No packaged/native YouTube download UAT has been claimed.
 
 ## Next safe slice
 
-Push this ordered-exit/workflow slice and require a green branch-only Windows workflow. Then proceed to identity-held verification and deterministic delegated-helper arguments before selecting or downloading exact helper assets.
+Push this identity-held helper slice and require a green branch-only Windows workflow. Then freeze one authoritative compatible helper/EJS/FFmpeg inventory and its license/source evidence before downloading assets. Do not enable execution merely because binaries can be acquired.
 
 After those gates pass, transcript-only execution remains the first end-to-end native candidate; media download and FFmpeg merge follow afterward.
 

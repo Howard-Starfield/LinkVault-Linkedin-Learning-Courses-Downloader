@@ -73,8 +73,10 @@ jobs:
       - name: Confirm helper lock remains fail-closed
         shell: pwsh
         run: |
+          $global:PSNativeCommandUseErrorActionPreference = $false
           npm --prefix apps/desktop run verify:youtube-helpers
-          if ($LASTEXITCODE -eq 0) {
+          $verificationExitCode = $LASTEXITCODE
+          if ($verificationExitCode -eq 0) {
             throw "The unpopulated YouTube helper lock unexpectedly passed verification."
           }
           Write-Host "Helper verification failed closed as required while the authoritative lock is unavailable."

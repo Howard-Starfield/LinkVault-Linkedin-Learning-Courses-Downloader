@@ -113,6 +113,7 @@ impl YouTubeExecutor {
             "--ignore-config".to_string(),
             "--no-plugin-dirs".to_string(),
             "--no-update".to_string(),
+            "--no-cache-dir".to_string(),
             "--no-warnings".to_string(),
             "--no-playlist".to_string(),
             "--newline".to_string(),
@@ -680,6 +681,10 @@ mod tests {
             title: "Example title".to_string(),
             source_url: "https://www.youtube.com/watch?v=video-1".to_string(),
         };
+        let args = executor.args_for(&item, &temp.path().join("output.%(ext)s"));
+        for required in ["--ignore-config", "--no-plugin-dirs", "--no-cache-dir"] {
+            assert!(args.iter().any(|argument| argument == required));
+        }
         let staging = root
             .staging_attempt_dir(&item.occurrence_id, &item.artifact_fingerprint)
             .unwrap();

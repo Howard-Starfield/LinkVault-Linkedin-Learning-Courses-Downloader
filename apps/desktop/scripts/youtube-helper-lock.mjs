@@ -148,7 +148,10 @@ export function validateLock(lock, repositoryRoot) {
     if (names.has(component.name)) fail(`duplicate component ${component.name}`);
     names.add(component.name);
     const relativePath = validateAsset(component, `component ${component.name}`);
-    if (!relativePath.endsWith(`-${TARGET_TRIPLE}.exe`)) fail(`component ${component.name} filename must carry the target triple`);
+    const expectedPath = `${component.name}-${TARGET_TRIPLE}.exe`;
+    if (relativePath !== expectedPath) {
+      fail(`component ${component.name} path must be exactly ${expectedPath}`);
+    }
     if (paths.has(relativePath)) fail(`duplicate installed asset path ${relativePath}`);
     paths.add(relativePath);
     if (!Array.isArray(component.loadedAssets)) fail(`component ${component.name}.loadedAssets must be an array`);

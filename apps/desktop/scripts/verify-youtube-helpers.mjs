@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   BINARY_RELATIVE_PATH,
   fail,
+  REQUIRED_COMPONENTS,
   readLock,
   resolveInside,
   sha256File,
@@ -12,6 +13,16 @@ import {
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopDirectory = path.resolve(scriptDirectory, "..");
 const repositoryRoot = path.resolve(desktopDirectory, "../..");
+
+async function verifySidecarConfig() {
+  const configPath = path.join(desktopDirectory, "src-tauri", "tauri.youtube.conf.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  const actual = config?.bundle?.externalBin;
+  const expected = REQUIRED_COMPONENTS.map((name) => `binaries/${name}`);
+  if (!Array.isArray(actual) || JSON.stringify(actual) !== JSON.stringify(expected)) {
+    fail(`tauri.youtube.conf.json externalBin must be exactly ${JSON.stringify(expected)}`);
+  }
+}
 
 function filePath(relativePath) {
   return resolveInside(repositoryRoot, relativePath, "installed helper path");
@@ -42,6 +53,7 @@ async function verifyLicense(asset, label) {
   }
 }
 
+await verifySidecarConfig();
 const { lock, validation } = await readLock(repositoryRoot);
 if (!validation.populated) {
   fail("lock is intentionally unpopulated; helper execution and packaging remain blocked until authoritative metadata is reviewed");

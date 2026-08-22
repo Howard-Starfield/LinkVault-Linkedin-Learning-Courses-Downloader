@@ -1,11 +1,13 @@
 #![cfg(windows)]
 
 use linkvault_lib::workflow::transient::managed_process::{
-    run_test, ManagedProcessError, ManagedProcessSpec, TestManagedProcessFault,
-    TestManagedProcessSpec,
+    lock_test_executable, run_test, ManagedProcessError, ManagedProcessSpec,
+    TestManagedProcessFault, TestManagedProcessSpec,
 };
 use linkvault_lib::workflow::transient::TransientRunControl;
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -36,6 +38,30 @@ fn wait_for_path(path: &Path, timeout: Duration) {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(path.exists(), "fixture did not create {}", path.display());
+}
+
+fn sha256(path: &Path) -> String {
+    let bytes = fs::read(path).expect("fixture bytes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[test]
+fn verified_executable_handle_blocks_tamper_and_replacement() {
+    let temp = tempdir().unwrap();
+    let candidate = temp.path().join("trusted-helper.exe");
+    fs::copy(fixture_path(), &candidate).unwrap();
+    let digest = sha256(&candidate);
+    assert!(matches!(
+        lock_test_executable(candidate.clone(), &"0".repeat(64)),
+        Err(ManagedProcessError::Integrity(_))
+    ));
+
+    let guard = lock_test_executable(candidate.clone(), &digest).unwrap();
+    assert!(fs::write(&candidate, b"tampered").is_err());
+    assert!(fs::rename(&candidate, temp.path().join("replacement.exe")).is_err());
+    assert_eq!(sha256(&candidate), digest);
+    drop(guard);
+    fs::write(&candidate, b"released").unwrap();
 }
 
 #[test]
