@@ -301,13 +301,18 @@ MAX_CAPTION_INSPECTION_CONCURRENCY   4
 MAX_DISCOVERY_STDOUT_BYTES     32 MiB
 MAX_MACHINE_RECORD_BYTES        4 MiB
 MAX_RETAINED_STDERR_BYTES      256 KiB
-DISCOVERY_IDLE_TIMEOUT             30 s
 DISCOVERY_WALL_TIMEOUT               5 min
-DOWNLOAD_IDLE_TIMEOUT                 5 min
-MERGE_IDLE_TIMEOUT                   10 min
+MIN_DOWNLOAD_WALL_TIMEOUT            30 min
+UNKNOWN_DURATION_DOWNLOAD_TIMEOUT    24 h
+MAX_DOWNLOAD_WALL_TIMEOUT              7 d
+DOWNLOAD_DURATION_MULTIPLIER             3
+DOWNLOAD_TIMEOUT_GRACE               30 min
+FRAGMENT_RETRIES                         10
+FILE_ACCESS_RETRIES                      10
+CONCURRENT_FRAGMENTS                       4
 ```
 
-Media download and merge have no fixed total wall timeout while progress continues; the idle deadlines and user cancellation still apply.
+Media downloads use yt-dlp's native DASH/HLS fragment engine with `.part` files, bounded fragment/file retries and four concurrent fragments. The managed-process wall deadline is three times the reviewed source duration plus 30 minutes, clamped from 30 minutes to seven days; unknown durations receive 24 hours. User cancellation remains authoritative and terminates the managed process tree.
 
 These are safety limits, not performance claims. A change requires a reviewed spec update and release-build measurement. Oversized, truncated, invalid UTF-8 or trailing-garbage machine output fails with a typed error; it is never partially trusted. stdout and stderr are drained concurrently through bounded readers.
 
@@ -503,13 +508,15 @@ For a playlist:
 
 The app-owned safe-filesystem service converts the selected folder into a validated `OutputRoot` before launching a helper. It rejects a file, symlink, junction or other Windows reparse point as the root; safely creates missing directories; canonicalizes each created component; opens root/staging directory handles without delete sharing; records their volume/file identity; and rechecks identity, reparse state and containment immediately before helper launch, after helper exit and before publication. The YouTube provider supplies only sanitized relative-path and artifact plans; it does not open an unvalidated user root itself.
 
-Rust-owned filename logic rejects traversal, absolute child paths, device paths, alternate data streams, control characters, Windows reserved names and components ending in a dot or space. V1 accepts only canonical local drive roots; UNC, device and extended-prefix inputs are rejected. Sanitized title components are capped at 80 UTF-16 code units while preserving the stable ID suffix, and staging/final absolute paths are capped at 240 UTF-16 code units. An unsafe path that cannot be shortened within those rules returns `OUTPUT_PATH_INVALID`. Provider titles and language tags are never used directly as unrestricted paths.
+Rust-owned filename logic rejects traversal, absolute child paths, device paths, alternate data streams, control characters, Windows reserved names and components ending in a dot or space. V1 accepts only canonical local drive roots; UNC, device and extended-prefix inputs are rejected. Sanitized title components are capped at 80 UTF-16 code units and shrink further when needed to preserve the stable ID suffix within the 240-unit final-path ceiling. Helper-visible staging directories are capped at 192 units, reserving space for yt-dlp's `.part`, fragment, language and extension suffixes; the helper writes to the fixed `media.%(ext)s` template. An unsafe path that cannot be shortened within those rules returns `OUTPUT_PATH_INVALID`. Provider titles and language tags are never used directly as unrestricted paths.
 
-Every attempt receives a cryptographically unpredictable, exclusively created, initially empty staging directory on the same volume beneath:
+Every attempt receives a process-unique, exclusively created, initially empty staging directory on the same volume beneath:
 
 ```text
-<output>/.linkvault-staging/youtube/<occurrence-id>/<artifact-fingerprint>/<attempt-id>/
+<output>/.lv/y-<compact-scope>-<attempt-id>/
 ```
+
+`compact-scope` is a bounded SHA-256-derived namespace key over the occurrence and artifact fingerprints. The full identities remain in the immutable plan and verified manifest; compacting only the hidden staging namespace prevents identity-sized directory components from consuming the Windows path budget.
 
 The helper writes only inside that clean attempt directory. Preserved partials are never reused in place: the safe-filesystem service opens each matching regular file without following reparse points, verifies its file/volume identity and copies it into the clean attempt before launch. It rejects every pre-existing or helper-created descendant that is a symlink, junction or other reparse point; leaf and nested identities are opened/rechecked before hashing and publication. A detected swap terminates the managed job and returns `SAFE_FILESYSTEM_VIOLATION`.
 

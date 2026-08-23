@@ -4,7 +4,7 @@ use crate::app::safe_output_filesystem::{
 };
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::helper::{
-    ffprobe_invocation, invocation, output_error, MAX_RECORD_STDOUT_BYTES,
+    download_invocation, ffprobe_invocation, invocation, output_error, MAX_RECORD_STDOUT_BYTES,
 };
 use crate::providers::youtube::manifest_contract::{
     artifact_fingerprint, canonical_manifest_bytes, project_manifest, ArtifactFingerprintInput,
@@ -211,6 +211,15 @@ impl YouTubeExecutor {
             "--no-cache-dir".to_string(),
             "--no-warnings".to_string(),
             "--no-playlist".to_string(),
+            "--continue".to_string(),
+            "--part".to_string(),
+            "--retries".to_string(),
+            "10".to_string(),
+            "--fragment-retries".to_string(),
+            "10".to_string(),
+            "--file-access-retries".to_string(),
+            "10".to_string(),
+            "--windows-filenames".to_string(),
             "--newline".to_string(),
             "--progress-template".to_string(),
             "%(progress.downloaded_bytes)s/%(progress.total_bytes)s".to_string(),
@@ -231,6 +240,8 @@ impl YouTubeExecutor {
                 args.push(selected.language_tag);
             }
             YouTubeDownloadMode::VideoAndTranscript => {
+                args.push("--concurrent-fragments".to_string());
+                args.push("4".to_string());
                 if let Some(selected) = self.item_selected_transcript(item)? {
                     args.push(match selected.source {
                         YouTubeTranscriptSource::Uploader => "--write-subs".to_string(),
@@ -245,6 +256,8 @@ impl YouTubeExecutor {
                 args.push(self.format_selector());
             }
             YouTubeDownloadMode::VideoOnly => {
+                args.push("--concurrent-fragments".to_string());
+                args.push("4".to_string());
                 args.push("--format".to_string());
                 args.push(self.format_selector());
             }
@@ -430,7 +443,8 @@ impl TransientExecutor for YouTubeExecutor {
                 message: "download was cancelled".to_string(),
             });
         }
-        let stem = safe_stem(item.ordinal, &item.title, &item.video_id);
+        let stem = safe_stem_for_root(&self.output_root, item.ordinal, &item.title, &item.video_id)
+            .map_err(safe_output_error)?;
         if let Some(artifact_kinds) = self.try_reuse_existing(item, &stem, control)? {
             progress(TransientProgressUpdate {
                 occurrence_id: item.occurrence_id.clone(),
@@ -450,7 +464,11 @@ impl TransientExecutor for YouTubeExecutor {
         if control.is_cancelled() {
             return Err(transient_error("CANCELLED", "download was cancelled"));
         }
-        let output_template = staging.join(format!("{stem}.%(ext)s"));
+        // Keep helper-visible leaf names compact. yt-dlp appends `.part`,
+        // fragment, subtitle-language, and container suffixes while a long
+        // download is in flight; the descriptive name belongs to the final
+        // item directory, not the temporary media leaf.
+        let output_template = staging.join("media.%(ext)s");
         progress(TransientProgressUpdate {
             occurrence_id: item.occurrence_id.clone(),
             phase: match &self.mode {
@@ -468,12 +486,27 @@ impl TransientExecutor for YouTubeExecutor {
         let helper_args = self
             .args_for(item, &output_template)
             .map_err(|message| transient_error("TRANSCRIPT_POLICY_MISSING", message))?;
-        let output = run(
-            invocation(helper_args, MAX_RECORD_STDOUT_BYTES),
-            Some(control),
-            None,
-        )
-        .map_err(|error| transient_error("HELPER_FAILED", error.to_string()))?;
+        let source_duration_seconds = self
+            .context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .items
+                    .iter()
+                    .find(|candidate| candidate.occurrence_id == item.occurrence_id)
+            })
+            .and_then(|context| context.source_duration_seconds);
+        let helper_spec = if matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
+            invocation(helper_args, MAX_RECORD_STDOUT_BYTES)
+        } else {
+            download_invocation(
+                helper_args,
+                MAX_RECORD_STDOUT_BYTES,
+                source_duration_seconds,
+            )
+        };
+        let output = run(helper_spec, Some(control), None)
+            .map_err(|error| transient_error("HELPER_FAILED", error.to_string()))?;
         cleanup
             .lease()
             .revalidate()
@@ -1569,7 +1602,49 @@ fn is_transient_artifact_name(name: &str) -> bool {
         .any(|suffix| lower.ends_with(suffix))
 }
 
+#[cfg(test)]
 fn safe_stem(ordinal: u32, title: &str, video_id: &str) -> String {
+    safe_stem_with_budget(ordinal, title, video_id, usize::MAX)
+        .expect("the default YouTube stem budget must fit its fixed identity")
+}
+
+fn safe_stem_for_root(
+    output_root: &ValidatedOutputRoot,
+    ordinal: u32,
+    title: &str,
+    video_id: &str,
+) -> Result<String, SafeOutputError> {
+    safe_stem_with_budget(
+        ordinal,
+        title,
+        video_id,
+        output_root.direct_child_name_budget(),
+    )
+}
+
+fn safe_stem_with_budget(
+    ordinal: u32,
+    title: &str,
+    video_id: &str,
+    max_units: usize,
+) -> Result<String, SafeOutputError> {
+    let safe_video_id = video_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let ordinal_label = format!("{ordinal:03}");
+    let fixed_units =
+        ordinal_label.encode_utf16().count() + safe_video_id.encode_utf16().count() + 2;
+    let title_budget = max_units.saturating_sub(fixed_units).min(80);
+    if title_budget == 0 {
+        return Err(SafeOutputError::PathTooLong);
+    }
     let mut stem = title
         .chars()
         .map(|character| {
@@ -1586,25 +1661,18 @@ fn safe_stem(ordinal: u32, title: &str, video_id: &str) -> String {
     if stem.is_empty() {
         stem = "youtube-video".to_string();
     }
-    stem = truncate_utf16(&stem, 80);
+    stem = truncate_utf16(&stem, title_budget);
     stem = stem
         .trim()
         .trim_matches(|character| character == '.' || character == ' ')
         .to_string();
     if stem.is_empty() {
-        stem = "youtube-video".to_string();
+        stem = truncate_utf16("video", title_budget);
     }
-    let safe_video_id = video_id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    format!("{:03}-{}-{}", ordinal, stem, safe_video_id)
+    if stem.is_empty() {
+        return Err(SafeOutputError::PathTooLong);
+    }
+    Ok(format!("{ordinal_label}-{stem}-{safe_video_id}"))
 }
 
 fn truncate_utf16(value: &str, max_units: usize) -> String {
@@ -1756,8 +1824,25 @@ mod tests {
         let args = executor
             .args_for(&item, &temp.path().join("output.%(ext)s"))
             .unwrap();
-        for required in ["--ignore-config", "--no-plugin-dirs", "--no-cache-dir"] {
+        for required in [
+            "--ignore-config",
+            "--no-plugin-dirs",
+            "--no-cache-dir",
+            "--continue",
+            "--part",
+            "--windows-filenames",
+            "--concurrent-fragments",
+        ] {
             assert!(args.iter().any(|argument| argument == required));
+        }
+        for (option, expected) in [
+            ("--retries", "10"),
+            ("--fragment-retries", "10"),
+            ("--file-access-retries", "10"),
+            ("--concurrent-fragments", "4"),
+        ] {
+            let index = args.iter().position(|argument| argument == option).unwrap();
+            assert_eq!(args[index + 1], expected);
         }
         let attempt = root
             .staging_attempt_lease(&item.occurrence_id, &item.artifact_fingerprint)
@@ -1797,13 +1882,8 @@ mod tests {
         assert_eq!(manifest["schemaVersion"], 1);
         assert_eq!(manifest["artifactFingerprint"], "fingerprint-1");
         assert_eq!(manifest["artifacts"][0]["sizeBytes"], 11);
-        let fingerprint_staging = temp
-            .path()
-            .join(".linkvault-staging")
-            .join("youtube")
-            .join("occurrence-1")
-            .join("fingerprint-1");
-        assert_eq!(fs::read_dir(fingerprint_staging).unwrap().count(), 0);
+        let compact_scope = staging.parent().unwrap();
+        assert_eq!(fs::read_dir(compact_scope).unwrap().count(), 0);
     }
 
     #[test]
@@ -1820,6 +1900,31 @@ mod tests {
         }
         assert!(!staging.exists());
         assert!(!temp.path().join("001-video-video-1").exists());
+    }
+
+    #[test]
+    fn final_stem_shrinks_to_fit_a_deep_output_root() {
+        let temp = tempdir().unwrap();
+        let base_units = temp.path().to_string_lossy().encode_utf16().count() + 1;
+        let component_units = 180usize.saturating_sub(base_units).max(1);
+        let deep_root = temp.path().join("r".repeat(component_units));
+        fs::create_dir(&deep_root).unwrap();
+        let root = validate_output_root(&deep_root).unwrap();
+        let stem = safe_stem_for_root(
+            &root,
+            1,
+            &"A very long descriptive title ".repeat(12),
+            "video-1",
+        )
+        .unwrap();
+        assert!(
+            deep_root
+                .join(stem)
+                .to_string_lossy()
+                .encode_utf16()
+                .count()
+                <= 240
+        );
     }
 
     const VALID_VTT: &str = "WEBVTT\n\n00:00.000 --> 00:01.500\nHello &amp; world\n";

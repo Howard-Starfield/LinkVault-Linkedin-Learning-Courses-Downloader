@@ -4,6 +4,7 @@
 //! a helper path or an output filename.  This module validates the selected
 //! root once and only exposes constrained descendants to provider code.
 
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +14,9 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+const MAX_SUPPORTED_PATH_UTF16: usize = 240;
+const MAX_HELPER_STAGING_DIR_UTF16: usize = 192;
 
 #[derive(Debug, Error)]
 pub enum SafeOutputError {
@@ -103,6 +107,12 @@ impl ValidatedOutputRoot {
         &self.path
     }
 
+    /// Maximum UTF-16 units available to one direct child while retaining the
+    /// conservative cross-helper path ceiling used by publication.
+    pub fn direct_child_name_budget(&self) -> usize {
+        MAX_SUPPORTED_PATH_UTF16.saturating_sub(path_utf16_len(&self.path).saturating_add(1))
+    }
+
     fn root_lease(&self) -> Result<&DirectoryLease, SafeOutputError> {
         self.leases
             .last()
@@ -145,7 +155,7 @@ impl ValidatedOutputRoot {
     ) -> Result<Option<ExistingOutputDirectoryLease>, SafeOutputError> {
         validate_component(final_name)?;
         let destination = self.path.join(final_name);
-        if path_utf16_len(&destination) > 240 {
+        if path_utf16_len(&destination) > MAX_SUPPORTED_PATH_UTF16 {
             return Err(SafeOutputError::PathTooLong);
         }
 
@@ -225,27 +235,27 @@ impl ValidatedOutputRoot {
         validate_component(occurrence_id)?;
         validate_component(artifact_fingerprint)?;
         static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+        let scope_name = compact_staging_scope(occurrence_id, artifact_fingerprint);
         let attempt_name = format!(
-            "attempt-{}-{}-{}",
-            std::process::id(),
+            "y-{}-{:x}-{:x}",
+            scope_name,
             now_nanos(),
             NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
         );
         validate_component(&attempt_name)?;
-        let names = [
-            ".linkvault-staging",
-            "youtube",
-            occurrence_id,
-            artifact_fingerprint,
-            attempt_name.as_str(),
-        ];
+        let names = [".lv", attempt_name.as_str()];
         self.revalidate()?;
         let mut current = self.path.clone();
         let mut ancestor_leases = Vec::with_capacity(names.len() - 1);
         let mut final_handle = None;
         for (index, name) in names.iter().enumerate() {
             current.push(name);
-            if path_utf16_len(&current) > 240 {
+            let path_limit = if index + 1 == names.len() {
+                MAX_HELPER_STAGING_DIR_UTF16
+            } else {
+                MAX_SUPPORTED_PATH_UTF16
+            };
+            if path_utf16_len(&current) > path_limit {
                 return Err(SafeOutputError::PathTooLong);
             }
             let is_final = index + 1 == names.len();
@@ -292,7 +302,7 @@ impl ValidatedOutputRoot {
         final_name: &str,
     ) -> Result<PathBuf, SafeOutputError> {
         validate_component(final_name)?;
-        if path_utf16_len(&self.path.join(final_name)) > 240 {
+        if path_utf16_len(&self.path.join(final_name)) > MAX_SUPPORTED_PATH_UTF16 {
             return Err(SafeOutputError::PathTooLong);
         }
         if attempt.root.path != self.path
@@ -979,6 +989,19 @@ fn path_utf16_len(path: &Path) -> usize {
     path.as_os_str().to_string_lossy().encode_utf16().count()
 }
 
+fn compact_staging_scope(occurrence_id: &str, artifact_fingerprint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((occurrence_id.len() as u64).to_le_bytes());
+    hasher.update(occurrence_id.as_bytes());
+    hasher.update((artifact_fingerprint.len() as u64).to_le_bytes());
+    hasher.update(artifact_fingerprint.as_bytes());
+    let digest = hasher.finalize();
+    digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn validate_root_shape(path: &Path) -> Result<(), SafeOutputError> {
     for component in path.components() {
         #[cfg(windows)]
@@ -1099,6 +1122,21 @@ mod tests {
         assert!(root
             .staging_attempt_lease("nested/name", "artifact-1")
             .is_err());
+    }
+
+    #[test]
+    fn compact_staging_namespace_supports_deep_output_roots() {
+        let temp = tempdir().unwrap();
+        let base_units = path_utf16_len(temp.path()) + 1;
+        let component_units = 150usize.saturating_sub(base_units).max(1);
+        let deep_root = temp.path().join("r".repeat(component_units));
+        fs::create_dir(&deep_root).unwrap();
+        let root = validate_output_root(&deep_root).unwrap();
+        let attempt = root
+            .staging_attempt_lease(&"o".repeat(64), &"f".repeat(64))
+            .unwrap();
+        assert!(path_utf16_len(attempt.path()) <= MAX_HELPER_STAGING_DIR_UTF16);
+        root.discard_attempt_lease(attempt).unwrap();
     }
 
     #[test]
@@ -1332,7 +1370,7 @@ mod tests {
         let attempt = root
             .staging_attempt_lease("occurrence-1", "artifact-1")
             .unwrap();
-        let staging = output.join(".linkvault-staging");
+        let staging = output.join(".lv");
         assert!(fs::rename(&staging, output.join("swapped-staging")).is_err());
         assert!(fs::rename(
             attempt.path(),
