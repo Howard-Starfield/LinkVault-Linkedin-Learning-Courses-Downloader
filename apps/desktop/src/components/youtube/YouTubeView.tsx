@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import {
   Button,
+  Dialog,
   EmptyRow,
   Field,
   Input,
@@ -170,6 +171,9 @@ export function YouTubeView() {
   const [helperError, setHelperError] = useState<YouTubeError | null>(null);
   const helperReady = !nativeRuntime || helperStatus === "ready";
   const [acknowledged, setAcknowledged] = useState(readAcknowledgement);
+  const [guardrailOpen, setGuardrailOpen] = useState(() => !readAcknowledgement());
+  const [rememberGuardrailChoice, setRememberGuardrailChoice] = useState(false);
+  const rememberGuardrailChoiceRef = useRef(false);
   const [sourceUrl, setSourceUrl] = useState("");
   const [scan, setScan] = useState<ScanYouTubeSourceResponse | null>(null);
   const [transcriptInspection, setTranscriptInspection] = useState<InspectYouTubeTranscriptsResponse | null>(null);
@@ -268,7 +272,7 @@ export function YouTubeView() {
     [scan, selectedOccurrenceIds]
   );
   const availableCount = useMemo(
-    () => scan?.items.filter((item) => item.availability !== "unavailable").length ?? 0,
+    () => scan?.items.filter((item) => item.availability === "available").length ?? 0,
     [scan]
   );
   const runItems = useMemo(
@@ -287,16 +291,35 @@ export function YouTubeView() {
       ? `${scan.items.length} ${scan.kind} occurrence${scan.items.length === 1 ? "" : "s"} ready for selection.`
       : "YouTube source reel is empty.";
 
-  function setAcknowledgement(next: boolean): void {
-    setAcknowledged(next);
+  const completeGuardrail = useCallback((): void => {
+    setAcknowledged(true);
     if (typeof window !== "undefined") {
-      if (next) window.localStorage.setItem(ACKNOWLEDGEMENT_KEY, "true");
+      if (rememberGuardrailChoiceRef.current) window.localStorage.setItem(ACKNOWLEDGEMENT_KEY, "true");
       else window.localStorage.removeItem(ACKNOWLEDGEMENT_KEY);
     }
-  }
+    setGuardrailOpen(false);
+  }, []);
+
+  const handleGuardrailOpenChange = useCallback((nextOpen: boolean): void => {
+    if (nextOpen) {
+      const remembered = readAcknowledgement();
+      rememberGuardrailChoiceRef.current = remembered;
+      setRememberGuardrailChoice(remembered);
+      setGuardrailOpen(true);
+      return;
+    }
+    completeGuardrail();
+  }, [completeGuardrail]);
+
+  const openGuardrail = useCallback((): void => {
+    const remembered = readAcknowledgement();
+    rememberGuardrailChoiceRef.current = remembered;
+    setRememberGuardrailChoice(remembered);
+    setGuardrailOpen(true);
+  }, []);
 
   function toggleOccurrence(item: YouTubeScanItem): void {
-    if (item.availability === "unavailable") return;
+    if (item.availability !== "available") return;
     transcriptInspectionGenerationRef.current += 1;
     setTranscriptInspection(null);
     setSelectedOccurrenceIds((current) => {
@@ -311,7 +334,7 @@ export function YouTubeView() {
     if (!scan) return;
     transcriptInspectionGenerationRef.current += 1;
     setTranscriptInspection(null);
-    const available = scan.items.filter((item) => item.availability !== "unavailable");
+    const available = scan.items.filter((item) => item.availability === "available");
     const allSelected = available.length > 0 && available.every((item) => selectedOccurrenceIds.has(item.occurrenceId));
     setSelectedOccurrenceIds(allSelected ? new Set() : new Set(available.map((item) => item.occurrenceId)));
   }
@@ -319,10 +342,6 @@ export function YouTubeView() {
   async function handleScan(): Promise<void> {
     if (!helperReady) {
       toast.error("YouTube helper is not ready", { description: "The exact Y0 helper lock and integrity gate must pass before native discovery." });
-      return;
-    }
-    if (!acknowledged) {
-      toast.error("Confirm the internal-use acknowledgement first");
       return;
     }
     if (!sourceUrl.trim()) {
@@ -340,7 +359,7 @@ export function YouTubeView() {
       });
       transcriptInspectionGenerationRef.current += 1;
       setScan(nextScan);
-      setSelectedOccurrenceIds(new Set(nextScan.items.filter((item) => item.availability !== "unavailable").map((item) => item.occurrenceId)));
+      setSelectedOccurrenceIds(new Set(nextScan.items.filter((item) => item.availability === "available").map((item) => item.occurrenceId)));
       toast.success("Source scanned", { description: `${nextScan.items.length} occurrence${nextScan.items.length === 1 ? "" : "s"} in source order.` });
     } catch (error) {
       toast.error("YouTube scan failed", { description: String(error) });
@@ -349,8 +368,8 @@ export function YouTubeView() {
     }
   }
 
-  async function handleInspectTranscripts(): Promise<void> {
-    if (!scan || selectedItems.length === 0 || !helperReady) return;
+  async function requestTranscriptInspection(announceSuccess: boolean): Promise<InspectYouTubeTranscriptsResponse | null> {
+    if (!scan || selectedItems.length === 0 || !helperReady) return null;
     const requestedOccurrenceIds = selectedItems.map((item) => item.occurrenceId);
     const requestGeneration = transcriptInspectionGenerationRef.current + 1;
     transcriptInspectionGenerationRef.current = requestGeneration;
@@ -361,42 +380,66 @@ export function YouTubeView() {
         scanPlanId: scan.scanPlanId,
         occurrenceIds: requestedOccurrenceIds
       });
-      if (requestGeneration !== transcriptInspectionGenerationRef.current) return;
+      if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
       const responseMatchesRequest = response.occurrences.length === requestedOccurrenceIds.length
         && response.occurrences.every((occurrence, index) => occurrence.occurrenceId === requestedOccurrenceIds[index]);
       if (!responseMatchesRequest) throw new Error("Transcript inspection response did not match the current occurrence selection.");
       setTranscriptInspection(response);
-      toast.success("Transcript tracks inspected", { description: `${response.occurrences.length} selected occurrence${response.occurrences.length === 1 ? "" : "s"}.` });
+      if (announceSuccess) {
+        toast.success("Transcript tracks inspected", { description: `${response.occurrences.length} selected occurrence${response.occurrences.length === 1 ? "" : "s"}.` });
+      }
+      return response;
     } catch (error) {
-      if (requestGeneration !== transcriptInspectionGenerationRef.current) return;
+      if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
       toast.error("Transcript inspection failed", { description: String(error) });
+      return null;
     } finally {
       setIsInspectingTranscripts(false);
     }
   }
 
-  async function browseOutputDirectory(): Promise<void> {
+  async function handleInspectTranscripts(): Promise<void> {
+    await requestTranscriptInspection(true);
+  }
+
+  async function pickOutputDirectory(): Promise<string | null> {
     try {
       const picked = await open({ directory: true, multiple: false, defaultPath: outputDir || undefined });
-      if (typeof picked === "string" && picked.trim()) setOutputDir(picked);
+      if (typeof picked === "string" && picked.trim()) {
+        const nextOutputDir = picked.trim();
+        setOutputDir(nextOutputDir);
+        return nextOutputDir;
+      }
+      return null;
     } catch (error) {
       toast.error("Folder picker failed", { description: String(error) });
+      return null;
     }
   }
 
+  async function browseOutputDirectory(): Promise<void> {
+    await pickOutputDirectory();
+  }
+
   async function handleStart(): Promise<void> {
-    if (!scan || selectedItems.length === 0 || !outputDir.trim()) {
-      toast.error("Choose at least one occurrence and an output directory");
+    if (!scan || selectedItems.length === 0) {
+      toast.error("Choose at least one public occurrence");
       return;
     }
-    if (!helperReady || !acknowledged) return;
+    if (!helperReady) return;
     setIsStarting(true);
     try {
+      const resolvedOutputDir = outputDir.trim() || await pickOutputDirectory();
+      if (!resolvedOutputDir) return;
+      if (mode !== "video_only" && !transcriptInspection) {
+        const inspected = await requestTranscriptInspection(false);
+        if (!inspected) return;
+      }
       const response = await startYouTubeDownload({
         clientSubmissionId: createClientId("youtube-submission"),
         scanPlanId: scan.scanPlanId,
         selectedOccurrenceIds: selectedItems.map((item) => item.occurrenceId),
-        outputDir: outputDir.trim(),
+        outputDir: resolvedOutputDir,
         mode,
         maxHeight,
         preferredLanguage,
@@ -488,16 +531,39 @@ export function YouTubeView() {
         <div className="youtube-guidance-copy">
           <strong>Internal-use guardrail</strong>
           <p>{PERSISTENT_GUIDANCE}</p>
-          <label className="youtube-acknowledgement">
-            <input
-              type="checkbox"
-              checked={acknowledged}
-              onChange={(event) => setAcknowledgement(event.target.checked)}
-            />
-            <span>{FIRST_USE_ACKNOWLEDGEMENT}</span>
-          </label>
+          <Button type="button" size="xs" variant="ghost" onClick={openGuardrail} className="youtube-guidance-action">
+            Review guardrail
+          </Button>
         </div>
       </div>
+
+      <Dialog
+        open={guardrailOpen}
+        onOpenChange={handleGuardrailOpenChange}
+        title="YouTube Internal-use guardrail"
+        description={FIRST_USE_ACKNOWLEDGEMENT}
+        className="youtube-guardrail-dialog"
+      >
+        <div className="youtube-guardrail-body">
+          <label className="youtube-guardrail-check">
+            <input
+              type="checkbox"
+              aria-label="Don't show this again"
+              checked={rememberGuardrailChoice}
+              onChange={(event) => {
+                rememberGuardrailChoiceRef.current = event.target.checked;
+                setRememberGuardrailChoice(event.target.checked);
+              }}
+            />
+            <span>Don't show this again</span>
+          </label>
+          <div className="youtube-guardrail-actions">
+            <Button type="button" variant="primary" onClick={completeGuardrail}>
+              Continue to YouTube archive
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <div className={`youtube-helper-status youtube-helper-status-${helperStatus}`} role="status">
         {helperReady ? <CheckCircle2 aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}
@@ -515,7 +581,7 @@ export function YouTubeView() {
             <span className="youtube-kicker">01 / SOURCE</span>
             <h3>Build a source reel</h3>
           </div>
-          <StatusBadge tone={acknowledged ? "success" : "muted"}>{acknowledged ? "Acknowledged" : "Acknowledgement required"}</StatusBadge>
+          <StatusBadge tone={acknowledged ? "success" : "muted"}>{acknowledged ? "Session cleared" : "Guardrail pending"}</StatusBadge>
         </div>
         <div className="youtube-command-grid">
           <Field label="Public YouTube URL">
@@ -529,9 +595,9 @@ export function YouTubeView() {
                 placeholder="https://www.youtube.com/watch?v=..."
                 aria-label="Public YouTube URL"
                 spellCheck={false}
-                disabled={!helperReady || !acknowledged || isScanning || activeRun}
+                disabled={!helperReady || isScanning || activeRun}
               />
-              <Button type="button" variant="primary" onClick={() => void handleScan()} loading={isScanning} loadingLabel="Scanning" disabled={!helperReady || !acknowledged || activeRun}>
+              <Button type="button" variant="primary" onClick={() => void handleScan()} loading={isScanning} loadingLabel="Scanning" disabled={!helperReady || isScanning || activeRun}>
                 <ScanLine aria-hidden="true" />
                 Scan
               </Button>
@@ -631,16 +697,17 @@ export function YouTubeView() {
               <ol className="youtube-source-reel" aria-label="Scanned YouTube occurrences">
                 {scan.items.map((item) => {
                   const outcome = runItems.get(item.occurrenceId);
-                  const state: YouTubeItemState = outcome?.state ?? (item.availability === "unavailable" ? "skipped" : "pending");
-                  const unavailable = item.availability === "unavailable";
+                  const available = item.availability === "available";
+                  const state: YouTubeItemState = outcome?.state ?? (available ? "pending" : "skipped");
+                  const availabilityLabel = item.availability === "unknown" ? "Unconfirmed" : "Unavailable";
                   return (
-                    <li key={item.occurrenceId} className="youtube-reel-item" data-state={state} data-unavailable={unavailable || undefined}>
+                    <li key={item.occurrenceId} className="youtube-reel-item" data-state={state} data-unavailable={!available || undefined}>
                       <label className="youtube-reel-select">
-                        <input type="checkbox" checked={selectedOccurrenceIds.has(item.occurrenceId)} onChange={() => toggleOccurrence(item)} disabled={unavailable || activeRun} aria-label={`Select occurrence ${item.ordinal}: ${item.title}`} />
+                        <input type="checkbox" checked={selectedOccurrenceIds.has(item.occurrenceId)} onChange={() => toggleOccurrence(item)} disabled={!available || activeRun} aria-label={`Select occurrence ${item.ordinal}: ${item.title}`} />
                         <span className="youtube-reel-check" aria-hidden="true"><Check /></span>
                         <span className="youtube-reel-ordinal" aria-hidden="true">{formatOrdinal(item.ordinal)}</span>
                         <span className="youtube-reel-copy"><strong>{item.title}</strong><span>{item.channelName ?? "Channel unavailable"} · {formatDuration(item.durationSeconds)}</span></span>
-                        <StatusBadge tone={itemStateTone(state)}>{unavailable ? "Unavailable" : itemStateLabel(state)}</StatusBadge>
+                        <StatusBadge tone={itemStateTone(state)}>{available ? itemStateLabel(state) : availabilityLabel}</StatusBadge>
                       </label>
                     </li>
                   );
@@ -701,9 +768,9 @@ export function YouTubeView() {
             </div>
           ) : <EmptyRow compact title="No active run" description="Start a selected source reel to see typed progress here." />}
           <div className="youtube-run-actions">
-            <Button type="button" variant="primary" onClick={() => void handleStart()} loading={isStarting} loadingLabel="Starting" disabled={!scan || selectedCount === 0 || !outputDir.trim() || !helperReady || !acknowledged || activeRun}>
+            <Button type="button" variant="primary" onClick={() => void handleStart()} loading={isStarting} loadingLabel="Starting" disabled={!scan || selectedCount === 0 || !helperReady || activeRun}>
               <Play aria-hidden="true" />
-              Start selected ({selectedCount})
+              {outputDir.trim() ? `Start selected (${selectedCount})` : `Choose folder & start (${selectedCount})`}
             </Button>
             <Button type="button" variant="outline" onClick={() => void (canResumeRun ? handleResume() : handlePause())} loading={isPausing || isResuming} loadingLabel={canResumeRun ? "Resuming" : "Pausing"} disabled={(!canPauseRun && !canResumeRun) || isCancelling}>
               {canResumeRun ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}

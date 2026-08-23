@@ -854,7 +854,6 @@ textarea {
   line-height: 16px;
 }
 
-.youtube-acknowledgement,
 .youtube-option-check {
   display: flex;
   min-width: 0;
@@ -866,11 +865,52 @@ textarea {
   line-height: 16px;
 }
 
-.youtube-acknowledgement input,
 .youtube-option-check input {
   flex: 0 0 auto;
   accent-color: var(--accent);
   margin-top: 2px;
+}
+
+.youtube-guidance-action {
+  justify-self: start;
+}
+
+.youtube-guardrail-dialog {
+  width: min(520px, calc(100vw - 24px));
+  max-width: none;
+  gap: 16px;
+  border-color: color-mix(in srgb, var(--warning) 36%, var(--border-soft));
+  background: var(--section-bg);
+}
+
+.youtube-guardrail-body {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+}
+
+.youtube-guardrail-check {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.youtube-guardrail-check input {
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  margin-top: 2px;
+}
+
+.youtube-guardrail-actions {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 12px;
 }
 
 .youtube-helper-status {

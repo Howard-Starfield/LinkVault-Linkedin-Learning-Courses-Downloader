@@ -22,14 +22,35 @@ try {
   page.on("pageerror", (error) => consoleErrors.push(error.message));
 
   await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => window.localStorage.removeItem("linkvault.youtube.internal-acknowledgement.v1"));
   await page.getByRole("button", { name: "Open YouTube archive" }).click();
   const view = page.locator(".youtube-view");
   await view.waitFor();
   await page.getByRole("heading", { name: "YouTube archive" }).waitFor();
 
+  const guardrail = page.getByRole("dialog", { name: "YouTube Internal-use guardrail" });
+  await guardrail.waitFor();
+  const guardrailCopy = await guardrail.innerText();
+  assert.match(guardrailCopy, /public videos and playlists you own or are authorized to save/i);
+  assert.match(guardrailCopy, /private.*member-only.*paid.*age-gated/is);
+  assert.equal(await guardrail.getByLabel("Don't show this again").isChecked(), false, "Remember choice is checked before the first-use decision");
+  assert.equal(await page.getByRole("button", { name: "Scan", exact: true }).isEnabled(), true, "Guardrail state still disables scan underneath the modal");
+  await guardrail.getByRole("button", { name: "Close YouTube Internal-use guardrail", exact: true }).click();
+  assert.equal(await guardrail.count(), 0, "Guardrail dialog did not close through its dismiss action");
+  assert.equal(await page.evaluate(() => window.localStorage.getItem("linkvault.youtube.internal-acknowledgement.v1")), null, "Unchecked remember choice persisted unexpectedly");
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Open YouTube archive" }).click();
+  const repeatedGuardrail = page.getByRole("dialog", { name: "YouTube Internal-use guardrail" });
+  await repeatedGuardrail.waitFor();
+  const rememberChoice = repeatedGuardrail.getByLabel("Don't show this again");
+  await rememberChoice.check();
+  assert.equal(await rememberChoice.evaluate((element) => element === document.activeElement), true, "Changing the remember choice moved keyboard focus away from the checkbox");
+  await repeatedGuardrail.getByRole("button", { name: "Continue to YouTube archive", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.localStorage.getItem("linkvault.youtube.internal-acknowledgement.v1")), "true", "Checked remember choice was not persisted");
+
   const guidance = await page.locator(".youtube-guidance").innerText();
   assert.match(guidance, /public content you own or are authorized to save/i);
-  assert.match(guidance, /private.*member-only.*paid.*age-gated/is);
   assert.equal(await page.locator('[aria-live="polite"]').count() > 0, true, "Live run announcer is missing");
   assert.equal(await page.getByLabel("Public YouTube URL").count(), 1);
   assert.equal(await page.getByLabel("YouTube output directory").count(), 1);
@@ -64,8 +85,6 @@ try {
     await assertNoHorizontalLoss(profile.label);
   }
 
-  const acknowledgement = page.locator(".youtube-acknowledgement input");
-  await acknowledgement.check();
   await page.getByLabel("Preferred transcript language").fill("en-US");
   await page.getByLabel("Fallback transcript languages").fill("fr, de");
   assert.equal(await page.getByLabel("Preferred transcript language").inputValue(), "en-US");
@@ -73,7 +92,6 @@ try {
   await page.getByLabel("Public YouTube URL").fill("https://www.youtube.com/watch?v=preview-video&list=PLlinkvault-preview");
   assert.equal(await page.getByLabel("When URL includes a video and playlist").count(), 1);
   await page.getByLabel("When URL includes a video and playlist").selectOption("playlist");
-  await page.getByLabel("YouTube output directory").fill("C:\\LinkVault\\YouTube-preview");
   await page.getByRole("button", { name: "Scan", exact: true }).click();
   await page.getByRole("list", { name: "Scanned YouTube occurrences" }).waitFor();
 
@@ -88,16 +106,17 @@ try {
     true,
     "Select all did not select every available occurrence"
   );
+  assert.equal(await page.getByRole("button", { name: "Choose folder & start (4)", exact: true }).isEnabled(), true, "A successful scan still leaves Start grey while the output directory is empty");
+  await page.getByLabel("YouTube output directory").fill("C:\\LinkVault\\YouTube-preview");
 
-  await page.getByRole("button", { name: "Inspect transcripts", exact: true }).click();
+  await page.getByRole("button", { name: "Start selected (4)", exact: true }).click();
   const transcriptInspection = page.getByRole("region", { name: "Transcript inspection" });
   await transcriptInspection.waitFor();
-  assert.equal(await transcriptInspection.locator(".youtube-transcript-item").count(), 4, "Preview transcript inspection did not preserve occurrence identity");
+  assert.equal(await transcriptInspection.locator(".youtube-transcript-item").count(), 4, "Start did not automatically inspect transcripts or preserve occurrence identity");
   assert.equal(await transcriptInspection.locator(".youtube-transcript-track-list li").count(), 8, "Preview transcript inspection did not render deterministic track metadata");
   assert.match(await transcriptInspection.innerText(), /English.*Uploader/is, "Uploader transcript track is missing");
   assert.match(await transcriptInspection.innerText(), /English \(automatic\).*Automatic/is, "Automatic transcript track is missing");
 
-  await page.getByRole("button", { name: "Start selected (4)", exact: true }).click();
   await page.locator(".youtube-progress-block").waitFor();
   await page.locator(".youtube-run-panel .status-pill").filter({ hasText: "Running" }).waitFor();
   await page.getByRole("button", { name: "Pause after current", exact: true }).click();

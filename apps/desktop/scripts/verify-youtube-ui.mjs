@@ -97,8 +97,9 @@ matches(view, /getYouTubeHelperStatus\(\)/, "Native YouTube view does not load h
 matches(view, /response\.status === "ready"/, "Helper status response is not mapped to the native readiness gate");
 matches(view, /youtube-helper-error[\s\S]*?role="alert"/, "Helper failures are not exposed through an accessible alert");
 matches(view, /new Set\(available\.map\(\(item\) => item\.occurrenceId\)\)/, "Select-all does not preserve occurrence identity");
-matches(view, /item\.availability === "unavailable"/, "Unavailable occurrences are not represented");
-matches(view, /disabled=\{unavailable \|\| activeRun\}/, "Unavailable occurrences remain selectable");
+matches(view, /item\.availability === "available"/, "Available occurrences are not represented explicitly");
+matches(view, /disabled=\{!available \|\| activeRun\}/, "Non-public or unconfirmed occurrences remain selectable");
+matches(view, /item\.availability === "unknown" \? "Unconfirmed" : "Unavailable"/, "Unknown availability is not distinguished from confirmed public content");
 matches(view, /aria-label=\{`Select occurrence \$\{item\.ordinal\}: \$\{item\.title\}`\}/, "Occurrence selection lacks an accessible name");
 matches(ipc, /const playlist = request\.playlistMode === "playlist"/, "Playlist URL handling is not explicit");
 matches(view, /playlistMode[\s\S]*scanYouTubeSource\([\s\S]*?playlistMode/, "Ambiguous video+playlist URLs do not send an explicit playlist mode");
@@ -123,7 +124,15 @@ for (const phrase of [
   "DRM/access-control bypass",
   "public distribution"
 ]) includes(view, phrase, `YouTube guardrail copy omits ${phrase}`);
-matches(view, /acknowledged.*localStorage|localStorage.*acknowledgement/s, "Owner-risk acknowledgement is not persisted locally");
+matches(view, /<Dialog[\s\S]*?open=\{guardrailOpen\}[\s\S]*?title="YouTube Internal-use guardrail"/, "First-use guardrail is not mounted as an accessible dialog");
+matches(view, /description=\{FIRST_USE_ACKNOWLEDGEMENT\}/, "Guardrail dialog does not expose the public-content acknowledgement copy");
+matches(view, /aria-label="Don't show this again"/, "Guardrail dialog does not expose a remember-choice checkbox");
+matches(view, /Continue to YouTube archive/, "Guardrail dialog does not expose a clear continuation action");
+matches(view, /if \(rememberGuardrailChoiceRef\.current\) window\.localStorage\.setItem\(ACKNOWLEDGEMENT_KEY, "true"\)/, "Guardrail acknowledgement is persisted without checking the remember choice");
+matches(view, /else window\.localStorage\.removeItem\(ACKNOWLEDGEMENT_KEY\)/, "Guardrail remember choice cannot be cleared");
+matches(view, /setAcknowledged\(true\)[\s\S]*?setGuardrailOpen\(false\)/, "Closing the guardrail does not clear the current-session gate");
+assert.doesNotMatch(view, /disabled=\{[^}]*acknowledged/, "Scan/start controls remain disabled by the acknowledgement state");
+assert.doesNotMatch(view, /if \(!acknowledged\)/, "Scan/start handlers still require a persistent acknowledgement gate");
 
 // The route exposes a usable keyboard/screen-reader surface and a live progress channel.
 for (const fragment of [
@@ -131,12 +140,16 @@ for (const fragment of [
   'role="status"',
   'role="alert"',
   'aria-live="polite"',
+  'Review guardrail',
   'aria-label="Public YouTube URL"',
   'aria-label="YouTube output directory"',
   'aria-label="Scanned YouTube occurrences"'
 ]) includes(view, fragment, `YouTube view is missing ${fragment}`);
 matches(view, /onKeyDown=\{\(event\) => \{[\s\S]*?event\.key === "Enter"/, "Source scan cannot be keyboard submitted");
 matches(view, /disabled=\{!scan \|\| selectedCount === 0/, "Start action is not gated on a selected occurrence");
+assert.doesNotMatch(view, /disabled=\{[^}]*!outputDir\.trim\(\)/, "An empty output directory still greys the Start action instead of opening the folder picker");
+matches(view, /outputDir\.trim\(\) \|\| await pickOutputDirectory\(\)/, "Start does not request an output directory when one has not been chosen");
+matches(view, /mode !== "video_only" && !transcriptInspection[\s\S]*?requestTranscriptInspection\(false\)/, "Transcript modes do not satisfy native inspection admission before start");
 matches(view, /disabled=\{!activeRun\}/, "Cancel action is not gated on an active run");
 matches(view, /inspectYouTubeTranscripts\(/, "Transcript inspection is not mounted through the typed adapter");
 matches(view, /transcriptInspectionGenerationRef\.current/, "Transcript inspection does not correlate responses with the active selection");
@@ -154,6 +167,8 @@ for (const fragment of [
   "@container lv-main (max-width: 980px)",
   "@container lv-main (max-width: 720px)",
   "@container lv-main (max-width: 520px)",
+  ".youtube-guardrail-dialog",
+  ".youtube-guardrail-check",
   "@media (prefers-reduced-motion: reduce)",
   ".youtube-view *::before",
   "min-width: 0"
