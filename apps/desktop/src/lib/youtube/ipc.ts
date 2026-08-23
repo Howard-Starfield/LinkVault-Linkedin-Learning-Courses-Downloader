@@ -148,13 +148,20 @@ function dispatchPreviewEvent(snapshot: YouTubeRunSnapshot): void {
 
 function scanPreviewSource(request: ScanYouTubeSourceRequest): ScanYouTubeSourceResponse {
   const parsed = parseYouTubeUrl(request.url);
-  const playlist = request.playlistMode === "playlist" || parsed.playlistId !== null;
+  const playlist = request.playlistMode === "playlist"
+    || (request.playlistMode === undefined && parsed.videoId === null && parsed.playlistId !== null);
+  const sourceId = playlist ? parsed.playlistId : parsed.videoId;
+  if (!sourceId) {
+    throw new Error(playlist
+      ? "The preview URL does not contain a playlist id."
+      : "The preview URL does not contain a video id.");
+  }
   const itemCount = playlist ? 4 : 1;
   const items: YouTubeScanItem[] = Array.from({ length: itemCount }, (_, index) => {
     const ordinal = index + 1;
-    const videoId = playlist ? `${parsed.videoId}-${ordinal}` : parsed.videoId;
+    const videoId = playlist ? `${parsed.videoId ?? `preview-${sourceId}`}-${ordinal}` : sourceId;
     return {
-      occurrenceId: `preview-occurrence-${parsed.sourceId}-${ordinal}`,
+      occurrenceId: `preview-occurrence-${sourceId}-${ordinal}`,
       videoId,
       sourceUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
       title: playlist ? `Preview source ${ordinal}` : "Preview YouTube source",
@@ -164,7 +171,7 @@ function scanPreviewSource(request: ScanYouTubeSourceRequest): ScanYouTubeSource
       durationSeconds: 90 + ordinal * 30,
       thumbnailAvailable: false,
       availability: "available",
-      metadataDigest: `preview-metadata-${parsed.sourceId}-${ordinal}`
+      metadataDigest: `preview-metadata-${sourceId}-${ordinal}`
     };
   });
   const response: ScanYouTubeSourceResponse = {
@@ -172,9 +179,11 @@ function scanPreviewSource(request: ScanYouTubeSourceRequest): ScanYouTubeSource
     expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
     kind: playlist ? "playlist" : "video",
     title: playlist ? "Preview playlist" : "Preview YouTube source",
-    sourceId: parsed.sourceId,
-    canonicalUrl: parsed.canonicalUrl,
-    playlistId: parsed.playlistId,
+    sourceId,
+    canonicalUrl: playlist
+      ? `https://www.youtube.com/playlist?list=${encodeURIComponent(sourceId)}`
+      : `https://www.youtube.com/watch?v=${encodeURIComponent(sourceId)}`,
+    playlistId: playlist ? parsed.playlistId : null,
     truncated: false,
     items
   };
@@ -413,7 +422,7 @@ function previewArtifactKinds(mode: YouTubeDownloadMode): YouTubeRunSnapshot["it
   return ["media", "vtt", "transcript_json", "metadata"];
 }
 
-function parseYouTubeUrl(raw: string): { canonicalUrl: string; sourceId: string; videoId: string; playlistId: string | null } {
+function parseYouTubeUrl(raw: string): { videoId: string | null; playlistId: string | null } {
   const trimmed = raw.trim();
   const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   let url: URL;
@@ -430,14 +439,11 @@ function parseYouTubeUrl(raw: string): { canonicalUrl: string; sourceId: string;
   const lastPathPart = pathParts.length > 0 ? pathParts[pathParts.length - 1] : "";
   const videoId = hostname === "youtu.be"
     ? url.pathname.slice(1).split("/")[0]
-    : url.searchParams.get("v") ?? lastPathPart;
+    : url.searchParams.get("v") ?? (lastPathPart !== "watch" && lastPathPart !== "playlist" ? lastPathPart : null);
   const playlistId = url.searchParams.get("list");
   if (!videoId && !playlistId) throw new Error("The YouTube URL does not contain a video or playlist.");
-  const sourceId = playlistId ?? videoId;
   return {
-    canonicalUrl: `https://www.youtube.com/${playlistId ? "playlist?list=" : "watch?v="}${encodeURIComponent(sourceId)}`,
-    sourceId,
-    videoId: videoId || `preview-${sourceId}`,
+    videoId: videoId || null,
     playlistId
   };
 }

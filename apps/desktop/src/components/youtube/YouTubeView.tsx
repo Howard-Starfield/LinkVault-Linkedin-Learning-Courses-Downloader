@@ -45,6 +45,7 @@ import {
   type YouTubeDownloadMode,
   type YouTubeError,
   type YouTubeItemState,
+  type YouTubePlaylistMode,
   type YouTubeRunSnapshot,
   type YouTubeRunState,
   type YouTubeScanItem
@@ -105,6 +106,22 @@ function formatBytes(bytes: number | null): string {
   return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
 }
 
+function parseLanguageList(raw: string): string[] {
+  return Array.from(new Set(raw.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean))).slice(0, 8);
+}
+
+function isAmbiguousWatchPlaylist(raw: string): boolean {
+  const withProtocol = /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
+  try {
+    const url = new URL(withProtocol);
+    const path = url.pathname.toLowerCase();
+    const hasVideo = url.searchParams.has("v") || path.startsWith("/shorts/") || path.startsWith("/live/") || url.hostname.toLowerCase().endsWith("youtu.be");
+    return hasVideo && url.searchParams.has("list");
+  } catch {
+    return false;
+  }
+}
+
 function runTone(state: YouTubeRunState | null): "neutral" | "primary" | "success" | "danger" | "muted" {
   if (state === "completed") return "success";
   if (state === "completed_with_warnings") return "primary";
@@ -158,8 +175,11 @@ export function YouTubeView() {
   const [transcriptInspection, setTranscriptInspection] = useState<InspectYouTubeTranscriptsResponse | null>(null);
   const [selectedOccurrenceIds, setSelectedOccurrenceIds] = useState<Set<string>>(() => new Set());
   const [outputDir, setOutputDir] = useState("");
+  const [playlistMode, setPlaylistMode] = useState<YouTubePlaylistMode>("video");
   const [mode, setMode] = useState<YouTubeDownloadMode>("video_and_transcript");
   const [maxHeight, setMaxHeight] = useState<StartYouTubeDownloadRequest["maxHeight"]>(1080);
+  const [preferredLanguage, setPreferredLanguage] = useState<StartYouTubeDownloadRequest["preferredLanguage"]>(null);
+  const [fallbackLanguages, setFallbackLanguages] = useState<StartYouTubeDownloadRequest["fallbackLanguages"]>([]);
   const [allowAutomaticCaptions, setAllowAutomaticCaptions] = useState(true);
   const [continueWithoutTranscript, setContinueWithoutTranscript] = useState(true);
   const [isScanning, setIsScanning] = useState(false);
@@ -172,6 +192,7 @@ export function YouTubeView() {
   const transcriptInspectionGenerationRef = useRef(0);
   const latestRunIdRef = useRef<string | null>(null);
   const latestRevisionRef = useRef(0);
+  const ambiguousPlaylistSource = isAmbiguousWatchPlaylist(sourceUrl);
 
   useEffect(() => {
     if (!nativeRuntime) return;
@@ -314,7 +335,8 @@ export function YouTubeView() {
     try {
       const nextScan = await scanYouTubeSource({
         clientOperationId: createClientId("youtube-operation"),
-        url: sourceUrl.trim()
+        url: sourceUrl.trim(),
+        playlistMode: ambiguousPlaylistSource ? playlistMode : undefined
       });
       transcriptInspectionGenerationRef.current += 1;
       setScan(nextScan);
@@ -377,8 +399,8 @@ export function YouTubeView() {
         outputDir: outputDir.trim(),
         mode,
         maxHeight,
-        preferredLanguage: null,
-        fallbackLanguages: [],
+        preferredLanguage,
+        fallbackLanguages,
         allowAutomaticCaptions,
         continueWithoutTranscript
       });
@@ -524,6 +546,19 @@ export function YouTubeView() {
               </Button>
             </div>
           </Field>
+          {ambiguousPlaylistSource ? (
+            <Field label="When URL includes a video and playlist">
+              <Select
+                value={playlistMode}
+                onChange={(event) => setPlaylistMode(event.target.value as YouTubePlaylistMode)}
+                disabled={isScanning || activeRun}
+                aria-label="When URL includes a video and playlist"
+              >
+                <option value="video">This video only</option>
+                <option value="playlist">Entire playlist</option>
+              </Select>
+            </Field>
+          ) : null}
         </div>
         <div className="youtube-options-row">
           <Field label="Capture mode">
@@ -543,8 +578,30 @@ export function YouTubeView() {
               <option value="480">480p</option>
             </Select>
           </Field>
-          <label className="youtube-option-check"><input type="checkbox" checked={allowAutomaticCaptions} onChange={(event) => setAllowAutomaticCaptions(event.target.checked)} disabled={activeRun} /><span>Allow automatic captions</span></label>
-          <label className="youtube-option-check"><input type="checkbox" checked={continueWithoutTranscript} onChange={(event) => setContinueWithoutTranscript(event.target.checked)} disabled={activeRun} /><span>Continue if transcript is missing</span></label>
+          <label className="youtube-option-check"><input type="checkbox" aria-label="Allow automatic captions" checked={allowAutomaticCaptions} onChange={(event) => setAllowAutomaticCaptions(event.target.checked)} disabled={activeRun} /><span>Allow automatic captions</span></label>
+          <label className="youtube-option-check"><input type="checkbox" aria-label="Continue if transcript is missing" checked={continueWithoutTranscript} onChange={(event) => setContinueWithoutTranscript(event.target.checked)} disabled={activeRun} /><span>Continue if transcript is missing</span></label>
+        </div>
+        <div className="youtube-options-row">
+          <Field label="Preferred transcript language">
+            <Input
+              value={preferredLanguage ?? ""}
+              onChange={(event) => setPreferredLanguage(event.target.value.trim() || null)}
+              placeholder="e.g. en-US"
+              aria-label="Preferred transcript language"
+              autoComplete="off"
+              disabled={activeRun}
+            />
+          </Field>
+          <Field label="Fallback transcript languages">
+            <Input
+              value={fallbackLanguages.join(", ")}
+              onChange={(event) => setFallbackLanguages(parseLanguageList(event.target.value))}
+              placeholder="e.g. en, fr"
+              aria-label="Fallback transcript languages"
+              autoComplete="off"
+              disabled={activeRun}
+            />
+          </Field>
         </div>
       </Panel>
 

@@ -66,6 +66,20 @@ pub struct OutputAttemptLease {
     handle: File,
 }
 
+/// A read-only capability for an already-published item directory.
+///
+/// The final directory handle is held for the lifetime of the lease.  On
+/// platforms that support denying directory renames through an open handle,
+/// this also prevents replacement of the leased namespace.  Other platforms
+/// are protected by the stable-identity checks in [`Self::revalidate`].
+#[derive(Debug)]
+pub struct ExistingOutputDirectoryLease {
+    root: ValidatedOutputRoot,
+    path: PathBuf,
+    identity: StableIdentity,
+    handle: File,
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StableIdentity {
@@ -116,6 +130,89 @@ impl ValidatedOutputRoot {
             });
         }
         Ok(())
+    }
+
+    /// Lease an existing final item for read-only verification and reuse.
+    ///
+    /// The final name is always resolved as one direct child of the validated
+    /// root.  A missing child is not an error; any existing child must be a
+    /// regular directory and is opened with the same no-follow/reparse guards
+    /// used by staging capabilities.  Contents are checked separately through
+    /// [`ExistingOutputDirectoryLease::validate_contents`].
+    pub fn existing_item_lease(
+        &self,
+        final_name: &str,
+    ) -> Result<Option<ExistingOutputDirectoryLease>, SafeOutputError> {
+        validate_component(final_name)?;
+        let destination = self.path.join(final_name);
+        if path_utf16_len(&destination) > 240 {
+            return Err(SafeOutputError::PathTooLong);
+        }
+
+        self.revalidate()?;
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.revalidate()?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if is_reparse_point(&metadata) {
+            return Err(SafeOutputError::UnsafeDescendant { path: destination });
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(SafeOutputError::OutputCollision { path: destination });
+        }
+
+        let handle = open_directory_guard(&destination, false, false).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) {
+                SafeOutputError::IdentityChanged {
+                    path: destination.clone(),
+                }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+        let handle_metadata = handle.metadata()?;
+        if is_untrusted_directory(&handle_metadata) {
+            return Err(SafeOutputError::UnsafeDescendant { path: destination });
+        }
+        let identity = stable_identity(&handle)?;
+
+        // Check the namespace again after opening the held handle.  This
+        // closes the ordinary path-swap window and makes a reparse replacement
+        // fail closed even on platforms where opening a directory follows it.
+        let current_metadata = fs::symlink_metadata(&destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SafeOutputError::IdentityChanged {
+                    path: destination.clone(),
+                }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+        if is_reparse_point(&current_metadata) {
+            return Err(SafeOutputError::UnsafeDescendant { path: destination });
+        }
+        if !current_metadata.file_type().is_dir() {
+            return Err(SafeOutputError::IdentityChanged { path: destination });
+        }
+        self.revalidate()?;
+
+        let lease = ExistingOutputDirectoryLease {
+            root: self.clone(),
+            path: destination,
+            identity,
+            handle,
+        };
+        lease.revalidate()?;
+        Ok(Some(lease))
     }
 
     /// Create and immediately lease a unique attempt directory.
@@ -394,6 +491,112 @@ impl OutputAttemptLease {
     }
 }
 
+impl ExistingOutputDirectoryLease {
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Re-open the final directory without following reparse points and
+    /// compare its stable identity with the identity held by this lease.
+    /// Root and final-directory identity are checked before every capability
+    /// read and again by the caller after the read completes.
+    pub fn revalidate(&self) -> Result<(), SafeOutputError> {
+        self.root.revalidate()?;
+        let held_metadata = self.handle.metadata()?;
+        if is_untrusted_directory(&held_metadata) {
+            return Err(SafeOutputError::UnsafeDescendant {
+                path: self.path.clone(),
+            });
+        }
+        let current_metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) {
+                SafeOutputError::IdentityChanged {
+                    path: self.path.clone(),
+                }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+        if is_reparse_point(&current_metadata) {
+            return Err(SafeOutputError::UnsafeDescendant {
+                path: self.path.clone(),
+            });
+        }
+        if !current_metadata.file_type().is_dir() {
+            return Err(SafeOutputError::IdentityChanged {
+                path: self.path.clone(),
+            });
+        }
+        let observer = open_directory_nofollow(&self.path, false).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) {
+                SafeOutputError::IdentityChanged {
+                    path: self.path.clone(),
+                }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+        let observer_metadata = observer.metadata()?;
+        if is_untrusted_directory(&observer_metadata) {
+            return Err(SafeOutputError::UnsafeDescendant {
+                path: self.path.clone(),
+            });
+        }
+        if stable_identity(&observer)? != self.identity {
+            return Err(SafeOutputError::IdentityChanged {
+                path: self.path.clone(),
+            });
+        }
+        self.root.revalidate()
+    }
+
+    /// Validate that the leased item is a flat directory of direct regular
+    /// files.  Every leaf is opened through a no-follow handle before this
+    /// method returns, so nested directories and reparse descendants fail
+    /// closed.
+    #[allow(dead_code)]
+    pub fn validate_contents(&self) -> Result<(), SafeOutputError> {
+        self.revalidate()?;
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+                return Err(SafeOutputError::UnsafeDescendant { path });
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| SafeOutputError::UnsafeDescendant { path: path.clone() })?;
+            validate_component(name)?;
+            let _file = self.open_leaf(name)?;
+        }
+        self.revalidate()
+    }
+
+    /// Open one direct regular-file child without following a reparse point.
+    /// The returned handle is read-only and remains safe if the directory is
+    /// renamed after this method returns.
+    pub fn open_leaf(&self, name: &str) -> Result<File, SafeOutputError> {
+        validate_component(name)?;
+        self.revalidate()?;
+        let file = open_regular_leaf(&self.path, name, false)?;
+        self.revalidate()?;
+        Ok(file)
+    }
+}
+
 pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutputError> {
     if !path.is_absolute() {
         return Err(SafeOutputError::NotAbsolute);
@@ -620,6 +823,15 @@ fn open_regular_leaf(
     create_new: bool,
 ) -> Result<File, SafeOutputError> {
     let path = directory.join(name);
+    // Windows uses FILE_FLAG_OPEN_REPARSE_POINT below.  On Unix, perform the
+    // equivalent path-side checks before and after opening so a direct leaf
+    // read cannot knowingly follow an existing symlink.  The held directory
+    // lease and the post-open check close the ordinary replacement window.
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+            return Err(SafeOutputError::UnsafeDescendant { path });
+        }
+    }
     let mut options = OpenOptions::new();
     options
         .read(!create_new)
@@ -648,6 +860,10 @@ fn open_regular_leaf(
     })?;
     let metadata = file.metadata()?;
     if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(SafeOutputError::UnsafeDescendant { path });
+    }
+    let path_metadata = fs::symlink_metadata(&path)?;
+    if is_reparse_point(&path_metadata) || !path_metadata.file_type().is_file() {
         return Err(SafeOutputError::UnsafeDescendant { path });
     }
     Ok(file)
@@ -948,6 +1164,100 @@ mod tests {
             fs::read(temp.path().join("video").join("artifact.mp4")).unwrap(),
             b"complete"
         );
+    }
+
+    #[test]
+    fn existing_item_lease_reports_absent_final_directory() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+
+        assert!(root.existing_item_lease("missing-video").unwrap().is_none());
+    }
+
+    #[test]
+    fn existing_item_lease_reads_valid_flat_item() {
+        use std::io::Read;
+
+        let temp = tempdir().unwrap();
+        let final_path = temp.path().join("video");
+        fs::create_dir(&final_path).unwrap();
+        fs::write(final_path.join("artifact.txt"), b"complete").unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let lease = root.existing_item_lease("video").unwrap().unwrap();
+
+        assert_eq!(lease.path(), final_path);
+        lease.validate_contents().unwrap();
+        let mut artifact = lease.open_leaf("artifact.txt").unwrap();
+        let mut bytes = Vec::new();
+        artifact.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"complete");
+    }
+
+    #[test]
+    fn existing_item_lease_rejects_nested_content() {
+        let temp = tempdir().unwrap();
+        let final_path = temp.path().join("video");
+        fs::create_dir(&final_path).unwrap();
+        fs::create_dir(final_path.join("nested")).unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let lease = root.existing_item_lease("video").unwrap().unwrap();
+
+        assert!(matches!(
+            lease.validate_contents(),
+            Err(SafeOutputError::UnsafeDescendant { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_item_lease_rejects_reparse_content() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let final_path = temp.path().join("video");
+        fs::create_dir(&final_path).unwrap();
+        symlink(temp.path(), final_path.join("link")).unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let lease = root.existing_item_lease("video").unwrap().unwrap();
+
+        assert!(matches!(
+            lease.validate_contents(),
+            Err(SafeOutputError::UnsafeDescendant { .. })
+        ));
+        assert!(matches!(
+            lease.open_leaf("link"),
+            Err(SafeOutputError::UnsafeDescendant { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_item_lease_detects_replacement_by_identity() {
+        let temp = tempdir().unwrap();
+        let final_path = temp.path().join("video");
+        fs::create_dir(&final_path).unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let lease = root.existing_item_lease("video").unwrap().unwrap();
+
+        fs::rename(&final_path, temp.path().join("moved-video")).unwrap();
+        fs::create_dir(&final_path).unwrap();
+        assert!(matches!(
+            lease.revalidate(),
+            Err(SafeOutputError::IdentityChanged { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_item_lease_denies_final_directory_rename() {
+        let temp = tempdir().unwrap();
+        let final_path = temp.path().join("video");
+        fs::create_dir(&final_path).unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let lease = root.existing_item_lease("video").unwrap().unwrap();
+
+        assert!(fs::rename(&final_path, temp.path().join("moved-video")).is_err());
+        lease.revalidate().unwrap();
     }
 
     #[test]

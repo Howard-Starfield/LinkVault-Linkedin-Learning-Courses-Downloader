@@ -9,6 +9,8 @@ mod error;
 mod executor;
 mod helper;
 pub mod manifest_contract;
+pub mod media_verifier;
 pub mod models;
 mod scan;
+pub(crate) mod transcript_inspection;
 pub mod transcript_normalizer;

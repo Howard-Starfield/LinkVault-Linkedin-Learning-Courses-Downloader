@@ -1,82 +1,57 @@
 # YouTube helper supply chain
 
 `youtube-helpers-lock.json` is the only source of truth for the Windows YouTube
-helper inputs. It is intentionally marked `unpopulated` until a reviewed,
-authoritative release choice supplies exact versions, HTTPS source URLs, asset
-and source-archive sizes, SHA-256 values, archive-member identities, licenses,
-and corresponding source records for yt-dlp, Deno, FFmpeg and FFprobe.
+helper set. The reviewed internal-test lock is `ready` with canonical digest
+`f2eb38349e71bd05b8da27807bc82e5eecb204cbf8b335952276bc1786527b7c`.
+It pins the distribution asset, extracted executable where applicable,
+corresponding source archive, license bytes, notice bytes, compatibility facts,
+and target triple for each component.
 
-The empty lock is deliberate. `npm run verify:youtube-helpers` and the Rust
-helper-integrity gate must fail closed while it remains unpopulated. The fetch
-script is opt-in and never runs as part of a normal development or build
-command. Do not copy a local Python launcher, a PATH installation, or an
-unreviewed release into `apps/desktop/src-tauri/binaries/`.
+The fetch script is opt-in and never runs during a normal development or build
+command. Do not copy a PATH installation, Python launcher, floating release, or
+unreviewed executable into `apps/desktop/src-tauri/binaries/`.
 
-The base `tauri.conf.json` deliberately omits the binaries so ordinary Rust
-checks remain possible while this gate is closed. After the validated helper
-inventory is staged, `npm run build:youtube-internal` first reruns the offline
-verifier and then merges `src-tauri/tauri.youtube.conf.json`, whose
-`bundle.externalBin` entries include the four target-triple executables. A
-normal Tauri build is not a helper-enabled YouTube package.
+## Reviewed internal helper set (2026-08-23)
 
-After the exact metadata has been reviewed, set `status` to `ready`, populate
-all four required components and their license/source records, then compute
-`lockDigest` as the SHA-256 of the canonical JSON document with `lockDigest`
-omitted. Run the verifier before any helper launch or package build.
-
-## Research snapshot (non-enabling, 2026-08-21)
-
-The following is upstream release evidence, not a populated lock. It does not
-authorize downloading, packaging, or launching any helper.
-
-### Compatible yt-dlp, EJS, and Deno candidate
-
-The exact tagged `yt-dlp` source declares `yt-dlp-ejs==0.8.0` and pins
-`deno==2.9.5` in its `pyproject.toml`. The official Windows standalone release
-also bundles EJS, so a separate EJS executable is not required. The official
-EJS release remains recorded for source/license review.
-
-| Input | Pinned upstream evidence |
+| Component | Reviewed identity |
 | --- | --- |
-| yt-dlp | `2026.08.19`; official `yt-dlp.exe`, 17,840,399 bytes, SHA-256 `66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a`; [release](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19), [binary](https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe), [source archive](https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.tar.gz) (6,020,567 bytes, SHA-256 `072aad4f2a7604e92155f61a275a4752dc64046c8f6d90df3710525d94cd37c1`) |
-| EJS | `0.8.0`; [tagged source](https://github.com/yt-dlp/ejs/releases/tag/0.8.0), source archive 96,571 bytes, SHA-256 `d5fa1639f63b5c4af8d932495f60689d5370f1a095782c944f7f62a303eb104e`; the tagged yt-dlp source requires this exact version |
-| Deno | `2.9.5`; official x86_64 Windows archive, 42,691,248 bytes, SHA-256 `171efab55ac6b9881fd53ee4c20f8bf3bb1340ffc618483746909014db12216a`; [release](https://github.com/denoland/deno/releases/tag/v2.9.5), [archive](https://github.com/denoland/deno/releases/download/v2.9.5/deno-x86_64-pc-windows-msvc.zip) |
+| yt-dlp | `2026.08.19`, official Windows standalone executable; bundled EJS `0.8.0` |
+| Deno | `2.9.5`, official `x86_64-pc-windows-msvc` archive and extracted executable |
+| FFmpeg | BtbN LGPL static build `n9.0.1-6-g9d4ca21220-20260820`, commit `9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611` |
+| FFprobe | The FFprobe executable from the same pinned BtbN archive/build as FFmpeg |
 
-The standalone yt-dlp executable's EJS-bundling fact comes from the upstream
-[EJS installation guidance](https://github.com/yt-dlp/yt-dlp/wiki/EJS). The
-yt-dlp source uses the Unlicense; its bundled PyInstaller distribution carries
-additional third-party notices. The EJS project uses the Unlicense with `meriyah`
-(ISC) and `astring` (MIT) exceptions, and Deno's repository is MIT. These facts
-still require exact committed notice files before a ready lock can be accepted.
+The authoritative byte sizes, SHA-256 digests, URLs, archive members, source
+records, license records, notices, and compatibility fields are in the lock.
+The offline verifier checks the committed license and notice bytes as well as
+every fetched executable before the Rust process boundary can resolve it.
 
-### FFmpeg/FFprobe remains unselected
+FFmpeg does not publish official Windows binaries. Its official download page
+links third-party builders; this branch pins one timestamped BtbN LGPL static
+build instead of a floating `latest` URL. This selection is approved only for
+the internal candidate described in `docs/legal/youtube-v1-approval.md`.
 
-FFmpeg's [official download page](https://ffmpeg.org/download.html) points to
-third-party Windows builders rather than publishing Windows executables. Two
-currently observable candidates are:
+## Lock and packaging rules
 
-- Gyan's `9.0.1` essentials ZIP, linked by the official FFmpeg page: 111,253,802
-  bytes, SHA-256 `fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9`,
-  source commit `FFmpeg/FFmpeg@bf1b838f2a`; the builder describes its Windows
-  builds as static GPLv3.
-- BtbN's timestamped `autobuild-2026-08-21-13-40` `9.0.1-6-g9d4ca21220` LGPL
-  static ZIP: 147,007,734 bytes, SHA-256
-  `a2f743d8147830645a45c38656278952dffb7627f91b46ef1aea7089d0ddf542`.
-  Its [release](https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-21-13-40)
-  is pinned by timestamp rather than the forbidden floating `latest` alias.
+Every component must declare an exact safe `filename`/`path`, distribution and
+source archive formats, compatibility object, and complete `sourceRecord`,
+`licenseRecord`, and `noticeRecord`. Archived assets also declare the exact
+member, extracted size, and extracted SHA-256. FFmpeg and FFprobe must bind the
+same non-null build ID; yt-dlp must bind its compatible EJS version. Floating
+versions and URLs are rejected.
 
-Neither candidate is ready for the lock. The archive checksum is not the
-extracted `ffmpeg.exe` or `ffprobe.exe` checksum required by the verifier, and
-the following must still be reviewed and recorded for the selected build:
+Only a `ready` lock with a matching canonical digest may be fetched, resolved,
+or packaged. `npm run fetch:youtube-helpers` follows only bounded,
+credential-free HTTPS redirects and atomically promotes files after size and
+SHA-256 verification. `npm run verify:youtube-helpers` rechecks the complete
+local inventory offline.
 
-1. exact archive member names, extracted sizes, SHA-256 values, PE identity, and
-   the fact that both tools come from the same archive;
-2. the corresponding FFmpeg source archive URL, size, and SHA-256 for the exact
-   build commit;
-3. the complete build configuration and dependency/license notices; and
-4. the redistribution/source-offer treatment for the chosen GPL or LGPL
-   variant.
+The base `tauri.conf.json` deliberately omits the helpers. The explicitly
+internal `npm run dev:youtube-internal` and `npm run build:youtube-internal`
+commands first rerun verification and then merge
+`src-tauri/tauri.youtube.conf.json`, whose `bundle.externalBin` entries name the
+four target-triple executables. A normal Tauri dev/build command is not a
+helper-enabled YouTube candidate.
 
-Until those facts are verified from the builder and FFmpeg sources, the lock
-must remain `unpopulated`, helper execution must remain disabled, and no
-binary should be added to `apps/desktop/src-tauri/binaries/`.
+Public packaging, redistribution, hosted use, and public release remain
+blocked pending a separate owner/legal review. Generated helper binaries,
+installers, UAT downloads, logs, and evidence directories are not committed.

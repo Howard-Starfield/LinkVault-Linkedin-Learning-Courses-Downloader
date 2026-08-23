@@ -33,6 +33,8 @@ try {
   assert.equal(await page.locator('[aria-live="polite"]').count() > 0, true, "Live run announcer is missing");
   assert.equal(await page.getByLabel("Public YouTube URL").count(), 1);
   assert.equal(await page.getByLabel("YouTube output directory").count(), 1);
+  assert.equal(await page.getByLabel("Allow automatic captions").count(), 1);
+  assert.equal(await page.getByLabel("When URL includes a video and playlist").count(), 0);
 
   const assertNoHorizontalLoss = async (label) => {
     const metrics = await page.evaluate(() => {
@@ -64,7 +66,13 @@ try {
 
   const acknowledgement = page.locator(".youtube-acknowledgement input");
   await acknowledgement.check();
-  await page.getByLabel("Public YouTube URL").fill("https://www.youtube.com/playlist?list=PLlinkvault-preview");
+  await page.getByLabel("Preferred transcript language").fill("en-US");
+  await page.getByLabel("Fallback transcript languages").fill("fr, de");
+  assert.equal(await page.getByLabel("Preferred transcript language").inputValue(), "en-US");
+  assert.equal(await page.getByLabel("Fallback transcript languages").inputValue(), "fr, de");
+  await page.getByLabel("Public YouTube URL").fill("https://www.youtube.com/watch?v=preview-video&list=PLlinkvault-preview");
+  assert.equal(await page.getByLabel("When URL includes a video and playlist").count(), 1);
+  await page.getByLabel("When URL includes a video and playlist").selectOption("playlist");
   await page.getByLabel("YouTube output directory").fill("C:\\LinkVault\\YouTube-preview");
   await page.getByRole("button", { name: "Scan", exact: true }).click();
   await page.getByRole("list", { name: "Scanned YouTube occurrences" }).waitFor();

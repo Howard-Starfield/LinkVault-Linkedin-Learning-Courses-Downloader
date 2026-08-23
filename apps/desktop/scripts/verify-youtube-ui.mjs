@@ -100,7 +100,16 @@ matches(view, /new Set\(available\.map\(\(item\) => item\.occurrenceId\)\)/, "Se
 matches(view, /item\.availability === "unavailable"/, "Unavailable occurrences are not represented");
 matches(view, /disabled=\{unavailable \|\| activeRun\}/, "Unavailable occurrences remain selectable");
 matches(view, /aria-label=\{`Select occurrence \$\{item\.ordinal\}: \$\{item\.title\}`\}/, "Occurrence selection lacks an accessible name");
-matches(ipc, /playlistMode === "playlist" \|\| parsed\.playlistId !== null/, "Playlist URL handling is not explicit");
+matches(ipc, /const playlist = request\.playlistMode === "playlist"/, "Playlist URL handling is not explicit");
+matches(view, /playlistMode[\s\S]*scanYouTubeSource\([\s\S]*?playlistMode/, "Ambiguous video+playlist URLs do not send an explicit playlist mode");
+matches(view, /aria-label="When URL includes a video and playlist"/, "Ambiguous video+playlist URLs do not expose a choice");
+matches(view, /preferredLanguage[\s\S]*startYouTubeDownload\([\s\S]*?preferredLanguage/, "Preferred transcript language is not sent from typed state");
+matches(view, /fallbackLanguages[\s\S]*startYouTubeDownload\([\s\S]*?fallbackLanguages/, "Fallback transcript languages are not sent from typed state");
+matches(view, /aria-label="Preferred transcript language"/, "Preferred transcript language control is missing");
+matches(view, /aria-label="Fallback transcript languages"/, "Fallback transcript language control is missing");
+matches(view, /aria-label="Allow automatic captions"/, "Automatic-caption choice is not explicitly labelled");
+assert.doesNotMatch(view, /preferredLanguage:\s*null/, "Download request hard-codes a null preferred language");
+assert.doesNotMatch(view, /fallbackLanguages:\s*\[\]/, "Download request hard-codes an empty fallback list");
 
 // Internal-only owner-risk acceptance and the restricted-content guardrails must remain visible.
 for (const phrase of [

@@ -1,18 +1,22 @@
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::error::{YouTubeError, YouTubeInternalError};
-use crate::providers::youtube::executor::YouTubeExecutor;
+use crate::providers::youtube::executor::{
+    YouTubeExecutor, YouTubeExecutorContext, YouTubeExecutorItemContext,
+};
 use crate::providers::youtube::helper::helper_kind;
 use crate::providers::youtube::manifest_contract::{
-    artifact_fingerprint, ArtifactFingerprintInput, ManifestContractError, FORMAT_POLICY_VERSION,
+    artifact_fingerprint, select_transcript, ArtifactFingerprintInput, ManifestContractError,
+    SelectedTranscript, FORMAT_POLICY_VERSION,
 };
 use crate::providers::youtube::models::{
     CancelYouTubeRunRequest, GetYouTubeDownloadStateRequest, GetYouTubeDownloadStateResponse,
     GetYouTubeHelperStatusResponse, InspectYouTubeTranscriptsRequest,
     InspectYouTubeTranscriptsResponse, MutateYouTubeRunRequest, ScanYouTubeSourceRequest,
     ScanYouTubeSourceResponse, StartYouTubeDownloadRequest, StartYouTubeDownloadResponse,
-    YouTubeHelperBackendStatus, YouTubeTranscriptOccurrence,
+    YouTubeAvailability, YouTubeHelperBackendStatus, YouTubeTranscriptOccurrence,
 };
-use crate::providers::youtube::scan::{scan_source, YouTubeScanPlan};
+use crate::providers::youtube::scan::{revalidate_selected_source, scan_source, YouTubeScanPlan};
+use crate::providers::youtube::transcript_inspection::{inspect_transcripts, into_plan_inspection};
 use crate::workflow::transient::managed_process::helper_identity;
 use crate::workflow::transient::{
     TransientRunSnapshot, TransientSubmissionReceipt, TransientWorkItem, TransientWorkflowState,
@@ -60,6 +64,37 @@ impl PlanCache {
         self.order.retain(|key| self.plans.contains_key(key));
         self.plans.get(scan_plan_id).cloned()
     }
+
+    fn apply_transcript_inspections(
+        &mut self,
+        scan_plan_id: &str,
+        inspections: Vec<crate::providers::youtube::models::PlannedYouTubeTranscriptInspection>,
+    ) -> Result<(), YouTubeInternalError> {
+        let plan = self
+            .plans
+            .get_mut(scan_plan_id)
+            .ok_or(YouTubeInternalError::PlanNotFound)?;
+        if plan.expires_at <= Instant::now() {
+            return Err(YouTubeInternalError::PlanExpired);
+        }
+        for inspection in inspections {
+            let item = plan
+                .items
+                .iter_mut()
+                .find(|item| item.public.occurrence_id == inspection.context.occurrence_id)
+                .ok_or(YouTubeInternalError::UnknownOccurrence)?;
+            if inspection.context.source_snapshot_digest != plan.source_snapshot_digest
+                || inspection.context.video_id != item.public.video_id
+                || inspection.context.metadata_digest != item.public.metadata_digest
+            {
+                return Err(YouTubeInternalError::InvalidRequest(
+                    "transcript inspection no longer matches the immutable scan plan".to_string(),
+                ));
+            }
+            item.transcript_inspection = Some(inspection);
+        }
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -73,7 +108,7 @@ pub fn get_youtube_helper_status() -> GetYouTubeHelperStatusResponse {
         Err(_) => GetYouTubeHelperStatusResponse {
             status: YouTubeHelperBackendStatus::Blocked,
             code: Some("HELPER_EXECUTION_BLOCKED".to_string()),
-            message: "YouTube helper execution remains blocked until the reviewed helper inventory and native runtime hardening are complete."
+            message: "YouTube helper execution is blocked because the reviewed packaged helper set is missing or failed integrity validation."
                 .to_string(),
         },
     }
@@ -114,6 +149,7 @@ pub fn inspect_youtube_transcripts(
     let plan = get_plan(&state, &request.scan_plan_id)?;
     let mut seen = std::collections::HashSet::new();
     let mut occurrences = Vec::new();
+    let mut plan_inspections = Vec::new();
     for occurrence_id in request.occurrence_ids {
         if !seen.insert(occurrence_id.clone()) {
             return Err(YouTubeError::from(
@@ -125,21 +161,33 @@ pub fn inspect_youtube_transcripts(
             .iter()
             .find(|item| item.public.occurrence_id == occurrence_id)
             .ok_or_else(|| YouTubeError::from(YouTubeInternalError::UnknownOccurrence))?;
+        if item.public.availability != YouTubeAvailability::Available {
+            return Err(YouTubeError::from(YouTubeInternalError::ScanPlanStale));
+        }
         if operation.cancellation_requested() {
             return Err(YouTubeError::new(
                 "DISCOVERY_CANCELLED",
                 "transcript inspection was cancelled",
             ));
         }
-        // The flat scan intentionally does not expose signed subtitle URLs.
-        // A later bounded inspection call can populate this typed list without
-        // changing the React contract; an empty list is an honest "unknown".
+        let inspected = inspect_transcripts(item, &operation).map_err(YouTubeError::from)?;
         occurrences.push(YouTubeTranscriptOccurrence {
-            occurrence_id: item.public.occurrence_id.clone(),
-            video_id: item.public.video_id.clone(),
-            tracks: Vec::new(),
+            occurrence_id: inspected.occurrence_id.clone(),
+            video_id: inspected.video_id.clone(),
+            tracks: inspected.tracks.clone(),
         });
+        plan_inspections.push(into_plan_inspection(
+            inspected,
+            &plan.source_snapshot_digest,
+            &item.public.metadata_digest,
+        ));
     }
+    state
+        .plans
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .apply_transcript_inspections(&request.scan_plan_id, plan_inspections)
+        .map_err(YouTubeError::from)?;
     Ok(InspectYouTubeTranscriptsResponse { occurrences })
 }
 
@@ -201,28 +249,60 @@ pub fn start_youtube_download(
             ));
         }
     }
-    let selected_items = plan
+    let planned_selected_items = plan
         .items
         .iter()
         .filter(|item| selected.contains(&item.public.occurrence_id))
         .collect::<Vec<_>>();
-    if selected_items.len() != selected.len() {
+    if planned_selected_items.len() != selected.len() {
         return Err(YouTubeError::from(YouTubeInternalError::UnknownOccurrence));
     }
+    if planned_selected_items
+        .iter()
+        .any(|item| item.public.availability != YouTubeAvailability::Available)
+    {
+        return Err(YouTubeError::from(YouTubeInternalError::ScanPlanStale));
+    }
+    let revalidation = workflow
+        .runtime()
+        .begin_discovery(opaque_id("revalidation"))
+        .map_err(YouTubeError::from)?;
+    let current_selected_items =
+        revalidate_selected_source(&plan, &request.selected_occurrence_ids, &revalidation)
+            .map_err(YouTubeError::from)?;
+    drop(revalidation);
     let output_root = validate_output_root(PathBuf::from(&request.output_dir).as_path())?;
-    // Helper resolution happens before admission and before any helper launch.
-    // The embedded lock is currently unpopulated, so this intentionally fails
-    // closed until Y0 supplies a reviewed ready lock and packaged executable.
+    // Revalidation has released its discovery admission. Re-resolve the same
+    // reviewed helper set before constructing the immutable run; a missing,
+    // changed, or non-ready inventory fails closed here.
     let helper = helper_identity(helper_kind())
         .map_err(|error| YouTubeError::new("HELPER_INTEGRITY_FAILED", error.to_string()))?;
     let plan_fingerprint = fingerprint(&request, &plan, &helper.digest)?;
     let run_id = opaque_id("run");
-    let work_items = selected_items
+    let selected_items = current_selected_items
         .into_iter()
-        .map(|item| {
+        .map(|current_item| {
+            let planned_item = planned_selected_items
+                .iter()
+                .find(|item| item.public.occurrence_id == current_item.public.occurrence_id)
+                .ok_or(YouTubeInternalError::ScanPlanStale)?;
+            let selected_transcript = selected_transcript(planned_item, &request)
+                .map_err(YouTubeInternalError::Public)?;
+            Ok((current_item, selected_transcript))
+        })
+        .collect::<Result<Vec<_>, YouTubeInternalError>>()
+        .map_err(YouTubeError::from)?;
+    let work_items = selected_items
+        .iter()
+        .map(|(item, selected_transcript)| {
             Ok(TransientWorkItem {
                 occurrence_id: item.public.occurrence_id.clone(),
-                artifact_fingerprint: fingerprint_item(item, &request, &helper.digest)?,
+                artifact_fingerprint: fingerprint_item(
+                    item,
+                    &request,
+                    selected_transcript.clone(),
+                    &helper.digest,
+                )?,
                 video_id: item.public.video_id.clone(),
                 ordinal: item.public.ordinal,
                 title: item.public.title.clone(),
@@ -230,7 +310,28 @@ pub fn start_youtube_download(
             })
         })
         .collect::<Result<Vec<_>, YouTubeError>>()?;
-    let executor = YouTubeExecutor::new(output_root, &request)?;
+    let executor = YouTubeExecutor::new_with_context(
+        output_root,
+        &request,
+        YouTubeExecutorContext {
+            source_snapshot_digest: plan.source_snapshot_digest.clone(),
+            playlist_id: plan.response.playlist_id.clone(),
+            helper_lock_digest: helper.digest.clone(),
+            items: selected_items
+                .iter()
+                .map(|(item, selected_transcript)| YouTubeExecutorItemContext {
+                    occurrence_id: item.public.occurrence_id.clone(),
+                    playlist_index: plan
+                        .response
+                        .playlist_id
+                        .as_ref()
+                        .map(|_| item.public.ordinal),
+                    source_duration_seconds: item.public.duration_seconds,
+                    selected_transcript: selected_transcript.clone(),
+                })
+                .collect(),
+        },
+    )?;
     let snapshot = workflow
         .runtime()
         .start_run(
@@ -395,20 +496,67 @@ fn fingerprint(
 fn fingerprint_item(
     item: &crate::providers::youtube::scan::PlannedYouTubeItem,
     request: &StartYouTubeDownloadRequest,
+    selected_transcript: Option<SelectedTranscript>,
     helper_digest: &str,
 ) -> Result<String, YouTubeError> {
-    // Transcript inspection is still an honest empty-track placeholder. Do
-    // not derive a semantic selection from language preferences alone.
     artifact_fingerprint(&ArtifactFingerprintInput {
         occurrence_id: item.public.occurrence_id.clone(),
         video_id: item.public.video_id.clone(),
         mode: request.mode.clone(),
         format_policy_version: FORMAT_POLICY_VERSION,
         max_height: effective_max_height(request),
-        selected_transcript: None,
+        selected_transcript,
         helper_lock_digest: helper_digest.to_string(),
     })
     .map_err(manifest_contract_error)
+}
+
+fn selected_transcript(
+    item: &crate::providers::youtube::scan::PlannedYouTubeItem,
+    request: &StartYouTubeDownloadRequest,
+) -> Result<Option<SelectedTranscript>, YouTubeError> {
+    if matches!(
+        request.mode,
+        crate::providers::youtube::models::YouTubeDownloadMode::VideoOnly
+    ) {
+        return Ok(None);
+    }
+    let inspection = item.transcript_inspection.as_ref().ok_or_else(|| {
+        YouTubeError::new(
+            "TRANSCRIPT_INSPECTION_REQUIRED",
+            "inspect transcripts for every selected item before starting the download",
+        )
+    })?;
+    if inspection.context.occurrence_id != item.public.occurrence_id
+        || inspection.context.video_id != item.public.video_id
+        || inspection.context.metadata_digest != item.public.metadata_digest
+    {
+        return Err(YouTubeError::new(
+            "TRANSCRIPT_INSPECTION_STALE",
+            "transcript inspection no longer matches the selected item",
+        ));
+    }
+    let excluded = ["live_chat".to_string()];
+    let selected = select_transcript(
+        &inspection.tracks,
+        request.preferred_language.as_deref(),
+        &request.fallback_languages,
+        request.allow_automatic_captions,
+        &excluded,
+    );
+    if selected.is_none()
+        && (!request.continue_without_transcript
+            || matches!(
+                request.mode,
+                crate::providers::youtube::models::YouTubeDownloadMode::TranscriptOnly
+            ))
+    {
+        return Err(YouTubeError::new(
+            "TRANSCRIPT_NOT_AVAILABLE",
+            "no inspected transcript matches the requested language policy",
+        ));
+    }
+    Ok(selected)
 }
 
 fn effective_max_height(request: &StartYouTubeDownloadRequest) -> Option<u16> {

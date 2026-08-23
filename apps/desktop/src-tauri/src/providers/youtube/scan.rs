@@ -1,8 +1,8 @@
 use crate::providers::youtube::error::YouTubeInternalError;
 use crate::providers::youtube::helper::{invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES};
 use crate::providers::youtube::models::{
-    ScanYouTubeSourceRequest, ScanYouTubeSourceResponse, YouTubeAvailability, YouTubePlaylistMode,
-    YouTubeScanItem,
+    PlannedYouTubeTranscriptInspection, ScanYouTubeSourceRequest, ScanYouTubeSourceResponse,
+    YouTubeAvailability, YouTubePlaylistMode, YouTubeScanItem,
 };
 use crate::workflow::transient::managed_process::run;
 use crate::workflow::transient::DiscoveryOperation;
@@ -20,6 +20,7 @@ pub const PLAN_TTL: Duration = Duration::from_secs(30 * 60);
 pub struct PlannedYouTubeItem {
     pub public: YouTubeScanItem,
     pub source_url: String,
+    pub transcript_inspection: Option<PlannedYouTubeTranscriptInspection>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +44,33 @@ pub fn scan_source(
     operation: &DiscoveryOperation,
 ) -> Result<YouTubeScanPlan, YouTubeInternalError> {
     let source = validate_url(&request.url, request.playlist_mode.clone())?;
-    let args = discovery_args(&source);
+    let stdout = discovery_stdout(&source, operation)?;
+    parse_scan_plan(source, &stdout)
+}
+
+/// Re-runs discovery against the canonical source captured by a scan plan and
+/// returns the current metadata for the selected occurrences.  Display-only
+/// metadata may drift, but source identity, occurrence identity, and
+/// availability remain immutable admission inputs.
+pub fn revalidate_selected_source(
+    plan: &YouTubeScanPlan,
+    selected_occurrence_ids: &[String],
+    operation: &DiscoveryOperation,
+) -> Result<Vec<PlannedYouTubeItem>, YouTubeInternalError> {
+    let source = validate_url(
+        &plan.response.canonical_url,
+        Some(plan.response.kind.clone()),
+    )?;
+    let stdout = discovery_stdout(&source, operation)?;
+    let current = parse_scan_plan(source, &stdout)?;
+    revalidate_selected_items(plan, &current, selected_occurrence_ids)
+}
+
+fn discovery_stdout(
+    source: &ValidatedSource,
+    operation: &DiscoveryOperation,
+) -> Result<String, YouTubeInternalError> {
+    let args = discovery_args(source);
     let cancel = operation.cancellation_flag();
     let output = run(
         invocation(args, MAX_DISCOVERY_STDOUT_BYTES),
@@ -69,7 +96,7 @@ pub fn scan_source(
     if !output.status.success() {
         return Err(YouTubeInternalError::Helper(output_error(&output)));
     }
-    parse_scan_plan(source, &output.stdout)
+    Ok(output.stdout)
 }
 
 pub fn validate_url(
@@ -237,6 +264,10 @@ fn parse_scan_plan(
             .and_then(value_string)
             .or_else(|| entry.get("uploader").and_then(value_string));
         let channel_id = entry.get("channel_id").and_then(value_string);
+        let channel_identity = channel_id
+            .as_deref()
+            .or(channel_name.as_deref())
+            .unwrap_or_default();
         let duration_seconds = entry
             .get("duration")
             .and_then(|value| value.as_f64())
@@ -252,12 +283,13 @@ fn parse_scan_plan(
             video_id
         ));
         let metadata_digest = digest(&format!(
-            "1|{}|{}|{}|{}|{}",
+            "1|{}|{}|{}|{}|{}|{}",
             video_id,
             item_source_url,
             title,
-            channel_id.as_deref().unwrap_or_default(),
-            duration_seconds.map_or_else(String::new, |duration| duration.to_string())
+            channel_identity,
+            duration_seconds.map_or_else(String::new, |duration| duration.to_string()),
+            availability_label(&availability),
         ));
         items.push(PlannedYouTubeItem {
             public: YouTubeScanItem {
@@ -274,6 +306,7 @@ fn parse_scan_plan(
                 metadata_digest,
             },
             source_url: item_source_url,
+            transcript_inspection: None,
         });
     }
     if items.is_empty() {
@@ -346,18 +379,77 @@ fn value_string(value: &serde_json::Value) -> Option<String> {
 }
 
 fn availability(value: &serde_json::Value) -> YouTubeAvailability {
-    if value
-        .get("is_live")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return YouTubeAvailability::Available;
-    }
-    match value.get("availability").and_then(value_string).as_deref() {
-        Some("unavailable") | Some("private") => YouTubeAvailability::Unavailable,
-        Some(_) => YouTubeAvailability::Available,
+    let status = value
+        .get("availability")
+        .and_then(value_string)
+        .map(|status| status.trim().to_ascii_lowercase());
+    match status.as_deref() {
+        Some("private")
+        | Some("restricted")
+        | Some("unavailable")
+        | Some("needs_auth")
+        | Some("premium_only")
+        | Some("subscriber_only") => YouTubeAvailability::Unavailable,
+        Some("unknown") => YouTubeAvailability::Unknown,
+        Some("public") => YouTubeAvailability::Available,
+        Some(_) => YouTubeAvailability::Unknown,
         None => YouTubeAvailability::Unknown,
     }
+}
+
+fn availability_label(value: &YouTubeAvailability) -> &'static str {
+    match value {
+        YouTubeAvailability::Available => "available",
+        YouTubeAvailability::Unavailable => "unavailable",
+        YouTubeAvailability::Unknown => "unknown",
+    }
+}
+
+fn revalidate_selected_items(
+    plan: &YouTubeScanPlan,
+    current: &YouTubeScanPlan,
+    selected_occurrence_ids: &[String],
+) -> Result<Vec<PlannedYouTubeItem>, YouTubeInternalError> {
+    if selected_occurrence_ids.is_empty() {
+        return Err(YouTubeInternalError::EmptySelection);
+    }
+    if plan.response.kind != current.response.kind
+        || plan.response.source_id != current.response.source_id
+        || plan.response.canonical_url != current.response.canonical_url
+        || plan.response.playlist_id != current.response.playlist_id
+    {
+        return Err(YouTubeInternalError::ScanPlanStale);
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(selected_occurrence_ids.len());
+    let mut selected = Vec::with_capacity(selected_occurrence_ids.len());
+    for occurrence_id in selected_occurrence_ids {
+        if !seen.insert(occurrence_id) {
+            return Err(YouTubeInternalError::DuplicateOccurrence);
+        }
+        let previous = plan
+            .items
+            .iter()
+            .find(|item| item.public.occurrence_id == occurrence_id.as_str())
+            .ok_or(YouTubeInternalError::UnknownOccurrence)?;
+        let current_item = current
+            .items
+            .iter()
+            .find(|item| item.public.ordinal == previous.public.ordinal)
+            .ok_or(YouTubeInternalError::ScanPlanStale)?;
+        if current_item.public.occurrence_id != previous.public.occurrence_id
+            || current_item.public.video_id != previous.public.video_id
+            || current_item.public.availability != previous.public.availability
+            || matches!(
+                &current_item.public.availability,
+                &YouTubeAvailability::Unavailable
+            )
+        {
+            return Err(YouTubeInternalError::ScanPlanStale);
+        }
+        selected.push(current_item.clone());
+    }
+    Ok(selected)
 }
 
 fn valid_id(value: &str) -> bool {
@@ -449,5 +541,129 @@ mod tests {
             .position(|argument| argument == "--playlist-end")
             .unwrap();
         assert_eq!(args[index + 1], (MAX_SCAN_ENTRIES + 1).to_string());
+    }
+
+    #[test]
+    fn availability_fixture_is_fail_closed_and_live_cannot_override_restrictions() {
+        let fixtures = [
+            (
+                r#"{"availability":"public"}"#,
+                YouTubeAvailability::Available,
+            ),
+            (
+                r#"{"availability":"public","is_live":true}"#,
+                YouTubeAvailability::Available,
+            ),
+            (r#"{"is_live":true}"#, YouTubeAvailability::Unknown),
+            (
+                r#"{"availability":" PRIVATE ","is_live":true}"#,
+                YouTubeAvailability::Unavailable,
+            ),
+            (
+                r#"{"availability":"restricted","is_live":true}"#,
+                YouTubeAvailability::Unavailable,
+            ),
+            (
+                r#"{"availability":"unavailable","is_live":true}"#,
+                YouTubeAvailability::Unavailable,
+            ),
+            (
+                r#"{"availability":"needs_auth","is_live":true}"#,
+                YouTubeAvailability::Unavailable,
+            ),
+            (
+                r#"{"availability":"unknown","is_live":true}"#,
+                YouTubeAvailability::Unknown,
+            ),
+            (
+                r#"{"availability":"future_status","is_live":true}"#,
+                YouTubeAvailability::Unknown,
+            ),
+            (
+                r#"{"availability":"unlisted"}"#,
+                YouTubeAvailability::Unknown,
+            ),
+            (r#"{}"#, YouTubeAvailability::Unknown),
+        ];
+        for (payload, expected) in fixtures {
+            let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(availability(&value), expected, "fixture {payload}");
+        }
+    }
+
+    #[test]
+    fn metadata_digest_changes_when_availability_changes() {
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let public = parse_scan_plan(
+            source,
+            r#"{"id":"abc123_XY","title":"Video","channel":"Channel","availability":"public"}"#,
+        )
+        .unwrap();
+        let restricted_source =
+            validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let restricted = parse_scan_plan(
+            restricted_source,
+            r#"{"id":"abc123_XY","title":"Video","channel":"Channel","availability":"private"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            public.items[0].public.availability,
+            YouTubeAvailability::Available
+        );
+        assert_eq!(
+            restricted.items[0].public.availability,
+            YouTubeAvailability::Unavailable
+        );
+        assert_ne!(
+            public.items[0].public.metadata_digest,
+            restricted.items[0].public.metadata_digest
+        );
+    }
+
+    #[test]
+    fn selected_source_revalidation_allows_display_drift_but_rejects_identity_or_availability_changes(
+    ) {
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let frozen = parse_scan_plan(
+            source,
+            r#"{"id":"PL_12345","title":"Playlist","entries":[{"id":"abc123_XY","title":"Original","channel":"Channel","availability":"public"}]}"#,
+        )
+        .unwrap();
+        let selected = vec![frozen.items[0].public.occurrence_id.clone()];
+
+        let current_source =
+            validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let current = parse_scan_plan(
+            current_source,
+            r#"{"id":"PL_12345","title":"Renamed playlist","entries":[{"id":"abc123_XY","title":"Renamed","channel":"Channel","availability":"public"}]}"#,
+        )
+        .unwrap();
+        let refreshed = revalidate_selected_items(&frozen, &current, &selected).unwrap();
+        assert_eq!(refreshed[0].public.title, "Renamed");
+
+        let restricted_source =
+            validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let restricted = parse_scan_plan(
+            restricted_source,
+            r#"{"id":"PL_12345","entries":[{"id":"abc123_XY","title":"Renamed","availability":"private"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            revalidate_selected_items(&frozen, &restricted, &selected),
+            Err(YouTubeInternalError::ScanPlanStale)
+        ));
+
+        let shifted_source =
+            validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let shifted = parse_scan_plan(
+            shifted_source,
+            r#"{"id":"PL_12345","entries":[{"id":"def456_ZZ","title":"Inserted","availability":"public"},{"id":"abc123_XY","title":"Original","availability":"public"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            revalidate_selected_items(&frozen, &shifted, &selected),
+            Err(YouTubeInternalError::ScanPlanStale)
+        ));
     }
 }

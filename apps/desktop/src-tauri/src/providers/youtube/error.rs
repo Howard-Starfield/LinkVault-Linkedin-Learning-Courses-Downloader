@@ -64,6 +64,8 @@ pub enum YouTubeInternalError {
     PlanNotFound,
     #[error("scan plan has expired")]
     PlanExpired,
+    #[error("scan plan no longer matches the current public source")]
+    ScanPlanStale,
     #[error("selected occurrence is not part of the scan plan")]
     UnknownOccurrence,
     #[error("selected occurrences must be unique")]
@@ -88,6 +90,10 @@ impl From<YouTubeInternalError> for YouTubeError {
             YouTubeInternalError::PlanExpired => {
                 Self::new("SCAN_PLAN_EXPIRED", "scan plan has expired")
             }
+            YouTubeInternalError::ScanPlanStale => Self::new(
+                "SCAN_PLAN_STALE",
+                "scan plan no longer matches the current public source",
+            ),
             YouTubeInternalError::UnknownOccurrence => Self::new(
                 "UNKNOWN_OCCURRENCE",
                 "selected occurrence is not part of the scan plan",

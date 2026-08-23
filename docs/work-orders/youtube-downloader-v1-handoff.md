@@ -151,3 +151,42 @@ This is not native downloader completion. Execution remains disabled and no help
 The next safe slice is transcript-only fixture execution: wire verified transcript inspection/selection and the WebVTT normalizer into the executor, publish raw VTT plus normalized JSON through the proven attempt capability, then add exact manifest reuse. After that, select and document exact FFmpeg/FFprobe distribution identities and implement FFprobe media validation before any Y3 media candidate. Keep `EXECUTION_HARDENING_COMPLETE = false` and the helper lock non-ready until every helper identity/license/source and native containment gate passes.
 
 Generated Rust `target`, frontend `dist`, helper binaries, installers, caches, logs, screenshots, and UAT downloads are not committed.
+
+## 2026-08-23 completion continuation (supersedes the stopping point above)
+
+The bounded Y1-Y3 implementation is now integrated for internal testing:
+
+- occurrence-bound transcript inspection and deterministic semantic selection;
+- raw WebVTT preservation plus deterministic normalized transcript JSON;
+- exact strict-manifest reuse with collision-on-mismatch behavior;
+- FFprobe-based bounded media validation and compatibility warnings;
+- safe-output leases held across verification and atomic publication;
+- fail-closed public-availability admission plus selected-source identity,
+  ordinal and availability revalidation immediately before run construction;
+- exact yt-dlp, Deno, FFmpeg and FFprobe supply-chain records under one ready
+  lock digest; and
+- mounted UI controls for ambiguous playlist URLs and transcript languages.
+
+Completion evidence for this continuation:
+
+- the production managed-process path verified all four packaged executable
+  bytes, launched yt-dlp `2026.08.19`, and launched pinned FFprobe successfully;
+- the release LinkVault executable and an NSIS internal bundle were produced;
+- updater signing then failed closed because `TAURI_SIGNING_PRIVATE_KEY` was not
+  provided; no signing check was disabled or bypassed;
+- an adversarial Luna audit found and drove closure of unsafe reuse, unknown
+  availability, stale-source admission, unbounded VTT reading, unheld future
+  companion assets, and transcript-label binding gaps; product `Video only`
+  correctly remains playable video with an audio stream and no transcript;
+- Rust formatting/checking passed; the library suite passed 649/649 with four
+  expected ignored tests; and all eight hostile Windows process tests passed;
+- helper-lock schema and offline inventory verification, no-explicit-`any`,
+  frontend build, static YouTube UI checks, and the narrow/compact/wide browser
+  fixture passed; and
+- helper fetching now removes verified acquisition archives/source tarballs and
+  atomically promotes only the four reviewed executables.
+
+Generated helper and package artifacts are removed before commit. No live
+content download, signed installer, or public-release approval is claimed. The
+next manual step is native UAT with a public source the operator owns or is
+expressly authorized to save; record that authorization outside the repository.

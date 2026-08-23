@@ -123,6 +123,24 @@ pub struct YouTubeTranscriptOccurrence {
     pub tracks: Vec<YouTubeTranscriptTrack>,
 }
 
+/// Plan-owned transcript inspection state.  This is deliberately separate
+/// from the public IPC response so a later command can prove that a selected
+/// track belongs to the same immutable occurrence and source snapshot that
+/// was inspected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct YouTubeTranscriptInspectionContext {
+    pub source_snapshot_digest: String,
+    pub occurrence_id: String,
+    pub video_id: String,
+    pub metadata_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedYouTubeTranscriptInspection {
+    pub context: YouTubeTranscriptInspectionContext,
+    pub tracks: Vec<YouTubeTranscriptTrack>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StartYouTubeDownloadRequest {

@@ -14,11 +14,11 @@
 
 **Reviewed specification blob SHA-256:** `DF7580529A091718F4591989D8B64DA4A1E3569537B51D6F267E150CA5C7F681`
 
-**Reviewed helper lock:** `docs/third-party/youtube-helpers-lock.json` — not yet created; Y0 must create and validate it before any helper execution
+**Reviewed helper lock:** `docs/third-party/youtube-helpers-lock.json` — exact internal candidate reviewed and verified 2026-08-23
 
-**Reviewed helper-lock digest:** `PENDING_Y0_HELPER_LOCK` — no helper launch is authorized while this remains pending
+**Reviewed helper-lock digest:** `f2eb38349e71bd05b8da27807bc82e5eecb204cbf8b335952276bc1786527b7c`
 
-**Approved target triple and component versions:** `x86_64-pc-windows-msvc`; yt-dlp, Deno/EJS runtime, FFmpeg and FFprobe versions must be pinned by the Y0 helper lock before execution
+**Approved target triple and component versions:** `x86_64-pc-windows-msvc`; yt-dlp `2026.08.19` with bundled EJS `0.8.0`; Deno `2.9.5`; BtbN LGPL-static FFmpeg and FFprobe build `n9.0.1-6-g9d4ca21220-20260820` from FFmpeg commit `9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611`
 
 ## Decision
 
@@ -68,7 +68,7 @@ reserved for a separate Y-PUBLIC-REVIEW decision.
 ## Evidence and follow-up
 
 - **Terms/policy sources reviewed with review dates:** YouTube Terms of Service, <https://www.youtube.com/static?template=terms>, reviewed 2026-08-20 for risk boundaries and prohibited behavior. This review is not legal advice or a platform authorization.
-- **Third-party helper redistribution review:** Pending Y0 helper-lock, source, checksum, license and clean-Windows verification; no public redistribution is authorized by this acceptance.
+- **Third-party helper redistribution review:** Exact helper/source/checksum/license records are verified for this internal-test candidate. This is not public-redistribution approval; public packaging remains reserved for Y-PUBLIC-REVIEW.
 - **Required re-review triggers:** Any change to the PRD bytes, architecture, helper lock, helper/component versions, process or path boundaries, cookie/account or restricted-content scope, UI copy, distribution target, UAT source policy, or any incident involving bypass, unauthorized content or public exposure.
 - **Candidate-validation rule:** Internal Y0-Y3 candidates must match the pinned specification bytes and this acceptance scope. The helper lock and integrity checks must pass before helper execution. Public packaging, distribution or release additionally requires a separate affirmative Y-PUBLIC-REVIEW decision with exact specification/helper-lock identity and packaged/native UAT evidence.
 

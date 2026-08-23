@@ -43,14 +43,22 @@ async function verifyInstalledAsset(asset, label) {
   if (actualHash !== asset.sha256) fail(`${label} SHA-256 mismatch: expected ${asset.sha256}, got ${actualHash}`);
 }
 
-async function verifyLicense(asset, label) {
-  const licensePath = filePath(asset.licenseFile);
+async function verifyProvenanceFile(relativePath, expectedHash, label) {
+  const targetPath = filePath(relativePath);
+  let contents;
   try {
-    const license = await readFile(licensePath, "utf8");
-    if (license.trim().length === 0) fail(`${label}.licenseFile is empty`);
+    contents = await readFile(targetPath, "utf8");
   } catch (error) {
-    fail(`${label}.licenseFile is unavailable: ${error.message}`);
+    fail(`${label} is unavailable: ${error.message}`);
   }
+  if (contents.trim().length === 0) fail(`${label} is empty`);
+  const actualHash = await sha256File(targetPath);
+  if (actualHash !== expectedHash) fail(`${label} SHA-256 mismatch: expected ${expectedHash}, got ${actualHash}`);
+}
+
+async function verifyProvenance(asset, label) {
+  await verifyProvenanceFile(asset.licenseRecord.file, asset.licenseRecord.sha256, `${label}.licenseRecord.file`);
+  await verifyProvenanceFile(asset.noticeRecord.file, asset.noticeRecord.sha256, `${label}.noticeRecord.file`);
 }
 
 await verifySidecarConfig();
@@ -64,10 +72,10 @@ if (!validation.populated) {
 
 for (const component of lock.components) {
   await verifyInstalledAsset(component, component.name);
-  await verifyLicense(component, component.name);
+  await verifyProvenance(component, component.name);
   for (const [index, asset] of component.loadedAssets.entries()) {
     await verifyInstalledAsset(asset, `${component.name}.loadedAssets[${index}]`);
-    await verifyLicense(asset, `${component.name}.loadedAssets[${index}]`);
+    await verifyProvenance(asset, `${component.name}.loadedAssets[${index}]`);
   }
 }
 

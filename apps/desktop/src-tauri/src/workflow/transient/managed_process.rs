@@ -24,14 +24,16 @@ const EMBEDDED_HELPER_LOCK: &[u8] = include_bytes!(concat!(
     "/../../../docs/third-party/youtube-helpers-lock.json"
 ));
 
-// Defense in depth: a populated supply-chain lock must not silently enable
-// execution before identity-held delegated-helper verification and the complete
-// hostile-process/native shutdown suite pass review.
-const EXECUTION_HARDENING_COMPLETE: bool = false;
+// Internal Y0-Y3 execution is admitted only after the ready lock, identity-held
+// delegated-helper verification, exact output reuse, FFprobe validation, and
+// the complete hostile-process/native shutdown suite have passed review.
+// Public packaging remains governed by the separate Y-PUBLIC-REVIEW decision.
+const EXECUTION_HARDENING_COMPLETE: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperKind {
     YouTubeYtDlp,
+    YouTubeFfprobe,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +54,21 @@ impl ManagedProcessSpec {
     ) -> Self {
         Self {
             helper: HelperKind::YouTubeYtDlp,
+            args,
+            stdout_limit,
+            stderr_limit,
+            timeout,
+        }
+    }
+
+    pub fn youtube_ffprobe(
+        args: Vec<OsString>,
+        stdout_limit: usize,
+        stderr_limit: usize,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            helper: HelperKind::YouTubeFfprobe,
             args,
             stdout_limit,
             stderr_limit,
@@ -217,7 +234,17 @@ impl VerifiedHelperSet {
         [&self.ytdlp, &self.deno, &self.ffmpeg, &self.ffprobe]
     }
 
-    fn apply_delegated_paths(&self, spec: &mut ManagedProcessSpec) {
+    fn executable(&self, kind: HelperKind) -> &VerifiedExecutable {
+        match kind {
+            HelperKind::YouTubeYtDlp => &self.ytdlp,
+            HelperKind::YouTubeFfprobe => &self.ffprobe,
+        }
+    }
+
+    fn apply_controlled_args(&self, kind: HelperKind, spec: &mut ManagedProcessSpec) {
+        if !matches!(kind, HelperKind::YouTubeYtDlp) {
+            return;
+        }
         let ffmpeg_directory = self
             .ffmpeg
             .path
@@ -247,9 +274,10 @@ pub fn run(
     discovery_cancel: Option<&AtomicBool>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     ensure_execution_hardened()?;
-    let verified = resolve_and_verify(spec.helper)?;
-    verified.apply_delegated_paths(&mut spec);
-    let executable = verified.ytdlp.path.clone();
+    let kind = spec.helper;
+    let verified = resolve_and_verify(kind)?;
+    verified.apply_controlled_args(kind, &mut spec);
+    let executable = verified.executable(kind).path.clone();
     let identities = verified.identities();
     run_resolved(
         executable,
@@ -321,7 +349,7 @@ fn run_resolved(
 }
 
 fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProcessError> {
-    if !matches!(kind, HelperKind::YouTubeYtDlp) {
+    if !matches!(kind, HelperKind::YouTubeYtDlp | HelperKind::YouTubeFfprobe) {
         return Err(ManagedProcessError::Integrity(
             "unsupported helper set".to_string(),
         ));
@@ -422,6 +450,17 @@ fn parse_locked_helpers(value: &Value) -> Option<LockedHelpers> {
             .find(|component| component.get("name").and_then(Value::as_str) == Some(name))?;
         let expected_filename = format!("{name}-x86_64-pc-windows-msvc.exe");
         if component.get("filename").and_then(Value::as_str) != Some(expected_filename.as_str()) {
+            return None;
+        }
+        // This V1 runtime supports only the four static/standalone executable
+        // records it opens and holds below. A future lock that introduces a
+        // separately loaded DLL, script, or component must add an equivalent
+        // identity-held runtime implementation before it can execute.
+        if !component
+            .get("loadedAssets")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
             return None;
         }
         let asset_digest = component.get("sha256").and_then(Value::as_str)?;
@@ -701,7 +740,8 @@ mod tests {
                     "name": name,
                     "filename": format!("{name}-x86_64-pc-windows-msvc.exe"),
                     "sha256": "a".repeat(64),
-                    "sizeBytes": 1
+                    "sizeBytes": 1,
+                    "loadedAssets": []
                 })
             })
             .collect::<Vec<_>>();
@@ -717,6 +757,15 @@ mod tests {
         assert_eq!(locked.components.len(), 4);
 
         value["components"][0]["filename"] = serde_json::json!("yt-dlp.exe");
+        seal_lock(&mut value);
+        assert!(parse_locked_helpers(&value).is_none());
+
+        value["components"][0]["filename"] = serde_json::json!("yt-dlp-x86_64-pc-windows-msvc.exe");
+        value["components"][0]["loadedAssets"] = serde_json::json!([{
+            "filename": "unheld.dll",
+            "sha256": "b".repeat(64),
+            "sizeBytes": 1
+        }]);
         seal_lock(&mut value);
         assert!(parse_locked_helpers(&value).is_none());
     }
@@ -751,7 +800,7 @@ mod tests {
             1024,
             Duration::from_secs(1),
         );
-        helpers.apply_delegated_paths(&mut spec);
+        helpers.apply_controlled_args(super::HelperKind::YouTubeYtDlp, &mut spec);
         assert_eq!(spec.args[0], "--js-runtimes");
         assert!(spec.args[1].to_string_lossy().starts_with("deno:"));
         assert_eq!(spec.args[2], "--ffmpeg-location");

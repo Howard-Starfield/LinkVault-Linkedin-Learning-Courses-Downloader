@@ -7,6 +7,7 @@ export const REQUIRED_COMPONENTS = Object.freeze(["yt-dlp", "deno", "ffmpeg", "f
 export const TARGET_TRIPLE = "x86_64-pc-windows-msvc";
 export const LOCK_RELATIVE_PATH = "docs/third-party/youtube-helpers-lock.json";
 export const BINARY_RELATIVE_PATH = "apps/desktop/src-tauri/binaries";
+export const ARCHIVE_FORMATS = Object.freeze(["zip", "tar.gz", "tar.xz", "tar.bz2", "tar.zst"]);
 
 export function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -94,15 +95,81 @@ function requirePositiveInteger(record, key, label) {
   if (!Number.isSafeInteger(record[key]) || record[key] <= 0) fail(`${label}.${key} must be a positive safe integer`);
 }
 
-function validateAsset(asset, label, { requireFilename = true } = {}) {
-  if (!isRecord(asset)) fail(`${label} must be an object`);
-  const relativePath = asset.path ?? asset.filename;
-  if (requireFilename) {
-    if (typeof asset.filename !== "string") fail(`${label}.filename must be present`);
-    safeRelativePath(asset.filename, `${label}.filename`);
+function requirePinnedString(record, key, label) {
+  requireString(record, key, label);
+  if (/latest/i.test(record[key])) fail(`${label}.${key} must be pinned, not latest`);
+}
+
+function requireNullablePinnedString(record, key, label) {
+  if (record[key] !== null && typeof record[key] !== "string") {
+    fail(`${label}.${key} must be a non-empty string or null`);
   }
-  if (typeof relativePath !== "string") fail(`${label}.path or filename must be present`);
-  safeRelativePath(relativePath, `${label}.path`);
+  if (typeof record[key] === "string") {
+    if (record[key].length === 0) fail(`${label}.${key} must be a non-empty string or null`);
+    if (/latest/i.test(record[key])) fail(`${label}.${key} must be pinned, not latest`);
+  }
+}
+
+function requireArchiveFormat(value, label, { nullable = false } = {}) {
+  if (nullable && value === null) return;
+  if (typeof value !== "string" || !ARCHIVE_FORMATS.includes(value)) {
+    fail(`${label} must be one of ${ARCHIVE_FORMATS.join(", ")}${nullable ? " or null" : ""}`);
+  }
+}
+
+function requireMatchingString(record, key, expected, label) {
+  requireString(record, key, label);
+  if (record[key] !== expected) fail(`${label}.${key} must exactly match ${JSON.stringify(expected)}`);
+}
+
+function validateCompatibility(asset, label, role) {
+  if (!isRecord(asset.compatibility)) fail(`${label}.compatibility must be an object`);
+  requireNullablePinnedString(asset.compatibility, "ytDlpEjsVersion", `${label}.compatibility`);
+  requireNullablePinnedString(asset.compatibility, "ffmpegBuildId", `${label}.compatibility`);
+  if (role === "yt-dlp" && asset.compatibility.ytDlpEjsVersion === null) {
+    fail(`${label}.compatibility.ytDlpEjsVersion is required for yt-dlp`);
+  }
+  if ((role === "ffmpeg" || role === "ffprobe") && asset.compatibility.ffmpegBuildId === null) {
+    fail(`${label}.compatibility.ffmpegBuildId is required for ${role}`);
+  }
+}
+
+function validateProvenance(asset, label) {
+  if (!isRecord(asset.sourceRecord)) fail(`${label}.sourceRecord must be an object`);
+  isPinnedHttpsUrl(asset.sourceRecord.projectUrl, `${label}.sourceRecord.projectUrl`);
+  isPinnedHttpsUrl(asset.sourceRecord.releaseUrl, `${label}.sourceRecord.releaseUrl`);
+  requirePinnedString(asset.sourceRecord, "revision", `${label}.sourceRecord`);
+  requireMatchingString(asset.sourceRecord, "assetUrl", asset.sourceUrl, `${label}.sourceRecord`);
+  requireMatchingString(asset.sourceRecord, "assetSha256", asset.sha256, `${label}.sourceRecord`);
+  if (asset.sourceRecord.assetSizeBytes !== asset.sizeBytes) {
+    fail(`${label}.sourceRecord.assetSizeBytes must exactly match ${label}.sizeBytes`);
+  }
+  requireMatchingString(asset.sourceRecord, "archiveUrl", asset.sourceArchiveUrl, `${label}.sourceRecord`);
+  requireMatchingString(asset.sourceRecord, "archiveSha256", asset.sourceArchiveSha256, `${label}.sourceRecord`);
+  if (asset.sourceRecord.archiveSizeBytes !== asset.sourceArchiveSizeBytes) {
+    fail(`${label}.sourceRecord.archiveSizeBytes must exactly match ${label}.sourceArchiveSizeBytes`);
+  }
+
+  if (!isRecord(asset.licenseRecord)) fail(`${label}.licenseRecord must be an object`);
+  requireMatchingString(asset.licenseRecord, "spdxExpression", asset.licenseId, `${label}.licenseRecord`);
+  isPinnedHttpsUrl(asset.licenseRecord.url, `${label}.licenseRecord.url`);
+  requireMatchingString(asset.licenseRecord, "file", asset.licenseFile, `${label}.licenseRecord`);
+  if (!sha256Hex(asset.licenseRecord.sha256)) fail(`${label}.licenseRecord.sha256 must be lowercase SHA-256`);
+
+  if (!isRecord(asset.noticeRecord)) fail(`${label}.noticeRecord must be an object`);
+  safeRelativePath(asset.noticeRecord.file, `${label}.noticeRecord.file`);
+  isPinnedHttpsUrl(asset.noticeRecord.url, `${label}.noticeRecord.url`);
+  if (!sha256Hex(asset.noticeRecord.sha256)) fail(`${label}.noticeRecord.sha256 must be lowercase SHA-256`);
+}
+
+function validateAsset(asset, label, { role = null } = {}) {
+  if (!isRecord(asset)) fail(`${label} must be an object`);
+  if (typeof asset.filename !== "string") fail(`${label}.filename must be present`);
+  const filename = safeRelativePath(asset.filename, `${label}.filename`);
+  if (typeof asset.path !== "string") fail(`${label}.path must be present and match filename`);
+  const assetPath = safeRelativePath(asset.path, `${label}.path`);
+  if (assetPath !== filename) fail(`${label}.path must exactly match ${label}.filename`);
+  const relativePath = filename;
   requireString(asset, "version", label);
   if (/latest/i.test(asset.version)) fail(`${label}.version must be pinned, not latest`);
   isPinnedHttpsUrl(asset.sourceUrl, `${label}.sourceUrl`);
@@ -114,7 +181,13 @@ function validateAsset(asset, label, { requireFilename = true } = {}) {
   if (asset.archiveMember !== null && typeof asset.archiveMember !== "string") {
     fail(`${label}.archiveMember must be null or a string`);
   }
-  if (typeof asset.archiveMember === "string") safeRelativePath(asset.archiveMember, `${label}.archiveMember`);
+  if (typeof asset.archiveMember === "string") {
+    safeRelativePath(asset.archiveMember, `${label}.archiveMember`);
+    requireArchiveFormat(asset.archiveFormat, `${label}.archiveFormat`);
+  } else {
+    if (asset.archiveFormat !== null) fail(`${label}.archiveFormat must be null when archiveMember is null`);
+  }
+  requireArchiveFormat(asset.sourceArchiveFormat, `${label}.sourceArchiveFormat`);
   if (asset.archiveMember === null) {
     if (asset.distributionArchiveSizeBytes !== undefined || asset.distributionArchiveSha256 !== undefined) {
       fail(`${label}.distributionArchive* is only valid when archiveMember is set`);
@@ -127,6 +200,8 @@ function validateAsset(asset, label, { requireFilename = true } = {}) {
   }
   requireString(asset, "licenseId", label);
   safeRelativePath(asset.licenseFile, `${label}.licenseFile`);
+  validateCompatibility(asset, label, role);
+  validateProvenance(asset, label);
   return relativePath;
 }
 
@@ -159,7 +234,7 @@ export function validateLock(lock, repositoryRoot) {
     if (!REQUIRED_COMPONENTS.includes(component.name)) fail(`unknown component ${component.name}`);
     if (names.has(component.name)) fail(`duplicate component ${component.name}`);
     names.add(component.name);
-    const relativePath = validateAsset(component, `component ${component.name}`);
+    const relativePath = validateAsset(component, `component ${component.name}`, { role: component.name });
     const expectedPath = `${component.name}-${TARGET_TRIPLE}.exe`;
     if (relativePath !== expectedPath) {
       fail(`component ${component.name} path must be exactly ${expectedPath}`);
@@ -168,7 +243,7 @@ export function validateLock(lock, repositoryRoot) {
     paths.add(relativePath);
     if (!Array.isArray(component.loadedAssets)) fail(`component ${component.name}.loadedAssets must be an array`);
     for (const [index, loadedAsset] of component.loadedAssets.entries()) {
-      const loadedPath = validateAsset(loadedAsset, `component ${component.name}.loadedAssets[${index}]`, { requireFilename: false });
+      const loadedPath = validateAsset(loadedAsset, `component ${component.name}.loadedAssets[${index}]`);
       if (paths.has(loadedPath)) fail(`duplicate installed asset path ${loadedPath}`);
       paths.add(loadedPath);
     }
@@ -178,11 +253,41 @@ export function validateLock(lock, repositoryRoot) {
   }
 
   for (const component of lock.components) {
+    for (const loadedAsset of component.loadedAssets) {
+      for (const key of ["ytDlpEjsVersion", "ffmpegBuildId"]) {
+        if (loadedAsset.compatibility[key] !== null && loadedAsset.compatibility[key] !== component.compatibility[key]) {
+          fail(`component ${component.name}.loadedAssets compatibility.${key} must match the component`);
+        }
+      }
+    }
+    if (component.name === "ffmpeg" || component.name === "ffprobe") {
+      const buildId = component.compatibility.ffmpegBuildId;
+      const peer = lock.components.find((candidate) => candidate.name === (component.name === "ffmpeg" ? "ffprobe" : "ffmpeg"));
+      if (peer && peer.compatibility.ffmpegBuildId !== buildId) {
+        fail(`components ffmpeg and ffprobe must share one ffmpegBuildId`);
+      }
+    }
     const licensePath = resolveInside(repositoryRoot, component.licenseFile, `${component.name}.licenseFile`);
+    const licenseRecordPath = resolveInside(repositoryRoot, component.licenseRecord.file, `${component.name}.licenseRecord.file`);
+    const noticePath = resolveInside(repositoryRoot, component.noticeRecord.file, `${component.name}.noticeRecord.file`);
     void licensePath;
+    void licenseRecordPath;
+    void noticePath;
     for (const asset of component.loadedAssets) {
       const loadedLicensePath = resolveInside(repositoryRoot, asset.licenseFile, `${component.name}.loadedAssets licenseFile`);
+      const loadedLicenseRecordPath = resolveInside(
+        repositoryRoot,
+        asset.licenseRecord.file,
+        `${component.name}.loadedAssets licenseRecord.file`,
+      );
+      const loadedNoticePath = resolveInside(
+        repositoryRoot,
+        asset.noticeRecord.file,
+        `${component.name}.loadedAssets noticeRecord.file`,
+      );
       void loadedLicensePath;
+      void loadedLicenseRecordPath;
+      void loadedNoticePath;
     }
   }
   return { populated: lock.status === "ready", components: lock.components };

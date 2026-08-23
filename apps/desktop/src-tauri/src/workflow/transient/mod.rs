@@ -208,6 +208,16 @@ impl TransientExecutionOutcome {
         }
     }
 
+    pub fn skipped_existing(artifacts: Vec<String>) -> Self {
+        Self {
+            state: TransientItemState::SkippedExisting,
+            phase: TransientItemPhase::Completed,
+            warnings: Vec::new(),
+            error: None,
+            published_artifact_kinds: artifacts,
+        }
+    }
+
     pub fn warning(code: impl Into<String>, artifacts: Vec<String>) -> Self {
         Self {
             state: TransientItemState::CompletedWithWarnings,
@@ -1211,16 +1221,27 @@ fn commit_item_outcome(
             candidate.error = outcome.error.clone();
             candidate.published_artifact_kinds = outcome.published_artifact_kinds.clone();
         }
-        if outcome.state == TransientItemState::Completed {
-            record.snapshot.counts.completed = record.snapshot.counts.completed.saturating_add(1);
-        } else if outcome.state == TransientItemState::CompletedWithWarnings {
-            record.snapshot.counts.completed_with_warnings = record
-                .snapshot
-                .counts
-                .completed_with_warnings
-                .saturating_add(1);
-        } else if outcome.state == TransientItemState::Failed {
-            record.snapshot.counts.failed = record.snapshot.counts.failed.saturating_add(1);
+        match outcome.state {
+            TransientItemState::Completed => {
+                record.snapshot.counts.completed =
+                    record.snapshot.counts.completed.saturating_add(1);
+            }
+            TransientItemState::CompletedWithWarnings => {
+                record.snapshot.counts.completed_with_warnings = record
+                    .snapshot
+                    .counts
+                    .completed_with_warnings
+                    .saturating_add(1);
+            }
+            TransientItemState::Skipped | TransientItemState::SkippedExisting => {
+                record.snapshot.counts.skipped = record.snapshot.counts.skipped.saturating_add(1);
+            }
+            TransientItemState::Failed => {
+                record.snapshot.counts.failed = record.snapshot.counts.failed.saturating_add(1);
+            }
+            TransientItemState::Pending
+            | TransientItemState::Running
+            | TransientItemState::Cancelled => {}
         }
         for code in &outcome.warnings {
             record.snapshot.warnings.push(TransientWarning {
@@ -1473,6 +1494,25 @@ mod tests {
         }
     }
 
+    struct SkipExistingExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TransientExecutor for SkipExistingExecutor {
+        fn execute(
+            &self,
+            _item: &TransientWorkItem,
+            _control: &TransientRunControl,
+            _progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(TransientExecutionOutcome::skipped_existing(vec![
+                "media".to_string(),
+                "transcript_json".to_string(),
+            ]))
+        }
+    }
+
     impl TransientExecutor for BlockingExecutor {
         fn execute(
             &self,
@@ -1555,6 +1595,78 @@ mod tests {
         assert!(last > 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(runtime.get_state(Some("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn skipped_existing_commits_once_and_replays_with_ordered_events() {
+        let events = Arc::new(Mutex::new(Vec::<TransientRunSnapshot>::new()));
+        let event_log = Arc::clone(&events);
+        let runtime = TransientWorkflowRuntime::new(Some(Arc::new(move |snapshot| {
+            event_log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(snapshot.clone());
+        })));
+        let calls = Arc::new(AtomicUsize::new(0));
+        runtime
+            .start_run(
+                "skip-existing-run".to_string(),
+                "skip-existing-submission".to_string(),
+                "skip-existing-plan".to_string(),
+                vec![item("existing", 0)],
+                Arc::new(SkipExistingExecutor {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+
+        let terminal = (0..200)
+            .find_map(|_| {
+                let snapshot = runtime.get_state(Some("skip-existing-run")).unwrap()?;
+                if snapshot.state.is_terminal() {
+                    Some(snapshot)
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    None
+                }
+            })
+            .expect("skipped-existing run should settle");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(terminal.state, TransientRunState::Completed);
+        assert_eq!(terminal.counts.completed, 0);
+        assert_eq!(terminal.counts.skipped, 1);
+        assert_eq!(terminal.items[0].state, TransientItemState::SkippedExisting);
+        assert_eq!(terminal.items[0].phase, TransientItemPhase::Completed);
+        assert_eq!(
+            terminal.items[0].published_artifact_kinds,
+            vec!["media".to_string(), "transcript_json".to_string()]
+        );
+
+        let replay = runtime
+            .get_state(Some("skip-existing-run"))
+            .unwrap()
+            .expect("terminal snapshot should remain available for replay");
+        assert_eq!(replay, terminal);
+
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!events.is_empty());
+        assert!(events
+            .windows(2)
+            .all(|window| window[0].revision < window[1].revision));
+        assert_eq!(
+            events
+                .windows(2)
+                .filter(|window| window[0].counts.skipped != window[1].counts.skipped)
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|snapshot| {
+            snapshot.items[0].state == TransientItemState::SkippedExisting
+                && snapshot.counts.skipped == 1
+        }));
     }
 
     #[test]

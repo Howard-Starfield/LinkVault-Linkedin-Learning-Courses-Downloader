@@ -9,11 +9,15 @@ import {
 
 const repositoryRoot = process.cwd();
 
-function makeAsset(name, archiveMember = null) {
+function makeAsset(name, archiveMember = null, role = null) {
+  const filename = `${name}-x86_64-pc-windows-msvc.exe`;
+  const ejsVersion = role === "yt-dlp" ? "0.8.0" : null;
+  const ffmpegBuildId = role === "ffmpeg" || role === "ffprobe" ? "ffmpeg-test-build-1" : null;
   const asset = {
     name,
     version: "1.0.0",
-    filename: `${name}-x86_64-pc-windows-msvc.exe`,
+    filename,
+    path: filename,
     sourceUrl: `https://example.com/${name}/1.0.0/${name}${archiveMember === null ? ".exe" : ".zip"}`,
     sourceArchiveUrl: `https://example.com/${name}/1.0.0/${name}-source.tar.gz`,
     sha256: "a".repeat(64),
@@ -21,9 +25,37 @@ function makeAsset(name, archiveMember = null) {
     sourceArchiveSha256: "b".repeat(64),
     sourceArchiveSizeBytes: 456,
     archiveMember,
+    archiveFormat: archiveMember === null ? null : "zip",
+    sourceArchiveFormat: "tar.gz",
+    compatibility: {
+      ytDlpEjsVersion: ejsVersion,
+      ffmpegBuildId,
+    },
     loadedAssets: [],
     licenseId: "MIT",
     licenseFile: `docs/third-party/${name}.LICENSE.txt`,
+    sourceRecord: {
+      projectUrl: `https://example.com/${name}`,
+      releaseUrl: `https://example.com/${name}/releases/1.0.0`,
+      revision: "v1.0.0",
+      assetUrl: `https://example.com/${name}/1.0.0/${name}${archiveMember === null ? ".exe" : ".zip"}`,
+      assetSha256: "a".repeat(64),
+      assetSizeBytes: 123,
+      archiveUrl: `https://example.com/${name}/1.0.0/${name}-source.tar.gz`,
+      archiveSha256: "b".repeat(64),
+      archiveSizeBytes: 456,
+    },
+    licenseRecord: {
+      spdxExpression: "MIT",
+      url: "https://spdx.org/licenses/MIT.html",
+      file: `docs/third-party/${name}.LICENSE.txt`,
+      sha256: "d".repeat(64),
+    },
+    noticeRecord: {
+      url: "https://example.com/notices",
+      file: "docs/third-party/THIRD_PARTY_NOTICES.md",
+      sha256: "e".repeat(64),
+    },
   };
   if (archiveMember !== null) {
     asset.distributionArchiveSha256 = "c".repeat(64);
@@ -38,7 +70,7 @@ function makeLock(status = "evidence", archivedComponent = null) {
     targetTriple: "x86_64-pc-windows-msvc",
     status,
     lockDigest: null,
-    components: REQUIRED_COMPONENTS.map((name) => makeAsset(name, name === archivedComponent ? `${name}/bin/${name}.exe` : null)),
+    components: REQUIRED_COMPONENTS.map((name) => makeAsset(name, name === archivedComponent ? `${name}/bin/${name}.exe` : null, name)),
   };
   lock.lockDigest = digestLock(lock);
   return lock;
@@ -85,4 +117,72 @@ test("direct executable assets reject archive-only metadata", () => {
     () => validateLock(lock, repositoryRoot),
     /component yt-dlp\.distributionArchive\* is only valid when archiveMember is set/,
   );
+});
+
+test("filename and path must agree exactly", () => {
+  const lock = makeLock();
+  lock.components[0].path = "different.exe";
+  lock.lockDigest = digestLock(lock);
+  assert.throws(
+    () => validateLock(lock, repositoryRoot),
+    /component yt-dlp\.path must exactly match component yt-dlp\.filename/,
+  );
+});
+
+test("archives require an explicit format and direct assets require null", () => {
+  const archived = makeLock("evidence", "deno");
+  archived.components[1].archiveFormat = null;
+  archived.lockDigest = digestLock(archived);
+  assert.throws(() => validateLock(archived, repositoryRoot), /component deno\.archiveFormat must be one of/);
+
+  const direct = makeLock();
+  direct.components[0].archiveFormat = "zip";
+  direct.lockDigest = digestLock(direct);
+  assert.throws(() => validateLock(direct, repositoryRoot), /component yt-dlp\.archiveFormat must be null/);
+
+  const missingSourceFormat = makeLock();
+  missingSourceFormat.components[0].sourceArchiveFormat = "rar";
+  missingSourceFormat.lockDigest = digestLock(missingSourceFormat);
+  assert.throws(() => validateLock(missingSourceFormat, repositoryRoot), /component yt-dlp\.sourceArchiveFormat must be one of/);
+});
+
+test("compatibility fields are typed and role requirements are fail-closed", () => {
+  const lock = makeLock();
+  lock.components[0].compatibility.ytDlpEjsVersion = 0.8;
+  lock.lockDigest = digestLock(lock);
+  assert.throws(() => validateLock(lock, repositoryRoot), /ytDlpEjsVersion must be a non-empty string or null/);
+
+  const missingEjs = makeLock();
+  missingEjs.components[0].compatibility.ytDlpEjsVersion = null;
+  missingEjs.lockDigest = digestLock(missingEjs);
+  assert.throws(() => validateLock(missingEjs, repositoryRoot), /ytDlpEjsVersion is required for yt-dlp/);
+
+  const mismatchedBuild = makeLock();
+  mismatchedBuild.components[3].compatibility.ffmpegBuildId = "other-build";
+  mismatchedBuild.lockDigest = digestLock(mismatchedBuild);
+  assert.throws(() => validateLock(mismatchedBuild, repositoryRoot), /ffmpeg and ffprobe must share one ffmpegBuildId/);
+
+  const mismatchedLoadedAsset = makeLock();
+  const loadedAsset = makeAsset("yt-dlp-ejs");
+  loadedAsset.compatibility.ytDlpEjsVersion = "0.7.0";
+  mismatchedLoadedAsset.components[0].loadedAssets.push(loadedAsset);
+  mismatchedLoadedAsset.lockDigest = digestLock(mismatchedLoadedAsset);
+  assert.throws(() => validateLock(mismatchedLoadedAsset, repositoryRoot), /loadedAssets compatibility\.ytDlpEjsVersion must match/);
+});
+
+test("source, license, and notice records must bind exact provenance", () => {
+  const sourceMismatch = makeLock();
+  sourceMismatch.components[0].sourceRecord.assetSha256 = "f".repeat(64);
+  sourceMismatch.lockDigest = digestLock(sourceMismatch);
+  assert.throws(() => validateLock(sourceMismatch, repositoryRoot), /sourceRecord\.assetSha256 must exactly match/);
+
+  const missingNotice = makeLock();
+  delete missingNotice.components[0].noticeRecord;
+  missingNotice.lockDigest = digestLock(missingNotice);
+  assert.throws(() => validateLock(missingNotice, repositoryRoot), /noticeRecord must be an object/);
+
+  const badLicenseHash = makeLock();
+  badLicenseHash.components[0].licenseRecord.sha256 = "not-a-sha";
+  badLicenseHash.lockDigest = digestLock(badLicenseHash);
+  assert.throws(() => validateLock(badLicenseHash, repositoryRoot), /licenseRecord\.sha256 must be lowercase SHA-256/);
 });

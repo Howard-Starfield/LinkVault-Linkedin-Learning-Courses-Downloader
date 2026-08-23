@@ -1,8 +1,8 @@
 #![cfg(windows)]
 
 use linkvault_lib::workflow::transient::managed_process::{
-    lock_test_executable, run_test, ManagedProcessError, ManagedProcessSpec,
-    TestManagedProcessFault, TestManagedProcessSpec,
+    helper_identity, lock_test_executable, run, run_test, HelperKind, ManagedProcessError,
+    ManagedProcessSpec, TestManagedProcessFault, TestManagedProcessSpec,
 };
 use linkvault_lib::workflow::transient::TransientRunControl;
 use sha2::{Digest, Sha256};
@@ -16,6 +16,49 @@ use tempfile::tempdir;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_youtube_process_fixture"))
+}
+
+#[test]
+#[ignore = "requires the reviewed YouTube helpers beside the test executable"]
+fn reviewed_packaged_helpers_pass_the_production_identity_and_launch_path() {
+    let identity = helper_identity(HelperKind::YouTubeYtDlp)
+        .expect("the embedded ready lock and packaged helper bytes must agree");
+    assert_eq!(
+        identity.digest,
+        "f2eb38349e71bd05b8da27807bc82e5eecb204cbf8b335952276bc1786527b7c"
+    );
+
+    let ytdlp = run(
+        ManagedProcessSpec::youtube_ytdlp(
+            vec![OsString::from("--version")],
+            4096,
+            4096,
+            Duration::from_secs(30),
+        ),
+        None,
+        None,
+    )
+    .expect("reviewed yt-dlp must launch through the production supervisor");
+    assert!(ytdlp.status.success());
+    assert_eq!(ytdlp.stdout.trim(), "2026.08.19");
+
+    let ffprobe = run(
+        ManagedProcessSpec::youtube_ffprobe(
+            vec![OsString::from("-version")],
+            64 * 1024,
+            4096,
+            Duration::from_secs(30),
+        ),
+        None,
+        None,
+    )
+    .expect("reviewed FFprobe must launch through the production supervisor");
+    assert!(ffprobe.status.success());
+    assert!(ffprobe
+        .stdout
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains("n9.0.1-6-g9d4ca21220-20260820")));
 }
 
 fn fixture_spec(args: &[&str], timeout: Duration) -> TestManagedProcessSpec {

@@ -23,7 +23,21 @@ const maximumDownloadBytes = 4 * 1024 * 1024 * 1024;
 
 async function downloadToFile(url, destination, expectedSize, label) {
   if (typeof fetch !== "function") fail("this Node runtime does not provide fetch");
-  const response = await fetch(url, { redirect: "error" });
+  let currentUrl = new URL(url);
+  let response;
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    response = await fetch(currentUrl, { redirect: "manual" });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+    if (redirects === 5) fail(`${label} exceeded the bounded redirect count`);
+    const location = response.headers.get("location");
+    if (location === null) fail(`${label} redirect omitted its location`);
+    const nextUrl = new URL(location, currentUrl);
+    if (nextUrl.protocol !== "https:" || nextUrl.username || nextUrl.password) {
+      fail(`${label} redirect must remain credential-free HTTPS`);
+    }
+    currentUrl = nextUrl;
+  }
+  if (response === undefined) fail(`${label} download did not produce a response`);
   if (!response.ok) fail(`${label} download returned HTTP ${response.status}`);
   const advertisedLength = response.headers.get("content-length");
   if (advertisedLength !== null && Number(advertisedLength) !== expectedSize) {
@@ -96,11 +110,11 @@ async function verifySourceArchive(asset, archivePath, label) {
   if (sourceHash !== asset.sourceArchiveSha256) fail(`${label} source archive SHA-256 mismatch`);
 }
 
-async function stageAsset(asset, stagingRoot, label) {
+async function stageAsset(asset, acquisitionRoot, outputRoot, label) {
   const relativePath = asset.path ?? asset.filename;
-  const outputPath = resolveInside(stagingRoot, relativePath, `${label} output path`);
+  const outputPath = resolveInside(outputRoot, relativePath, `${label} output path`);
   await mkdir(path.dirname(outputPath), { recursive: true });
-  const sourceDownload = path.join(stagingRoot, `.download-${randomSuffix()}`);
+  const sourceDownload = path.join(acquisitionRoot, `.download-${randomSuffix()}`);
   const sourceSize = asset.archiveMember === null ? asset.sizeBytes : asset.distributionArchiveSizeBytes;
   const sourceHash = await downloadToFile(
     asset.sourceUrl,
@@ -114,7 +128,7 @@ async function stageAsset(asset, stagingRoot, label) {
   }
   let executablePath = sourceDownload;
   if (asset.archiveMember !== null) {
-    executablePath = await extractArchiveMember(sourceDownload, asset.archiveMember, path.join(stagingRoot, `.extract-${randomSuffix()}`), label);
+    executablePath = await extractArchiveMember(sourceDownload, asset.archiveMember, path.join(acquisitionRoot, `.extract-${randomSuffix()}`), label);
   }
   const executableStats = await stat(executablePath);
   if (executableStats.size !== asset.sizeBytes) fail(`${label} extracted size mismatch`);
@@ -122,7 +136,7 @@ async function stageAsset(asset, stagingRoot, label) {
   if (executableHash !== asset.sha256) fail(`${label} extracted SHA-256 mismatch`);
   await rename(executablePath, outputPath);
 
-  const sourceArchivePath = path.join(stagingRoot, `.source-${randomSuffix()}`);
+  const sourceArchivePath = path.join(acquisitionRoot, `.source-${randomSuffix()}`);
   const sourceArchiveHash = await downloadToFile(
     asset.sourceArchiveUrl,
     sourceArchivePath,
@@ -156,9 +170,9 @@ await mkdir(stagingOutput, { recursive: true });
 
 try {
   for (const component of lock.components) {
-    await stageAsset(component, stagingOutput, component.name);
+    await stageAsset(component, stagingRoot, stagingOutput, component.name);
     for (const [index, asset] of component.loadedAssets.entries()) {
-      await stageAsset(asset, stagingOutput, `${component.name}.loadedAssets[${index}]`);
+      await stageAsset(asset, stagingRoot, stagingOutput, `${component.name}.loadedAssets[${index}]`);
     }
   }
   await rename(stagingOutput, binaryDirectory);
