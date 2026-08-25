@@ -885,7 +885,7 @@ textarea {
 }
 
 .youtube-search-input {
- min-height: 40px;
+ min-height: 40px !important;
  max-height: 132px;
  height: 40px;
  overflow-y: auto;
@@ -946,9 +946,54 @@ textarea {
  grid-template-columns: minmax(0, 1fr) auto;
  align-items: center;
  gap: 12px;
- border-radius: 12px;
+ border-radius: 10px;
  background: var(--section-bg);
  padding: 12px 14px;
+}
+
+.youtube-result-row-skeleton {
+ pointer-events: none;
+ min-height: 62px;
+}
+
+.youtube-skeleton-line {
+ display: block;
+ border-radius: 6px;
+ background:
+  linear-gradient(
+   90deg,
+   transparent,
+   color-mix(in srgb, var(--text-muted) 18%, transparent),
+   transparent
+  ),
+  color-mix(in srgb, var(--text-muted) 14%, var(--section-bg));
+ background-size: 220% 100%, 100% 100%;
+ background-position: 100% 0, 0 0;
+ animation: youtube-skeleton-shimmer 1.45s ease-in-out infinite;
+}
+
+.youtube-skeleton-title {
+ width: min(72%, 420px);
+ height: 14px;
+ margin: 3px 0;
+}
+
+.youtube-skeleton-meta {
+ width: min(46%, 240px);
+ height: 10px;
+ margin: 3px 0;
+}
+
+.youtube-skeleton-action {
+ width: 88px;
+ height: 28px;
+ border-radius: 8px;
+}
+
+@keyframes youtube-skeleton-shimmer {
+ to {
+  background-position: -220% 0, 0 0;
+ }
 }
 
 .youtube-result-copy {
@@ -1014,9 +1059,10 @@ textarea {
 }
 
 .youtube-scanning {
- margin: 12px 0 0;
+ margin: 8px 0 0;
  color: var(--text-soft);
- font-size: 13px;
+ font-size: 12px;
+ line-height: 16px;
 }
 
 .youtube-helper-error {

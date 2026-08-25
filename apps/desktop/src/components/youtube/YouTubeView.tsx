@@ -28,6 +28,7 @@ import {
   startYouTubeDownload,
   subscribeYouTubeRunChanged,
   youtubeErrorFromUnknown,
+  isYouTubeRunSnapshot,
   YOUTUBE_UI_MOCK_RUN_PREFIX
 } from "../../lib/youtube/ipc";
 import {
@@ -73,6 +74,34 @@ const NO_CAPTION_OPTION: TranscriptLanguageOption = { tag: "", label: "No captio
 /** Matches `.youtube-search-input` min/max-height; keep in sync with CSS. */
 const YOUTUBE_SEARCH_MIN_HEIGHT_PX = 40;
 const YOUTUBE_SEARCH_MAX_HEIGHT_PX = 132;
+/** Cap post-scan caption probes so large playlists stay usable (spec NFR-6). */
+const YOUTUBE_LANGUAGE_PROBE_LIMIT = 3;
+/** Debounce typed URL changes; paste still scans immediately. */
+const YOUTUBE_AUTO_SCAN_DEBOUNCE_MS = 400;
+/** Empty-scan skeleton count; keep layout stable before the first result arrives. */
+const YOUTUBE_SCAN_SKELETON_COUNT = 3;
+
+function YouTubeScanSkeletonRows({ count }: { count: number }) {
+  return (
+    <>
+      {Array.from({ length: count }, (_, index) => (
+        <li
+          key={`youtube-scan-skeleton-${index}`}
+          className="youtube-result-row youtube-result-row-skeleton"
+          aria-hidden="true"
+        >
+          <div className="youtube-result-copy">
+            <span className="youtube-skeleton-line youtube-skeleton-title" />
+            <span className="youtube-skeleton-line youtube-skeleton-meta" />
+          </div>
+          <div className="youtube-result-overlay">
+            <span className="youtube-skeleton-line youtube-skeleton-action" />
+          </div>
+        </li>
+      ))}
+    </>
+  );
+}
 
 function groupsForVideos(targets: ResultVideo[]): DownloadGroup[] {
   const groups: DownloadGroup[] = [];
@@ -228,30 +257,50 @@ export function YouTubeView() {
   const latestRunIdRef = useRef<string | null>(null);
   const latestRevisionRef = useRef(0);
   const scanGenerationRef = useRef(0);
+  const languageProbeTokenRef = useRef(0);
   const playlistModeRef = useRef(playlistMode);
   playlistModeRef.current = playlistMode;
   const lastFingerprintRef = useRef("");
   const downloadQueueRef = useRef<DownloadGroup[]>([]);
   const startingGroupRef = useRef(false);
   const warnedRunIdRef = useRef<string | null>(null);
+  const autoScanTimerRef = useRef<number | null>(null);
+  const lastHeightSyncKeyRef = useRef<string | null>(null);
   const hasDestinationFolder = outputDir.trim().length > 0;
   const ambiguousPlaylistSource = detectedLinks.some((link) => link.kind === "ambiguous")
     || scanPlans.some((plan) => isAmbiguousWatchPlaylist(plan.canonicalUrl));
+  const sourceNewlineCount = useMemo(
+    () => (sourceUrl.match(/\n/g) ?? []).length,
+    [sourceUrl]
+  );
+  const sourceIsEmpty = sourceUrl.trim().length === 0;
 
-  const syncSearchInputHeight = useCallback(() => {
+  const syncSearchInputHeight = useCallback((force = false) => {
     const el = sourceInputRef.current;
     if (!el) return;
+    const syncKey = `${sourceNewlineCount}:${sourceIsEmpty ? "empty" : "filled"}`;
+    if (!force && lastHeightSyncKeyRef.current === syncKey) return;
+    lastHeightSyncKeyRef.current = syncKey;
     el.style.height = "0px";
     const next = Math.min(
       Math.max(el.scrollHeight, YOUTUBE_SEARCH_MIN_HEIGHT_PX),
       YOUTUBE_SEARCH_MAX_HEIGHT_PX
     );
     el.style.height = `${next}px`;
-  }, []);
+  }, [sourceNewlineCount, sourceIsEmpty]);
 
   useLayoutEffect(() => {
     syncSearchInputHeight();
-  }, [sourceUrl, syncSearchInputHeight]);
+  }, [syncSearchInputHeight]);
+
+  useEffect(() => {
+    return () => {
+      if (autoScanTimerRef.current !== null) {
+        window.clearTimeout(autoScanTimerRef.current);
+        autoScanTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!nativeRuntime) return;
@@ -319,6 +368,11 @@ export function YouTubeView() {
           const currentRunId = latestRunIdRef.current;
           const mockRun = event.runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX);
           if (currentRunId !== null && currentRunId !== event.runId && !mockRun) return;
+          // Live/preview emit full snapshots; apply them directly to avoid a refetch per revision.
+          if (isYouTubeRunSnapshot(event)) {
+            applyRunSnapshot(event, mockRun);
+            return;
+          }
           void getYouTubeDownloadState({ runId: event.runId })
             .then((snapshot) => {
               if (!disposed) applyRunSnapshot(snapshot, mockRun);
@@ -391,11 +445,13 @@ export function YouTubeView() {
       .slice(0, 8),
     [languageOptions, preferredLanguage]
   );
-  const liveAnnouncement = runSnapshot
-    ? `${runSnapshot.state}. ${runSnapshot.counts.completed} of ${runSnapshot.counts.selected} complete${runSnapshot.item ? `. ${runSnapshot.item.title}` : ""}.`
-    : videos.length > 0
-      ? `${videos.length} video${videos.length === 1 ? "" : "s"} detected.`
-      : "Paste a YouTube link to detect videos.";
+  const liveAnnouncement = isScanning && videos.length === 0
+    ? "Finding videos…"
+    : runSnapshot
+      ? `${runSnapshot.state}. ${runSnapshot.counts.completed} of ${runSnapshot.counts.selected} complete${runSnapshot.item ? `. ${runSnapshot.item.title}` : ""}.`
+      : videos.length > 0
+        ? `${videos.length} video${videos.length === 1 ? "" : "s"} detected.`
+        : "Paste a YouTube link to detect videos.";
 
   useEffect(() => {
     if (!runSnapshot || runSnapshot.state !== "completed_with_warnings") return;
@@ -413,12 +469,14 @@ export function YouTubeView() {
   function resetDetectedResults(): void {
     transcriptInspectionGenerationRef.current += 1;
     scanGenerationRef.current += 1;
+    languageProbeTokenRef.current += 1;
     lastFingerprintRef.current = "";
     setScanPlans([]);
     setVideos([]);
     setSelectedOccurrenceIds(new Set());
     setLanguageOptions([NO_CAPTION_OPTION]);
     setPreferredLanguage(null);
+    setIsDetectingLanguages(false);
     downloadQueueRef.current = [];
   }
 
@@ -432,17 +490,36 @@ export function YouTubeView() {
     return links;
   }
 
-  async function refreshDetectedLanguages(nextVideos: ResultVideo[], generation: number): Promise<void> {
+  async function refreshDetectedLanguages(
+    nextVideos: ResultVideo[],
+    generation: number,
+    occurrenceLimit = YOUTUBE_LANGUAGE_PROBE_LIMIT
+  ): Promise<void> {
     const groups = groupsForVideos(nextVideos);
-    if (groups.length === 0) {
+    if (groups.length === 0 || occurrenceLimit <= 0) {
       setLanguageOptions([NO_CAPTION_OPTION]);
       setPreferredLanguage(null);
       return;
     }
+    let remaining = occurrenceLimit;
+    const limitedGroups: DownloadGroup[] = [];
+    for (const group of groups) {
+      if (remaining <= 0) break;
+      const occurrenceIds = group.occurrenceIds.slice(0, remaining);
+      if (occurrenceIds.length === 0) continue;
+      limitedGroups.push({ scanPlanId: group.scanPlanId, occurrenceIds });
+      remaining -= occurrenceIds.length;
+    }
+    if (limitedGroups.length === 0) {
+      setLanguageOptions([NO_CAPTION_OPTION]);
+      setPreferredLanguage(null);
+      return;
+    }
+    const probeToken = ++languageProbeTokenRef.current;
     setIsDetectingLanguages(true);
     const tracks: YouTubeTranscriptTrack[] = [];
     try {
-      for (const group of groups) {
+      for (const group of limitedGroups) {
         if (generation !== scanGenerationRef.current) return;
         try {
           const response = await inspectYouTubeTranscripts({
@@ -463,8 +540,22 @@ export function YouTubeView() {
       setLanguageOptions(options);
       setPreferredLanguage((current) => pickPreferredLanguage(options, current));
     } finally {
-      if (generation === scanGenerationRef.current) setIsDetectingLanguages(false);
+      // Only the latest probe may clear the flag; an aborted probe must not
+      // clobber a newer in-flight detect (which would re-enable Language mid-work).
+      if (probeToken === languageProbeTokenRef.current) {
+        setIsDetectingLanguages(false);
+      }
     }
+  }
+
+  function ensureLanguageOptionsForSelection(): void {
+    if (isDetectingLanguages || activeRun) return;
+    if (languageOptions.some((option) => option.tag !== "")) return;
+    const selected = videos.filter((video) => selectedOccurrenceIds.has(video.item.occurrenceId));
+    const targets = selected.length > 0 ? selected : availableVideos;
+    if (targets.length === 0) return;
+    const generation = scanGenerationRef.current;
+    void refreshDetectedLanguages(targets, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
   }
 
   async function handleScan(urlOverride?: string, nextPlaylistMode?: YouTubePlaylistMode): Promise<void> {
@@ -493,11 +584,13 @@ export function YouTubeView() {
     const fingerprint = completeLinkFingerprint(complete);
     lastFingerprintRef.current = fingerprint;
     transcriptInspectionGenerationRef.current += 1;
+    languageProbeTokenRef.current += 1;
     setScanPlans([]);
     setVideos([]);
     setSelectedOccurrenceIds(new Set());
     setLanguageOptions([NO_CAPTION_OPTION]);
     setPreferredLanguage(null);
+    setIsDetectingLanguages(false);
     setIsScanning(true);
     const generation = ++scanGenerationRef.current;
     const mergedPlans: ScanYouTubeSourceResponse[] = [];
@@ -527,7 +620,8 @@ export function YouTubeView() {
         setSelectedOccurrenceIds(new Set(available.map((item) => item.occurrenceId)));
       }
       if (generation === scanGenerationRef.current) {
-        await refreshDetectedLanguages(mergedVideos, generation);
+        // Probe a bounded sample only — never full-playlist caption inspection after scan.
+        await refreshDetectedLanguages(mergedVideos, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
       }
     } catch (error) {
       if (generation !== scanGenerationRef.current) return;
@@ -542,6 +636,16 @@ export function YouTubeView() {
     if (!fingerprint) return;
     if (fingerprint === lastFingerprintRef.current) return;
     void scanCompleteLinks(links.filter((link) => link.complete));
+  }
+
+  function scheduleAutoScan(links: DetectedYouTubeLink[]): void {
+    if (autoScanTimerRef.current !== null) {
+      window.clearTimeout(autoScanTimerRef.current);
+    }
+    autoScanTimerRef.current = window.setTimeout(() => {
+      autoScanTimerRef.current = null;
+      requestAutoScan(links);
+    }, YOUTUBE_AUTO_SCAN_DEBOUNCE_MS);
   }
 
   function openDestinationFolderGate(): void {
@@ -581,9 +685,14 @@ export function YouTubeView() {
       ? pasted
       : `${sourceUrl.slice(0, start)}${pasted}${sourceUrl.slice(end)}`;
     event.preventDefault();
+    if (autoScanTimerRef.current !== null) {
+      window.clearTimeout(autoScanTimerRef.current);
+      autoScanTimerRef.current = null;
+    }
     const links = detectYouTubeLinks(next);
     setSourceUrl(next);
     setDetectedLinks(links);
+    window.setTimeout(() => syncSearchInputHeight(true), 0);
     if (!next.trim()) {
       resetDetectedResults();
       return;
@@ -596,8 +705,14 @@ export function YouTubeView() {
   function handleSourceChange(next: string): void {
     if (!ensureDestinationFolder()) return;
     const links = applySourceText(next);
-    if (!next.trim()) return;
-    requestAutoScan(links);
+    if (!next.trim()) {
+      if (autoScanTimerRef.current !== null) {
+        window.clearTimeout(autoScanTimerRef.current);
+        autoScanTimerRef.current = null;
+      }
+      return;
+    }
+    scheduleAutoScan(links);
   }
 
   function handleSearchKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): void {
@@ -607,6 +722,10 @@ export function YouTubeView() {
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
+      if (autoScanTimerRef.current !== null) {
+        window.clearTimeout(autoScanTimerRef.current);
+        autoScanTimerRef.current = null;
+      }
       void handleScan();
     }
   }
@@ -832,7 +951,7 @@ export function YouTubeView() {
             spellCheck={false}
             rows={1}
             disabled={activeRun}
-            className="youtube-search-input"
+            className="youtube-search-input min-h-0"
           />
         </div>
 
@@ -861,6 +980,7 @@ export function YouTubeView() {
             <Select
               value={preferredLanguage ?? ""}
               onChange={(event) => setPreferredLanguage(event.target.value.trim() || null)}
+              onFocus={() => ensureLanguageOptionsForSelection()}
               disabled={activeRun || isDetectingLanguages}
               aria-label="Preferred transcript language"
             >
@@ -984,8 +1104,14 @@ export function YouTubeView() {
                 </li>
               );
             })}
+            {isScanning && videos.length === 0 ? (
+              <YouTubeScanSkeletonRows count={YOUTUBE_SCAN_SKELETON_COUNT} />
+            ) : null}
+            {isScanning && videos.length > 0 ? (
+              <YouTubeScanSkeletonRows count={1} />
+            ) : null}
           </ol>
-          {isScanning && videos.length === 0 ? (
+          {isScanning ? (
             <p className="youtube-scanning" role="status">Finding videos…</p>
           ) : null}
         </section>

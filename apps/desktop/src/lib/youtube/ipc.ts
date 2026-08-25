@@ -648,9 +648,13 @@ function isYouTubeProgressEvent(value: unknown): value is YouTubeProgressEvent {
     && isRecord(value.counts);
 }
 
-function isRunSnapshot(value: unknown): value is YouTubeRunSnapshot {
+export function isYouTubeRunSnapshot(value: unknown): value is YouTubeRunSnapshot {
   if (!isRecord(value) || !isYouTubeProgressEvent(value)) return false;
   return typeof value.clientSubmissionId === "string"
     && typeof value.planFingerprint === "string"
     && Array.isArray(value.items);
+}
+
+function isRunSnapshot(value: unknown): value is YouTubeRunSnapshot {
+  return isYouTubeRunSnapshot(value);
 }

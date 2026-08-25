@@ -169,7 +169,16 @@ matches(detect, /youtu\.be/, "YouTube URL detector does not recognize youtu.be")
 matches(detect, /complete:/, "YouTube URL detector does not mark complete links");
 matches(view, /onPaste=\{handlePaste\}/, "Paste does not auto-detect YouTube links");
 matches(view, /handlePaste\([\s\S]*?detectYouTubeLinks\([\s\S]*?requestAutoScan\(links\)/, "Complete pasted URLs do not auto-scan");
-matches(view, /handleSourceChange\([\s\S]*?requestAutoScan\(links\)/, "Replacing the pasted text does not re-scan detected links");
+matches(view, /handleSourceChange\([\s\S]*?scheduleAutoScan\(links\)/, "Typed URL changes do not debounce auto-scan");
+matches(view, /YOUTUBE_AUTO_SCAN_DEBOUNCE_MS/, "Typed URL auto-scan debounce constant is missing");
+matches(view, /YOUTUBE_LANGUAGE_PROBE_LIMIT/, "Caption language probe is not capped after scan");
+matches(view, /refreshDetectedLanguages\([\s\S]*?YOUTUBE_LANGUAGE_PROBE_LIMIT/, "Post-scan caption inspection is not bounded");
+matches(view, /languageProbeTokenRef/, "Language probe supersession token is missing");
+matches(view, /probeToken === languageProbeTokenRef\.current/, "Superseded language probes can leave Language permanently disabled");
+matches(view, /setIsDetectingLanguages\(false\)/, "Rescan/reset does not clear language detection busy state");
+matches(view, /isYouTubeRunSnapshot\(event\)/, "Full run snapshots from events are refetched instead of applied");
+matches(view, /ensureLanguageOptionsForSelection/, "Language picker does not lazily probe captions when still empty");
+matches(view, /handleSearchKeyDown\([\s\S]*?autoScanTimerRef[\s\S]*?handleScan/, "Enter-to-scan does not cancel a pending typed auto-scan debounce");
 matches(view, /detectedKindLabel\(kind\)/, "Detected links are not presented as video vs playlist results");
 matches(view, /youtube-search-stage/, "Search-first stage is missing");
 matches(view, /youtube-control-cluster/, "Download options are not unified into a compact control cluster");
@@ -184,6 +193,18 @@ matches(view, /Download all/, "Multiple results do not expose Download all");
 matches(view, /youtube-download-overlay-button/, "Download is not overlaid on the result row");
 matches(view, /youtube-result-progress/, "Result rows do not show a live progress bar");
 matches(view, /syncSearchInputHeight|YOUTUBE_SEARCH_MAX_HEIGHT_PX/, "Search box does not auto-expand before the height cap");
+matches(view, /sourceNewlineCount|lastHeightSyncKeyRef/, "Search box height sync still runs on every keystroke");
+matches(view, /function YouTubeScanSkeletonRows/, "Scan skeleton row helper is missing");
+matches(view, /youtube-result-row-skeleton/, "Scan skeleton rows are missing the skeleton class");
+matches(view, /YOUTUBE_SCAN_SKELETON_COUNT/, "Empty-scan skeleton count constant is missing");
+matches(view, /isScanning && videos\.length === 0 \? \([\s\S]*?<YouTubeScanSkeletonRows count=\{YOUTUBE_SCAN_SKELETON_COUNT\} \/>/, "Empty scan does not show primary skeleton placeholders");
+matches(view, /isScanning && videos\.length > 0 \? \([\s\S]*?<YouTubeScanSkeletonRows count=\{1\} \/>/, "Multi-link scan does not keep results with a trailing skeleton");
+matches(view, /isScanning \? \([\s\S]*?Finding videos…/, "Scan status copy is missing while skeletons are shown");
+matches(styles, /\.youtube-result-row-skeleton/, "YouTube scan skeleton styles are missing");
+matches(styles, /\.youtube-skeleton-line/, "YouTube skeleton line styles are missing");
+matches(styles, /@keyframes youtube-skeleton-shimmer/, "YouTube skeleton shimmer animation is missing");
+matches(styles, /\.youtube-result-row \{[\s\S]*?border-radius: 10px;/, "Result rows do not use the shared 10px radius");
+includes(styles, ".youtube-view *::before", "YouTube reduced-motion contract no longer targets pseudo-elements");
 
 // The route exposes a usable keyboard/screen-reader surface and a live progress channel.
 for (const fragment of [
