@@ -7,7 +7,7 @@ const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL 
 const page = await browser.newPage({ viewport: { width: 1720, height: 960 } });
 await page.goto(url);
 await page.waitForFunction(() => Boolean(document.documentElement.dataset.theme));
-const linkedInDownloadButton = page.getByRole("button", { name: "Start Download", exact: true });
+const linkedInDownloadButton = page.getByRole("button", { name: "Download", exact: true });
 const linkedInButtonBox = await linkedInDownloadButton.boundingBox();
 const linkedInButtonClass = await linkedInDownloadButton.getAttribute("class");
 const linkedInScheduleButton = page.getByRole("button", { name: "Schedule", exact: true });

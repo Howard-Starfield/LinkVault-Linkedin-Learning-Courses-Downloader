@@ -20,7 +20,7 @@ use thiserror::Error;
 // Bump this whenever any provider-owned schema changes. Provider migrations run
 // only while advancing this global version, so leaving it unchanged would make
 // existing installations skip new columns that fresh databases already have.
-pub const CURRENT_SCHEMA_VERSION: i32 = 6;
+pub const CURRENT_SCHEMA_VERSION: i32 = 7;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -130,6 +130,19 @@ CREATE TABLE IF NOT EXISTS coursera_settings (
 
 CREATE INDEX IF NOT EXISTS idx_coursera_jobs_status ON coursera_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_coursera_events_job ON coursera_job_events(job_id);
+
+CREATE TABLE IF NOT EXISTS youtube_jobs (
+    id TEXT PRIMARY KEY NOT NULL,
+    source_url TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT,
+    status TEXT NOT NULL,
+    output_dir TEXT NOT NULL,
+    warning TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_youtube_jobs_status ON youtube_jobs(status);
 "#;
 
 pub fn initialize_database(
@@ -274,7 +287,7 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn schema_version(connection: &Connection) -> Result<i32> {
+pub(crate) fn schema_version(connection: &Connection) -> Result<i32> {
     connection.pragma_query_value(None, "user_version", |row| row.get(0))
 }
 

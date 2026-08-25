@@ -125,7 +125,26 @@ pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
     else {
         return Ok(None);
     };
+    process_prepared_job_and_download_artifacts_with_quiz_assessments(
+        connection,
+        course_client,
+        artifact_client,
+        cancellation,
+        timestamp,
+        quiz_assessments,
+        queued_job,
+    )
+}
 
+pub fn process_prepared_job_and_download_artifacts_with_quiz_assessments(
+    connection: &Connection,
+    course_client: &mut impl CourseApiClient,
+    artifact_client: &mut impl ArtifactHttpClient,
+    cancellation: &impl CancellationFlag,
+    timestamp: i64,
+    quiz_assessments: Vec<CourseAssessment>,
+    queued_job: JobRecord,
+) -> Result<Option<ArtifactDownloadSummary>, DownloadOrchestrationError> {
     transition_job_status(
         connection,
         &queued_job.id,

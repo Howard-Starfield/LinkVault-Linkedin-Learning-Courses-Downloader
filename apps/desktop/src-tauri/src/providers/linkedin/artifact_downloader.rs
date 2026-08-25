@@ -21,6 +21,8 @@ const DEFAULT_VIDEO_WAIT_MIN_SECONDS: u32 = 0;
 #[cfg(test)]
 const DEFAULT_VIDEO_WAIT_MAX_SECONDS: u32 = 0;
 
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactDownloadSource {
     Url(String),
@@ -49,6 +51,25 @@ pub struct ArtifactHttpAttempt {
 
 pub trait ArtifactHttpClient {
     fn get_bytes(&mut self, url: &str) -> Result<ArtifactHttpResponse, ArtifactDownloadError>;
+
+    /// Write a successful URL body to `dest`.
+    ///
+    /// The default implementation buffers via [`get_bytes`]; live LinkedIn
+    /// downloads override this to stream in 64 KiB chunks.
+    fn save_url_to_path(
+        &mut self,
+        url: &str,
+        dest: &Path,
+    ) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
+        let response = self.get_bytes(url)?;
+        if (200..300).contains(&response.status) {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(dest, &response.bytes)?;
+        }
+        Ok(response)
+    }
 }
 
 pub trait CancellationFlag {
@@ -530,34 +551,51 @@ fn write_artifact(
     cancellation: &impl CancellationFlag,
     download: &PlannedArtifactDownload,
 ) -> Result<ArtifactWriteOutcome, ArtifactDownloadError> {
-    let bytes = match &download.source {
-        ArtifactDownloadSource::Text(text) => text.as_bytes().to_vec(),
-        ArtifactDownloadSource::Url(url) => download_bytes_from_urls(client, &[url])?,
+    let dest = Path::new(&download.artifact.path);
+    let staging = partial_path(dest);
+    let size_bytes = match &download.source {
+        ArtifactDownloadSource::Text(text) => {
+            write_bytes_to_path(&staging, text.as_bytes())?;
+            text.len() as i64
+        }
+        ArtifactDownloadSource::Url(url) => {
+            download_url_to_path(client, &[url.as_str()], &staging)?
+        }
         ArtifactDownloadSource::Urls(urls) => {
             let url_refs = urls.iter().map(String::as_str).collect::<Vec<_>>();
-            download_bytes_from_urls(client, &url_refs)?
+            download_url_to_path(client, &url_refs, &staging)?
         }
     };
     cancellation.wait_if_paused();
     if cancellation.is_cancelled() {
+        let _ = fs::remove_file(&staging);
         return Ok(ArtifactWriteOutcome::CancelledBeforeWrite);
     }
 
-    write_bytes_atomically(Path::new(&download.artifact.path), &bytes)?;
-    Ok(ArtifactWriteOutcome::Written(bytes.len() as i64))
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Err(error) = fs::rename(&staging, dest) {
+        let _ = fs::remove_file(&staging);
+        return Err(error.into());
+    }
+    Ok(ArtifactWriteOutcome::Written(size_bytes))
 }
 
-fn download_bytes_from_urls(
+fn download_url_to_path(
     client: &mut impl ArtifactHttpClient,
     urls: &[&str],
-) -> Result<Vec<u8>, ArtifactDownloadError> {
+    dest: &Path,
+) -> Result<i64, ArtifactDownloadError> {
     let mut attempts = Vec::new();
     for url in urls {
-        match client.get_bytes(url) {
+        match client.save_url_to_path(url, dest) {
             Ok(response) if (200..300).contains(&response.status) => {
-                return Ok(response.bytes);
+                let size = i64::try_from(fs::metadata(dest)?.len()).unwrap_or(0);
+                return Ok(size);
             }
             Ok(response) => {
+                let _ = fs::remove_file(dest);
                 attempts.push(ArtifactHttpAttempt {
                     url: (*url).to_string(),
                     status: Some(response.status),
@@ -565,13 +603,17 @@ fn download_bytes_from_urls(
                 });
             }
             Err(ArtifactDownloadError::Network(kind)) => {
+                let _ = fs::remove_file(dest);
                 attempts.push(ArtifactHttpAttempt {
                     url: (*url).to_string(),
                     status: None,
                     error_kind: Some(kind),
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _ = fs::remove_file(dest);
+                return Err(error);
+            }
         }
     }
 
@@ -582,15 +624,42 @@ fn download_bytes_from_urls(
     }
 }
 
-fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+fn write_bytes_to_path(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    fs::write(path, bytes)
+}
 
-    let temp_path = partial_path(path);
-    fs::write(&temp_path, bytes)?;
-    fs::rename(&temp_path, path)?;
-    Ok(())
+pub(crate) fn copy_reader_to_path(
+    reader: &mut impl std::io::Read,
+    dest: &Path,
+) -> Result<u64, std::io::Error> {
+    use std::io::Write;
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(dest)?;
+    let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
+    let mut written = 0_u64;
+    let result = (|| -> Result<u64, std::io::Error> {
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buffer[..n])?;
+            written += n as u64;
+        }
+        file.flush()?;
+        Ok(written)
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(dest);
+    }
+    result
 }
 
 fn partial_path(path: &Path) -> PathBuf {
@@ -879,6 +948,58 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
         connection
+    }
+
+    struct StreamingOnlyClient;
+
+    impl ArtifactHttpClient for StreamingOnlyClient {
+        fn get_bytes(&mut self, url: &str) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
+            panic!("url artifacts must stream to disk; get_bytes was called for {url}");
+        }
+
+        fn save_url_to_path(
+            &mut self,
+            url: &str,
+            dest: &Path,
+        ) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
+            assert_eq!(url, "https://cdn/video.mp4");
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(dest, b"streamed-video").unwrap();
+            Ok(ArtifactHttpResponse {
+                status: 200,
+                bytes: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn url_artifact_streams_to_path_without_get_bytes() {
+        let output = tempdir().unwrap();
+        let dest = output.path().join("course").join("video.mp4");
+        let download = planned_url(
+            "artifact-video",
+            "job-1",
+            "video",
+            &dest,
+            "https://cdn/video.mp4",
+        );
+        let mut client = StreamingOnlyClient;
+        let outcome = write_artifact(&mut client, &NeverCancelled, &download).unwrap();
+        assert_eq!(outcome, ArtifactWriteOutcome::Written(14));
+        assert_eq!(fs::read(&dest).unwrap(), b"streamed-video");
+    }
+
+    #[test]
+    fn copy_reader_to_path_writes_payload_larger_than_chunk() {
+        let output = tempdir().unwrap();
+        let dest = output.path().join("blob.bin");
+        let payload = vec![7_u8; STREAM_CHUNK_BYTES + 1500];
+        let mut cursor = Cursor::new(payload.clone());
+        let written = copy_reader_to_path(&mut cursor, &dest).unwrap();
+        assert_eq!(written as usize, payload.len());
+        assert_eq!(fs::read(&dest).unwrap(), payload);
     }
 
     #[test]

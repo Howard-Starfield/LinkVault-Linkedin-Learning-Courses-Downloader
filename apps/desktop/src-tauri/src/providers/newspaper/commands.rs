@@ -40,6 +40,7 @@ use super::{
     thumbnails::{EnsureThumbnailResult, ThumbnailCoordinator},
 };
 use crate::cache::{clear_newspaper_provider_data, NewspaperResetCounts};
+use crate::workflow::application::runtime::WorkflowRuntime;
 
 pub use super::state::NewspaperState;
 
@@ -54,8 +55,9 @@ pub fn schedule_page_dimension_backfill(app: &tauri::AppHandle) {
 #[tauri::command]
 pub fn bootstrap_newspaper_state(
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
 ) -> Result<NewspaperBootstrap, String> {
-    overview_service::bootstrap(state.db_path())
+    overview_service::bootstrap(state.db_path(), Some(&runtime))
 }
 
 #[tauri::command]
@@ -75,9 +77,10 @@ pub async fn refresh_newspaper_catalog(
 #[tauri::command]
 pub fn create_newspaper_batch(
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
     request: CreateNewspaperBatchRequest,
 ) -> Result<CreateNewspaperBatchResponse, String> {
-    batch_service::create(state.db_path(), request)
+    batch_service::create(state.db_path(), &runtime, request)
 }
 
 /// Thin Phase 2 adapter: all source resolution, filesystem work, staging,
@@ -145,13 +148,39 @@ pub fn delete_newspaper_schedule(
 pub async fn process_newspaper_queue(
     app: tauri::AppHandle,
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
 ) -> Result<Vec<NewspaperJob>, String> {
     if state.download_running.swap(true, Ordering::SeqCst) {
         return Ok(Vec::new());
     }
     state.cancelled.store(false, Ordering::SeqCst);
-    let result = match schedule_service::materialize_due(state.db_path()) {
-        Ok(()) => queue_service::process_queue(state.db_path(), &state.cancelled, &app).await,
+    let db_path = state.db_path().to_path_buf();
+    let cancelled = Arc::clone(&state.cancelled);
+    let runtime = (*runtime).clone();
+    let result = match tauri::async_runtime::spawn_blocking({
+        let db_path = db_path.clone();
+        let cancelled = Arc::clone(&cancelled);
+        let runtime = runtime.clone();
+        move || {
+            schedule_service::materialize_due(&db_path, Some(&runtime))?;
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    break;
+                }
+                let outcome = runtime
+                    .drain_type("newspaper_download")
+                    .map_err(|error| error.to_string())?;
+                if !outcome.processed {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    {
+        Ok(()) => queue_service::process_queue(&db_path, &cancelled, &app).await,
         Err(error) => Err(error),
     };
     state.download_running.store(false, Ordering::SeqCst);
@@ -245,9 +274,11 @@ pub fn pause_newspaper_batch(
 #[tauri::command]
 pub fn cancel_newspaper_batch(
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
     batch_id: String,
 ) -> Result<(), String> {
     batch_service::cancel(state.db_path(), &batch_id)?;
+    cancel_newspaper_workflow_runs(&runtime, &batch_id)?;
     state.cancelled.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -295,6 +326,7 @@ pub fn set_all_newspaper_jobs_paused(
 #[tauri::command]
 pub fn reset_newspaper_database(
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
     app: tauri::AppHandle,
 ) -> Result<NewspaperResetCounts, String> {
     // The UI is expected to call set_all_newspaper_jobs_paused(true) first
@@ -309,6 +341,9 @@ pub fn reset_newspaper_database(
         .dimension_backfill_running
         .store(false, Ordering::SeqCst);
     state.set_optimization_runtime(OptimizationRuntimeStatus::default());
+    runtime
+        .delete_newspaper_runs()
+        .map_err(|error| error.to_string())?;
 
     let connection =
         crate::cache::open_runtime(state.db_path()).map_err(|error| error.to_string())?;
@@ -355,9 +390,28 @@ pub fn reorder_newspaper_jobs(
 pub fn remove_newspaper_job(
     app: tauri::AppHandle,
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<(), String> {
-    let status = job_service::delete(state.db_path(), &job_id)?;
+    let status = match job_service::delete(state.db_path(), &job_id) {
+        Ok(status) => status,
+        Err(error) => {
+            if runtime
+                .get_run(job_id.clone())
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                cancel_or_delete_newspaper_run(&runtime, &job_id)?;
+                let _ = app.emit(
+                    "newspaper://clipping-invalidated",
+                    serde_json::json!({ "reason": "source_changed", "jobId": job_id }),
+                );
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    cancel_or_delete_newspaper_run(&runtime, &job_id)?;
     if matches!(status.as_str(), "active" | "optimizing") {
         state.cancelled.store(true, Ordering::SeqCst);
     }
@@ -411,12 +465,14 @@ pub async fn get_newspaper_library_item(
 #[tauri::command]
 pub async fn get_newspaper_activity_snapshot(
     state: State<'_, NewspaperState>,
+    runtime: State<'_, WorkflowRuntime>,
 ) -> Result<NewspaperActivitySnapshot, String> {
     let db_path = state.db_path.clone();
     let revision = state.progress_revision();
-    let runtime = state.optimization_runtime();
+    let optimization_runtime = state.optimization_runtime();
+    let runtime = (*runtime).clone();
     tauri::async_runtime::spawn_blocking(move || {
-        overview_service::activity(&db_path, revision, runtime)
+        overview_service::activity(&db_path, revision, optimization_runtime, Some(&runtime))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -744,19 +800,8 @@ pub async fn open_newspaper_snapshot_root(
         let path = service
             .verified_root_open_path(&root_id)
             .map_err(|error| error.as_safe_string())?;
-        #[cfg(windows)]
-        {
-            std::process::Command::new("explorer")
-                .arg(path)
-                .spawn()
-                .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?;
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = path;
-            Err("CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())
-        }
+        crate::shell::open_folder_in_explorer(&path)
+            .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())
     })
     .await
     .map_err(|_| "CLIPPING_ASSET_ROOT_UNAVAILABLE".to_string())?
@@ -764,19 +809,7 @@ pub async fn open_newspaper_snapshot_root(
 
 #[tauri::command]
 pub fn open_newspaper_download_folder(path: String) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        std::process::Command::new("explorer")
-            .arg(&path)
-            .spawn()
-            .map_err(|error| error.to_string())?;
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        return Err("Opening newspaper folders is currently supported on Windows.".to_string());
-    }
-    Ok(())
+    crate::shell::open_folder_in_explorer(Path::new(&path))
 }
 
 #[tauri::command]
@@ -810,4 +843,66 @@ pub async fn repair_newspaper_library(
         library_events::after_archive_change(&app, &state)?;
     }
     result
+}
+
+fn cancel_newspaper_workflow_runs(runtime: &WorkflowRuntime, batch_id: &str) -> Result<(), String> {
+    let now = Utc::now().timestamp();
+    for run in runtime
+        .list_newspaper_runs(1_000)
+        .map_err(|error| error.to_string())?
+    {
+        if run.state.is_terminal() {
+            continue;
+        }
+        let job = super::projection::job_from_run(&run);
+        if job.batch_id == batch_id {
+            runtime
+                .cancel_run(run.id, now)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn cancel_or_delete_newspaper_run(runtime: &WorkflowRuntime, job_id: &str) -> Result<(), String> {
+    if let Some(run) = runtime
+        .get_run(job_id.to_string())
+        .map_err(|error| error.to_string())?
+    {
+        if !run.state.is_terminal() {
+            runtime
+                .cancel_run(job_id.to_string(), Utc::now().timestamp())
+                .map_err(|error| error.to_string())?;
+        }
+        let _ = runtime.delete_run_if_terminal(job_id.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn download_queue_command_does_not_run_sqlite_on_the_async_executor() {
+        let source = include_str!("commands.rs");
+        assert!(
+            source.contains("pub async fn process_newspaper_queue"),
+            "queue processing must stay an async command so it can yield"
+        );
+        let process_fn = source
+            .split("pub async fn process_newspaper_queue")
+            .nth(1)
+            .unwrap_or_default();
+        let process_fn = process_fn
+            .split("#[tauri::command]")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            process_fn.contains("tauri::async_runtime::spawn_blocking"),
+            "materialize_due must use spawn_blocking"
+        );
+        assert!(
+            process_fn.contains("Arc::clone(&state.cancelled)"),
+            "clone cancelled before the download pass so the command does not borrow state across .await"
+        );
+    }
 }

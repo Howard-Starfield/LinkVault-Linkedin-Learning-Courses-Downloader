@@ -954,6 +954,24 @@ impl ClippingAssetLayout {
         )
     }
 
+    /// Resolve a contained canonical file for Range serving without loading it.
+    /// Size is checked; checksum and decode stay on the full-body path.
+    pub fn open_canonical_file_for_protocol(
+        &self,
+        clipping_id: &str,
+        relative: &str,
+        expected_byte_count: u64,
+    ) -> Result<PathBuf, ClippingError> {
+        let path = self.contained_regular_file(&self.canonical_path_at(clipping_id, relative)?)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::AssetMissing))?;
+        if !validate_asset_byte_count(expected_byte_count) || metadata.len() != expected_byte_count
+        {
+            return Err(ClippingError::new(ClippingErrorCode::AssetValidationFailed));
+        }
+        Ok(path)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn read_validated_canonical_for_protocol_inner<F>(
         &self,

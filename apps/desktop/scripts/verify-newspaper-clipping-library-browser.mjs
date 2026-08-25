@@ -768,8 +768,11 @@ try {
   await page.evaluate(() => { window.__CLIPPING_LIBRARY_TEST__.details = []; });
   await page.getByRole("button", { name: "Clippings", exact: true }).click();
   await page.getByRole("heading", { name: "No clippings yet" }).waitFor();
-  assert.equal(await page.locator(".clipping-gallery__skeletons:not(.is-loading) > span").count(), 4, "empty gallery does not show four clipping skeletons");
-  await page.getByText("Clips you save from Newspaper library appear here with their notes.", { exact: true }).waitFor();
+  assert.equal(await page.locator(".clipping-gallery__empty-card").count(), 1, "empty gallery does not show the refined empty card");
+  assert.equal(await page.locator(".clipping-gallery__skeletons:not(.is-loading)").count(), 0, "empty gallery still shows decorative skeletons");
+  await page.getByText("Save clips from Newspaper library and they will show up here with their notes.", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "List view" }).waitFor();
+  await page.getByRole("button", { name: "Gallery view" }).waitFor();
   await page.getByText("0 clippings", { exact: true }).waitFor();
   if (process.env.LINKVAULT_CLIPPING_EMPTY_SCREENSHOT) {
     await page.screenshot({ path: process.env.LINKVAULT_CLIPPING_EMPTY_SCREENSHOT });

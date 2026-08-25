@@ -10,7 +10,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <Toaster
       theme="dark"
       visibleToasts={5}
-      position="bottom-right"
+      position="bottom-left"
+      offset={20}
       className="lv-toaster"
       toastOptions={{
         classNames: {
@@ -20,7 +21,9 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
           success: "lv-toast-success",
           error: "lv-toast-error",
           warning: "lv-toast-warning",
-          info: "lv-toast-info"
+          info: "lv-toast-info",
+          closeButton: "lv-toast-close",
+          actionButton: "lv-toast-action"
         }
       }}
     />

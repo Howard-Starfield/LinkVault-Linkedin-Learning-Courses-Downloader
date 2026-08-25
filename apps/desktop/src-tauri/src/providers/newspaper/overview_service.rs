@@ -10,8 +10,9 @@ use super::{
         NewspaperActivitySnapshot, NewspaperBootstrap, NewspaperJob, NewspaperJobProgress,
         OptimizationRuntimeStatus,
     },
-    reader_service, schedule_service,
+    projection, reader_service, schedule_service,
 };
+use crate::workflow::application::runtime::WorkflowRuntime;
 
 struct RawOptimizationProgress {
     total: u32,
@@ -26,12 +27,15 @@ struct RawOptimizationProgress {
     last_completed_at: Option<i64>,
 }
 
-pub(super) fn bootstrap(db_path: &Path) -> Result<NewspaperBootstrap, String> {
+pub(super) fn bootstrap(
+    db_path: &Path,
+    runtime: Option<&WorkflowRuntime>,
+) -> Result<NewspaperBootstrap, String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
     Ok(NewspaperBootstrap {
         catalog: catalog_service::list_with_connection(&connection)?,
         batches: batch_service::list(&connection)?,
-        jobs: job_repository::list(&connection, None)?,
+        jobs: merge_jobs(&connection, runtime)?,
         schedules: schedule_service::list(&connection)?,
         reading_progress: reader_service::list_progress(&connection)?,
         settings: load_settings(&connection)?,
@@ -42,9 +46,10 @@ pub(super) fn activity(
     db_path: &Path,
     revision: u64,
     optimization_runtime: OptimizationRuntimeStatus,
+    runtime: Option<&WorkflowRuntime>,
 ) -> Result<NewspaperActivitySnapshot, String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    let jobs = job_repository::list(&connection, None)?;
+    let jobs = merge_jobs(&connection, runtime)?;
     let progress = job_progress(&connection, &jobs)?;
     let has_live_activity = jobs.iter().any(|job| {
         matches!(job.status.as_str(), "queued" | "active" | "optimizing") || job.retry_at.is_some()
@@ -169,6 +174,23 @@ fn current_stage(
     .to_string()
 }
 
+fn merge_jobs(
+    connection: &Connection,
+    runtime: Option<&WorkflowRuntime>,
+) -> Result<Vec<NewspaperJob>, String> {
+    let legacy = job_repository::list(connection, None)?;
+    let Some(runtime) = runtime else {
+        return Ok(legacy);
+    };
+    let workflow = runtime
+        .list_newspaper_runs(500)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(projection::job_from_run)
+        .collect();
+    Ok(projection::merge_newspaper_jobs(workflow, legacy))
+}
+
 pub(super) fn load_settings(connection: &Connection) -> Result<serde_json::Value, String> {
     let value: Option<String> = connection
         .query_row(
@@ -259,6 +281,7 @@ mod tests {
                 active: true,
                 ..OptimizationRuntimeStatus::default()
             },
+            None,
         )
         .unwrap();
         let progress = &snapshot.progress[0];

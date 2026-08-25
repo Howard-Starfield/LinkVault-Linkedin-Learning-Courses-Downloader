@@ -9,11 +9,15 @@ pub mod database;
 pub mod database_diagnostics;
 pub mod database_migrations;
 pub mod database_writer;
+pub mod dpapi;
+pub mod managed_process;
 #[cfg(feature = "crop-baseline")]
 pub mod newspaper_clipping_crop_baseline;
 #[cfg(feature = "durability-baseline")]
 pub mod newspaper_clipping_note_durability_baseline;
+pub mod safe_output_filesystem;
 pub mod security;
+pub mod shell;
 pub mod storage;
 pub(crate) mod updates;
 pub(crate) mod window_activation;

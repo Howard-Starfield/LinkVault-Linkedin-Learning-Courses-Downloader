@@ -9,11 +9,11 @@ use crate::browser_cookies::{
 };
 use crate::cache::{
     append_job_event, clear_failed_jobs, clear_job_schedule, clear_linkedin_provider_data,
-    get_course_cache_entry, get_job, get_setting, insert_job, list_artifacts_for_job,
-    list_download_history, list_job_events, list_jobs_by_status, list_ready_queued_jobs,
-    list_recent_jobs, open_runtime, remove_completed_download_job, remove_download_job,
-    retry_failed_job, set_all_download_jobs_paused, set_download_job_paused, upsert_setting_json,
-    DownloadHistoryEntry, JobRecord, NewJobEvent, ProviderResetCounts,
+    get_course_cache_entry, get_job, get_setting, list_artifacts_for_job, list_download_history,
+    list_job_events, list_jobs_by_status, list_ready_queued_jobs, list_recent_jobs, open_runtime,
+    remove_completed_download_job, remove_download_job, set_all_download_jobs_paused,
+    set_download_job_paused, upsert_setting_json, DownloadHistoryEntry, JobRecord, NewJobEvent,
+    ProviderResetCounts,
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
@@ -21,16 +21,18 @@ use crate::linkedin::{parse_course_urls, CourseUrl};
 use crate::live_clients::AuthenticatedLinkedInClient;
 use crate::quality::{fallback_order, VideoQuality};
 use crate::quiz_hints::{quiz_hints_from_json, quiz_hints_json, QuizHints};
+use crate::shell::open_folder_in_explorer;
 use crate::token_store;
+use crate::workflow::application::runtime::{DrainOutcome, WorkflowRuntime};
+use crate::workflow::domain::state::RunState;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,16 +42,33 @@ pub struct LinkVaultState {
     token_path: PathBuf,
     download_cancellation: Arc<AtomicBool>,
     download_paused: Arc<AtomicBool>,
+    session_token: Arc<Mutex<Option<String>>>,
 }
 
 impl LinkVaultState {
+    #[cfg(test)]
     pub fn new(db_path: PathBuf) -> Self {
+        Self::with_shared_flags(
+            db_path,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    pub fn with_shared_flags(
+        db_path: PathBuf,
+        download_cancellation: Arc<AtomicBool>,
+        download_paused: Arc<AtomicBool>,
+        session_token: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         let token_path = db_path.with_file_name("linkvault.li_at.dpapi");
         Self {
             db_path,
             token_path,
-            download_cancellation: Arc::new(AtomicBool::new(false)),
-            download_paused: Arc::new(AtomicBool::new(false)),
+            download_cancellation,
+            download_paused,
+            session_token,
         }
     }
 
@@ -76,6 +95,10 @@ impl LinkVaultState {
 
     fn set_download_paused(&self, paused: bool) {
         self.download_paused.store(paused, Ordering::SeqCst);
+    }
+
+    fn session_token_slot(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.session_token)
     }
 
     #[cfg(test)]
@@ -261,16 +284,18 @@ pub struct OpenDownloadFolderResponse {
 }
 
 #[tauri::command]
-pub fn bootstrap_state(state: tauri::State<'_, LinkVaultState>) -> Result<BootstrapState, String> {
+pub fn bootstrap_state(
+    state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
+) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
     let history_file_path = download_history_file_path_for_db(&state.db_path);
-    let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -286,10 +311,11 @@ pub fn quality_fallback_order(selected: VideoQuality) -> Vec<VideoQuality> {
 #[tauri::command]
 pub fn start_download_jobs(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     request: StartDownloadRequest,
 ) -> Result<StartDownloadResponse, String> {
     let connection = state.connection()?;
-    queue_download_jobs(&connection, request, now_unix_timestamp())
+    queue_download_jobs(&runtime, &connection, request, now_unix_timestamp())
         .map_err(|error| error.to_string())
 }
 
@@ -321,18 +347,29 @@ pub fn cancel_active_download(
 #[tauri::command]
 pub fn set_download_job_pause(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
     paused: bool,
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
-    let job = set_download_job_paused(&connection, &job_id, paused, now_unix_timestamp())
-        .map_err(|error| error.to_string())?;
-    if job.status == "active" {
-        state.set_download_paused(paused);
+    match set_download_job_paused(&connection, &job_id, paused, now_unix_timestamp()) {
+        Ok(job) => {
+            if job.status == "active" {
+                state.set_download_paused(paused);
+            }
+        }
+        Err(_) => {
+            if let Some(run) = runtime.get_run(job_id).map_err(|error| error.to_string())? {
+                if matches!(run.state, RunState::Running | RunState::Cancelling) {
+                    state.set_download_paused(paused);
+                }
+            }
+        }
     }
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
@@ -341,6 +378,7 @@ pub fn set_download_job_pause(
 #[tauri::command]
 pub fn set_all_downloads_paused(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     paused: bool,
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
@@ -350,6 +388,7 @@ pub fn set_all_downloads_paused(
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
@@ -358,12 +397,16 @@ pub fn set_all_downloads_paused(
 #[tauri::command]
 pub fn reset_linkedin_database(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<ProviderResetCounts, String> {
     // The UI is expected to call set_all_downloads_paused(true) first so the
     // worker unwinds at a safe boundary. We still defensively re-arm the
     // flags here so a stale in-flight request can't keep writing after the
     // wipe commits.
     state.set_download_paused(true);
+    runtime
+        .delete_linkedin_runs()
+        .map_err(|error| error.to_string())?;
     let connection = state.connection()?;
     let counts = clear_linkedin_provider_data(&connection).map_err(|error| error.to_string())?;
     // Regenerate the history markdown so the next read sees a valid empty
@@ -377,57 +420,79 @@ pub fn reset_linkedin_database(
 #[tauri::command]
 pub fn retry_failed_download_job(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
-    retry_failed_job(&connection, &job_id, now_unix_timestamp())
-        .map_err(|error| error.to_string())?;
+    retry_failed_download_job_inner(&runtime, &connection, job_id, now_unix_timestamp())?;
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn clear_failed_download_jobs(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<BootstrapState, String> {
+    runtime
+        .delete_terminal_linkedin_runs()
+        .map_err(|error| error.to_string())?;
     let connection = state.connection()?;
     clear_failed_jobs(&connection).map_err(|error| error.to_string())?;
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn remove_download_queue_item(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
+    let now = now_unix_timestamp();
+    let mut removed_workflow = false;
+    if runtime
+        .get_run(job_id.clone())
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        let _ = runtime.cancel_run(job_id.clone(), now);
+        removed_workflow = runtime
+            .delete_run_if_terminal(job_id.clone())
+            .map_err(|error| error.to_string())?;
+    }
     let connection = state.connection()?;
-    remove_download_job(&connection, &job_id).map_err(|error| error.to_string())?;
+    match remove_download_job(&connection, &job_id) {
+        Ok(_) => {}
+        Err(_error) if removed_workflow => {}
+        Err(error) => return Err(error.to_string()),
+    }
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn delete_completed_download(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
@@ -442,32 +507,57 @@ pub fn delete_completed_download(
         list_artifacts_for_job(&connection, &job.id).map_err(|error| error.to_string())?;
     delete_completed_download_files(&job, &artifacts)?;
     remove_completed_download_job(&connection, &job.id).map_err(|error| error.to_string())?;
+    let _ = runtime.delete_run_if_terminal(job_id);
 
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn download_scheduled_job_now(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
-    clear_job_schedule(&connection, &job_id, now_unix_timestamp())
-        .map_err(|error| error.to_string())?;
+    let now = now_unix_timestamp();
+    if let Some(run) = runtime
+        .get_run(job_id.clone())
+        .map_err(|error| error.to_string())?
+    {
+        let mut request: super::projection::LinkedInWorkflowRequest =
+            serde_json::from_str(&run.request_json).map_err(|error| error.to_string())?;
+        request.scheduled_at = None;
+        runtime
+            .cancel_run(job_id.clone(), now)
+            .map_err(|error| error.to_string())?;
+        let _ = runtime.delete_run_if_terminal(job_id.clone());
+        runtime
+            .submit_linkedin_download(
+                job_id,
+                request.course_slug.clone(),
+                serde_json::to_string(&request).map_err(|error| error.to_string())?,
+                run.output_root,
+                now,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        clear_job_schedule(&connection, &job_id, now).map_err(|error| error.to_string())?;
+    }
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     load_bootstrap_state(
         &connection,
+        Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -511,7 +601,7 @@ pub fn open_download_folder(
     let artifacts =
         list_artifacts_for_job(&connection, &job.id).map_err(|error| error.to_string())?;
     let folder = download_folder_for_job(&job, &artifacts);
-    open_folder_in_file_explorer(&folder)?;
+    open_folder_in_explorer(&folder)?;
     Ok(OpenDownloadFolderResponse {
         path: folder.to_string_lossy().to_string(),
     })
@@ -521,10 +611,25 @@ pub fn open_download_folder(
 pub async fn process_next_queued_download_with_saved_token(
     app: tauri::AppHandle,
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let db_path = state.db_path.clone();
     let token_path = state.token_path.clone();
     let cancellation = state.reset_download_cancellation();
+    let runtime = (*runtime).clone();
+    let drained = tauri::async_runtime::spawn_blocking({
+        let runtime = runtime.clone();
+        move || {
+            runtime
+                .drain_type("linkedin_download")
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    if drained.processed {
+        return Ok(drain_outcome_to_process_response(drained));
+    }
     let token_and_session = tauri::async_runtime::spawn_blocking(move || {
         let token = token_store::load_token(&token_path).map_err(|error| error.to_string())?;
         let mut home_client =
@@ -557,25 +662,51 @@ pub async fn process_next_queued_download_with_saved_token(
 #[tauri::command]
 pub async fn process_queued_download_batch_with_saved_token(
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     request: ProcessQueuedBatchRequest,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let db_path = state.db_path.clone();
     let token_path = state.token_path.clone();
     let cancellation = state.reset_download_cancellation();
+    let runtime = (*runtime).clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let mut combined = ProcessQueuedDownloadResponse {
+            processed: false,
+            completed_artifacts: 0,
+            failed_artifacts: 0,
+            cancelled_artifacts: 0,
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(combined);
+            }
+            let outcome = runtime
+                .drain_type("linkedin_download")
+                .map_err(|error| error.to_string())?;
+            if !outcome.processed {
+                break;
+            }
+            merge_process_response(&mut combined, &drain_outcome_to_process_response(outcome));
+            if combined.cancelled_artifacts > 0 || cancellation.is_cancelled() {
+                return Ok(combined);
+            }
+            sleep_between_queued_courses(request.delay_seconds, &cancellation);
+        }
         let token = token_store::load_token(&token_path).map_err(|error| error.to_string())?;
         let mut home_client =
             ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
         let session = validate_li_at_with_client(&token, &mut home_client)
             .map_err(|error| error.to_string())?;
-        process_queued_download_batch_with_validated_token(
+        let legacy = process_queued_download_batch_with_validated_token(
             db_path,
             token,
             session,
             request.delay_seconds,
             now_unix_timestamp(),
             cancellation,
-        )
+        )?;
+        merge_process_response(&mut combined, &legacy);
+        Ok(combined)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -585,10 +716,13 @@ pub async fn process_queued_download_batch_with_saved_token(
 pub async fn process_next_queued_download_from_browser_source(
     app: tauri::AppHandle,
     state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
     source: BrowserSource,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let db_path = state.db_path.clone();
     let cancellation = state.reset_download_cancellation();
+    let session_token = state.session_token_slot();
+    let runtime = (*runtime).clone();
     let token_and_session = tauri::async_runtime::spawn_blocking(move || {
         let roots = BrowserCookieRoots::from_env();
         let decoder = chromium_user_data_path_for_source(source, &roots)
@@ -606,6 +740,32 @@ pub async fn process_next_queued_download_from_browser_source(
     .map_err(|error| error.to_string())??;
 
     let (token, session) = token_and_session;
+    {
+        let mut slot = session_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(token.clone());
+    }
+    let drained = tauri::async_runtime::spawn_blocking({
+        let runtime = runtime.clone();
+        move || {
+            runtime
+                .drain_type("linkedin_download")
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|error| error.to_string());
+    {
+        let mut slot = session_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+    let drained = drained??;
+    if drained.processed {
+        return Ok(drain_outcome_to_process_response(drained));
+    }
     let quiz_assessments =
         extract_quizzes_for_next_job(app, db_path.clone(), session.clone(), now_unix_timestamp())
             .await;
@@ -871,34 +1031,6 @@ fn course_folder_from_artifact_path(output_dir: &Path, artifact_path: &Path) -> 
     Some(output_dir.join(first))
 }
 
-fn open_folder_in_file_explorer(folder: &Path) -> Result<(), String> {
-    if !folder.is_dir() {
-        return Err(format!(
-            "Folder does not exist yet: {}",
-            folder.to_string_lossy()
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("explorer")
-            .arg(folder)
-            .spawn()
-            .map_err(|error| format!("Failed to open File Explorer: {error}"))?;
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("open")
-            .arg(folder)
-            .spawn()
-            .or_else(|_| Command::new("xdg-open").arg(folder).spawn())
-            .map_err(|error| format!("Failed to open folder: {error}"))?;
-    }
-
-    Ok(())
-}
-
 fn download_history_file_path_for_db(db_path: &Path) -> PathBuf {
     db_path.with_file_name("download-history.md")
 }
@@ -1014,6 +1146,7 @@ fn record_quiz_metadata_discovery_for_next_job(
 }
 
 fn queue_download_jobs(
+    runtime: &WorkflowRuntime,
     connection: &Connection,
     request: StartDownloadRequest,
     created_at: i64,
@@ -1037,61 +1170,29 @@ fn queue_download_jobs(
     let mut jobs = Vec::with_capacity(courses.len());
     for (index, course) in courses.iter().enumerate() {
         let scheduled_at = scheduled_times[index];
-        let job_id = unique_job_id(connection, created_at, &course.slug, index)?;
-        insert_job(
-            connection,
-            &JobRecord {
-                id: job_id.clone(),
-                course_slug: course.slug.clone(),
-                source_url: course.normalized_url.clone(),
-                status: "queued".to_string(),
-                selected_quality: request.selected_quality.clone(),
-                download_videos: request.download_videos,
-                download_exercises: request.download_exercises,
-                download_subtitles: request.download_subtitles,
-                download_quizzes: request.download_quizzes,
-                quiz_hints_json: course_quiz_hints_json(course),
-                output_dir: request.output_dir.clone(),
-                paused: false,
+        let job_id = unique_job_id(runtime, connection, created_at, &course.slug, index)?;
+        let workflow_request = super::projection::LinkedInWorkflowRequest {
+            schema_version: 1,
+            course_slug: course.slug.clone(),
+            source_url: course.normalized_url.clone(),
+            selected_quality: request.selected_quality.clone(),
+            download_videos: request.download_videos,
+            download_exercises: request.download_exercises,
+            download_subtitles: request.download_subtitles,
+            download_quizzes: request.download_quizzes,
+            quiz_hints_json: course_quiz_hints_json(course),
+            scheduled_at,
+        };
+        runtime
+            .submit_linkedin_download(
+                job_id.clone(),
+                course.slug.clone(),
+                serde_json::to_string(&workflow_request).map_err(|error| error.to_string())?,
+                request.output_dir.clone(),
+                created_at,
                 scheduled_at,
-                created_at,
-                updated_at: created_at,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        append_job_event(
-            connection,
-            &NewJobEvent {
-                job_id: job_id.clone(),
-                event_type: if scheduled_at.is_some() {
-                    "job.scheduled"
-                } else {
-                    "job.queued"
-                }
-                .to_string(),
-                message: if let Some(run_at) = scheduled_at {
-                    format!(
-                        "Scheduled LinkedIn Learning course {} for {}.",
-                        course.slug,
-                        format_unix_timestamp_utc(run_at)
-                    )
-                } else {
-                    format!("Queued LinkedIn Learning course: {}", course.slug)
-                },
-                payload_json: Some(
-                    serde_json::json!({
-                        "sourceUrl": course.normalized_url,
-                        "quizUrls": course.quiz_urls,
-                        "assessmentUrns": course.assessment_urns,
-                        "delaySeconds": request.delay_seconds,
-                        "scheduledAt": scheduled_at,
-                    })
-                    .to_string(),
-                ),
-                created_at,
-            },
-        )
-        .map_err(|error| error.to_string())?;
+            )
+            .map_err(|error| error.to_string())?;
 
         jobs.push(QueuedDownloadJob {
             id: job_id,
@@ -1107,6 +1208,7 @@ fn queue_download_jobs(
 }
 
 fn unique_job_id(
+    runtime: &WorkflowRuntime,
     connection: &Connection,
     created_at: i64,
     course_slug: &str,
@@ -1116,23 +1218,107 @@ fn unique_job_id(
         "job-{created_at}-{}-{index}",
         sanitize_identifier_fragment(course_slug)
     );
-    if get_job(connection, &base)
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
+    if job_id_is_free(runtime, connection, &base)? {
         return Ok(base);
     }
 
     for suffix in 2..=10_000 {
         let candidate = format!("{base}-{suffix}");
-        if get_job(connection, &candidate)
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
+        if job_id_is_free(runtime, connection, &candidate)? {
             return Ok(candidate);
         }
     }
     Err("Could not allocate a unique download job identifier.".to_string())
+}
+
+fn job_id_is_free(
+    runtime: &WorkflowRuntime,
+    connection: &Connection,
+    id: &str,
+) -> Result<bool, String> {
+    if runtime
+        .get_run(id.to_string())
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(get_job(connection, id)
+        .map_err(|error| error.to_string())?
+        .is_none())
+}
+
+fn retry_failed_download_job_inner(
+    runtime: &WorkflowRuntime,
+    connection: &Connection,
+    job_id: String,
+    now: i64,
+) -> Result<(), String> {
+    if let Some(run) = runtime
+        .get_run(job_id.clone())
+        .map_err(|error| error.to_string())?
+    {
+        if !matches!(run.state, RunState::Failed | RunState::Cancelled) {
+            return Err("Download job was not found or is no longer failed.".to_string());
+        }
+        let mut request: super::projection::LinkedInWorkflowRequest =
+            serde_json::from_str(&run.request_json).map_err(|error| error.to_string())?;
+        request.scheduled_at = None;
+        let new_id = unique_job_id(runtime, connection, now, &request.course_slug, 0)?;
+        runtime
+            .submit_linkedin_download(
+                new_id,
+                request.course_slug.clone(),
+                serde_json::to_string(&request).map_err(|error| error.to_string())?,
+                run.output_root,
+                now,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let Some(legacy) = get_job(connection, &job_id).map_err(|error| error.to_string())? else {
+        return Err("Download job was not found or is no longer failed.".to_string());
+    };
+    if !matches!(
+        legacy.status.to_ascii_lowercase().as_str(),
+        "failed" | "cancelled"
+    ) {
+        return Err("Download job was not found or is no longer failed.".to_string());
+    }
+    let request = super::projection::LinkedInWorkflowRequest {
+        schema_version: 1,
+        course_slug: legacy.course_slug.clone(),
+        source_url: legacy.source_url.clone(),
+        selected_quality: legacy.selected_quality.clone(),
+        download_videos: legacy.download_videos,
+        download_exercises: legacy.download_exercises,
+        download_subtitles: legacy.download_subtitles,
+        download_quizzes: legacy.download_quizzes,
+        quiz_hints_json: legacy.quiz_hints_json.clone(),
+        scheduled_at: None,
+    };
+    let new_id = unique_job_id(runtime, connection, now, &legacy.course_slug, 0)?;
+    runtime
+        .submit_linkedin_download(
+            new_id,
+            legacy.course_slug,
+            serde_json::to_string(&request).map_err(|error| error.to_string())?,
+            legacy.output_dir,
+            now,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn drain_outcome_to_process_response(outcome: DrainOutcome) -> ProcessQueuedDownloadResponse {
+    ProcessQueuedDownloadResponse {
+        processed: outcome.processed,
+        completed_artifacts: outcome.completed as usize,
+        failed_artifacts: outcome.failed as usize,
+        cancelled_artifacts: outcome.cancelled as usize,
+    }
 }
 
 fn scheduled_download_times(
@@ -1251,13 +1437,27 @@ fn default_download_quizzes() -> bool {
 
 fn load_bootstrap_state(
     connection: &Connection,
+    runtime: Option<&WorkflowRuntime>,
     has_saved_token: bool,
     download_history_file_path: &Path,
 ) -> Result<BootstrapState, String> {
     let saved_download_preferences = get_setting(connection, "download.preferences")
         .map_err(|error| error.to_string())?
         .and_then(|setting| serde_json::from_str(&setting.value_json).ok());
-    let recent_jobs = bootstrap_jobs(connection).map_err(|error| error.to_string())?;
+    let recent_jobs = {
+        let legacy = bootstrap_jobs(connection).map_err(|error| error.to_string())?;
+        if let Some(runtime) = runtime {
+            let workflow_jobs = runtime
+                .list_linkedin_runs(250)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(super::projection::job_from_run)
+                .collect();
+            super::projection::merge_linkedin_jobs(workflow_jobs, legacy)
+        } else {
+            legacy
+        }
+    };
     let mut recent_events = Vec::new();
     for job in &recent_jobs {
         recent_events.extend(
@@ -1463,8 +1663,8 @@ mod tests {
     use super::*;
     use crate::artifact_downloader::{ArtifactDownloadError, ArtifactHttpResponse, NeverCancelled};
     use crate::cache::{
-        get_setting, initialize, list_job_events, list_jobs_by_status, transition_job_status,
-        upsert_artifact, ArtifactRecord,
+        get_setting, initialize, list_job_events, list_jobs_by_status, upsert_artifact,
+        ArtifactRecord,
     };
     use crate::course::CourseFetchError;
 
@@ -1474,11 +1674,27 @@ mod tests {
         connection
     }
 
+    fn workflow_harness() -> (tempfile::TempDir, WorkflowRuntime, Connection) {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+        drop(connection);
+        let writer = crate::app::database_writer::DatabaseWriter::start(
+            db_path.clone(),
+            crate::app::database_diagnostics::DatabaseDiagnostics::default(),
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::new(writer);
+        let connection = crate::cache::open_runtime(&db_path).unwrap();
+        (directory, runtime, connection)
+    }
+
     #[test]
     fn queue_download_jobs_persists_safe_settings_jobs_and_events() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
 
         let response = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "linkedin.com/learning/sample-course\nhttps://www.linkedin.com/learning/second-course?trk=share".to_string(),
@@ -1499,8 +1715,13 @@ mod tests {
         let setting = get_setting(&connection, "download.preferences")
             .unwrap()
             .unwrap();
-        let queued_jobs = list_jobs_by_status(&connection, "queued").unwrap();
-        let first_events = list_job_events(&connection, &response.jobs[0].id).unwrap();
+        let runs = runtime.list_linkedin_runs(10).unwrap();
+        let sample = runs
+            .iter()
+            .find(|run| run.id == response.jobs[0].id)
+            .unwrap();
+        let request: super::super::projection::LinkedInWorkflowRequest =
+            serde_json::from_str(&sample.request_json).unwrap();
 
         assert_eq!(response.jobs.len(), 2);
         assert_eq!(response.jobs[0].id, "job-1700000000-sample-course-0");
@@ -1511,27 +1732,31 @@ mod tests {
         assert!(setting.value_json.contains(r#""selectedQuality":"1080""#));
         assert!(!setting.value_json.to_ascii_lowercase().contains("li_at"));
         assert!(!setting.value_json.to_ascii_lowercase().contains("token"));
-        assert_eq!(queued_jobs.len(), 2);
+        assert!(list_jobs_by_status(&connection, "queued")
+            .unwrap()
+            .is_empty());
+        assert_eq!(runs.len(), 2);
         assert_eq!(
-            queued_jobs[0].source_url,
+            request.source_url,
             "https://www.linkedin.com/learning/sample-course"
         );
-        assert_eq!(queued_jobs[0].selected_quality, "1080");
-        assert!(queued_jobs[0].download_videos);
-        assert!(queued_jobs[0].download_exercises);
-        assert!(!queued_jobs[0].download_subtitles);
-        assert!(queued_jobs[0].download_quizzes);
-        assert_eq!(first_events.len(), 1);
-        assert_eq!(first_events[0].event_type, "job.queued");
-        assert!(first_events[0].message.contains("sample-course"));
+        assert_eq!(request.selected_quality, "1080");
+        assert!(request.download_videos);
+        assert!(request.download_exercises);
+        assert!(!request.download_subtitles);
+        assert!(request.download_quizzes);
+        assert!(list_job_events(&connection, &response.jobs[0].id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn queue_download_jobs_persists_randomized_schedule_inside_window() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
         let created_at = 1_700_000_000;
 
         let response = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/first-course\nhttps://www.linkedin.com/learning/second-course".to_string(),
@@ -1553,31 +1778,28 @@ mod tests {
         )
         .unwrap();
 
-        let jobs = list_jobs_by_status(&connection, "queued").unwrap();
         assert_eq!(response.jobs.len(), 2);
-        assert_eq!(jobs.len(), 2);
-        assert!(jobs.iter().all(|job| job.scheduled_at.is_some()));
-        assert!(jobs[0].scheduled_at.unwrap() >= created_at + 10 * 60);
-        assert!(jobs[1].scheduled_at.unwrap() > jobs[0].scheduled_at.unwrap());
-        assert!(jobs[1].scheduled_at.unwrap() <= created_at + 2 * 60 * 60);
-        assert!(list_ready_queued_jobs(&connection, created_at + 9 * 60)
+        assert!(response.jobs.iter().all(|job| job.scheduled_at.is_some()));
+        assert!(response.jobs[0].scheduled_at.unwrap() >= created_at + 10 * 60);
+        assert!(response.jobs[1].scheduled_at.unwrap() > response.jobs[0].scheduled_at.unwrap());
+        assert!(response.jobs[1].scheduled_at.unwrap() <= created_at + 2 * 60 * 60);
+        assert!(runtime
+            .list_linkedin_runs(10)
+            .unwrap()
+            .iter()
+            .all(|run| run.state == RunState::RetryWait));
+        assert!(list_jobs_by_status(&connection, "queued")
             .unwrap()
             .is_empty());
-        let events = list_job_events(&connection, &jobs[0].id).unwrap();
-        assert_eq!(events[0].event_type, "job.scheduled");
-        assert!(events[0]
-            .payload_json
-            .as_deref()
-            .unwrap()
-            .contains("scheduledAt"));
     }
 
     #[test]
     fn queue_download_jobs_accepts_a_sub_hour_schedule_window() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
         let created_at = 1_700_000_000;
 
         let response = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/short-window-course".to_string(),
@@ -1606,13 +1828,14 @@ mod tests {
 
     #[test]
     fn queue_download_jobs_rejects_schedule_window_shorter_than_minimum_waits() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
         let course_urls = (0..5)
             .map(|index| format!("https://www.linkedin.com/learning/course-{index}"))
             .collect::<Vec<_>>()
             .join("\n");
 
         let error = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls,
@@ -1642,9 +1865,10 @@ mod tests {
 
     #[test]
     fn queue_download_jobs_persists_direct_quiz_hints() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
 
         queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/sample-course/quiz/urn:li:learningApiAssessment:69813586?resume=false&u=52983649&trk=ignored".to_string(),
@@ -1662,15 +1886,18 @@ mod tests {
         )
         .unwrap();
 
-        let queued_job = list_jobs_by_status(&connection, "queued")
+        let run = runtime
+            .list_linkedin_runs(1)
             .unwrap()
             .into_iter()
             .next()
             .unwrap();
-        let hints = quiz_hints_from_json(&queued_job.quiz_hints_json);
+        let request: super::super::projection::LinkedInWorkflowRequest =
+            serde_json::from_str(&run.request_json).unwrap();
+        let hints = quiz_hints_from_json(&request.quiz_hints_json);
 
         assert_eq!(
-            queued_job.source_url,
+            request.source_url,
             "https://www.linkedin.com/learning/sample-course"
         );
         assert_eq!(
@@ -1688,9 +1915,10 @@ mod tests {
 
     #[test]
     fn queue_download_jobs_rejects_empty_output_folder() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
 
         let error = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
@@ -1716,8 +1944,9 @@ mod tests {
 
     #[test]
     fn bootstrap_state_loads_saved_preferences_and_persisted_jobs() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
         let response = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
@@ -1734,20 +1963,25 @@ mod tests {
             1_700_000_000,
         )
         .unwrap();
-        transition_job_status(
+        crate::cache::insert_job(
             &connection,
-            &response.jobs[0].id,
-            "active",
-            1_700_000_010,
-            Some("Started metadata fetch."),
-        )
-        .unwrap();
-        transition_job_status(
-            &connection,
-            &response.jobs[0].id,
-            "failed",
-            1_700_000_020,
-            Some("Metadata fetch failed."),
+            &JobRecord {
+                id: response.jobs[0].id.clone(),
+                course_slug: "sample-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+                status: "failed".to_string(),
+                selected_quality: "720".to_string(),
+                download_videos: true,
+                download_exercises: false,
+                download_subtitles: true,
+                download_quizzes: true,
+                quiz_hints_json: "[]".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                paused: false,
+                scheduled_at: None,
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_020,
+            },
         )
         .unwrap();
         for (id, artifact_type, status) in [
@@ -1775,6 +2009,7 @@ mod tests {
 
         let bootstrap = load_bootstrap_state(
             &connection,
+            Some(&runtime),
             true,
             Path::new("C:/downloads/download-history.md"),
         )
@@ -1795,7 +2030,7 @@ mod tests {
         assert_eq!(bootstrap.persisted_jobs.len(), 1);
         assert_eq!(bootstrap.persisted_jobs[0].id, response.jobs[0].id);
         assert_eq!(bootstrap.persisted_jobs[0].course_slug, "sample-course");
-        assert_eq!(bootstrap.persisted_jobs[0].status, "failed");
+        assert_eq!(bootstrap.persisted_jobs[0].status, "queued");
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.total, 5);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.completed, 3);
         assert_eq!(bootstrap.persisted_jobs[0].artifact_counts.failed, 1);
@@ -1833,11 +2068,6 @@ mod tests {
             bootstrap.persisted_jobs[0].artifact_counts.exercise_total,
             1
         );
-        assert_eq!(bootstrap.recent_events.len(), 3);
-        assert_eq!(bootstrap.recent_events[0].event_type, "job.failed");
-        assert_eq!(bootstrap.recent_events[0].message, "Metadata fetch failed.");
-        assert!(bootstrap.recent_events[0].payload_json.is_none());
-        assert_eq!(bootstrap.recent_events[0].job_id, response.jobs[0].id);
         assert_eq!(
             bootstrap.persisted_jobs[0].source_url,
             "https://www.linkedin.com/learning/sample-course"
@@ -1846,13 +2076,14 @@ mod tests {
 
     #[test]
     fn bootstrap_state_keeps_large_pending_queue_uncapped() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
         let course_urls = (0..105)
             .map(|index| format!("https://www.linkedin.com/learning/course-{index:03}"))
             .collect::<Vec<_>>()
             .join("\n");
 
         queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls,
@@ -1872,6 +2103,7 @@ mod tests {
 
         let bootstrap = load_bootstrap_state(
             &connection,
+            Some(&runtime),
             true,
             Path::new("C:/downloads/download-history.md"),
         )
@@ -1944,8 +2176,10 @@ mod tests {
 
     #[test]
     fn immediate_queue_processing_leaves_future_scheduled_jobs_untouched() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
+        let created_at = chrono::Utc::now().timestamp();
         let scheduled_response = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/scheduled-course".to_string(),
@@ -1963,10 +2197,11 @@ mod tests {
                     max_wait_minutes: 30,
                 }),
             },
-            100,
+            created_at,
         )
         .unwrap();
         let immediate_response = queue_download_jobs(
+            &runtime,
             &connection,
             StartDownloadRequest {
                 course_urls: "https://www.linkedin.com/learning/immediate-course".to_string(),
@@ -1980,24 +2215,30 @@ mod tests {
                 download_quizzes: true,
                 schedule: None,
             },
-            100,
+            created_at,
         )
         .unwrap();
 
-        let ready = list_ready_queued_jobs(&connection, 100).unwrap();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].id, immediate_response.jobs[0].id);
-
-        let scheduled = get_job(&connection, &scheduled_response.jobs[0].id)
+        let scheduled = runtime
+            .get_run(scheduled_response.jobs[0].id.clone())
             .unwrap()
             .unwrap();
-        assert_eq!(scheduled.status, "queued");
-        assert_eq!(scheduled.scheduled_at, Some(100 + 30 * 60));
+        let immediate = runtime
+            .get_run(immediate_response.jobs[0].id.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduled.state, RunState::RetryWait);
+        assert_eq!(immediate.state, RunState::Queued);
+        assert_eq!(
+            scheduled_response.jobs[0].scheduled_at,
+            Some(created_at + 30 * 60)
+        );
+        assert!(immediate_response.jobs[0].scheduled_at.is_none());
     }
 
     #[test]
     fn duplicate_course_requests_in_the_same_second_keep_distinct_jobs() {
-        let connection = initialized_connection();
+        let (_dir, runtime, connection) = workflow_harness();
         let request = || StartDownloadRequest {
             course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
             output_dir: "C:/downloads".to_string(),
@@ -2011,11 +2252,14 @@ mod tests {
             schedule: None,
         };
 
-        let first = queue_download_jobs(&connection, request(), 100).unwrap();
-        let second = queue_download_jobs(&connection, request(), 100).unwrap();
+        let first = queue_download_jobs(&runtime, &connection, request(), 100).unwrap();
+        let second = queue_download_jobs(&runtime, &connection, request(), 100).unwrap();
 
         assert_ne!(first.jobs[0].id, second.jobs[0].id);
-        assert_eq!(list_jobs_by_status(&connection, "queued").unwrap().len(), 2);
+        assert_eq!(runtime.list_linkedin_runs(10).unwrap().len(), 2);
+        assert!(list_jobs_by_status(&connection, "queued")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

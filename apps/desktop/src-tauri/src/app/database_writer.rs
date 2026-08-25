@@ -32,7 +32,6 @@ enum WriterMessage {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // First production callers arrive with the Phase 2 workflow repository.
 pub struct DatabaseWriteContext {
     pub operation: &'static str,
     pub provider: DatabaseProvider,
@@ -118,7 +117,6 @@ impl DatabaseWriter {
         Ok(Self { inner })
     }
 
-    #[allow(dead_code)] // First production callers arrive with the Phase 2 workflow repository.
     pub fn execute<T, F>(
         &self,
         context: DatabaseWriteContext,

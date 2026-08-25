@@ -289,7 +289,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .contains("pre-migration-v5-to-v6")
+                    .contains(&format!("pre-migration-v5-to-v{CURRENT_SCHEMA_VERSION}"))
                     && entry.path().extension().is_some_and(|value| value == "bak")
             })
             .count();

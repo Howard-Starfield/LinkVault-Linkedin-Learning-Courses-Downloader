@@ -1,18 +1,22 @@
 use std::{
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::http::{
-    header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG},
-    Request, Response, StatusCode,
+    header::{
+        ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
+        CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
+    },
+    HeaderValue, Request, Response, StatusCode,
 };
 
 const CACHE_SCHEMA_VERSION: i64 = 1;
 
 use super::clipping_assets::{ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION};
-use super::clipping_models::{validate_clipping_id, ClippingErrorCode};
+use super::clipping_models::{validate_clipping_id, ClippingErrorCode, CLIPPING_ASSET_MIME};
 use super::clipping_service::ClippingService;
 
 pub fn handle_request(
@@ -22,12 +26,7 @@ pub fn handle_request(
     request: &Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
     match resolve_media(db_path, cache_root, clipping_service, request) {
-        Ok(media) => response(
-            StatusCode::OK,
-            media.bytes,
-            Some(&media.mime_type),
-            Some(&media.etag),
-        ),
+        Ok(media) => serve_resolved_media(request, media, clipping_service),
         Err(MediaError::BadRequest) => response(
             StatusCode::BAD_REQUEST,
             b"Invalid newspaper media request.".to_vec(),
@@ -56,9 +55,31 @@ pub fn handle_request(
 }
 
 struct ResolvedMedia {
-    bytes: Vec<u8>,
     mime_type: String,
     etag: String,
+    body: MediaBody,
+    clipping_integrity: Option<ClippingIntegrity>,
+}
+
+struct ClippingIntegrity {
+    clipping_id: String,
+    asset_root_id: String,
+    relative_path: String,
+    expected_byte_count: u64,
+    expected_width: u32,
+    expected_height: u32,
+    expected_sha256: String,
+}
+
+enum MediaBody {
+    Bytes(Vec<u8>),
+    File { path: PathBuf, len: u64 },
+}
+
+enum ByteRange {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
 }
 
 enum MediaError {
@@ -117,14 +138,14 @@ fn resolve_media(
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
         return Err(MediaError::NotFound);
     }
-    let bytes = std::fs::read(&path).map_err(|_| MediaError::Internal)?;
-    if bytes.is_empty() {
-        return Err(MediaError::NotFound);
-    }
     Ok(ResolvedMedia {
-        bytes,
         mime_type,
         etag,
+        body: MediaBody::File {
+            path,
+            len: metadata.len(),
+        },
+        clipping_integrity: None,
     })
 }
 
@@ -165,39 +186,33 @@ fn resolve_clipping(
     let layout = service
         .root_layout(&record.0)
         .map_err(|_| MediaError::NotFound)?;
-    let validated = layout.read_validated_canonical_at(
-        clipping_id,
-        &record.1,
-        record.4,
-        record.5,
-        record.6,
-        &record.7,
-    );
-    let (bytes, mime) = match validated {
-        Ok(validated) => validated,
+    let path = match layout.open_canonical_file_for_protocol(clipping_id, &record.1, record.4) {
+        Ok(path) => path,
         Err(error) => {
-            // `root_layout` may use the deliberately short verified-root
-            // cache. Recheck after an I/O failure so an offline removable
-            // drive does not permanently turn a healthy clipping `missing`.
-            if service.verify_root_fresh_for_integrity(&record.0).is_err() {
-                return Err(MediaError::NotFound);
-            }
-            let safe_code = match error.code {
-                ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
-                _ => "CLIPPING_ASSET_MISSING",
-            };
-            let _ = service.schedule_media_integrity_transition(
+            return Err(map_clipping_integrity_error(
+                service,
                 clipping_id,
-                safe_code,
-                chrono::Utc::now().timestamp(),
-            );
-            return Err(MediaError::NotFound);
+                &record.0,
+                error,
+            ));
         }
     };
     Ok(ResolvedMedia {
-        bytes,
-        mime_type: mime.to_string(),
+        mime_type: CLIPPING_ASSET_MIME.to_string(),
         etag: format!("clipping-{clipping_id}-{}", record.2),
+        body: MediaBody::File {
+            path,
+            len: record.4,
+        },
+        clipping_integrity: Some(ClippingIntegrity {
+            clipping_id: clipping_id.to_string(),
+            asset_root_id: record.0,
+            relative_path: record.1,
+            expected_byte_count: record.4,
+            expected_width: record.5,
+            expected_height: record.6,
+            expected_sha256: record.7,
+        }),
     })
 }
 
@@ -225,9 +240,10 @@ fn resolve_clipping_thumbnail(
         .read_thumbnail_for_protocol(clipping_id, record.0)
         .map_err(|_| MediaError::NotFound)?;
     Ok(ResolvedMedia {
-        bytes,
         mime_type: mime.to_string(),
         etag: format!("clipping-thumbnail-{clipping_id}-{expected}"),
+        body: MediaBody::Bytes(bytes),
+        clipping_integrity: None,
     })
 }
 
@@ -238,15 +254,17 @@ fn resolve_page(
 ) -> Result<(PathBuf, String, String), MediaError> {
     let record = connection
         .query_row(
-            "SELECT COALESCE(optimized_path, original_path), media_version
-             FROM newspaper_pages
-             WHERE id = ?1 AND status = 'completed'
-               AND COALESCE(optimized_path, original_path) IS NOT NULL",
+            "SELECT COALESCE(p.optimized_path, p.original_path), p.media_version, j.output_dir
+             FROM newspaper_pages p
+             JOIN newspaper_jobs j ON j.id = p.job_id
+             WHERE p.id = ?1 AND p.status = 'completed'
+               AND COALESCE(p.optimized_path, p.original_path) IS NOT NULL",
             params![page_id],
             |row| {
                 Ok((
                     PathBuf::from(row.get::<_, String>(0)?),
                     row.get::<_, i64>(1)?,
+                    PathBuf::from(row.get::<_, String>(2)?),
                 ))
             },
         )
@@ -256,9 +274,14 @@ fn resolve_page(
     if record.1.to_string() != requested_version {
         return Err(MediaError::NotFound);
     }
-    let mime = mime_for_path(&record.0)?;
+    let canonical_root = record.2.canonicalize().map_err(|_| MediaError::NotFound)?;
+    let canonical_path = record.0.canonicalize().map_err(|_| MediaError::NotFound)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(MediaError::NotFound);
+    }
+    let mime = mime_for_path(&canonical_path)?;
     Ok((
-        record.0,
+        canonical_path,
         mime.to_string(),
         format!("page-{page_id}-{}", record.1),
     ))
@@ -316,6 +339,206 @@ fn valid_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn map_clipping_integrity_error(
+    service: &ClippingService,
+    clipping_id: &str,
+    asset_root_id: &str,
+    error: super::clipping_models::ClippingError,
+) -> MediaError {
+    // `root_layout` may use the deliberately short verified-root
+    // cache. Recheck after an I/O failure so an offline removable
+    // drive does not permanently turn a healthy clipping `missing`.
+    if service
+        .verify_root_fresh_for_integrity(asset_root_id)
+        .is_err()
+    {
+        return MediaError::NotFound;
+    }
+    let safe_code = match error.code {
+        ClippingErrorCode::AssetChecksumMismatch => "CLIPPING_ASSET_CHECKSUM_MISMATCH",
+        _ => "CLIPPING_ASSET_MISSING",
+    };
+    let _ = service.schedule_media_integrity_transition(
+        clipping_id,
+        safe_code,
+        chrono::Utc::now().timestamp(),
+    );
+    MediaError::NotFound
+}
+
+fn serve_resolved_media(
+    request: &Request<Vec<u8>>,
+    media: ResolvedMedia,
+    clipping_service: &ClippingService,
+) -> Response<Vec<u8>> {
+    let quoted_etag = format!("\"{}\"", media.etag);
+    if etag_matches(request.headers().get(IF_NONE_MATCH), &quoted_etag) {
+        return not_modified_response(&quoted_etag);
+    }
+    let total = match &media.body {
+        MediaBody::Bytes(bytes) => bytes.len() as u64,
+        MediaBody::File { len, .. } => *len,
+    };
+    if total == 0 {
+        return response(
+            StatusCode::NOT_FOUND,
+            b"Newspaper media is unavailable.".to_vec(),
+            Some("text/plain; charset=utf-8"),
+            None,
+        );
+    }
+    match parse_byte_range(request.headers().get(RANGE), total) {
+        ByteRange::Full => match read_full_media_bytes(&media, clipping_service) {
+            Ok((bytes, mime_type)) => {
+                media_response(StatusCode::OK, bytes, &mime_type, &quoted_etag, None, total)
+            }
+            Err(_) => response(
+                StatusCode::NOT_FOUND,
+                b"Newspaper media is unavailable.".to_vec(),
+                Some("text/plain; charset=utf-8"),
+                None,
+            ),
+        },
+        ByteRange::Partial { start, end } => match read_media_bytes(&media.body, start, end) {
+            Ok(bytes) => media_response(
+                StatusCode::PARTIAL_CONTENT,
+                bytes,
+                &media.mime_type,
+                &quoted_etag,
+                Some((start, end)),
+                total,
+            ),
+            Err(_) => response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                b"Newspaper media could not be loaded.".to_vec(),
+                Some("text/plain; charset=utf-8"),
+                None,
+            ),
+        },
+        ByteRange::Unsatisfiable => range_not_satisfiable(total),
+    }
+}
+
+fn read_full_media_bytes(
+    media: &ResolvedMedia,
+    clipping_service: &ClippingService,
+) -> Result<(Vec<u8>, String), MediaError> {
+    if let Some(integrity) = &media.clipping_integrity {
+        let layout = clipping_service
+            .root_layout(&integrity.asset_root_id)
+            .map_err(|_| MediaError::NotFound)?;
+        let validated = layout.read_validated_canonical_at(
+            &integrity.clipping_id,
+            &integrity.relative_path,
+            integrity.expected_byte_count,
+            integrity.expected_width,
+            integrity.expected_height,
+            &integrity.expected_sha256,
+        );
+        return match validated {
+            Ok((bytes, mime)) => Ok((bytes, mime.to_string())),
+            Err(error) => Err(map_clipping_integrity_error(
+                clipping_service,
+                &integrity.clipping_id,
+                &integrity.asset_root_id,
+                error,
+            )),
+        };
+    }
+    let end = match &media.body {
+        MediaBody::Bytes(bytes) => bytes.len() as u64,
+        MediaBody::File { len, .. } => *len,
+    }
+    .saturating_sub(1);
+    read_media_bytes(&media.body, 0, end).map(|bytes| (bytes, media.mime_type.clone()))
+}
+
+fn etag_matches(header: Option<&HeaderValue>, quoted_etag: &str) -> bool {
+    let Some(value) = header.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == quoted_etag)
+}
+
+fn parse_byte_range(header: Option<&HeaderValue>, total: u64) -> ByteRange {
+    let Some(value) = header.and_then(|value| value.to_str().ok()) else {
+        return ByteRange::Full;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return ByteRange::Full;
+    }
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return ByteRange::Full;
+    };
+    if spec.contains(',') {
+        return ByteRange::Full;
+    }
+    let Some((start_raw, end_raw)) = spec.split_once('-') else {
+        return ByteRange::Full;
+    };
+    if total == 0 {
+        return ByteRange::Unsatisfiable;
+    }
+    if start_raw.is_empty() {
+        let Ok(suffix) = end_raw.parse::<u64>() else {
+            return ByteRange::Full;
+        };
+        if suffix == 0 {
+            return ByteRange::Unsatisfiable;
+        }
+        return ByteRange::Partial {
+            start: total.saturating_sub(suffix),
+            end: total - 1,
+        };
+    }
+    let Ok(start) = start_raw.parse::<u64>() else {
+        return ByteRange::Full;
+    };
+    if start >= total {
+        return ByteRange::Unsatisfiable;
+    }
+    let end = if end_raw.is_empty() {
+        total - 1
+    } else {
+        let Ok(end) = end_raw.parse::<u64>() else {
+            return ByteRange::Full;
+        };
+        end.min(total - 1)
+    };
+    if start > end {
+        return ByteRange::Unsatisfiable;
+    }
+    ByteRange::Partial { start, end }
+}
+
+fn read_media_bytes(body: &MediaBody, start: u64, end: u64) -> Result<Vec<u8>, MediaError> {
+    let len = end.saturating_sub(start).saturating_add(1);
+    let len_usize = usize::try_from(len).map_err(|_| MediaError::Internal)?;
+    match body {
+        MediaBody::Bytes(bytes) => {
+            let start_index = usize::try_from(start).map_err(|_| MediaError::Internal)?;
+            let end_index = usize::try_from(end).map_err(|_| MediaError::Internal)?;
+            bytes
+                .get(start_index..=end_index)
+                .map(<[u8]>::to_vec)
+                .ok_or(MediaError::Internal)
+        }
+        MediaBody::File { path, .. } => {
+            let mut file = std::fs::File::open(path).map_err(|_| MediaError::Internal)?;
+            file.seek(SeekFrom::Start(start))
+                .map_err(|_| MediaError::Internal)?;
+            let mut buf = vec![0_u8; len_usize];
+            file.read_exact(&mut buf)
+                .map_err(|_| MediaError::Internal)?;
+            Ok(buf)
+        }
+    }
+}
+
 fn mime_for_path(path: &Path) -> Result<&'static str, MediaError> {
     match path
         .extension()
@@ -359,12 +582,81 @@ fn response(
     })
 }
 
-pub fn request_for_url(url: &str) -> Result<Request<Vec<u8>>, String> {
-    let uri = tauri::http::Uri::from_str(url).map_err(|error| error.to_string())?;
-    Request::builder()
-        .uri(uri)
+fn media_response(
+    status: StatusCode,
+    body: Vec<u8>,
+    mime_type: &str,
+    quoted_etag: &str,
+    range: Option<(u64, u64)>,
+    total: u64,
+) -> Response<Vec<u8>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(CONTENT_TYPE, mime_type)
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CACHE_CONTROL, "private, max-age=31536000, immutable")
+        .header(ETAG, quoted_etag);
+    if let Some((start, end)) = range {
+        builder = builder.header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+    }
+    builder.body(body).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Vec::new())
+            .expect("static media error response must be valid")
+    })
+}
+
+fn not_modified_response(quoted_etag: &str) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(CONTENT_LENGTH, "0")
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CACHE_CONTROL, "private, max-age=31536000, immutable")
+        .header(ETAG, quoted_etag)
         .body(Vec::new())
-        .map_err(|error| error.to_string())
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Vec::new())
+                .expect("static media error response must be valid")
+        })
+}
+
+fn range_not_satisfiable(total: u64) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(CONTENT_LENGTH, "0")
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_RANGE, format!("bytes */{total}"))
+        .header(CACHE_CONTROL, "no-store")
+        .body(Vec::new())
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Vec::new())
+                .expect("static media error response must be valid")
+        })
+}
+
+pub fn request_for_url(url: &str) -> Result<Request<Vec<u8>>, String> {
+    request_for_url_with_headers(url, &[])
+}
+
+fn request_for_url_with_headers(
+    url: &str,
+    headers: &[(&str, &str)],
+) -> Result<Request<Vec<u8>>, String> {
+    let uri = tauri::http::Uri::from_str(url).map_err(|error| error.to_string())?;
+    let mut builder = Request::builder().uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(Vec::new()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -483,6 +775,97 @@ mod tests {
         let thumbnail_response = handle_request(&db_path, &cache_root, &service, &thumbnail);
         assert_eq!(thumbnail_response.status(), StatusCode::OK);
         assert_eq!(thumbnail_response.headers()[CONTENT_TYPE], "image/webp");
+        assert_eq!(page_response.headers()[ACCEPT_RANGES], "bytes");
+    }
+
+    #[test]
+    fn page_range_request_returns_206_with_content_range() {
+        let (_directory, db_path, cache_root, _clipping_layout, _writer, service, _diagnostics) =
+            fixture();
+        let request = request_for_url_with_headers(
+            "http://newspaper-media.localhost/page/page?v=3",
+            &[("range", "bytes=0-3")],
+        )
+        .unwrap();
+        let response = handle_request(&db_path, &cache_root, &service, &request);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[CONTENT_RANGE], "bytes 0-3/10");
+        assert_eq!(response.body().as_slice(), b"page");
+    }
+
+    #[test]
+    fn page_range_beyond_eof_returns_416() {
+        let (_directory, db_path, cache_root, _clipping_layout, _writer, service, _diagnostics) =
+            fixture();
+        let request = request_for_url_with_headers(
+            "http://newspaper-media.localhost/page/page?v=3",
+            &[("range", "bytes=10-20")],
+        )
+        .unwrap();
+        let response = handle_request(&db_path, &cache_root, &service, &request);
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[CONTENT_RANGE], "bytes */10");
+    }
+
+    #[test]
+    fn clipping_range_does_not_require_full_file_read() {
+        const ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let (_directory, db_path, cache_root, clipping_layout, _writer, service, _diagnostics) =
+            fixture();
+        let prefix = encode_test_webp(24, 16);
+        let mut bytes = prefix.clone();
+        bytes.resize(65_536, 0x5A);
+        clipping_layout.write_staging(ID, &bytes).unwrap();
+        service
+            .register_staged_legacy_fixture(NewClippingRecord {
+                id: ID.to_string(),
+                source_job_id: None,
+                source_page_id: None,
+                source_media_version_snapshot: 1,
+                source_kind_snapshot: ClippingSourceKind::Optimized,
+                source_mime_type_snapshot: "image/webp".to_string(),
+                source_checksum_snapshot: None,
+                edition_code_snapshot: "NY".to_string(),
+                edition_name_snapshot: "New York".to_string(),
+                publication_date_snapshot: "2026-08-08".to_string(),
+                page_number_snapshot: "A01".to_string(),
+                source_pixel_width: 24,
+                source_pixel_height: 16,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 24,
+                crop_height: 16,
+                asset_root_id: crate::newspaper::storage::LEGACY_CLIPPING_ROOT_ID.to_owned(),
+                asset_relative_path: ClippingAssetLayout::canonical_relative_path(ID).unwrap(),
+                asset_byte_count: bytes.len() as u64,
+                asset_checksum_sha256: sha256_hex(&bytes),
+                title: "New York · 2026-08-08 · A01".to_string(),
+                now: 100,
+            })
+            .unwrap();
+        let mut corrupted = bytes.clone();
+        let tail = corrupted.len() - 8;
+        corrupted[tail..].fill(0xFF);
+        std::fs::write(clipping_layout.canonical_path(ID).unwrap(), &corrupted).unwrap();
+
+        let range = request_for_url_with_headers(
+            &format!("http://newspaper-media.localhost/clipping/{ID}?v=1"),
+            &[("range", "bytes=0-1023")],
+        )
+        .unwrap();
+        let ranged = handle_request(&db_path, &cache_root, &service, &range);
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.body().len(), 1024);
+        assert_eq!(&ranged.body()[..prefix.len()], prefix.as_slice());
+
+        let full = request_for_url(&format!(
+            "http://newspaper-media.localhost/clipping/{ID}?v=1"
+        ))
+        .unwrap();
+        assert_eq!(
+            handle_request(&db_path, &cache_root, &service, &full).status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]

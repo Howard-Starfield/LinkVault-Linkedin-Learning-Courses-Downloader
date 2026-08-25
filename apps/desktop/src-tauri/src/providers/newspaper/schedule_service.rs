@@ -157,7 +157,10 @@ pub(super) fn validate_request(request: &CreateNewspaperScheduleRequest) -> Resu
     Ok(())
 }
 
-pub(super) fn materialize_due(db_path: &Path) -> Result<(), String> {
+pub(super) fn materialize_due(
+    db_path: &Path,
+    runtime: Option<&crate::workflow::application::runtime::WorkflowRuntime>,
+) -> Result<(), String> {
     let now_local = Local::now();
     let today = now_local.date_naive().to_string();
     let schedules = {
@@ -195,6 +198,7 @@ pub(super) fn materialize_due(db_path: &Path) -> Result<(), String> {
                 &mut connection,
                 request,
                 &schedule.id,
+                runtime,
             )
         };
         let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;

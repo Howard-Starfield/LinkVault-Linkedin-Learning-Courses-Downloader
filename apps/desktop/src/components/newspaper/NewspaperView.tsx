@@ -8,6 +8,7 @@ import {
   CircleHelp,
   Clock3,
   Download,
+  Folder,
   FolderOpen,
   GripVertical,
   History,
@@ -15,13 +16,12 @@ import {
   Pause,
   Play,
   RotateCcw,
-  Search,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
-import { readNewspaperOptimizationPreferences } from "./newspaper-optimization-preferences";
+import { readNewspaperOptimizationPreferences, type NewspaperOptimizationRunOptions } from "./newspaper-optimization-preferences";
 import type { NewspaperReaderSourceTarget } from "./newspaper-navigation";
 
 type EditionKind = "daily" | "weekly" | "special";
@@ -167,12 +167,14 @@ function editionKey(edition: NewspaperEdition) {
 
 export function NewspaperView({
   mode = "download",
+  onRequestQueueProcess,
   onOpenClipping,
   onReturnClipping,
   readerTarget,
   onReaderTargetConsumed
 }: {
   mode?: "download" | "library";
+  onRequestQueueProcess?: (options?: NewspaperOptimizationRunOptions | null) => void | Promise<void>;
   onOpenClipping?: (clippingId: string) => void;
   onReturnClipping?: (clippingId: string) => void;
   readerTarget?: NewspaperReaderSourceTarget | null;
@@ -183,7 +185,6 @@ export function NewspaperView({
   const [jobs, setJobs] = useState<NewspaperJob[]>([]);
   const [schedules, setSchedules] = useState<NewspaperSchedule[]>([]);
   const [selected, setSelected] = useState<Set<string>>(() => new Set(initial.current.selected ?? ["NY"]));
-  const [query, setQuery] = useState("");
   const [kind, setKind] = useState<"all" | EditionKind>("all");
   const [dateMode, setDateMode] = useState<"single" | "last7_days" | "custom">("single");
   const [startDate, setStartDate] = useState(today());
@@ -311,13 +312,10 @@ export function NewspaperView({
     optimizationTotal: aggregate.optimizationTotal + item.optimizationTotal
   }), { downloaded: 0, downloadTotal: 0, optimized: 0, optimizationTotal: 0 }), [jobProgress]);
 
-  const visibleEditions = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return catalog.filter((edition) =>
-      (kind === "all" || edition.kind === kind)
-      && (!needle || `${edition.code} ${edition.nameZh} ${edition.nameEn}`.toLowerCase().includes(needle))
-    );
-  }, [catalog, kind, query]);
+  const visibleEditions = useMemo(
+    () => catalog.filter((edition) => kind === "all" || edition.kind === kind),
+    [catalog, kind],
+  );
   const progressJobs = [...jobs]
     .filter((job) => !job.dismissed)
     .sort((left, right) => {
@@ -423,10 +421,7 @@ export function NewspaperView({
       }
       await refresh();
       setProcessing(true);
-      await invoke("process_newspaper_queue");
-      void invoke("process_newspaper_optimization_queue", {
-        options: buildOptimizationRunOptions()
-      }).catch(() => undefined);
+      await onRequestQueueProcess?.(buildOptimizationRunOptions());
       await refresh();
     } catch (error) {
       toast.error("Could not start newspaper download", { description: String(error) });
@@ -462,12 +457,11 @@ export function NewspaperView({
   }
 
   function continueQueue() {
-    if (!isTauriRuntime()) return;
+    if (!isTauriRuntime() || !onRequestQueueProcess) return;
     setProcessing(true);
     const options = buildOptimizationRunOptions();
-    void invoke("process_newspaper_queue")
-      .then(() => invoke("process_newspaper_optimization_queue", { options }))
-      .catch((error) => toast.error("Could not continue newspaper queue", { description: String(error) }))
+    void Promise.resolve(onRequestQueueProcess(options))
+      .catch((error: unknown) => toast.error("Could not continue newspaper queue", { description: String(error) }))
       .finally(() => {
         setProcessing(false);
         void refresh();
@@ -627,87 +621,197 @@ export function NewspaperView({
 
   return (
     <section className="newspaper-download" aria-label="Download World Journal editions">
-      <div className="newspaper-dispatch-grid">
-        <section className="newspaper-dispatch-panel newspaper-editions" aria-label="Select newspaper editions">
-          <label className="newspaper-search">
-            <Search aria-hidden="true" />
-            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search editions…" aria-label="Search editions" />
-          </label>
-          <div className="newspaper-edition-tabs" role="tablist" aria-label="Edition groups">
-            {([["all", "All"], ["daily", "Regional"], ["weekly", "Weekly"], ["special", "Special"]] as const).map(([value, label]) => (
-              <button type="button" role="tab" aria-selected={kind === value} className={kind === value ? "active" : undefined} key={value} onClick={() => setKind(value)}>
-                {label} <span>({value === "all" ? catalog.length : catalog.filter((item) => item.kind === value).length})</span>
-              </button>
-            ))}
-          </div>
-          <div className="newspaper-edition-list">
-            {visibleEditions.map((edition) => {
-              const key = editionKey(edition);
-              return (
-                <div className="newspaper-edition-row" key={key}>
-                  <Checkbox label="" checked={selected.has(key)} aria-label={`Select ${edition.nameZh} ${edition.code}`} onChange={(event) => {
-                    const next = new Set(selected);
-                    if (event.target.checked) next.add(key); else next.delete(key);
-                    setSelected(next);
-                  }} />
-                  <span>{edition.nameZh}<small>{edition.nameEn}</small></span>
-                  <em>{edition.code}</em>
-                </div>
-              );
-            })}
-            {visibleEditions.length === 0 ? <div className="newspaper-empty">No editions match this filter.</div> : null}
-          </div>
-          <footer className="newspaper-edition-footer">
-            <span>Showing {visibleEditions.length} of {catalog.length} · {selected.size} selected</span>
-            <button type="button" onClick={() => {
-              const allVisibleSelected = visibleEditions.every((edition) => selected.has(editionKey(edition)));
-              const next = new Set(selected);
-              visibleEditions.forEach((edition) => {
+      <div className="lv-workspace newspaper-downloads-workspace">
+        <div className="newspaper-search-stage">
+          <section className="newspaper-editions" aria-label="Select newspaper editions">
+            <div className="newspaper-edition-tabs" role="tablist" aria-label="Edition groups">
+              {([["all", "All"], ["daily", "Regional"], ["weekly", "Weekly"], ["special", "Special"]] as const).map(([value, label]) => (
+                <button type="button" role="tab" aria-selected={kind === value} className={kind === value ? "active" : undefined} key={value} onClick={() => setKind(value)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="newspaper-edition-list">
+              {visibleEditions.map((edition) => {
                 const key = editionKey(edition);
-                if (allVisibleSelected) next.delete(key); else next.add(key);
-              });
-              setSelected(next);
-            }}>
-              {visibleEditions.length > 0 && visibleEditions.every((edition) => selected.has(editionKey(edition))) ? "Clear visible" : "Select visible"}
-            </button>
-          </footer>
-        </section>
+                return (
+                  <div className="newspaper-edition-row" key={key}>
+                    <Checkbox label="" checked={selected.has(key)} aria-label={`Select ${edition.nameZh} ${edition.code}`} onChange={(event) => {
+                      const next = new Set(selected);
+                      if (event.target.checked) next.add(key); else next.delete(key);
+                      setSelected(next);
+                    }} />
+                    <span>{edition.nameZh}<small>{edition.nameEn}</small></span>
+                    <em>{edition.code}</em>
+                  </div>
+                );
+              })}
+              {visibleEditions.length === 0 ? <div className="newspaper-empty">No editions in this group.</div> : null}
+            </div>
+            <footer className="newspaper-edition-footer">
+              <span>{selected.size} selected</span>
+              <button type="button" onClick={() => {
+                const allVisibleSelected = visibleEditions.every((edition) => selected.has(editionKey(edition)));
+                const next = new Set(selected);
+                visibleEditions.forEach((edition) => {
+                  const key = editionKey(edition);
+                  if (allVisibleSelected) next.delete(key); else next.add(key);
+                });
+                setSelected(next);
+              }}>
+                {visibleEditions.length > 0 && visibleEditions.every((edition) => selected.has(editionKey(edition))) ? "Clear" : "Select all"}
+              </button>
+            </footer>
+          </section>
 
-        <section className="newspaper-dispatch-panel newspaper-scheduler" aria-label="Daily newspaper schedule">
-          <div className="newspaper-schedule-tabs" role="tablist" aria-label="Schedule and download history">
-            <button type="button" role="tab" aria-selected={scheduleTab === "schedule"} className={scheduleTab === "schedule" ? "active" : undefined} onClick={() => setScheduleTab("schedule")}>Daily schedule</button>
-            <button type="button" role="tab" aria-selected={scheduleTab === "history"} className={scheduleTab === "history" ? "active" : undefined} onClick={() => setScheduleTab("history")}>History</button>
+          <div className="newspaper-control-cluster" aria-label="Newspaper download settings">
+            <label className="newspaper-cluster-field newspaper-option-date">
+              <span>
+                Dates
+                <Tooltip label="Uses the system date automatically and includes today.">
+                  <button type="button" className="newspaper-setting-help" aria-label="About the Last 7 days date range">
+                    <CircleHelp aria-hidden="true" />
+                  </button>
+                </Tooltip>
+              </span>
+              <Select value={dateMode} onChange={(event) => setDateMode(event.target.value as typeof dateMode)}>
+                <option value="single">Single</option>
+                <option value="last7_days">Last 7</option>
+                <option value="custom">Custom</option>
+              </Select>
+            </label>
+            <div className={`newspaper-cluster-field newspaper-option-when${dateMode === "last7_days" ? " is-system-date" : ""}`}>
+              <span>{dateMode === "custom" ? "Span" : "Day"}</span>
+              <div className="newspaper-date-controls">
+                <Input type="date" value={dateMode === "last7_days" ? today() : startDate} onChange={(event) => setStartDate(event.target.value)} disabled={dateMode === "last7_days"} aria-label={dateMode === "last7_days" ? "System current date" : "Start publication date"} />
+                {dateMode === "custom" ? <Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} aria-label="End publication date" /> : null}
+              </div>
+            </div>
+            <label className="newspaper-cluster-field newspaper-option-delay">
+              <span>Delay</span>
+              <div className="newspaper-delay-field">
+                <Input type="number" min={0} max={3600} value={delaySeconds} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Edition delay in seconds" className="newspaper-delay-input" />
+                <span className="newspaper-delay-unit" aria-hidden="true">sec</span>
+              </div>
+            </label>
+            <label className="newspaper-cluster-field newspaper-cluster-folder">
+              <span>Folder</span>
+              <button
+                type="button"
+                className="newspaper-folder-field"
+                onClick={() => void chooseFolder()}
+                aria-label="Browse newspaper folder"
+                title={destination || "Choose folder"}
+              >
+                <Folder aria-hidden="true" />
+                <span className="newspaper-folder-path">{destination || "Choose folder"}</span>
+              </button>
+            </label>
+            <label className="newspaper-cluster-field newspaper-option-time">
+              <span>Schedule</span>
+              <Input type="time" value={cronTime} onChange={(event) => setCronTime(event.target.value)} aria-label="Daily newspaper schedule time" />
+            </label>
+          </div>
+
+          <div className={`newspaper-options-row${optimize ? "" : " is-disabled"}`} aria-label="Image optimization">
+            <div className="newspaper-optimization-toggles">
+              <Switch label="Optimize" checked={optimize} onChange={(event) => setOptimize(event.target.checked)} />
+              <Checkbox label="Keep JPG" checked={keepOriginal} onChange={(event) => setKeepOriginal(event.target.checked)} disabled={!optimize} />
+              <Tooltip label={`${compressionLabel} · Quality 25 may soften fine print. JPG remains only if WebP is larger or fails.${optimizationRuntime.limitedReason ? ` ${optimizationRuntime.limitedReason}` : ""}`}>
+                <button type="button" className="newspaper-setting-help" aria-label="About newspaper image optimization">
+                  <CircleHelp aria-hidden="true" />
+                </button>
+              </Tooltip>
+            </div>
+            <label className="newspaper-cluster-field newspaper-option-quality">
+              <span>Quality</span>
+              <Select value={String(optimizationQuality)} onChange={(event) => setOptimizationQuality(Number(event.target.value))} disabled={!optimize} aria-label="Image compression quality">
+                <option value="92">92 · Clear</option>
+                <option value="86">86 · Crisp</option>
+                <option value="74">74 · Balance</option>
+                <option value="55">55 · Small</option>
+                <option value="45">45 · Compact</option>
+                <option value="35">35 · Tiny</option>
+                <option value="25">25 · Max</option>
+              </Select>
+            </label>
+            <label className="newspaper-cluster-field newspaper-option-workers">
+              <span>Workers</span>
+              <Select value={optimizationMode} onChange={(event) => setOptimizationMode(event.target.value as "auto" | "manual")} disabled={!optimize} aria-label="Optimization worker mode">
+                <option value="auto">Auto</option>
+                <option value="manual">Manual</option>
+              </Select>
+            </label>
+            <label className="newspaper-cluster-field newspaper-option-ceiling">
+              <span>Max</span>
+              <Select value={String(workerCeiling)} onChange={(event) => setWorkerCeiling(Number(event.target.value))} disabled={!optimize || optimizationMode === "auto"} aria-label="Optimization worker ceiling">
+                {[2, 4, 8, 12, 16, 20].map((workers) => <option value={workers} key={workers}>{workers}</option>)}
+              </Select>
+            </label>
+          </div>
+
+          <div className="newspaper-artifact-row">
+            <div className="command-actions newspaper-download-actions">
+              <Button type="button" variant="outline" className="newspaper-action-button" loading={savingSchedule} onClick={() => void saveSchedule()}>
+                <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
+                Add schedule
+              </Button>
+              <Button type="button" variant="primary" className="newspaper-action-button" loading={submitting || processing} onClick={() => void submitDownload()}>
+                <Download aria-hidden="true" className="h-3.5 w-3.5" />
+                Download now
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <section className="newspaper-schedule-panel" aria-label="Daily newspaper schedule">
+          <div className="queue-section-tabs newspaper-schedule-section-tabs" role="group" aria-label="Schedule and download history">
+            <button
+              type="button"
+              className={`queue-section-tab${scheduleTab === "schedule" ? " is-selected" : ""}`}
+              data-section="schedule"
+              data-tone="queue"
+              aria-pressed={scheduleTab === "schedule"}
+              onClick={() => setScheduleTab("schedule")}
+            >
+              <span className="queue-section-tab-label">Schedule</span>
+              <span className="queue-section-tab-value">{schedules.length}</span>
+            </button>
+            <button
+              type="button"
+              className={`queue-section-tab${scheduleTab === "history" ? " is-selected" : ""}`}
+              data-section="history"
+              data-tone="success"
+              aria-pressed={scheduleTab === "history"}
+              onClick={() => setScheduleTab("history")}
+            >
+              <span className="queue-section-tab-label">History</span>
+              <span className="queue-section-tab-value">{historyJobs.length}</span>
+            </button>
           </div>
           {scheduleTab === "schedule" ? (
-            <>
-              <div className="newspaper-schedule-create">
-                <Select value="daily" aria-label="Schedule frequency" disabled><option value="daily">Daily</option></Select>
-                <Input type="time" value={cronTime} onChange={(event) => setCronTime(event.target.value)} aria-label="Daily newspaper schedule time" />
-              </div>
-              <div className="newspaper-schedule-label">Scheduled editions ({schedules.length})</div>
-              <div className="newspaper-schedule-cards">
-                {schedules.length === 0 ? (
-                  <div className="newspaper-empty newspaper-schedule-empty"><Clock3 aria-hidden="true" /><span>No daily schedules yet. Choose editions and a time below.</span></div>
-                ) : schedules.map((item) => (
-                  <article className="newspaper-schedule-card" key={item.id}>
-                    <time>{formatClockTime(item.cron_time)}</time>
-                    <div>
-                      <strong>{scheduleEditionSummary(item, catalog)}</strong>
-                      <span>{item.edition_codes.length} edition{item.edition_codes.length === 1 ? "" : "s"} · {scheduleDateModeLabel(item.date_mode)} · Local time</span>
-                      {item.last_run_date ? <small>Last run {item.last_run_date}</small> : null}
-                      {item.last_error ? <small className="is-error">{item.last_error}</small> : null}
+            <div className="newspaper-schedule-cards">
+              {schedules.length === 0 ? (
+                <div className="newspaper-empty newspaper-schedule-empty"><Clock3 aria-hidden="true" /><span>No schedules yet</span></div>
+              ) : schedules.map((item) => (
+                <article className="newspaper-schedule-card" key={item.id}>
+                  <time>{formatClockTime(item.cron_time)}</time>
+                  <div>
+                    <strong>{scheduleEditionSummary(item, catalog)}</strong>
+                    <span>{item.edition_codes.length} edition{item.edition_codes.length === 1 ? "" : "s"} · {scheduleDateModeLabel(item.date_mode)} · Local time</span>
+                    {item.last_run_date ? <small>Last run {item.last_run_date}</small> : null}
+                    {item.last_error ? <small className="is-error">{item.last_error}</small> : null}
+                  </div>
+                  <div className="newspaper-schedule-trailing">
+                    <StatusBadge tone={item.enabled ? "success" : "neutral"} className="newspaper-schedule-status">{item.enabled ? "Enabled" : "Paused"}</StatusBadge>
+                    <div className="newspaper-schedule-actions">
+                      <button type="button" aria-label={item.enabled ? "Pause daily schedule" : "Resume daily schedule"} title={item.enabled ? "Pause schedule" : "Resume schedule"} onClick={() => void toggleSchedule(item)}>{item.enabled ? <Pause /> : <Play />}</button>
+                      <button type="button" className="danger" aria-label="Delete daily schedule" title="Delete schedule" onClick={() => void deleteSchedule(item)}><Trash2 /></button>
                     </div>
-                    <div className="newspaper-schedule-trailing">
-                      <StatusBadge tone={item.enabled ? "success" : "neutral"} className="newspaper-schedule-status">{item.enabled ? "Enabled" : "Paused"}</StatusBadge>
-                      <div className="newspaper-schedule-actions">
-                        <button type="button" aria-label={item.enabled ? "Pause daily schedule" : "Resume daily schedule"} title={item.enabled ? "Pause schedule" : "Resume schedule"} onClick={() => void toggleSchedule(item)}>{item.enabled ? <Pause /> : <Play />}</button>
-                        <button type="button" className="danger" aria-label="Delete daily schedule" title="Delete schedule" onClick={() => void deleteSchedule(item)}><Trash2 /></button>
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </>
+                  </div>
+                </article>
+              ))}
+            </div>
           ) : (
             <div className="newspaper-history-list" aria-label="Newspaper download history">
               {historyJobs.length === 0 ? (
@@ -723,196 +827,127 @@ export function NewspaperView({
           )}
         </section>
 
-        <section className="newspaper-dispatch-panel newspaper-options" aria-label="Newspaper download settings">
-          <div className="newspaper-settings-stack">
-            <label className="newspaper-setting-field">
-              <span>
-                Date range
-                <Tooltip label="Uses the system date automatically and includes today.">
-                  <button type="button" className="newspaper-setting-help" aria-label="About the Last 7 days date range">
-                    <CircleHelp aria-hidden="true" />
-                  </button>
-                </Tooltip>
-              </span>
-              <Select value={dateMode} onChange={(event) => setDateMode(event.target.value as typeof dateMode)}>
-                <option value="single">Single date</option>
-                <option value="last7_days">Last 7 days</option>
-                <option value="custom">Custom range</option>
-              </Select>
-            </label>
-            <div className={`newspaper-date-controls${dateMode === "last7_days" ? " is-system-date" : ""}`}>
-              <Input type="date" value={dateMode === "last7_days" ? today() : startDate} onChange={(event) => setStartDate(event.target.value)} disabled={dateMode === "last7_days"} aria-label={dateMode === "last7_days" ? "System current date" : "Start publication date"} />
-              {dateMode === "custom" ? <Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} aria-label="End publication date" /> : null}
-            </div>
-            <label className="newspaper-delay-setting">
-              <span>Delay between editions</span>
-              <Input type="number" min={0} max={3600} value={delaySeconds} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Delay between editions in seconds" />
-              <em>seconds</em>
-            </label>
-            <label className="newspaper-destination-setting">
-              <span>Save location</span>
-              <div>
-                <Input id="newspaper-destination" value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="Choose a newspaper folder" />
-                <Button variant="outline" onClick={() => void chooseFolder()}><FolderOpen /> Browse</Button>
-              </div>
-            </label>
-            <div className={`newspaper-optimization-setting${optimize ? "" : " is-disabled"}`}>
-              <span className="newspaper-optimization-heading">
-                Image optimization
-                <Tooltip label={`${compressionLabel} · Quality 25 may soften fine print. JPG remains only if WebP is larger or fails.${optimizationRuntime.limitedReason ? ` ${optimizationRuntime.limitedReason}` : ""}`}>
-                  <button type="button" className="newspaper-setting-help" aria-label="About newspaper image optimization">
-                    <CircleHelp aria-hidden="true" />
-                  </button>
-                </Tooltip>
-              </span>
-              <div>
-                <Switch label="Optimize images" checked={optimize} onChange={(event) => setOptimize(event.target.checked)} />
-                <Select value={String(optimizationQuality)} onChange={(event) => setOptimizationQuality(Number(event.target.value))} disabled={!optimize} aria-label="Image compression strength">
-                  <option value="92">High clarity · WebP 92</option>
-                  <option value="86">Crisp · WebP 86</option>
-                  <option value="74">Balanced · WebP 74</option>
-                  <option value="55">Small · WebP 55</option>
-                  <option value="45">Compact · WebP 45</option>
-                  <option value="35">Very small · WebP 35</option>
-                  <option value="25">Maximum savings · WebP 25</option>
-                </Select>
-                <Checkbox label="Keep source JPG" checked={keepOriginal} onChange={(event) => setKeepOriginal(event.target.checked)} disabled={!optimize} />
-              </div>
-              <div className="newspaper-worker-setting">
-                <span>Workers</span>
-                <Select value={optimizationMode} onChange={(event) => setOptimizationMode(event.target.value as "auto" | "manual")} disabled={!optimize} aria-label="Optimization worker mode">
-                  <option value="auto">Auto</option>
-                  <option value="manual">Manual ceiling</option>
-                </Select>
-                <Select value={String(workerCeiling)} onChange={(event) => setWorkerCeiling(Number(event.target.value))} disabled={!optimize || optimizationMode === "auto"} aria-label="Optimization worker ceiling">
-                  {[2, 4, 8, 12, 16, 20].map((workers) => <option value={workers} key={workers}>{workers}</option>)}
-                </Select>
-              </div>
-            </div>
-          </div>
-          <div className="command-actions newspaper-download-actions">
-            <Button variant="outline" loading={savingSchedule} onClick={() => void saveSchedule()}>
-              <CalendarClock /> Add schedule
-            </Button>
-            {isNewspaperQueueRunning ? (
-              <Button
-                variant="primary"
-                loading={isPausingAll || processing}
-                onClick={() => void toggleAllNewspaperJobsPause()}
-                disabled={isPausingAll}
-              >
-                {allNewspaperJobsPaused
-                  ? <Play aria-hidden="true" className="h-3.5 w-3.5" />
-                  : <Pause aria-hidden="true" className="h-3.5 w-3.5" />}
-                {isPausingAll
-                  ? "Updating"
-                  : allNewspaperJobsPaused
-                    ? "Resume all"
-                    : "Pause all"}
-              </Button>
-            ) : (
-              <Button variant="primary" loading={submitting || processing} onClick={() => void submitDownload()}>
-                <Download /> Download now
-              </Button>
-            )}
-          </div>
-        </section>
-      </div>
-      <section className="newspaper-progress-panel" aria-label="Newspaper download progress">
-        <div className="newspaper-progress-table">
-          <div className="newspaper-progress-head"><span></span><span>Newspaper</span><span>Status</span><span>Progress</span><span>Actions</span></div>
-          {progressJobs.length === 0 ? <div className="newspaper-empty">Newspaper downloads will appear here.</div> : progressJobs.map((job) => {
-            const details = progressByJob.get(job.id);
-            const progress = exactProgressPercent(job, details);
-            const awaitingRelease = Boolean(job.retry_at && job.retry_at * 1000 > Date.now());
-            return (
-              <article
-                className={`newspaper-progress-row${draggedJobId === job.id ? " is-dragging" : ""}`}
-                key={job.id}
-                onDragOver={(event) => {
-                  if (job.status === "queued") {
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = "move";
-                  }
-                }}
-                onDrop={(event) => void handleQueueDrop(event, job)}
-              >
-                <button
-                  type="button"
-                  className="newspaper-drag-handle"
-                  draggable={job.status === "queued"}
-                  disabled={job.status !== "queued"}
-                  aria-label={`Reorder ${job.edition_name}`}
-                  title={job.status === "queued" ? "Drag to reorder" : "Only queued items can be reordered"}
-                  onDragStart={(event) => handleQueueDragStart(event, job)}
-                  onDragEnd={() => setDraggedJobId(null)}
-                >
-                  <GripVertical />
-                </button>
-                <div className="newspaper-progress-edition"><strong>{job.edition_name} · {job.edition_code}</strong><span>{job.publication_date}</span></div>
-                <div className="newspaper-progress-status">
-                  <StatusBadge className={job.status === "completed" ? "is-completed" : undefined} tone={job.status === "completed" ? "success" : job.status === "failed" || job.status === "partial" ? "danger" : job.paused || awaitingRelease ? "neutral" : "primary"}>
-                    {awaitingRelease ? "Awaiting release" : formatJobStatus(job, details)}
-                  </StatusBadge>
-                  <span>{formatJobTime(job)}</span>
+        <section className="newspaper-queue-panel" aria-label="Newspaper download progress">
+          <div className="table-panel-header">
+            <h3>Queue</h3>
+            <div className="table-panel-header-status newspaper-queue-header-actions">
+              {isNewspaperQueueRunning ? (
+                <div className="newspaper-queue-controls" aria-label="Newspaper queue controls">
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    loading={isPausingAll}
+                    onClick={() => void toggleAllNewspaperJobsPause()}
+                    disabled={isPausingAll}
+                  >
+                    {allNewspaperJobsPaused
+                      ? <Play aria-hidden="true" className="h-3.5 w-3.5" />
+                      : <Pause aria-hidden="true" className="h-3.5 w-3.5" />}
+                    {isPausingAll
+                      ? "Updating"
+                      : allNewspaperJobsPaused
+                        ? "Resume all"
+                        : "Pause all"}
+                  </Button>
                 </div>
-                <div className="newspaper-job-progress">
-                  <span className="newspaper-job-progress-percent">{job.status === "queued" || job.paused ? "—" : `${progress}%`}</span>
-                  <div role="progressbar" aria-label={`${job.edition_name} download progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
-                    <i style={{ width: `${progress}%` }} />
+              ) : null}
+            </div>
+          </div>
+          <div className="newspaper-progress-table">
+            {progressJobs.length === 0 ? <div className="newspaper-empty">Newspaper downloads will appear here.</div> : progressJobs.map((job) => {
+              const details = progressByJob.get(job.id);
+              const progress = exactProgressPercent(job, details);
+              const awaitingRelease = Boolean(job.retry_at && job.retry_at * 1000 > Date.now());
+              return (
+                <article
+                  className={`newspaper-progress-row${draggedJobId === job.id ? " is-dragging" : ""}`}
+                  key={job.id}
+                  onDragOver={(event) => {
+                    if (job.status === "queued") {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                    }
+                  }}
+                  onDrop={(event) => void handleQueueDrop(event, job)}
+                >
+                  <button
+                    type="button"
+                    className="newspaper-drag-handle"
+                    draggable={job.status === "queued"}
+                    disabled={job.status !== "queued"}
+                    aria-label={`Reorder ${job.edition_name}`}
+                    title={job.status === "queued" ? "Drag to reorder" : "Only queued items can be reordered"}
+                    onDragStart={(event) => handleQueueDragStart(event, job)}
+                    onDragEnd={() => setDraggedJobId(null)}
+                  >
+                    <GripVertical />
+                  </button>
+                  <div className="newspaper-progress-edition"><strong>{job.edition_name} · {job.edition_code}</strong><span>{job.publication_date}</span></div>
+                  <div className="newspaper-progress-status">
+                    <StatusBadge className={job.status === "completed" ? "is-completed" : undefined} tone={job.status === "completed" ? "success" : job.status === "failed" || job.status === "partial" ? "danger" : job.paused || awaitingRelease ? "neutral" : "primary"}>
+                      {awaitingRelease ? "Awaiting release" : formatJobStatus(job, details)}
+                    </StatusBadge>
+                    <span>{formatJobTime(job)}</span>
                   </div>
-                  {(() => {
-                    if (!details) return <div className="newspaper-stage-counts"><span>Waiting</span></div>;
-                    const hasFailure = details.downloadFailed > 0 || details.optimizationFailed > 0;
-                    if (hasFailure) {
+                  <div className="newspaper-job-progress">
+                    <span className="newspaper-job-progress-percent">{job.status === "queued" || job.paused ? "—" : `${progress}%`}</span>
+                    <div role="progressbar" aria-label={`${job.edition_name} download progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+                      <i style={{ width: `${progress}%` }} />
+                    </div>
+                    {(() => {
+                      if (!details) return <div className="newspaper-stage-counts"><span>Waiting</span></div>;
+                      const hasFailure = details.downloadFailed > 0 || details.optimizationFailed > 0;
+                      if (hasFailure) {
+                        return (
+                          <div className="newspaper-stage-counts is-failed" role="status">
+                            {details.downloadFailed > 0 ? (
+                              <span><em>Failed</em> {details.downloadFailed} download{details.downloadFailed === 1 ? "" : "s"}</span>
+                            ) : null}
+                            {details.optimizationFailed > 0 ? (
+                              <span><em>Failed</em> {details.optimizationFailed} optimization{details.optimizationFailed === 1 ? "" : "s"}</span>
+                            ) : null}
+                          </div>
+                        );
+                      }
                       return (
-                        <div className="newspaper-stage-counts is-failed" role="status">
-                          {details.downloadFailed > 0 ? (
-                            <span><em>Failed</em> {details.downloadFailed} download{details.downloadFailed === 1 ? "" : "s"}</span>
-                          ) : null}
-                          {details.optimizationFailed > 0 ? (
-                            <span><em>Failed</em> {details.optimizationFailed} optimization{details.optimizationFailed === 1 ? "" : "s"}</span>
+                        <div className="newspaper-stage-counts">
+                          <span><em>Downloaded</em> {details.downloadCompleted}/{details.downloadTotal}</span>
+                          {details.optimizationTotal > 0 ? (
+                            <span><em>Optimized</em> {details.optimizationCompleted}/{details.optimizationTotal}</span>
                           ) : null}
                         </div>
                       );
-                    }
-                    return (
-                      <div className="newspaper-stage-counts">
-                        <span><em>Downloaded</em> {details.downloadCompleted}/{details.downloadTotal}</span>
-                        {details.optimizationTotal > 0 ? (
-                          <span><em>Optimized</em> {details.optimizationCompleted}/{details.optimizationTotal}</span>
-                        ) : null}
-                      </div>
-                    );
-                  })()}
-                </div>
-                <div className="newspaper-progress-actions">
-                  {job.status === "active" || job.status === "optimizing" ? (
-                    <button type="button" aria-label={`Pause ${job.edition_name}`} title="Pause download" onClick={() => void toggleJobPause(job)}><Pause /></button>
-                  ) : null}
-                  {job.status === "queued" ? (
-                    <button type="button" aria-label={`${job.paused ? "Resume" : "Start"} ${job.edition_name}`} title={job.paused ? "Resume download" : "Start this download next"} onClick={() => void startQueuedJob(job)}><Play /></button>
-                  ) : null}
-                  {["partial", "failed", "unavailable"].includes(job.status) ? (
-                    <button type="button" aria-label={`Retry ${job.edition_name}`} title="Retry missing pages" onClick={() => void retryJob(job)}><RotateCcw /></button>
-                  ) : null}
-                  {["completed", "partial"].includes(job.status) ? (
-                    <button type="button" aria-label={`Open ${job.edition_name} folder`} title="Open download folder" onClick={() => void invoke("open_newspaper_download_folder", { path: job.output_dir })}><FolderOpen /></button>
-                  ) : null}
-                  <button
-                    type="button"
-                    className="danger"
-                    aria-label={`Delete ${job.edition_name} and its local files`}
-                    title={["active", "optimizing"].includes(job.status) ? "Pause this download before deleting it" : "Delete edition and local files"}
-                    disabled={["active", "optimizing"].includes(job.status)}
-                    onClick={() => void removeJob(job)}
-                  ><Trash2 /></button>
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      </section>
+                    })()}
+                  </div>
+                  <div className="newspaper-progress-actions">
+                    {job.status === "active" || job.status === "optimizing" ? (
+                      <button type="button" aria-label={`Pause ${job.edition_name}`} title="Pause download" onClick={() => void toggleJobPause(job)}><Pause /></button>
+                    ) : null}
+                    {job.status === "queued" ? (
+                      <button type="button" aria-label={`${job.paused ? "Resume" : "Start"} ${job.edition_name}`} title={job.paused ? "Resume download" : "Start this download next"} onClick={() => void startQueuedJob(job)}><Play /></button>
+                    ) : null}
+                    {["partial", "failed", "unavailable"].includes(job.status) ? (
+                      <button type="button" aria-label={`Retry ${job.edition_name}`} title="Retry missing pages" onClick={() => void retryJob(job)}><RotateCcw /></button>
+                    ) : null}
+                    {["completed", "partial"].includes(job.status) ? (
+                      <button type="button" aria-label={`Open ${job.edition_name} folder`} title="Open download folder" onClick={() => void invoke("open_newspaper_download_folder", { path: job.output_dir })}><FolderOpen /></button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="danger"
+                      aria-label={`Delete ${job.edition_name} and its local files`}
+                      title={["active", "optimizing"].includes(job.status) ? "Pause this download before deleting it" : "Delete edition and local files"}
+                      disabled={["active", "optimizing"].includes(job.status)}
+                      onClick={() => void removeJob(job)}
+                    ><Trash2 /></button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      </div>
       {processing || optimizationRuntime.active ? (
         <div className="newspaper-processing">
           <LoaderCircle className="lv-button-spinner" />
