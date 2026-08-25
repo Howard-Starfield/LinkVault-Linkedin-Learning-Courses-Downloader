@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { ButtonHTMLAttributes, HTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, LoaderCircle, X } from "lucide-react";
@@ -68,9 +68,13 @@ export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElem
   );
 }
 
-export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+export const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(function Textarea(
+  { className, ...props },
+  ref
+) {
   return (
     <textarea
+      ref={ref}
       className={cn(
         "min-h-16 w-full resize-none rounded-md border border-input bg-input/30 px-3 py-2 text-[13px] text-foreground caret-current shadow-xs outline-none transition-[border-color,box-shadow,color]",
         "placeholder:text-muted focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50",
@@ -79,7 +83,7 @@ export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTex
       {...props}
     />
   );
-}
+});
 
 export function Select({ className, children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
   return (
@@ -229,11 +233,11 @@ export function StatusBadge({
   );
 }
 
-export function EmptyRow({ title, description, compact = false }: { title: string; description: string; compact?: boolean }) {
+export function EmptyRow({ title, description, compact = false }: { title: string; description?: string; compact?: boolean }) {
   return (
     <div className={cn("lv-table-empty", compact && "compact-empty")}>
       <span>{title}</span>
-      <span>{description}</span>
+      {description ? <span>{description}</span> : null}
     </div>
   );
 }

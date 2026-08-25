@@ -21,7 +21,7 @@ import {
 import { toast } from "sonner";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
-import { readNewspaperOptimizationPreferences } from "./newspaper-optimization-preferences";
+import { readNewspaperOptimizationPreferences, type NewspaperOptimizationRunOptions } from "./newspaper-optimization-preferences";
 import type { NewspaperReaderSourceTarget } from "./newspaper-navigation";
 
 type EditionKind = "daily" | "weekly" | "special";
@@ -167,12 +167,14 @@ function editionKey(edition: NewspaperEdition) {
 
 export function NewspaperView({
   mode = "download",
+  onRequestQueueProcess,
   onOpenClipping,
   onReturnClipping,
   readerTarget,
   onReaderTargetConsumed
 }: {
   mode?: "download" | "library";
+  onRequestQueueProcess?: (options?: NewspaperOptimizationRunOptions | null) => void | Promise<void>;
   onOpenClipping?: (clippingId: string) => void;
   onReturnClipping?: (clippingId: string) => void;
   readerTarget?: NewspaperReaderSourceTarget | null;
@@ -423,10 +425,7 @@ export function NewspaperView({
       }
       await refresh();
       setProcessing(true);
-      await invoke("process_newspaper_queue");
-      void invoke("process_newspaper_optimization_queue", {
-        options: buildOptimizationRunOptions()
-      }).catch(() => undefined);
+      await onRequestQueueProcess?.(buildOptimizationRunOptions());
       await refresh();
     } catch (error) {
       toast.error("Could not start newspaper download", { description: String(error) });
@@ -462,12 +461,11 @@ export function NewspaperView({
   }
 
   function continueQueue() {
-    if (!isTauriRuntime()) return;
+    if (!isTauriRuntime() || !onRequestQueueProcess) return;
     setProcessing(true);
     const options = buildOptimizationRunOptions();
-    void invoke("process_newspaper_queue")
-      .then(() => invoke("process_newspaper_optimization_queue", { options }))
-      .catch((error) => toast.error("Could not continue newspaper queue", { description: String(error) }))
+    void Promise.resolve(onRequestQueueProcess(options))
+      .catch((error: unknown) => toast.error("Could not continue newspaper queue", { description: String(error) }))
       .finally(() => {
         setProcessing(false);
         void refresh();
@@ -636,7 +634,7 @@ export function NewspaperView({
           <div className="newspaper-edition-tabs" role="tablist" aria-label="Edition groups">
             {([["all", "All"], ["daily", "Regional"], ["weekly", "Weekly"], ["special", "Special"]] as const).map(([value, label]) => (
               <button type="button" role="tab" aria-selected={kind === value} className={kind === value ? "active" : undefined} key={value} onClick={() => setKind(value)}>
-                {label} <span>({value === "all" ? catalog.length : catalog.filter((item) => item.kind === value).length})</span>
+                {label}
               </button>
             ))}
           </div>
@@ -658,7 +656,7 @@ export function NewspaperView({
             {visibleEditions.length === 0 ? <div className="newspaper-empty">No editions match this filter.</div> : null}
           </div>
           <footer className="newspaper-edition-footer">
-            <span>Showing {visibleEditions.length} of {catalog.length} · {selected.size} selected</span>
+            <span>{selected.size} selected</span>
             <button type="button" onClick={() => {
               const allVisibleSelected = visibleEditions.every((edition) => selected.has(editionKey(edition)));
               const next = new Set(selected);
@@ -675,19 +673,24 @@ export function NewspaperView({
 
         <section className="newspaper-dispatch-panel newspaper-scheduler" aria-label="Daily newspaper schedule">
           <div className="newspaper-schedule-tabs" role="tablist" aria-label="Schedule and download history">
-            <button type="button" role="tab" aria-selected={scheduleTab === "schedule"} className={scheduleTab === "schedule" ? "active" : undefined} onClick={() => setScheduleTab("schedule")}>Daily schedule</button>
+            <button type="button" role="tab" aria-selected={scheduleTab === "schedule"} className={scheduleTab === "schedule" ? "active" : undefined} onClick={() => setScheduleTab("schedule")}>Schedule</button>
             <button type="button" role="tab" aria-selected={scheduleTab === "history"} className={scheduleTab === "history" ? "active" : undefined} onClick={() => setScheduleTab("history")}>History</button>
           </div>
           {scheduleTab === "schedule" ? (
             <>
               <div className="newspaper-schedule-create">
-                <Select value="daily" aria-label="Schedule frequency" disabled><option value="daily">Daily</option></Select>
-                <Input type="time" value={cronTime} onChange={(event) => setCronTime(event.target.value)} aria-label="Daily newspaper schedule time" />
+                <label className="newspaper-cluster-field">
+                  <span>Frequency</span>
+                  <Select value="daily" aria-label="Schedule frequency" disabled><option value="daily">Daily</option></Select>
+                </label>
+                <label className="newspaper-cluster-field">
+                  <span>Time</span>
+                  <Input type="time" value={cronTime} onChange={(event) => setCronTime(event.target.value)} aria-label="Daily newspaper schedule time" />
+                </label>
               </div>
-              <div className="newspaper-schedule-label">Scheduled editions ({schedules.length})</div>
               <div className="newspaper-schedule-cards">
                 {schedules.length === 0 ? (
-                  <div className="newspaper-empty newspaper-schedule-empty"><Clock3 aria-hidden="true" /><span>No daily schedules yet. Choose editions and a time below.</span></div>
+                  <div className="newspaper-empty newspaper-schedule-empty"><Clock3 aria-hidden="true" /><span>No schedules yet</span></div>
                 ) : schedules.map((item) => (
                   <article className="newspaper-schedule-card" key={item.id}>
                     <time>{formatClockTime(item.cron_time)}</time>
@@ -725,7 +728,7 @@ export function NewspaperView({
 
         <section className="newspaper-dispatch-panel newspaper-options" aria-label="Newspaper download settings">
           <div className="newspaper-settings-stack">
-            <label className="newspaper-setting-field">
+            <label className="newspaper-cluster-field newspaper-setting-field">
               <span>
                 Date range
                 <Tooltip label="Uses the system date automatically and includes today.">
@@ -744,16 +747,20 @@ export function NewspaperView({
               <Input type="date" value={dateMode === "last7_days" ? today() : startDate} onChange={(event) => setStartDate(event.target.value)} disabled={dateMode === "last7_days"} aria-label={dateMode === "last7_days" ? "System current date" : "Start publication date"} />
               {dateMode === "custom" ? <Input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} aria-label="End publication date" /> : null}
             </div>
-            <label className="newspaper-delay-setting">
+            <label className="newspaper-cluster-field newspaper-delay-setting">
               <span>Delay between editions</span>
-              <Input type="number" min={0} max={3600} value={delaySeconds} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Delay between editions in seconds" />
-              <em>seconds</em>
+              <div className="newspaper-delay-field">
+                <Input type="number" min={0} max={3600} value={delaySeconds} onChange={(event) => setDelaySeconds(Number(event.target.value))} aria-label="Delay between editions in seconds" className="newspaper-delay-input" />
+                <em>seconds</em>
+              </div>
             </label>
-            <label className="newspaper-destination-setting">
+            <label className="newspaper-cluster-field newspaper-destination-setting">
               <span>Save location</span>
-              <div>
+              <div className="newspaper-destination-row">
                 <Input id="newspaper-destination" value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="Choose a newspaper folder" />
-                <Button variant="outline" onClick={() => void chooseFolder()}><FolderOpen /> Browse</Button>
+                <Button variant="outline" className="newspaper-action-button" onClick={() => void chooseFolder()} aria-label="Browse newspaper folder">
+                  <FolderOpen /> Browse
+                </Button>
               </div>
             </label>
             <div className={`newspaper-optimization-setting${optimize ? "" : " is-disabled"}`}>
@@ -791,12 +798,13 @@ export function NewspaperView({
             </div>
           </div>
           <div className="command-actions newspaper-download-actions">
-            <Button variant="outline" loading={savingSchedule} onClick={() => void saveSchedule()}>
+            <Button variant="outline" className="newspaper-action-button" loading={savingSchedule} onClick={() => void saveSchedule()}>
               <CalendarClock /> Add schedule
             </Button>
             {isNewspaperQueueRunning ? (
               <Button
                 variant="primary"
+                className="newspaper-action-button"
                 loading={isPausingAll || processing}
                 onClick={() => void toggleAllNewspaperJobsPause()}
                 disabled={isPausingAll}
@@ -811,7 +819,7 @@ export function NewspaperView({
                     : "Pause all"}
               </Button>
             ) : (
-              <Button variant="primary" loading={submitting || processing} onClick={() => void submitDownload()}>
+              <Button variant="primary" className="newspaper-action-button" loading={submitting || processing} onClick={() => void submitDownload()}>
                 <Download /> Download now
               </Button>
             )}
@@ -820,7 +828,6 @@ export function NewspaperView({
       </div>
       <section className="newspaper-progress-panel" aria-label="Newspaper download progress">
         <div className="newspaper-progress-table">
-          <div className="newspaper-progress-head"><span></span><span>Newspaper</span><span>Status</span><span>Progress</span><span>Actions</span></div>
           {progressJobs.length === 0 ? <div className="newspaper-empty">Newspaper downloads will appear here.</div> : progressJobs.map((job) => {
             const details = progressByJob.get(job.id);
             const progress = exactProgressPercent(job, details);
