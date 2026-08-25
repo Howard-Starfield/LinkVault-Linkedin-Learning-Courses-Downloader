@@ -8,6 +8,11 @@ import {
   listenForClippingInstanceActivation
 } from "./clipping-instance-activation";
 import {
+  CLIPPING_VIEW_MODE_EVENT,
+  readClippingViewMode,
+  type ClippingViewMode
+} from "./clipping-view-preferences";
+import {
   ensureNewspaperClippingThumbnail,
   getNewspaperClippingsPage,
   isTauriRuntime,
@@ -17,6 +22,7 @@ import {
 const PAGE_SIZE = 50;
 const GRID_GAP = 16;
 const MAX_MOUNTED_CARDS = 48;
+const LIST_ROW_HEIGHT = 72;
 
 function columnCountForWidth(width: number) {
   if (width < 560) return 1;
@@ -38,6 +44,24 @@ function ClippingSkeletonShelf({ loading = false }: { loading?: boolean }) {
       {Array.from({ length: 4 }, (_, index) => <span key={index} />)}
     </div>
   );
+}
+
+function ClippingEmptyState({ onOpenLibrary }: { onOpenLibrary: () => void }) {
+  return (
+    <div className="clipping-gallery__empty">
+      <div className="clipping-gallery__empty-card">
+        <h2>No clippings yet</h2>
+        <p>Save clips from Newspaper library and they will show up here with their notes.</p>
+        <Button onClick={onOpenLibrary} size="sm" variant="primary">Open Newspaper library</Button>
+      </div>
+    </div>
+  );
+}
+
+function clippingMeta(item: NewspaperClippingSummary) {
+  return [item.editionName, item.publicationDate, item.pageNumber ? `p. ${item.pageNumber}` : null]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 export function NewspaperClippingList({
@@ -64,13 +88,37 @@ export function NewspaperClippingList({
   const thumbnailErrorRef = useRef(new Set<string>());
   const mountedRef = useRef(true);
   const scrollRestoredRef = useRef(false);
+  const [viewMode, setViewMode] = useState<ClippingViewMode>(() => readClippingViewMode());
   const [items, setItems] = useState<Array<NewspaperClippingSummary | undefined>>([]);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
   const [initialLoading, setInitialLoading] = useState(true);
   const [viewportWidth, setViewportWidth] = useState(1200);
   const columnCount = columnCountForWidth(viewportWidth);
-  const rowCount = Math.ceil(total / columnCount);
+  const galleryRowCount = Math.ceil(total / columnCount);
+  const isGallery = viewMode === "gallery";
+
+  useEffect(() => {
+    const handleViewMode = (event: Event) => {
+      const detail = (event as CustomEvent<ClippingViewMode>).detail;
+      if (detail === "gallery" || detail === "list") setViewMode(detail);
+      else setViewMode(readClippingViewMode());
+    };
+    window.addEventListener(CLIPPING_VIEW_MODE_EVENT, handleViewMode);
+    return () => window.removeEventListener(CLIPPING_VIEW_MODE_EVENT, handleViewMode);
+  }, []);
+
+  const viewModeReadyRef = useRef(false);
+  useEffect(() => {
+    if (!viewModeReadyRef.current) {
+      viewModeReadyRef.current = true;
+      return;
+    }
+    const element = scrollRef.current;
+    if (!element) return;
+    element.scrollTop = 0;
+    onScrollTopChange(0);
+  }, [viewMode, onScrollTopChange]);
 
   const loadPage = useCallback(async (offset: number, generation: number, reset = false) => {
     const owner = `${generation}:${offset}`;
@@ -203,29 +251,44 @@ export function NewspaperClippingList({
     };
   }, [refreshLoadedPages]);
 
-  const virtualizer = useVirtualizer({
-    count: rowCount,
+  const galleryVirtualizer = useVirtualizer({
+    count: isGallery ? galleryRowCount : 0,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => Math.max(180, (viewportWidth - (columnCount + 1) * GRID_GAP) / columnCount / 1.35 + GRID_GAP),
+    estimateSize: () => Math.max(180, (viewportWidth - (columnCount + 1) * GRID_GAP) / columnCount / 1.45 + GRID_GAP),
     getItemKey: (rowIndex) => `clipping-grid-row-${rowIndex}-${columnCount}`,
     overscan: 2
   });
-  const virtualRows = virtualizer.getVirtualItems();
+  const listVirtualizer = useVirtualizer({
+    count: isGallery ? 0 : total,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => LIST_ROW_HEIGHT,
+    getItemKey: (index) => items[index]?.id ?? `clipping-list-${index}`,
+    overscan: 6
+  });
+
+  const galleryVirtualRows = galleryVirtualizer.getVirtualItems();
+  const listVirtualRows = listVirtualizer.getVirtualItems();
   const boundedVirtualRows = useMemo(() => {
     const maxRows = Math.max(1, Math.ceil(MAX_MOUNTED_CARDS / columnCount));
-    const scrollTop = virtualizer.scrollOffset ?? scrollRef.current?.scrollTop ?? 0;
+    const scrollTop = galleryVirtualizer.scrollOffset ?? scrollRef.current?.scrollTop ?? 0;
     const viewportHeight = scrollRef.current?.clientHeight ?? 960;
-    const rowSize = virtualRows[0]?.size ?? 180;
-    const nearViewport = virtualRows.filter((row) => (
+    const rowSize = galleryVirtualRows[0]?.size ?? 180;
+    const nearViewport = galleryVirtualRows.filter((row) => (
       row.end >= scrollTop - rowSize * 2
       && row.start <= scrollTop + viewportHeight + rowSize * 2
     ));
-    return (nearViewport.length ? nearViewport : virtualRows).slice(0, maxRows);
-  }, [columnCount, viewportWidth, virtualRows, virtualizer.scrollOffset]);
-  const visibleItemIndexes = useMemo(() => boundedVirtualRows.flatMap((row) => {
-    const start = row.index * columnCount;
-    return Array.from({ length: columnCount }, (_, column) => start + column).filter((index) => index < total);
-  }), [boundedVirtualRows, columnCount, total]);
+    return (nearViewport.length ? nearViewport : galleryVirtualRows).slice(0, maxRows);
+  }, [columnCount, galleryVirtualRows, galleryVirtualizer.scrollOffset]);
+
+  const visibleItemIndexes = useMemo(() => {
+    if (!isGallery) {
+      return listVirtualRows.map((row) => row.index).filter((index) => index < total);
+    }
+    return boundedVirtualRows.flatMap((row) => {
+      const start = row.index * columnCount;
+      return Array.from({ length: columnCount }, (_, column) => start + column).filter((index) => index < total);
+    });
+  }, [boundedVirtualRows, columnCount, isGallery, listVirtualRows, total]);
 
   useEffect(() => {
     if (!visibleItemIndexes.length) return;
@@ -235,10 +298,11 @@ export function NewspaperClippingList({
       if (!items[index]) offsets.add(Math.floor(index / PAGE_SIZE) * PAGE_SIZE);
     }
     const last = visibleItemIndexes[visibleItemIndexes.length - 1] ?? 0;
-    const nextOffset = Math.floor((last + columnCount * 2) / PAGE_SIZE) * PAGE_SIZE;
+    const lookahead = isGallery ? columnCount * 2 : 8;
+    const nextOffset = Math.floor((last + lookahead) / PAGE_SIZE) * PAGE_SIZE;
     if (nextOffset < total && !items[nextOffset]) offsets.add(nextOffset);
     offsets.forEach((offset) => void loadPage(offset, generation));
-  }, [columnCount, items, loadPage, total, visibleItemIndexes]);
+  }, [columnCount, isGallery, items, loadPage, total, visibleItemIndexes]);
 
   useEffect(() => {
     for (const index of visibleItemIndexes) {
@@ -263,81 +327,117 @@ export function NewspaperClippingList({
     }
   }, [items, visibleItemIndexes]);
 
+  const renderThumb = (item: NewspaperClippingSummary | undefined, compact = false) => (
+    <span className={compact ? "clipping-list-row__thumb" : "clipping-gallery__thumb"}>
+      {item?.thumbnailReady && item.thumbnailUrl ? (
+        <img
+          alt=""
+          decoding="async"
+          onError={() => {
+            thumbnailErrorRef.current.add(item.id);
+            setItems((current) => current.map((candidate) => candidate?.id === item.id
+              ? { ...candidate, thumbnailReady: false, thumbnailUrl: null, thumbnailVersion: null }
+              : candidate));
+          }}
+          onLoad={(event) => { event.currentTarget.dataset.loaded = "true"; }}
+          src={item.thumbnailUrl}
+        />
+      ) : (
+        <span
+          aria-label={item?.assetState === "missing" || (item && thumbnailErrorRef.current.has(item.id)) ? "Clipping preview unavailable" : "Preparing clipping preview"}
+          className={compact ? "clipping-list-row__placeholder" : "clipping-gallery__placeholder"}
+          role="img"
+        />
+      )}
+    </span>
+  );
+
   return (
-    <section className="clipping-gallery" aria-label="Saved clippings" hidden={hidden}>
+    <section
+      className={`clipping-gallery${isGallery ? "" : " clipping-gallery--list"}`}
+      aria-label="Saved clippings"
+      hidden={hidden}
+      data-view-mode={viewMode}
+    >
       <div className="clipping-gallery__scroll" ref={scrollRef} data-testid="newspaper-clipping-list-scroll">
         {error ? <div className="clipping-gallery__message" role="alert">Could not load clippings. {error}</div> : null}
         {!error && initialLoading ? (
           <div className="clipping-gallery__loading" role="status">
             <span className="sr-only">Loading clippings…</span>
-            <ClippingSkeletonShelf loading />
+            {isGallery ? <ClippingSkeletonShelf loading /> : (
+              <div className="clipping-list clipping-list--loading" aria-hidden="true">
+                {Array.from({ length: 4 }, (_, index) => (
+                  <div className="clipping-list-row clipping-list-row--skeleton" key={index} />
+                ))}
+              </div>
+            )}
           </div>
         ) : null}
         {!error && !initialLoading && total === 0 ? (
-          <div className="clipping-gallery__empty">
-            <ClippingSkeletonShelf />
-            <div>
-              <span>Start here</span>
-              <h2>No clippings yet</h2>
-              <p>Clips you save from Newspaper library appear here with their notes.</p>
-              <Button onClick={onOpenLibrary} size="sm" variant="primary">Open Newspaper library</Button>
-            </div>
-          </div>
+          <ClippingEmptyState onOpenLibrary={onOpenLibrary} />
         ) : null}
-        <div className="clipping-gallery__virtual" style={{ height: `${virtualizer.getTotalSize()}px` }}>
-          {boundedVirtualRows.map((row) => {
-            const start = row.index * columnCount;
-            return (
-              <div
-                className="clipping-gallery__row"
-                data-index={row.index}
-                key={row.key}
-                ref={virtualizer.measureElement}
-                style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`, transform: `translateY(${row.start}px)` }}
-              >
-                {Array.from({ length: columnCount }, (_, column) => {
-                  const item = items[start + column];
-                  if (start + column >= total) return null;
-                  return (
-                    <button
-                      aria-label={item ? `Open ${item.title}` : "Loading clipping"}
-                      className="clipping-gallery__card"
-                      disabled={!item}
-                      key={item?.id ?? `clipping-placeholder-${start + column}`}
-                      onClick={() => item && onSelect(item.id)}
-                      style={{ "--clipping-aspect": clippingAspectRatio(item) } as CSSProperties}
-                      type="button"
-                    >
-                      <span className="clipping-gallery__thumb">
-                        {item?.thumbnailReady && item.thumbnailUrl ? (
-                          <img
-                            alt=""
-                            decoding="async"
-                            onError={() => {
-                              thumbnailErrorRef.current.add(item.id);
-                              setItems((current) => current.map((candidate) => candidate?.id === item.id
-                                ? { ...candidate, thumbnailReady: false, thumbnailUrl: null, thumbnailVersion: null }
-                                : candidate));
-                            }}
-                            onLoad={(event) => { event.currentTarget.dataset.loaded = "true"; }}
-                            src={item.thumbnailUrl}
-                          />
-                        ) : (
-                          <span
-                            aria-label={item?.assetState === "missing" || (item && thumbnailErrorRef.current.has(item.id)) ? "Clipping preview unavailable" : "Preparing clipping preview"}
-                            className="clipping-gallery__placeholder"
-                            role="img"
-                          />
-                        )}
+        {isGallery ? (
+          <div className="clipping-gallery__virtual" style={{ height: `${galleryVirtualizer.getTotalSize()}px` }}>
+            {boundedVirtualRows.map((row) => {
+              const start = row.index * columnCount;
+              return (
+                <div
+                  className="clipping-gallery__row"
+                  data-index={row.index}
+                  key={row.key}
+                  ref={galleryVirtualizer.measureElement}
+                  style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`, transform: `translateY(${row.start}px)` }}
+                >
+                  {Array.from({ length: columnCount }, (_, column) => {
+                    const item = items[start + column];
+                    if (start + column >= total) return null;
+                    return (
+                      <button
+                        aria-label={item ? `Open ${item.title}` : "Loading clipping"}
+                        className="clipping-gallery__card"
+                        disabled={!item}
+                        key={item?.id ?? `clipping-placeholder-${start + column}`}
+                        onClick={() => item && onSelect(item.id)}
+                        style={{ "--clipping-aspect": clippingAspectRatio(item) } as CSSProperties}
+                        type="button"
+                      >
+                        {renderThumb(item)}
+                        {item ? <span className="clipping-gallery__title"><strong>{item.title}</strong></span> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="clipping-list" style={{ height: `${listVirtualizer.getTotalSize()}px` }} aria-label="Clipping list">
+            {listVirtualRows.map((row) => {
+              const item = items[row.index];
+              return (
+                <button
+                  type="button"
+                  key={row.key}
+                  className={`clipping-list-row${item ? "" : " clipping-list-row--skeleton"}`}
+                  disabled={!item}
+                  aria-label={item ? `Open ${item.title}` : "Loading clipping"}
+                  onClick={() => item && onSelect(item.id)}
+                  style={{ height: `${row.size}px`, transform: `translateY(${row.start}px)` }}
+                >
+                  {item ? (
+                    <>
+                      {renderThumb(item, true)}
+                      <span className="clipping-list-row__copy">
+                        <strong>{item.title}</strong>
+                        <span>{clippingMeta(item)}</span>
                       </span>
-                      {item ? <span className="clipping-gallery__title"><strong>{item.title}</strong></span> : null}
-                    </button>
-                  );
-                })}
-              </div>
-            );
-          })}
-        </div>
+                    </>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
     </section>
   );

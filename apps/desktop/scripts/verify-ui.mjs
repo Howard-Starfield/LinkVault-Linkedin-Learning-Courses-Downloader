@@ -15,6 +15,7 @@ for (const required of [
   'activeView === "newspaper-download"',
   'activeView === "newspaper-library"',
   "processNewspaperSchedules",
+  "ensureNewspaperQueueProcessing",
   'invoke("process_newspaper_queue")',
   '"process_newspaper_optimization_queue"',
   "Default zoom level",
@@ -33,10 +34,24 @@ for (const required of [
   "reset_coursera_database",
   "reset_newspaper_database",
   "performProviderReset",
-  "pausingForReset"
+  "pausingForReset",
+  "queue-detail-overlay",
+  "queue-job-stack",
+  "createDownloadEmulatorJob",
+  "Excel: Pivot tables for analysts",
+  "CSS: Grid and flexbox layouts",
+  "Leadership: Coaching your team",
+  "UPDATE_TOAST_ID",
+  "Install now"
 ]) {
   assert.ok(app.includes(required), `App shell is missing: ${required}`);
 }
+
+assert.ok(!app.includes('settings-section-title">Artifacts'), "Settings must not duplicate LinkedIn artifact toggles.");
+assert.ok(!app.includes("Download videos by default"), "Artifact download defaults belong on the LinkedIn command board, not Settings.");
+
+const main = await readFile(new URL("../src/main.tsx", import.meta.url), "utf8");
+assert.ok(main.includes('position="bottom-left"'), "Sonner toasts must appear on the left.");
 
 for (const required of [
   "queueNeedsSessionRefresh",
@@ -55,28 +70,29 @@ for (const required of [
   "Regional",
   "Weekly",
   "Special",
-  "Daily schedule",
+  "Schedule",
   "Add schedule",
   "scheduleDateModeLabel",
   "dateMode,",
   "History",
   "System current date",
-  "Delay between editions",
-  "Save location",
-  "Image compression strength",
+  "Delay",
+  "Folder",
+  "Quality",
   "compressionLabel",
-  "High clarity · WebP 92",
-  "Compact · WebP 45",
-  "Very small · WebP 35",
-  "Maximum savings · WebP 25",
-  "Keep source JPG",
+  "92 · Clear",
+  "45 · Compact",
+  "35 · Tiny",
+  "25 · Max",
+  "Keep JPG",
   "JPG remains only if WebP is larger or fails",
   "Download now",
   "command-actions newspaper-download-actions",
-  "seconds",
+  "newspaper-delay-unit",
+  ">sec<",
   "Awaiting release",
   "Optimization worker mode",
-  "Manual ceiling",
+  "Manual</option>",
   "newspaper://optimization-progress",
   "Downloaded",
   "Optimized",
@@ -100,6 +116,10 @@ for (const required of [
   assert.ok(view.includes(required), `Newspaper view is missing: ${required}`);
 }
 assert.ok(!view.includes("92 - Math.round"), "Quality labels and submitted values must use the same explicit preset.");
+assert.ok(
+  !view.includes('invoke("process_newspaper_queue")'),
+  "App owns the newspaper download queue worker; NewspaperView must request processing through onRequestQueueProcess."
+);
 
 for (const required of [
   "All statuses",
@@ -154,10 +174,10 @@ assert.ok(readerPreferences.includes("window.localStorage.setItem"), "Reader pre
 assert.equal((app.match(/className="lv-sidebar-reopen"/g) ?? []).length, 1, "The shared main surface must own one sidebar reopen control.");
 assert.ok(app.indexOf('className="lv-sidebar-reopen"') < app.indexOf('className="lv-content"'), "The sidebar reopen control must not be scoped to one provider view.");
 assert.ok(app.includes('className="settings-dialog"'), "Settings must own a compact responsive dialog contract.");
-assert.ok(app.includes("lv-sidebar-optimization"), "Sidebar runtime status needs an intrinsic-width owner.");
+assert.ok(!app.includes("lv-sidebar-optimization"), "Sidebar must not show newspaper optimization runtime chrome.");
+assert.ok(css.includes(".lv-sidebar nav > *") && css.includes("min-width: 0"), "Sidebar nav children need an intrinsic-width owner.");
 assert.ok(css.includes(".settings-dialog") && css.includes("overflow-x: hidden"), "Settings must not expose a horizontal scroll surface.");
 assert.ok(css.includes(".queue-url-hint") && css.includes(".queue-session-warning"), "LinkedIn queue recovery needs copy and session-refresh affordances.");
-assert.ok(css.includes(".lv-sidebar-optimization > span") && css.includes("text-overflow: ellipsis"), "Sidebar runtime text can widen the navigation rail.");
 assert.ok(!library.includes(">Read</Button>"), "Opening a newspaper must be owned by the whole library row.");
 assert.ok(!library.includes("Register archive") && !library.includes("Repair existing"), "Archive maintenance belongs in Settings, not the Library toolbar.");
 assert.ok(!library.includes("Default newspaper zoom"), "Reader defaults belong in Settings, not the Library toolbar.");
@@ -165,14 +185,30 @@ assert.ok(library.includes("item.readPageCount"), "Library progress must use uni
 assert.ok(!library.includes("item.furthestPageIndex + 1"), "Library progress must not treat the furthest reached page as read coverage.");
 assert.ok(!newspaperApi.includes("get_newspaper_preview"), "Thumbnail transport must not use the legacy base64 IPC command.");
 assert.ok(!newspaperApi.includes("get_newspaper_page_image"), "Reader transport must not use the legacy base64 IPC command.");
-assert.ok(css.includes(".newspaper-dispatch-grid"), "Newspaper view needs the three-panel dispatch grid.");
-assert.ok(css.includes("minmax(280px, 0.96fr) minmax(340px, 1.08fr) minmax(300px, 0.98fr)"), "Wide newspaper workspace must render three durable panels.");
-assert.ok(css.includes('grid-template-areas: "editions settings schedule"'), "Download settings must sit between editions and schedule.");
-assert.ok(css.includes("minmax(380px, 0.64fr) minmax(240px, 0.56fr)"), "Compact dispatch row must reserve useful height for Progress.");
+assert.ok(css.includes(".newspaper-downloads-workspace"), "Newspaper download needs a LinkedIn-like centered workspace.");
+assert.ok(css.includes(".newspaper-search-stage"), "Newspaper download needs a concise search/control stage.");
+assert.ok(css.includes(".newspaper-control-cluster"), "Newspaper download needs a compact labeled control cluster.");
+assert.ok(css.includes(".newspaper-queue-panel"), "Newspaper download needs a LinkedIn-like queue panel.");
+assert.ok(css.includes("--newspaper-control-height: 32px"), "Newspaper controls must share the 32px control height.");
+assert.ok(css.includes("border-radius: 10px"), "Newspaper download controls must use the shared 10px radius.");
+assert.ok(css.includes(".newspaper-editions") && css.includes("width: min(100%, 420px)"), "Edition picker must stay narrower than the workspace.");
+assert.ok(css.includes("minmax(90px, 140px)"), "Edition list height must stay compact (half of the prior 180–280 band).");
+assert.ok(view.includes("newspaper-schedule-section-tabs") && view.includes("queue-section-tab"), "Schedule/History must reuse one-row queue section tabs.");
+assert.ok(!view.includes("newspaper-schedule-tabs"), "Schedule/History must not keep underline-style newspaper schedule tabs.");
+assert.ok(css.includes(".newspaper-control-cluster") && css.includes("margin-inline: auto 0"), "Control cluster must sit asymmetrically.");
+assert.ok(!view.includes("Search editions"), "Edition search was removed to free vertical space.");
+assert.ok(!view.includes("Delay between editions"), "Option labels must stay concise.");
+assert.ok(!view.includes("Image compression strength"), "Compression label must stay concise.");
+assert.ok(!view.includes("Keep source JPG"), "JPG retention label must stay concise.");
 assert.ok(css.includes(".newspaper-progress-actions") && css.includes("opacity: 0"), "Queue actions must reveal on hover or focus.");
 assert.ok(css.includes("@container lv-main (max-width: 900px)"), "Newspaper view needs the container-based responsive collapse.");
 assert.ok(css.includes("@container lv-main (max-width: 650px)"), "Newspaper view needs the narrow newspaper stack.");
-assert.ok(css.includes(".newspaper-dispatch-panel {\n    min-height: 380px;"), "Compact newspaper panels must retain usable height before the schedule row.");
+assert.ok(view.includes("newspaper-downloads-workspace"), "Newspaper download markup must use the concise workspace.");
+assert.ok(view.includes("newspaper-search-stage"), "Newspaper download markup must use the search stage.");
+assert.ok(view.includes("newspaper-control-cluster"), "Newspaper download markup must use the control cluster.");
+assert.ok(view.includes("newspaper-queue-panel"), "Newspaper download markup must use the queue panel.");
+assert.ok(!view.includes("newspaper-dispatch-grid"), "Newspaper download must not keep the three-panel dispatch grid.");
+assert.ok(!view.includes("newspaper-dispatch-panel"), "Newspaper download must not keep bordered dispatch panel chrome.");
 assert.ok(css.includes("width: 100vw") && css.includes("height: 100vh"), "Reader must occupy the full window.");
 assert.ok(css.includes("conic-gradient(var(--accent) var(--reading-progress)"), "Reading progress needs the circular library indicator.");
 assert.ok(css.includes(".newspaper-library-toolbar .newspaper-search input") && css.includes("height: 2.25rem"), "Library search must match adjacent control height.");
@@ -183,6 +219,9 @@ assert.ok(css.includes('data-panning="true"') && css.includes("cursor: grabbing"
 assert.ok(css.includes("cursor: default"), "The baseline Reader page must retain the arrow cursor.");
 assert.ok(css.includes(".newspaper-reader-control-section") && css.includes("border-left: 1px solid var(--border-soft)"), "Reader option groups need vertical dividers.");
 assert.ok(css.includes(".newspaper-library-virtual") && css.includes(".newspaper-reader-virtual"), "Library and reader need virtual scroll geometry.");
+assert.ok(css.includes("--queue-live:"), "LinkedIn queue live states must use a non-orange live color.");
+assert.ok(css.includes(".queue-detail-overlay"), "LinkedIn video progress must overlay later queue rows.");
+assert.ok(css.includes(".queue-job-stack.is-open"), "The expanded queue row must stack above later downloads.");
 assert.ok(!reader.includes("newspaper-reader-backdrop"), "Reader must not be embedded inside a modal card.");
 assert.ok(!view.includes("newspaper-page-header"), "Downloader must not spend vertical space on a duplicate page header.");
 assert.ok(!view.includes("newspaper-panel-heading"), "Dispatch panels must not render title rows.");

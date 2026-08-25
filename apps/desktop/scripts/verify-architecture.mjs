@@ -9,7 +9,7 @@ const sourceDirectory = path.join(desktopDirectory, "src-tauri", "src");
 
 const expectedRootRustFiles = new Set(["lib.rs", "main.rs"]);
 const expectedOwnedDirectories = ["app", "providers", "workflow"];
-const expectedProviderDirectories = ["coursera", "linkedin", "newspaper"];
+const expectedProviderDirectories = ["coursera", "linkedin", "newspaper", "youtube"];
 
 function fail(message) {
   throw new Error(`Architecture verification failed: ${message}`);
@@ -70,6 +70,7 @@ const requiredModuleFiles = [
   path.join(sourceDirectory, "providers", "coursera", "mod.rs"),
   path.join(sourceDirectory, "providers", "linkedin", "mod.rs"),
   path.join(sourceDirectory, "providers", "newspaper", "mod.rs"),
+  path.join(sourceDirectory, "providers", "youtube", "mod.rs"),
   path.join(sourceDirectory, "workflow", "mod.rs"),
 ];
 
@@ -110,7 +111,7 @@ for (const provider of expectedProviderDirectories) {
     (candidate) => candidate !== provider,
   );
 
-  for (const rustFile of await collectRustFiles(providerDirectory)) {
+    for (const rustFile of await collectRustFiles(providerDirectory)) {
     const source = await readFile(rustFile, "utf8");
     for (const otherProvider of otherProviders) {
       const forbiddenImports = [
@@ -120,6 +121,15 @@ for (const provider of expectedProviderDirectories) {
       if (forbiddenImports.some((forbidden) => source.includes(forbidden))) {
         fail(
           `${path.relative(desktopDirectory, rustFile)} imports provider ${otherProvider} directly`,
+        );
+      }
+    }
+    if (provider === "youtube") {
+      const forbiddenYouTubeProcessLaunch =
+        /(?:\buse\s+std::process\b|\bstd::process::Command\b|\bCommand\s*::\s*new\b)/;
+      if (forbiddenYouTubeProcessLaunch.test(source)) {
+        fail(
+          `${path.relative(desktopDirectory, rustFile)} launches a process inside YouTube; providers may only submit typed helper requests to app::managed_process`,
         );
       }
     }

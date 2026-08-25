@@ -1,9 +1,9 @@
 {
-  "version": 11,
-  "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover in Phases 3 through 5.",
+  "version": 17,
+  "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover. Coursera, YouTube, LinkedIn, and newspaper start/process now write through the workflow kernel.",
   "directSqlPrimitiveCounts": {
-    "src-tauri/src/providers/coursera/commands.rs": 1,
-    "src-tauri/src/providers/coursera/job.rs": 15,
+    "src-tauri/src/providers/coursera/commands.rs": 0,
+    "src-tauri/src/providers/coursera/job.rs": 18,
     "src-tauri/src/providers/newspaper/archive_service.rs": 6,
     "src-tauri/src/providers/newspaper/batch_service.rs": 11,
     "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
@@ -13,6 +13,7 @@
     "src-tauri/src/providers/newspaper/clipping_repository.rs": 23,
     "src-tauri/src/providers/newspaper/clipping_roots.rs": 2,
     "src-tauri/src/providers/newspaper/clipping_service.rs": 5,
+    "src-tauri/src/providers/newspaper/executor.rs": 1,
     "src-tauri/src/providers/newspaper/job_service.rs": 9,
     "src-tauri/src/providers/newspaper/media_protocol.rs": 0,
     "src-tauri/src/providers/newspaper/optimization_service.rs": 3,
@@ -26,17 +27,17 @@
   },
   "sharedWriteHelperCallCounts": {
     "src-tauri/src/providers/coursera/commands.rs": {
-      "append_job_event": 2,
       "clear_coursera_provider_data": 1,
-      "clear_failed_jobs": 1,
-      "insert_job": 1,
-      "retry_failed_job": 1
+      "clear_failed_jobs": 1
     },
     "src-tauri/src/providers/coursera/job.rs": {
       "append_job_event": 1,
       "clear_failed_jobs": 1,
       "insert_job": 1,
       "retry_failed_job": 1
+    },
+    "src-tauri/src/providers/linkedin/executor.rs": {
+      "insert_job": 1
     },
     "src-tauri/src/providers/linkedin/artifact_downloader.rs": {
       "append_job_event": 2,
@@ -51,10 +52,8 @@
       "upsert_course_cache_entry": 1
     },
     "src-tauri/src/providers/linkedin/commands.rs": {
-      "append_job_event": 2,
-      "clear_failed_jobs": 1,
-      "insert_job": 1,
-      "retry_failed_job": 1
+      "append_job_event": 1,
+      "clear_failed_jobs": 1
     },
     "src-tauri/src/providers/newspaper/commands.rs": {
       "clear_newspaper_provider_data": 1
@@ -74,6 +73,12 @@
     "8": "Added the reviewed schema-v4 clipping root table, legacy-root seed, populated-v3 table rebuild, one root-registry repository insert, and its one DatabaseWriter submission. The root row commits before crop staging; filesystem and marker work remain outside writer closures.",
     "9": "Added the reviewed schema-v5 raw and normalized derived search indexes, atomic repository synchronization/repair savepoints, and the conditional snapshot-root reconnect update. Canonical clipping writes and root locator mutation remain serialized through DatabaseWriter; search reads and filesystem probes do not mutate SQLite.",
     "10": "Corrected production-source scanning so internal cfg(test) fields and helpers do not hide later production code. Pinned the already-existing LinkedIn command helper calls and newspaper optimization service SQL writes that were previously omitted by the scanner; no new write site was introduced.",
-    "11": "Added the reviewed schema-v6 clipping recovery repository writes and one canonical note savepoint seam. Recovery CRUD and matching checkpoint clear remain serialized through the existing DatabaseWriter; draft bytes never enter canonical search owners."
+    "11": "Added the reviewed schema-v6 clipping recovery repository writes and one canonical note savepoint seam. Recovery CRUD and matching checkpoint clear remain serialized through the existing DatabaseWriter; draft bytes never enter canonical search owners.",
+    "12": "Recorded Generic Video / YouTube job-table writes (insert, status update, restart reconcile) and the command-site insert_job helper. Also recorded three Coursera restart-reconcile SQL primitives (transaction plus Failed status and restart_failed event). Both remain on the frozen legacy write path until workflow-kernel cutover; no additional scheduler was added.",
+    "13": "Coursera start, retry, and process commands now persist through workflow_runs only. Production commands.rs has zero direct SQL primitives and no insert_job / append_job_event / retry_failed_job helpers. Legacy coursera_jobs remain a read/reset/reconcile compatibility projection; job.rs write counts are unchanged.",
+    "14": "YouTube queue/process commands now persist through workflow_runs only. Production youtube/commands.rs has zero insert_job helpers; youtube/job.rs remains a legacy read/reconcile projection.",
+    "15": "LinkedIn start, retry, process, and reset now persist through workflow_runs. Production commands.rs no longer calls insert_job or retry_failed_job; the executor materializes a jobs row at execute time for artifact parent keys. Legacy jobs remain a read/cleanup projection.",
+    "16": "Newspaper batch create, schedule materialize, process, and reset now persist through workflow_runs. Production create() does not insert newspaper_jobs; the executor materializes a newspaper_jobs row at execute time for page/library parent keys. create_with_connection remains the test fixture path. Legacy newspaper_jobs remain a read/progress projection that wins on merge.",
+    "17": "YouTube V1 now submits durable youtube_download runs and publishes verified media plus raw VTT and normalized transcript JSON. The legacy youtube_jobs write surface is gone; helper launches go through app::managed_process."
   }
 }

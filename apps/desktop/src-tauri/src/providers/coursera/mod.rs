@@ -16,13 +16,16 @@ pub mod coursera_token_store;
 pub mod define;
 pub mod downloader;
 pub mod error;
+pub mod executor;
 pub mod extractors;
 pub mod filter;
 pub mod format;
 pub mod job;
 pub mod orchestrator;
+pub mod projection;
 pub mod syllabus;
 pub mod utils;
+pub mod workflow_compat;
 
 #[allow(unused_imports)]
 pub use config::{

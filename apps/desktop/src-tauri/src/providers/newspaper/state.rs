@@ -23,9 +23,13 @@ pub struct NewspaperState {
 
 impl NewspaperState {
     pub fn new(db_path: PathBuf) -> Self {
+        Self::with_cancellation(db_path, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn with_cancellation(db_path: PathBuf, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             db_path,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled,
             download_running: AtomicBool::new(false),
             optimization_running: Arc::new(AtomicBool::new(false)),
             library_revision: AtomicU64::new(1),

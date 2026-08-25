@@ -1,7 +1,10 @@
-use crate::artifact_downloader::{ArtifactDownloadError, ArtifactHttpClient, ArtifactHttpResponse};
+use crate::artifact_downloader::{
+    copy_reader_to_path, ArtifactDownloadError, ArtifactHttpClient, ArtifactHttpResponse,
+};
 use crate::auth::{LinkedInCookie, ValidatedLinkedInSession};
 use crate::course::{CourseApiClient, CourseFetchError};
 use reqwest::blocking::{Client, RequestBuilder};
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
@@ -121,28 +124,47 @@ impl CourseApiClient for AuthenticatedLinkedInClient {
 
 impl ArtifactHttpClient for AuthenticatedLinkedInClient {
     fn get_bytes(&mut self, url: &str) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
-        let mut last_response = None;
+        let staging =
+            std::env::temp_dir().join(format!("linkvault-linkedin-{}.part", std::process::id()));
+        let response = self.save_url_to_path(url, &staging)?;
+        if (200..300).contains(&response.status) {
+            let bytes = std::fs::read(&staging).unwrap_or_default();
+            let _ = std::fs::remove_file(&staging);
+            return Ok(ArtifactHttpResponse {
+                status: response.status,
+                bytes,
+            });
+        }
+        let _ = std::fs::remove_file(&staging);
+        Ok(response)
+    }
+
+    fn save_url_to_path(
+        &mut self,
+        url: &str,
+        dest: &Path,
+    ) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
+        let mut last_status = 0_u16;
         for mode in artifact_request_modes_for_url(url) {
-            let response = self
+            let mut response = self
                 .build_artifact_get_request(url, mode)
                 .send()
                 .map_err(|error| ArtifactDownloadError::Network(classify_reqwest_error(&error)))?;
-            let status = response.status().as_u16();
-            let bytes = response
-                .bytes()
-                .map_err(|error| ArtifactDownloadError::Network(classify_reqwest_error(&error)))?
-                .to_vec();
-            let artifact_response = ArtifactHttpResponse { status, bytes };
-            if (200..300).contains(&status) {
-                return Ok(artifact_response);
+            last_status = response.status().as_u16();
+            if !(200..300).contains(&last_status) {
+                continue;
             }
-            last_response = Some(artifact_response);
+            copy_reader_to_path(&mut response, dest)?;
+            return Ok(ArtifactHttpResponse {
+                status: last_status,
+                bytes: Vec::new(),
+            });
         }
 
-        Ok(last_response.unwrap_or(ArtifactHttpResponse {
-            status: 0,
+        Ok(ArtifactHttpResponse {
+            status: last_status,
             bytes: Vec::new(),
-        }))
+        })
     }
 }
 

@@ -157,11 +157,18 @@ impl<'a> CourseraDownloader<'a> {
                         summary.skipped.push(link.url.clone());
                         continue;
                     }
-                    let dest = self
-                        .output_root
-                        .join(self.slug)
-                        .join(dir)
-                        .join(&link.filename);
+                    let Some(dest) = crate::coursera::format::safe_join(
+                        self.output_root,
+                        &[self.slug, dir, &link.filename],
+                    ) else {
+                        self.emit(CourseEvent::FileFailed {
+                            url: link.url.clone(),
+                            error: "refusing to write outside the Coursera output root".into(),
+                            retryable: false,
+                        });
+                        summary.failed.push(link.url.clone());
+                        continue;
+                    };
                     self.emit(CourseEvent::FileStarted {
                         url: link.url.clone(),
                         dest: dest.to_string_lossy().to_string(),
@@ -205,12 +212,27 @@ impl<'a> CourseraDownloader<'a> {
                 }
             }
             DispatchResult::QuizHtml(html) | DispatchResult::ExamHtml(html) => {
-                let dest = self
-                    .output_root
-                    .join(self.slug)
-                    .join(dir)
-                    .join(&html.filename);
-                let _ = std::fs::create_dir_all(dest.parent().unwrap());
+                let Some(dest) = crate::coursera::format::safe_join(
+                    self.output_root,
+                    &[self.slug, dir, &html.filename],
+                ) else {
+                    summary.failed.push(html.filename.clone());
+                    self.emit(CourseEvent::FileFailed {
+                        url: html.filename.clone(),
+                        error: "refusing to write outside the Coursera output root".into(),
+                        retryable: false,
+                    });
+                    return;
+                };
+                if let Err(e) = crate::coursera::format::create_parent_dir(&dest) {
+                    summary.failed.push(html.filename.clone());
+                    self.emit(CourseEvent::FileFailed {
+                        url: html.filename.clone(),
+                        error: e.to_string(),
+                        retryable: false,
+                    });
+                    return;
+                }
                 let res = std::fs::write(&dest, &html.html);
                 if let Err(e) = res {
                     summary.failed.push(html.filename.clone());
@@ -251,7 +273,7 @@ mod tests {
     use crate::coursera::downloader::NativeDownloader;
     use crate::coursera::syllabus::ModulesV1;
     use crate::coursera::utils::mkdir_p;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     fn empty_modules() -> ModulesV1 {
@@ -292,5 +314,171 @@ mod tests {
             .iter()
             .any(|e| matches!(e, CourseEvent::CourseFinished { .. })));
         mkdir_p(Path::new(".")).unwrap(); // touch
+    }
+
+    fn dummy_item() -> crate::coursera::syllabus::ItemV2 {
+        crate::coursera::syllabus::ItemV2 {
+            id: "item-1".into(),
+            type_name: "quiz".into(),
+            name: "Quiz".into(),
+            slug: "quiz".into(),
+            asset_id: None,
+            raw: serde_json::json!({}),
+        }
+    }
+
+    struct RecordingDownloader {
+        dests: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl Downloader for RecordingDownloader {
+        fn download(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _on_progress: &mut dyn FnMut(crate::coursera::downloader::DownloadProgress),
+        ) -> Result<(), crate::coursera::downloader::DownloadError> {
+            self.dests.lock().unwrap().push(dest.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn quiz_html_rejects_path_traversal_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().to_path_buf();
+        let client = crate::coursera::client::build_client().unwrap();
+        let opts = CourseraOptions::default();
+        let downloader: Arc<dyn Downloader> = Arc::new(NativeDownloader::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<CourseEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured2 = captured.clone();
+        let on_event: Arc<dyn Fn(CourseEvent) + Send + Sync> = Arc::new(move |e| {
+            captured2.lock().unwrap().push(e);
+        });
+        let d = CourseraDownloader {
+            client: &client,
+            options: &opts,
+            output_root: &out,
+            downloader,
+            cancellation: cancel,
+            slug: "ml-005",
+            on_event: Some(on_event),
+        };
+        let html = crate::coursera::extractors::HtmlArtifact {
+            filename: "../../pwned.html".into(),
+            html: "<html>pwn</html>".into(),
+        };
+        let mut summary = CourseSummary::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(d.process_dispatch(
+            &dummy_item(),
+            &crate::coursera::extractors::DispatchResult::QuizHtml(html),
+            "01_Module/01_Welcome",
+            &mut summary,
+        ));
+        let escaped = tmp.path().parent().unwrap().join("pwned.html");
+        assert!(
+            !escaped.exists(),
+            "traversal filename must not write outside output_root"
+        );
+        assert!(
+            !out.join("ml-005").join("pwned.html").exists(),
+            "dot-dot segments must not land a file in a sibling directory"
+        );
+        assert!(
+            !summary.failed.is_empty(),
+            "unsafe destinations must be recorded as failed"
+        );
+        assert!(
+            captured.lock().unwrap().iter().any(|event| matches!(
+                event,
+                CourseEvent::FileFailed { error, .. }
+                    if error.contains("refusing to write outside the Coursera output root")
+            )),
+            "must emit FileFailed with the refusal message"
+        );
+    }
+
+    #[test]
+    fn quiz_html_writes_under_output_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().to_path_buf();
+        let client = crate::coursera::client::build_client().unwrap();
+        let opts = CourseraOptions::default();
+        let downloader: Arc<dyn Downloader> = Arc::new(NativeDownloader::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let d = CourseraDownloader {
+            client: &client,
+            options: &opts,
+            output_root: &out,
+            downloader,
+            cancellation: cancel,
+            slug: "ml-005",
+            on_event: None,
+        };
+        let html = crate::coursera::extractors::HtmlArtifact {
+            filename: "quiz.html".into(),
+            html: "<html>ok</html>".into(),
+        };
+        let mut summary = CourseSummary::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(d.process_dispatch(
+            &dummy_item(),
+            &crate::coursera::extractors::DispatchResult::QuizHtml(html),
+            "01_Module/01_Welcome",
+            &mut summary,
+        ));
+        let expected = out
+            .join("ml-005")
+            .join("01_Module")
+            .join("01_Welcome")
+            .join("quiz.html");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "<html>ok</html>"
+        );
+        assert!(summary.failed.is_empty());
+    }
+
+    #[test]
+    fn resource_link_rejects_path_traversal_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().to_path_buf();
+        let client = crate::coursera::client::build_client().unwrap();
+        let opts = CourseraOptions::default();
+        let recorder = Arc::new(RecordingDownloader {
+            dests: std::sync::Mutex::new(Vec::new()),
+        });
+        let downloader: Arc<dyn Downloader> = recorder.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let d = CourseraDownloader {
+            client: &client,
+            options: &opts,
+            output_root: &out,
+            downloader,
+            cancellation: cancel,
+            slug: "ml-005",
+            on_event: None,
+        };
+        let links = vec![crate::coursera::extractors::ResourceLink {
+            url: "https://example.com/video.mp4".into(),
+            filename: r"..\..\pwned.mp4".into(),
+            kind: "video".into(),
+        }];
+        let mut summary = CourseSummary::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(d.process_dispatch(
+            &dummy_item(),
+            &crate::coursera::extractors::DispatchResult::Links(links),
+            "01_Module/01_Welcome",
+            &mut summary,
+        ));
+        assert!(
+            recorder.dests.lock().unwrap().is_empty(),
+            "downloader must not be invoked for an escaping destination"
+        );
+        assert!(!summary.failed.is_empty());
     }
 }

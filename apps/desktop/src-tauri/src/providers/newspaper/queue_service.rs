@@ -1,7 +1,7 @@
 //! Download queue selection, orchestration, retries, and lifecycle transitions.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -11,12 +11,15 @@ use std::{
 use chrono::{Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::Manager;
+use url::Url;
 
 use super::{
     batch_service,
     client::{FetchError, NewspaperClient},
     commands::run_optimization_pass,
-    downloader::{download_validated_page, validate_existing_page, PageDownloadError},
+    downloader::{
+        download_validated_page, validate_existing_page, DownloadedPage, PageDownloadError,
+    },
     job_repository, manifest,
     models::{NewspaperJob, OptimizationRunOptions},
     naming,
@@ -30,6 +33,14 @@ use super::{
 /// don't spawn a no-op task for jobs that the queue would skip anyway.
 const OPTIMIZATION_ELIGIBLE_STATUSES: &[&str] = &["completed", "partial"];
 
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 pub(super) async fn process_queue(
     db_path: &Path,
     cancelled: &Arc<AtomicBool>,
@@ -42,28 +53,43 @@ pub(super) async fn process_queue(
             break;
         }
         let next = {
-            let connection =
-                crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-            next_due_job(&connection)?
+            let db_path = db_path.to_path_buf();
+            run_blocking(move || {
+                let connection =
+                    crate::cache::open_runtime(&db_path).map_err(|error| error.to_string())?;
+                next_due_job(&connection)
+            })
+            .await?
         };
         let Some((job, delay_seconds, scheduled_at)) = next else {
-            let connection =
-                crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-            mark_retry_waiting_batches_scheduled(&connection)?;
+            let db_path = db_path.to_path_buf();
+            run_blocking(move || {
+                let connection =
+                    crate::cache::open_runtime(&db_path).map_err(|error| error.to_string())?;
+                mark_retry_waiting_batches_scheduled(&connection)
+            })
+            .await?;
             break;
         };
         if scheduled_at.is_some_and(|scheduled| scheduled < Utc::now().timestamp()) {
-            let connection =
-                crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-            connection
-                .execute(
-                    "INSERT INTO newspaper_events
+            let db_path = db_path.to_path_buf();
+            let batch_id = job.batch_id.clone();
+            let job_id = job.id.clone();
+            run_blocking(move || {
+                let connection =
+                    crate::cache::open_runtime(&db_path).map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO newspaper_events
                      (batch_id, job_id, event_type, message, created_at)
                      VALUES (?1, ?2, 'overdue_start',
                              'Scheduled batch started after its requested time.', ?3)",
-                    params![job.batch_id, job.id, Utc::now().timestamp()],
-                )
-                .map_err(|error| error.to_string())?;
+                        params![batch_id, job_id, Utc::now().timestamp()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .await?;
         }
         let outcome = process_job(db_path, &client, job.clone(), cancelled).await?;
         let outcome_status = outcome.status.clone();
@@ -78,9 +104,13 @@ pub(super) async fn process_queue(
             spawn_per_edition_optimization(app.clone(), outcome_status);
         }
         let has_next_due_job = {
-            let connection =
-                crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-            next_due_job(&connection)?.is_some()
+            let db_path = db_path.to_path_buf();
+            run_blocking(move || {
+                let connection =
+                    crate::cache::open_runtime(&db_path).map_err(|error| error.to_string())?;
+                Ok(next_due_job(&connection)?.is_some())
+            })
+            .await?
         };
         if has_next_due_job && delay_seconds > 0 && !cancelled.load(Ordering::SeqCst) {
             let mut remaining = u64::from(delay_seconds);
@@ -110,7 +140,7 @@ fn spawn_per_edition_optimization(app: tauri::AppHandle, job_status: String) {
     });
 }
 
-pub(super) async fn process_job(
+pub(crate) async fn process_job(
     db_path: &Path,
     client: &NewspaperClient,
     mut job: NewspaperJob,
@@ -118,19 +148,10 @@ pub(super) async fn process_job(
 ) -> Result<NewspaperJob, String> {
     let now = Utc::now().timestamp();
     {
-        let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-        connection
-            .execute(
-                "UPDATE newspaper_jobs
-                 SET status = 'active', retry_at = NULL, warning = NULL, updated_at = ?2
-                 WHERE id = ?1",
-                params![job.id, now],
-            )
-            .map_err(|error| error.to_string())?;
-        connection.execute(
-            "UPDATE newspaper_batches SET status = 'active', scheduled_at = NULL, updated_at = ?2 WHERE id = ?1",
-            params![job.batch_id, now],
-        ).map_err(|error| error.to_string())?;
+        let db_path = db_path.to_path_buf();
+        let job_id = job.id.clone();
+        let batch_id = job.batch_id.clone();
+        run_blocking(move || activate_queued_job(&db_path, &job_id, &batch_id, now)).await?;
     }
     job.status = "active".to_string();
     let manifest = match client
@@ -139,20 +160,34 @@ pub(super) async fn process_job(
     {
         Ok(value) => value,
         Err(FetchError::Unavailable) => {
-            if publication_is_today_or_future(&job.publication_date) {
-                schedule_release_retry(db_path, &mut job, "Edition has not been released yet.")?;
-            } else {
-                update_job_terminal(db_path, &job.id, "unavailable", None)?;
-                job.status = "unavailable".to_string();
-            }
-            return Ok(job);
+            let db_path = db_path.to_path_buf();
+            let retry_release = publication_is_today_or_future(&job.publication_date);
+            return run_blocking(move || {
+                if retry_release {
+                    schedule_release_retry(
+                        &db_path,
+                        &mut job,
+                        "Edition has not been released yet.",
+                    )?;
+                } else {
+                    update_job_terminal(&db_path, &job.id, "unavailable", None)?;
+                    job.status = "unavailable".to_string();
+                }
+                Ok(job)
+            })
+            .await;
         }
         Err(FetchError::Cancelled) => {
-            job.status = apply_interrupted_job_state(db_path, &job)?.to_string();
-            return Ok(job);
+            let db_path = db_path.to_path_buf();
+            return run_blocking(move || {
+                job.status = apply_interrupted_job_state(&db_path, &job)?.to_string();
+                Ok(job)
+            })
+            .await;
         }
         Err(error) => {
-            if publication_is_today_or_future(&job.publication_date)
+            let db_path = db_path.to_path_buf();
+            let retry_release = publication_is_today_or_future(&job.publication_date)
                 && matches!(
                     &error,
                     FetchError::Manifest(
@@ -160,78 +195,46 @@ pub(super) async fn process_job(
                             | manifest::ManifestError::HtmlBody
                             | manifest::ManifestError::Empty
                     )
-                )
-            {
-                schedule_release_retry(db_path, &mut job, "Edition has not been released yet.")?;
-            } else {
-                update_job_terminal(db_path, &job.id, "failed", Some(&error.to_string()))?;
-                job.status = "failed".to_string();
-            }
-            return Ok(job);
+                );
+            let error_message = error.to_string();
+            return run_blocking(move || {
+                if retry_release {
+                    schedule_release_retry(
+                        &db_path,
+                        &mut job,
+                        "Edition has not been released yet.",
+                    )?;
+                } else {
+                    update_job_terminal(&db_path, &job.id, "failed", Some(&error_message))?;
+                    job.status = "failed".to_string();
+                }
+                Ok(job)
+            })
+            .await;
         }
     };
 
-    let referer = client
-        .origin()
+    let origin = client.origin().clone();
+    let referer = origin
         .join(&format!("/{}/{}", job.edition_code, job.publication_date))
         .map_err(|error| error.to_string())?;
     let pages: Vec<_> = manifest.pages().cloned().collect();
     {
-        let mut connection =
-            crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "UPDATE newspaper_jobs SET page_count = ?2, updated_at = ?3 WHERE id = ?1",
-                params![job.id, pages.len() as i64, Utc::now().timestamp()],
-            )
-            .map_err(|error| error.to_string())?;
-        for page in &pages {
-            let source_url =
-                manifest::resolve_page_url_with_origin(&page.pagefile, client.origin())
-                    .map_err(|error| error.to_string())?;
-            let extension = manifest::page_file_extension(&source_url);
-            let destination = Path::new(&job.output_dir).join(format!(
-                "{}.{}",
-                naming::sanitize_segment(&page.pageno),
-                extension
-            ));
-            transaction
-                .execute(
-                    "INSERT INTO newspaper_pages
-                (id, job_id, page_number, section_name, source_url, original_path,
-                 status, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)
-                ON CONFLICT(job_id, page_number) DO UPDATE SET
-                    section_name = excluded.section_name,
-                    source_url = excluded.source_url,
-                    original_path = excluded.original_path,
-                    updated_at = excluded.updated_at",
-                    params![
-                        naming::unique_id("newspaper-page"),
-                        job.id,
-                        page.pageno,
-                        page.name,
-                        source_url.as_str(),
-                        destination.to_string_lossy(),
-                        Utc::now().timestamp(),
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        transaction.commit().map_err(|error| error.to_string())?;
+        let db_path = db_path.to_path_buf();
+        let job = job.clone();
+        let pages = pages.clone();
+        let origin = origin.clone();
+        run_blocking(move || upsert_job_pages(&db_path, &job, &origin, &pages)).await?;
     }
 
     for (page_index, page) in pages.into_iter().enumerate() {
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
-        let source_url = manifest::resolve_page_url_with_origin(&page.pagefile, client.origin())
+        let source_url = manifest::resolve_page_url_with_origin(&page.pagefile, &origin)
             .map_err(|error| error.to_string())?;
         let extension = manifest::page_file_extension(&source_url);
-        let destination = Path::new(&job.output_dir).join(format!(
+        let destination = PathBuf::from(&job.output_dir).join(format!(
             "{}.{}",
             naming::sanitize_segment(&page.pageno),
             extension
@@ -254,77 +257,197 @@ pub(super) async fn process_job(
                 .await
             }
         };
-        let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-        if matches!(&result, Err(PageDownloadError::NotReleased)) {
-            drop(connection);
-            schedule_release_retry(db_path, &mut job, "Edition has not been released yet.")?;
-            return Ok(job);
+        let db_path = db_path.to_path_buf();
+        let cancelled_now = cancelled.load(Ordering::SeqCst);
+        match run_blocking(move || {
+            persist_page_download(
+                &db_path,
+                job,
+                &page,
+                page_index,
+                &destination,
+                result,
+                cancelled_now,
+            )
+        })
+        .await?
+        {
+            PersistPageOutcome::Continue(updated) => job = updated,
+            PersistPageOutcome::Stop(updated) => return Ok(updated),
         }
-        match result {
-            Ok(downloaded) => {
-                if page_index == 0
-                    && first_page_matches_another_date(
-                        &connection,
-                        &job,
-                        &page.pageno,
-                        &downloaded.checksum_sha256,
-                    )?
-                {
-                    let _ = std::fs::remove_file(&destination);
-                    drop(connection);
-                    schedule_release_retry(
-                        db_path,
-                        &mut job,
-                        "Edition is still showing an earlier newspaper; retry scheduled.",
-                    )?;
-                    return Ok(job);
-                }
-                connection
-                    .execute(
-                        "UPDATE newspaper_pages SET status = 'completed', attempts = attempts + 1,
+    }
+    if cancelled.load(Ordering::SeqCst) {
+        let db_path = db_path.to_path_buf();
+        return run_blocking(move || {
+            job.status = apply_interrupted_job_state(&db_path, &job)?.to_string();
+            Ok(job)
+        })
+        .await;
+    }
+    let db_path = db_path.to_path_buf();
+    run_blocking(move || finalize_processed_job(&db_path, job)).await
+}
+
+enum PersistPageOutcome {
+    Continue(NewspaperJob),
+    Stop(NewspaperJob),
+}
+
+fn activate_queued_job(
+    db_path: &Path,
+    job_id: &str,
+    batch_id: &str,
+    now: i64,
+) -> Result<(), String> {
+    let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE newspaper_jobs
+             SET status = 'active', retry_at = NULL, warning = NULL, updated_at = ?2
+             WHERE id = ?1",
+            params![job_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE newspaper_batches SET status = 'active', scheduled_at = NULL, updated_at = ?2 WHERE id = ?1",
+            params![batch_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn upsert_job_pages(
+    db_path: &Path,
+    job: &NewspaperJob,
+    origin: &Url,
+    pages: &[manifest::Page],
+) -> Result<(), String> {
+    let mut connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE newspaper_jobs SET page_count = ?2, updated_at = ?3 WHERE id = ?1",
+            params![job.id, pages.len() as i64, Utc::now().timestamp()],
+        )
+        .map_err(|error| error.to_string())?;
+    for page in pages {
+        let source_url = manifest::resolve_page_url_with_origin(&page.pagefile, origin)
+            .map_err(|error| error.to_string())?;
+        let extension = manifest::page_file_extension(&source_url);
+        let destination = Path::new(&job.output_dir).join(format!(
+            "{}.{}",
+            naming::sanitize_segment(&page.pageno),
+            extension
+        ));
+        transaction
+            .execute(
+                "INSERT INTO newspaper_pages
+                (id, job_id, page_number, section_name, source_url, original_path,
+                 status, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)
+                ON CONFLICT(job_id, page_number) DO UPDATE SET
+                    section_name = excluded.section_name,
+                    source_url = excluded.source_url,
+                    original_path = excluded.original_path,
+                    updated_at = excluded.updated_at",
+                params![
+                    naming::unique_id("newspaper-page"),
+                    job.id,
+                    page.pageno,
+                    page.name,
+                    source_url.as_str(),
+                    destination.to_string_lossy(),
+                    Utc::now().timestamp(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn persist_page_download(
+    db_path: &Path,
+    mut job: NewspaperJob,
+    page: &manifest::Page,
+    page_index: usize,
+    destination: &Path,
+    result: Result<DownloadedPage, PageDownloadError>,
+    cancelled: bool,
+) -> Result<PersistPageOutcome, String> {
+    let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
+    if matches!(&result, Err(PageDownloadError::NotReleased)) {
+        drop(connection);
+        schedule_release_retry(db_path, &mut job, "Edition has not been released yet.")?;
+        return Ok(PersistPageOutcome::Stop(job));
+    }
+    match result {
+        Ok(downloaded) => {
+            if page_index == 0
+                && first_page_matches_another_date(
+                    &connection,
+                    &job,
+                    &page.pageno,
+                    &downloaded.checksum_sha256,
+                )?
+            {
+                let _ = std::fs::remove_file(destination);
+                drop(connection);
+                schedule_release_retry(
+                    db_path,
+                    &mut job,
+                    "Edition is still showing an earlier newspaper; retry scheduled.",
+                )?;
+                return Ok(PersistPageOutcome::Stop(job));
+            }
+            connection
+                .execute(
+                    "UPDATE newspaper_pages SET status = 'completed', attempts = attempts + 1,
                      original_bytes = ?3, final_bytes = ?3, checksum = ?4,
                      pixel_width = ?5, pixel_height = ?6,
                      media_version = media_version + 1,
                      error = NULL, updated_at = ?7
                      WHERE job_id = ?1 AND page_number = ?2",
-                        params![
-                            job.id,
-                            page.pageno,
-                            downloaded.size_bytes,
-                            downloaded.checksum_sha256,
-                            downloaded.width,
-                            downloaded.height,
-                            Utc::now().timestamp(),
-                        ],
-                    )
-                    .map_err(|error| error.to_string())?;
-            }
-            Err(error) => {
-                if cancelled.load(Ordering::SeqCst) {
-                    drop(connection);
-                    job.status = apply_interrupted_job_state(db_path, &job)?.to_string();
-                    return Ok(job);
-                }
-                connection
-                    .execute(
-                        "UPDATE newspaper_pages SET status = 'failed', attempts = attempts + 1,
-                     error = ?3, updated_at = ?4 WHERE job_id = ?1 AND page_number = ?2",
-                        params![
-                            job.id,
-                            page.pageno,
-                            error.to_string(),
-                            Utc::now().timestamp()
-                        ],
-                    )
-                    .map_err(|sql_error| sql_error.to_string())?;
-            }
+                    params![
+                        job.id,
+                        page.pageno,
+                        downloaded.size_bytes,
+                        downloaded.checksum_sha256,
+                        downloaded.width,
+                        downloaded.height,
+                        Utc::now().timestamp(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
         }
-        refresh_job_progress(&connection, &job.id)?;
+        Err(error) => {
+            if cancelled {
+                drop(connection);
+                job.status = apply_interrupted_job_state(db_path, &job)?.to_string();
+                return Ok(PersistPageOutcome::Stop(job));
+            }
+            connection
+                .execute(
+                    "UPDATE newspaper_pages SET status = 'failed', attempts = attempts + 1,
+                     error = ?3, updated_at = ?4 WHERE job_id = ?1 AND page_number = ?2",
+                    params![
+                        job.id,
+                        page.pageno,
+                        error.to_string(),
+                        Utc::now().timestamp()
+                    ],
+                )
+                .map_err(|sql_error| sql_error.to_string())?;
+        }
     }
-    if cancelled.load(Ordering::SeqCst) {
-        job.status = apply_interrupted_job_state(db_path, &job)?.to_string();
-        return Ok(job);
-    }
+    refresh_job_progress(&connection, &job.id)?;
+    Ok(PersistPageOutcome::Continue(job))
+}
+
+fn finalize_processed_job(db_path: &Path, mut job: NewspaperJob) -> Result<NewspaperJob, String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
     let completion = storage::finalize_job(&connection, &job.id, Utc::now().timestamp())
         .map_err(|error| error.to_string())?;
@@ -569,6 +692,39 @@ pub(super) fn mark_retry_waiting_batches_scheduled(connection: &Connection) -> R
 #[cfg(test)]
 mod tests {
     use super::OPTIMIZATION_ELIGIBLE_STATUSES;
+
+    #[test]
+    fn process_job_does_not_open_sqlite_on_the_async_executor() {
+        let source = include_str!("queue_service.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let process_job = production
+            .split("pub(crate) async fn process_job")
+            .nth(1)
+            .and_then(|rest| rest.split("enum PersistPageOutcome").next())
+            .unwrap_or_default();
+        assert!(
+            process_job.contains("run_blocking"),
+            "process_job SQLite must run on the blocking pool"
+        );
+        assert!(
+            !process_job.contains("crate::cache::open_runtime"),
+            "process_job must not open rusqlite on the async executor; call helpers from run_blocking"
+        );
+        for helper in [
+            "activate_queued_job",
+            "schedule_release_retry",
+            "update_job_terminal",
+            "apply_interrupted_job_state",
+            "upsert_job_pages",
+            "persist_page_download",
+            "finalize_processed_job",
+        ] {
+            assert!(
+                process_job.contains(helper),
+                "process_job should delegate {helper} through run_blocking"
+            );
+        }
+    }
 
     #[test]
     fn per_edition_trigger_fires_only_for_terminal_download_statuses() {

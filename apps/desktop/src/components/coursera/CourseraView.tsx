@@ -8,7 +8,6 @@ import {
   EyeOff,
   Folder,
   FolderOpen,
-  History,
   KeyRound,
   Play,
   RotateCcw,
@@ -62,7 +61,7 @@ import type {
 
 /** Matches `.coursera-search-input` min/max-height; keep in sync with CSS. */
 const COURSERA_URL_MIN_HEIGHT_PX = 40;
-const COURSERA_URL_MAX_HEIGHT_PX = 132;
+const COURSERA_URL_MAX_HEIGHT_PX = 96;
 const SAVED_CAUTH_PLACEHOLDER = "••••••••••••••••";
 const COURSERA_PREFS_STORAGE_KEY = "linkvault.coursera.preferences";
 const COURSERA_RESOLUTIONS = ["360p", "540p", "720p"] as const;
@@ -785,9 +784,9 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
                 onChange={(event) => setAuthMethod(event.target.value as AuthMethodKind)}
                 aria-label="Coursera auth method"
               >
-                <option value="saved_token">Use saved CAUTH</option>
-                <option value="cauth">Paste CAUTH cookie</option>
-                <option value="email_password">Email + password</option>
+                <option value="saved_token">Saved CAUTH</option>
+                <option value="cauth">Paste CAUTH</option>
+                <option value="email_password">Email</option>
               </Select>
             </label>
             <label className="coursera-cluster-field coursera-option-subtitle">
@@ -1292,32 +1291,6 @@ function derivedTotal(counts: ReturnType<typeof parseCourseraArtifactCounts>): n
   );
 }
 
-function CourseraHistoryTable({
-  entries,
-  onOpenFolder
-}: {
-  entries: CourseraHistoryEntry[];
-  onOpenFolder: (job: CourseraJob) => void | Promise<void>;
-}) {
-  return (
-    <DataTable className="history-table">
-      {entries.map((entry) => (
-        <DataTableRow key={entry.job.id} className="history-row">
-          <div className="min-w-0">
-            <div className="truncate font-medium" title={entry.job.className}>{entry.job.className}</div>
-            <div className="truncate text-soft" title={entry.job.outputDir}>{entry.job.outputDir}</div>
-          </div>
-          <div className="history-date">{formatEventTime(entry.lastEventAt ?? entry.job.updatedAt)}</div>
-          <Button size="sm" variant="ghost" onClick={() => onOpenFolder(entry.job)}>
-            <History aria-hidden="true" className="h-3.5 w-3.5" />
-            Open
-          </Button>
-        </DataTableRow>
-      ))}
-    </DataTable>
-  );
-}
-
 function CourseraHistoryPage({
   entries,
   onOpenFolder
@@ -1326,21 +1299,48 @@ function CourseraHistoryPage({
   onOpenFolder: (job: CourseraJob) => void | Promise<void>;
 }) {
   return (
-    <Panel className="history-page-panel">
-      <div className="history-page-header">
-        <div>
-          <h3>Coursera download history</h3>
-          <p>{entries.length} completed course{entries.length === 1 ? "" : "s"}</p>
-        </div>
+    <div className="lv-workspace download-history-workspace">
+      <div className="download-history-header">
+        <p className="download-history-count">
+          {entries.length} completed course{entries.length === 1 ? "" : "s"}
+        </p>
       </div>
-      {entries.length > 0 ? (
-        <CourseraHistoryTable entries={entries} onOpenFolder={onOpenFolder} />
+      {entries.length === 0 ? (
+        <div className="download-history-empty" role="status">
+          <span>No downloaded Coursera courses</span>
+          <span>Completed Coursera downloads will appear here.</span>
+        </div>
       ) : (
-        <DataTable className="history-table">
-          <EmptyRow title="No downloaded Coursera courses" description="Completed Coursera downloads will appear here." />
-        </DataTable>
+        <ol className="download-history-list" aria-label="Coursera download history">
+          {entries.map((entry) => {
+            const when = formatEventTime(entry.lastEventAt ?? entry.job.updatedAt);
+            return (
+              <li key={entry.job.id} className="download-history-row">
+                <div className="download-history-copy">
+                  <strong title={entry.job.className}>{entry.job.className}</strong>
+                  <span title={entry.job.outputDir}>
+                    {[when, entry.job.outputDir].filter(Boolean).join(" · ")}
+                  </span>
+                </div>
+                <div className="download-history-overlay">
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    className="download-history-file-action"
+                    onClick={() => void onOpenFolder(entry.job)}
+                    aria-label={`Open folder for ${entry.job.className}`}
+                  >
+                    <FolderOpen aria-hidden="true" />
+                    Open Folder
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
       )}
-    </Panel>
+    </div>
   );
 }
 

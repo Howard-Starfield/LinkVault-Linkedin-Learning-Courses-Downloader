@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
@@ -14,6 +13,8 @@ import {
   Folder,
   FolderOpen,
   History,
+  LayoutGrid,
+  List,
   Moon,
   Newspaper,
   PanelLeft,
@@ -78,6 +79,12 @@ import {
   readNewspaperOptimizationPreferences,
   writeNewspaperOptimizationPreferences
 } from "./components/newspaper/newspaper-optimization-preferences";
+import {
+  CLIPPING_VIEW_MODE_EVENT,
+  readClippingViewMode,
+  writeClippingViewMode,
+  type ClippingViewMode
+} from "./components/newspaper/clipping-view-preferences";
 
 const NEWSPAPER_READER_ZOOM_OPTIONS = Array.from(
   { length: Math.round((NEWSPAPER_READER_ZOOM_MAX - NEWSPAPER_READER_ZOOM_MIN) / NEWSPAPER_READER_ZOOM_STEP) + 1 },
@@ -256,10 +263,10 @@ const DOWNLOAD_DELAY_STORAGE_KEY = "linkvault.downloadDelaySeconds";
 const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
-const APP_VERSION = "0.2.20";
+const APP_VERSION = "0.2.21";
 const UPDATE_TOAST_ID = "linkvault-update";
 type AppTheme = "light" | "dark";
-type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings" | "youtube";
+type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings" | "youtube" | "youtube-history";
 
 function readInitialTheme(): AppTheme {
   if (typeof window === "undefined") return "dark";
@@ -348,21 +355,6 @@ export default function App() {
   const [newspaperPageTone, setNewspaperPageTone] = useState<NewspaperPageTone>(initialNewspaperReaderPreferences.current.pageTone);
   const [newspaperOptimizationPreferences, setNewspaperOptimizationPreferences] =
     useState<NewspaperOptimizationPreferences>(() => readNewspaperOptimizationPreferences());
-  const [optimizationRuntime, setOptimizationRuntime] = useState<{
-    active: boolean;
-    admittedWorkers: number;
-    activeWorkers: number;
-    cpuPercent: number | null;
-    mode: string;
-    limitedReason: string | null;
-  }>({
-    active: false,
-    admittedWorkers: 0,
-    activeWorkers: 0,
-    cpuPercent: null,
-    mode: "auto",
-    limitedReason: null
-  });
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isScheduleOpen, setIsScheduleOpen] = useState(false);
   const [scheduleStep, setScheduleStep] = useState<"configure" | "confirm">("configure");
@@ -384,12 +376,14 @@ export default function App() {
     total: number;
     loading: boolean;
   } | null>(null);
+  const [clippingViewMode, setClippingViewMode] = useState<ClippingViewMode>(() => readClippingViewMode());
   const [isClippingDetailOpen, setIsClippingDetailOpen] = useState(false);
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [activeSearchQuery, setActiveSearchQuery] = useState("");
   const [isLinkedInExpanded, setIsLinkedInExpanded] = useState(true);
   const [isCourseraExpanded, setIsCourseraExpanded] = useState(true);
   const [isNewspaperExpanded, setIsNewspaperExpanded] = useState(true);
+  const [isYouTubeExpanded, setIsYouTubeExpanded] = useState(true);
   const [theme, setTheme] = useState<AppTheme>(readInitialTheme);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -620,6 +614,16 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    const handleViewMode = (event: Event) => {
+      const detail = (event as CustomEvent<ClippingViewMode>).detail;
+      if (detail === "gallery" || detail === "list") setClippingViewMode(detail);
+      else setClippingViewMode(readClippingViewMode());
+    };
+    window.addEventListener(CLIPPING_VIEW_MODE_EVENT, handleViewMode);
+    return () => window.removeEventListener(CLIPPING_VIEW_MODE_EVENT, handleViewMode);
+  }, []);
+
+  useEffect(() => {
     let resizeFrame: number | null = null;
     let resizeSettledTimer: number | null = null;
     const root = document.documentElement;
@@ -664,47 +668,6 @@ export default function App() {
     setNewspaperPageTone(preferences.pageTone);
     setNewspaperOptimizationPreferences(readNewspaperOptimizationPreferences());
   }, [isSettingsOpen]);
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen<{
-      revision: number;
-      runtime: {
-        active: boolean;
-        admittedWorkers: number;
-        activeWorkers: number;
-        cpuPercent: number | null;
-        mode: string;
-        limitedReason: string | null;
-      };
-    }>("newspaper://optimization-progress", (event) => {
-      if (disposed) return;
-      const runtime = event.payload?.runtime;
-      if (!runtime) return;
-      setOptimizationRuntime({
-        active: Boolean(runtime.active),
-        admittedWorkers: Number(runtime.admittedWorkers ?? 0),
-        activeWorkers: Number(runtime.activeWorkers ?? 0),
-        cpuPercent: typeof runtime.cpuPercent === "number" ? runtime.cpuPercent : null,
-        mode: String(runtime.mode ?? "auto"),
-        limitedReason: runtime.limitedReason ?? null
-      });
-    })
-      .then((dispose) => {
-        if (disposed) {
-          dispose();
-        } else {
-          unlisten = dispose;
-        }
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
 
   function startSidebarResize(event: ReactPointerEvent<HTMLButtonElement>) {
     if (isSidebarCollapsed) return;
@@ -2232,47 +2195,48 @@ export default function App() {
               </SidebarItem>
             </div>
           </div>
-          <SidebarItem
-            active={activeView === "youtube"}
-            icon={<IconMovie aria-hidden="true" size={18} />}
-            aria-label="Open YouTube archive"
-            onClick={() => void requestNavigation("youtube")}
-          >
-            YouTube
-          </SidebarItem>
-          <div
-            className="lv-sidebar-optimization mt-4 flex min-w-0 flex-col gap-1.5 border-t border-sidebar-border pt-3 text-xs text-sidebar-muted"
-            aria-label="Newspaper optimization performance"
-          >
-            <span>Optimization</span>
-            {optimizationRuntime.active ? (
-              <>
-                <span
-                  className="font-mono text-[11px] text-foreground"
-                  aria-label="Admitted optimization workers"
-                >
-                  {optimizationRuntime.admittedWorkers} worker{optimizationRuntime.admittedWorkers === 1 ? "" : "s"}
-                  {" · "}
-                  {optimizationRuntime.activeWorkers} active
-                </span>
-                <span
-                  className="font-mono text-[11px] text-foreground"
-                  aria-label="System CPU usage"
-                >
-                  {optimizationRuntime.cpuPercent == null
-                    ? "CPU —"
-                    : `CPU ${optimizationRuntime.cpuPercent.toFixed(0)}%`}
-                  {optimizationRuntime.limitedReason ? ` · ${optimizationRuntime.limitedReason}` : ""}
-                </span>
-              </>
-            ) : (
-              <span
-                className="self-start rounded-full border border-sidebar-border px-2 py-0.5 text-[10px] text-text-soft"
-                aria-label="Optimization idle"
+          <div className="lv-nav-group">
+            <SidebarItem
+              icon={<IconMovie aria-hidden="true" size={18} />}
+              trailing={<ChevronDown aria-hidden="true" className="lv-nav-chevron" />}
+              aria-expanded={isYouTubeExpanded}
+              aria-label="Open YouTube archive"
+              onClick={() => {
+                const isCurrentProvider = activeView === "youtube" || activeView === "youtube-history";
+                if (isCurrentProvider) {
+                  setIsYouTubeExpanded((expanded) => {
+                    const nextExpanded = !expanded;
+                    if (nextExpanded) void requestNavigation("youtube");
+                    return nextExpanded;
+                  });
+                } else {
+                  void requestNavigation("youtube");
+                  setIsYouTubeExpanded(true);
+                }
+              }}
+            >
+              YouTube
+            </SidebarItem>
+            <div className="lv-nav-children" hidden={!isYouTubeExpanded}>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "youtube"}
+                icon={<Download aria-hidden="true" />}
+                aria-label="Download YouTube video"
+                onClick={() => void requestNavigation("youtube")}
               >
-                Idle
-              </span>
-            )}
+                Download video
+              </SidebarItem>
+              <SidebarItem
+                className="lv-nav-child"
+                active={activeView === "youtube-history"}
+                icon={<History aria-hidden="true" />}
+                aria-label="YouTube downloaded history"
+                onClick={() => void requestNavigation("youtube-history")}
+              >
+                Downloaded history
+              </SidebarItem>
+            </div>
           </div>
         </nav>
 
@@ -2389,12 +2353,41 @@ export default function App() {
                   <button aria-label="Clear clipping search" onClick={() => void updateGlobalSearch("")} type="button">
                     <X aria-hidden="true" />
                   </button>
-                ) : clippingGallerySummary ? (
+                ) : null}
+                <div className="lv-global-search__aside" aria-label="Clipping view controls">
                   <div className="lv-global-search__context">
                     <strong>Clippings</strong>
-                    <span>{clippingGallerySummary.loading ? "Loading" : `${clippingGallerySummary.total} clipping${clippingGallerySummary.total === 1 ? "" : "s"}`}</span>
+                    <span>
+                      {clippingGallerySummary?.loading
+                        ? "Loading"
+                        : `${clippingGallerySummary?.total ?? 0} clipping${(clippingGallerySummary?.total ?? 0) === 1 ? "" : "s"}`}
+                    </span>
                   </div>
-                ) : <span>Clippings</span>}
+                  <div className="lv-global-search__view-toggle" role="group" aria-label="Clipping layout">
+                    <IconButton
+                      type="button"
+                      size="icon-sm"
+                      aria-label="Gallery view"
+                      aria-pressed={clippingViewMode === "gallery"}
+                      data-active={clippingViewMode === "gallery" ? "true" : undefined}
+                      className="clipping-view-toggle"
+                      onClick={() => writeClippingViewMode("gallery")}
+                    >
+                      <LayoutGrid aria-hidden="true" className="h-3.5 w-3.5" />
+                    </IconButton>
+                    <IconButton
+                      type="button"
+                      size="icon-sm"
+                      aria-label="List view"
+                      aria-pressed={clippingViewMode === "list"}
+                      data-active={clippingViewMode === "list" ? "true" : undefined}
+                      className="clipping-view-toggle"
+                      onClick={() => writeClippingViewMode("list")}
+                    >
+                      <List aria-hidden="true" className="h-3.5 w-3.5" />
+                    </IconButton>
+                  </div>
+                </div>
               </>
             )}
           </div>
@@ -2408,6 +2401,8 @@ export default function App() {
             <CourseraView mode="history" />
           ) : activeView === "youtube" ? (
             <YouTubeView />
+          ) : activeView === "youtube-history" ? (
+            <YouTubeView mode="history" />
           ) : activeView === "newspaper-download" ? (
             <NewspaperView
               onRequestQueueProcess={(options) => ensureNewspaperQueueProcessing(options ?? null, true)}
@@ -3853,35 +3848,53 @@ function HistoryPage({
   onOpenFolderByJobId: (jobId: string, fallbackPath?: string) => void | Promise<void>;
 }) {
   return (
-    <Panel className="history-page-panel">
-      <div className="history-page-header">
-        <div>
-          <h3>LinkedIn download history</h3>
-          <p>{entries.length} completed course{entries.length === 1 ? "" : "s"}</p>
-        </div>
+    <div className="lv-workspace download-history-workspace">
+      <div className="download-history-header">
+        <p className="download-history-count">
+          {entries.length} completed course{entries.length === 1 ? "" : "s"}
+        </p>
         {historyFilePath ? (
-          <div className="history-file-path" title={historyFilePath}>
+          <p className="download-history-meta" title={historyFilePath}>
             {historyFilePath}
-          </div>
+          </p>
         ) : null}
       </div>
-      <DataTable className="history-table">
-        {entries.length > 0 ? entries.map((entry) => (
-          <DataTableRow key={entry.job_id} className="history-row">
-            <div className="min-w-0">
-              <div className="truncate font-medium" title={entry.course_title}>{entry.course_title}</div>
-              <div className="truncate text-soft" title={entry.source_url}>{entry.source_url}</div>
-            </div>
-            <div className="history-date">{formatEventTime(entry.completed_at)}</div>
-            <Button size="sm" variant="ghost" onClick={() => onOpenFolderByJobId(entry.job_id, entry.output_dir)}>
-              Open Folder
-            </Button>
-          </DataTableRow>
-        )) : (
-          <EmptyRow title="No downloaded courses" description="Completed course downloads will appear here and in download-history.md." />
-        )}
-      </DataTable>
-    </Panel>
+      {entries.length === 0 ? (
+        <div className="download-history-empty" role="status">
+          <span>No downloaded courses</span>
+          <span>Completed course downloads will appear here and in download-history.md.</span>
+        </div>
+      ) : (
+        <ol className="download-history-list" aria-label="LinkedIn download history">
+          {entries.map((entry) => {
+            const when = formatEventTime(entry.completed_at);
+            return (
+              <li key={entry.job_id} className="download-history-row">
+                <div className="download-history-copy">
+                  <strong title={entry.course_title}>{entry.course_title}</strong>
+                  <span title={entry.source_url}>
+                    {[when, entry.source_url].filter(Boolean).join(" · ")}
+                  </span>
+                </div>
+                <div className="download-history-overlay">
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    className="download-history-file-action"
+                    onClick={() => void onOpenFolderByJobId(entry.job_id, entry.output_dir)}
+                    aria-label={`Open folder for ${entry.course_title}`}
+                  >
+                    <FolderOpen aria-hidden="true" />
+                    Open Folder
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
   );
 }
 

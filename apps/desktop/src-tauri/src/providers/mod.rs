@@ -7,3 +7,4 @@
 pub mod coursera;
 pub mod linkedin;
 pub mod newspaper;
+pub mod youtube;

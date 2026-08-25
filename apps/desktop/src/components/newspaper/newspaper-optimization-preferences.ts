@@ -24,6 +24,13 @@ export const NEWSPAPER_OPTIMIZATION_PREFERENCES_DEFAULTS: NewspaperOptimizationP
   memoryReserveMb: 4096,
 };
 
+export type NewspaperOptimizationRunOptions = {
+  mode: "auto" | "manual";
+  workerCeiling: number;
+  workerMemoryBudgetMb: number;
+  memoryReserveBytes: number;
+};
+
 export const NEWSPAPER_OPTIMIZATION_MEMORY_BOUNDS = {
   workerMemoryBudgetMb: { min: 64, max: 1024, step: 16 },
   memoryReserveMb: { min: 512, max: 32_768, step: 256 }

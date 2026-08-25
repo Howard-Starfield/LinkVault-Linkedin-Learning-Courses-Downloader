@@ -44,17 +44,14 @@ pub async fn download_validated_page(
         return Err(PageDownloadError::NotReleased);
     }
     let bytes = response.bytes;
-    let image = image::load_from_memory(&bytes)?;
-    let (width, height) = image.dimensions();
-    let checksum_sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let decoded = decode_page_image(bytes).await?;
     let part_path = sibling_part_path(destination);
 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).await?;
     }
     let mut file = fs::File::create(&part_path).await?;
-    file.write_all(&bytes).await?;
+    file.write_all(&decoded.bytes).await?;
     file.flush().await?;
     file.sync_all().await?;
     drop(file);
@@ -66,10 +63,10 @@ pub async fn download_validated_page(
 
     Ok(DownloadedPage {
         path: destination.to_path_buf(),
-        size_bytes,
-        checksum_sha256,
-        width,
-        height,
+        size_bytes: decoded.size_bytes,
+        checksum_sha256: decoded.checksum_sha256,
+        width: decoded.width,
+        height: decoded.height,
     })
 }
 
@@ -84,15 +81,55 @@ fn is_unreleased_placeholder(content_type: &str, bytes: &[u8]) -> bool {
 }
 
 pub async fn validate_existing_page(path: &Path) -> Result<DownloadedPage, PageDownloadError> {
-    let bytes = fs::read(path).await?;
+    let path = path.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::read(&path)?;
+        let decoded = inspect_page_bytes(bytes)?;
+        Ok(DownloadedPage {
+            path,
+            size_bytes: decoded.size_bytes,
+            checksum_sha256: decoded.checksum_sha256,
+            width: decoded.width,
+            height: decoded.height,
+        })
+    })
+    .await
+    .map_err(|error| {
+        PageDownloadError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            error.to_string(),
+        ))
+    })?
+}
+
+struct DecodedPage {
+    bytes: Vec<u8>,
+    size_bytes: u64,
+    checksum_sha256: String,
+    width: u32,
+    height: u32,
+}
+
+async fn decode_page_image(bytes: Vec<u8>) -> Result<DecodedPage, PageDownloadError> {
+    tauri::async_runtime::spawn_blocking(move || inspect_page_bytes(bytes))
+        .await
+        .map_err(|error| {
+            PageDownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                error.to_string(),
+            ))
+        })?
+}
+
+fn inspect_page_bytes(bytes: Vec<u8>) -> Result<DecodedPage, PageDownloadError> {
     let image = image::load_from_memory(&bytes)?;
     let (width, height) = image.dimensions();
-    Ok(DownloadedPage {
-        path: path.to_path_buf(),
+    Ok(DecodedPage {
         size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         checksum_sha256: format!("{:x}", Sha256::digest(&bytes)),
         width,
         height,
+        bytes,
     })
 }
 
@@ -217,5 +254,18 @@ mod tests {
         let result = validate_existing_page(&destination).await.unwrap();
         assert_eq!((result.width, result.height), (1, 1));
         assert_eq!(result.checksum_sha256.len(), 64);
+    }
+
+    #[test]
+    fn image_decode_runs_on_the_blocking_pool() {
+        let source = include_str!("downloader.rs");
+        assert!(
+            source.contains("tauri::async_runtime::spawn_blocking"),
+            "image decode and hashing must not run on the async executor"
+        );
+        assert!(
+            source.contains("decode_page_image"),
+            "CPU-bound page inspection should live in a dedicated helper"
+        );
     }
 }

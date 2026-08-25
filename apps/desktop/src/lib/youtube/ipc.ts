@@ -6,13 +6,17 @@ import type {
   GetYouTubeHelperStatusResponse,
   InspectYouTubeTranscriptsRequest,
   InspectYouTubeTranscriptsResponse,
+  ListYouTubeHistoryRequest,
   MutateYouTubeRunRequest,
+  OpenYouTubeDownloadFolderRequest,
+  OpenYouTubeDownloadFolderResponse,
   SavedYouTubePreferences,
   ScanYouTubeSourceRequest,
   ScanYouTubeSourceResponse,
   StartYouTubeDownloadRequest,
   StartYouTubeDownloadResponse,
   YouTubeDownloadMode,
+  YouTubeHistoryEntry,
   YouTubeItemState,
   YouTubeProgressEvent,
   YouTubeProgressItem,
@@ -185,6 +189,29 @@ export async function resumeYouTubeDownload(
     return invoke<YouTubeRunSnapshot>("resume_youtube_download", { request });
   }
   return resumePreviewDownload(request);
+}
+
+export async function openYouTubeDownloadFolder(
+  request: OpenYouTubeDownloadFolderRequest
+): Promise<OpenYouTubeDownloadFolderResponse> {
+  if (isTauriRuntime() && !(request.runId && isYouTubeUiMockRun(request.runId))) {
+    return invoke<OpenYouTubeDownloadFolderResponse>("open_youtube_download_folder", { request });
+  }
+  // Preview / UI mock: no Explorer; surface the resolved fallback path.
+  const path = request.outputDir.trim();
+  if (!path) {
+    throw new Error("Choose a download folder before opening files.");
+  }
+  return { path };
+}
+
+export async function listYouTubeHistory(
+  request: ListYouTubeHistoryRequest = {}
+): Promise<YouTubeHistoryEntry[]> {
+  if (isTauriRuntime()) {
+    return invoke<YouTubeHistoryEntry[]>("list_youtube_history", { request });
+  }
+  return [];
 }
 
 export async function startYouTubeUiMock(): Promise<StartYouTubeDownloadResponse> {

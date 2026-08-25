@@ -895,8 +895,8 @@ fn due_daily_schedule_materializes_only_once_per_local_date() {
         .unwrap();
     drop(connection);
 
-    schedule_service::materialize_due(&db_path).unwrap();
-    schedule_service::materialize_due(&db_path).unwrap();
+    schedule_service::materialize_due(&db_path, None).unwrap();
+    schedule_service::materialize_due(&db_path, None).unwrap();
 
     let connection = Connection::open(&db_path).unwrap();
     let job_count: i64 = connection
@@ -930,7 +930,7 @@ fn due_last_seven_days_schedule_materializes_the_rolling_window() {
         .unwrap();
     drop(connection);
 
-    schedule_service::materialize_due(&db_path).unwrap();
+    schedule_service::materialize_due(&db_path, None).unwrap();
 
     let connection = Connection::open(&db_path).unwrap();
     let window: (i64, String, String, i64) = connection
@@ -976,7 +976,7 @@ fn due_last_seven_days_schedule_materializes_the_rolling_window() {
         .unwrap();
     drop(connection);
 
-    schedule_service::materialize_due(&db_path).unwrap();
+    schedule_service::materialize_due(&db_path, None).unwrap();
 
     let connection = Connection::open(&db_path).unwrap();
     let second_poll: (i64, i64, i64, String) = connection
@@ -1011,7 +1011,7 @@ fn deleting_a_schedule_stops_retry_and_allows_immediate_manual_download() {
         .unwrap();
     drop(connection);
 
-    schedule_service::materialize_due(&db_path).unwrap();
+    schedule_service::materialize_due(&db_path, None).unwrap();
     let connection = Connection::open(&db_path).unwrap();
     let mut job = job_repository::list(&connection, None).unwrap().remove(0);
     let job_id = job.id.clone();

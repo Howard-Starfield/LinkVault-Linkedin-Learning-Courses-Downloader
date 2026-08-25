@@ -35,9 +35,16 @@ function matches(source, expression, message) {
 // The route must remain a mounted application view, not an orphaned component.
 includes(app, 'type AppView = "downloads"', "AppView does not define the existing route union");
 includes(app, '"youtube"', "AppView does not include the YouTube route");
+includes(app, '"youtube-history"', "AppView does not include the YouTube history route");
 includes(app, 'aria-label="Open YouTube archive"', "YouTube navigation item is not discoverable");
+includes(app, "Download video", "YouTube nav is missing Download video child");
+includes(app, "Downloaded history", "YouTube nav is missing Downloaded history child");
 includes(app, 'activeView === "youtube" ? (', "YouTube route is not mounted in the main view switch");
+includes(app, 'activeView === "youtube-history" ? (', "YouTube history route is not mounted in the main view switch");
 includes(app, "<YouTubeView />", "YouTube route does not render YouTubeView");
+includes(app, '<YouTubeView mode="history" />', "YouTube history route does not render history mode");
+includes(app, "isYouTubeExpanded", "YouTube nav expand/collapse state is missing");
+includes(styles, '.lv-content[data-active-view="youtube-history"]', "YouTube history content scroll rule is missing");
 
 // IPC stays behind the typed adapter and must use the event-first reconciliation contract.
 for (const command of [
@@ -48,6 +55,8 @@ for (const command of [
   '"inspect_youtube_transcripts"',
   '"pause_youtube_download"',
   '"resume_youtube_download"',
+  '"open_youtube_download_folder"',
+  '"list_youtube_history"',
   '"get_youtube_helper_status"',
   '"get_youtube_preferences"',
   '"save_youtube_preferences"'
@@ -60,9 +69,20 @@ matches(ipc, /invoke<SavedYouTubePreferences>\("save_youtube_preferences"/, "Pre
 matches(ipc, /invoke<InspectYouTubeTranscriptsResponse>\("inspect_youtube_transcripts"/, "Transcript inspection IPC is not typed");
 matches(ipc, /invoke<YouTubeRunSnapshot>\("pause_youtube_download"/, "Pause IPC is not typed");
 matches(ipc, /invoke<YouTubeRunSnapshot>\("resume_youtube_download"/, "Resume IPC is not typed");
+matches(ipc, /invoke<YouTubeHistoryEntry\[\]>\("list_youtube_history"/, "History list IPC is not typed");
+matches(ipc, /export async function listYouTubeHistory/, "listYouTubeHistory adapter is missing");
 matches(ipc, /return \{ status: "ready", code: null, message: "" \}/, "Browser preview does not remain helper-ready");
 matches(ipc, /listen<YouTubeProgressEvent>\(/, "Run-change listener is not typed");
 matches(view, /subscribeYouTubeRunChanged/, "YouTube view does not subscribe to run events");
+matches(view, /export function YouTubeView\(\{ mode = "downloads" \}/, "YouTubeView does not accept downloads/history mode");
+matches(view, /mode === "history"/, "YouTube history mode mount is missing");
+matches(view, /listYouTubeHistory/, "YouTube history mode does not load durable history");
+matches(view, /Paste a URL to scan/, "Empty queue copy is missing");
+assert.doesNotMatch(
+  view,
+  /\{videos\.length > 0 \|\| isScanning \? \(/,
+  "Queue/Active/Completed/Failed tabs must not be gated solely by videos.length > 0 || isScanning"
+);
 matches(
   view,
   /const cleanup = await subscribeYouTubeRunChanged\([\s\S]*?const snapshot = await getYouTubeDownloadState\(\{ runId: null \}\)/,
@@ -107,6 +127,10 @@ for (const type of [
   "InspectYouTubeTranscriptsResponse",
   "YouTubeTranscriptTrack",
   "MutateYouTubeRunRequest",
+  "OpenYouTubeDownloadFolderRequest",
+  "OpenYouTubeDownloadFolderResponse",
+  "YouTubeHistoryEntry",
+  "ListYouTubeHistoryRequest",
   "GetYouTubeHelperStatusResponse",
   "SavedYouTubePreferences",
   "YouTubeScanItem",
@@ -197,14 +221,35 @@ matches(view, /sourceNewlineCount|lastHeightSyncKeyRef/, "Search box height sync
 matches(view, /function YouTubeScanSkeletonRows/, "Scan skeleton row helper is missing");
 matches(view, /youtube-result-row-skeleton/, "Scan skeleton rows are missing the skeleton class");
 matches(view, /YOUTUBE_SCAN_SKELETON_COUNT/, "Empty-scan skeleton count constant is missing");
-matches(view, /isScanning && videos\.length === 0 \? \([\s\S]*?<YouTubeScanSkeletonRows count=\{YOUTUBE_SCAN_SKELETON_COUNT\} \/>/, "Empty scan does not show primary skeleton placeholders");
-matches(view, /isScanning && videos\.length > 0 \? \([\s\S]*?<YouTubeScanSkeletonRows count=\{1\} \/>/, "Multi-link scan does not keep results with a trailing skeleton");
-matches(view, /isScanning \? \([\s\S]*?Finding videos…/, "Scan status copy is missing while skeletons are shown");
+matches(view, /queueSection === "queue" && isScanning && videos\.length === 0 \? \([\s\S]*?<YouTubeScanSkeletonRows count=\{YOUTUBE_SCAN_SKELETON_COUNT\} \/>/, "Empty scan does not show primary skeleton placeholders");
+matches(view, /queueSection === "queue" && isScanning && videos\.length > 0 \? \([\s\S]*?<YouTubeScanSkeletonRows count=\{1\} \/>/, "Multi-link scan does not keep results with a trailing skeleton");
+matches(view, /isScanning && queueSection === "queue" \? \([\s\S]*?Finding videos…/, "Scan status copy is missing while skeletons are shown");
 matches(styles, /\.youtube-result-row-skeleton/, "YouTube scan skeleton styles are missing");
 matches(styles, /\.youtube-skeleton-line/, "YouTube skeleton line styles are missing");
 matches(styles, /@keyframes youtube-skeleton-shimmer/, "YouTube skeleton shimmer animation is missing");
 matches(styles, /\.youtube-result-row \{[\s\S]*?border-radius: 10px;/, "Result rows do not use the shared 10px radius");
+matches(styles, /\.youtube-file-action/, "Completed File action hover styles are missing");
+matches(styles, /\.youtube-result-row:hover \.youtube-file-action/, "File action does not reveal on row hover");
+matches(styles, /\.youtube-queue-section-tabs/, "YouTube queue section tab styles are missing");
 includes(styles, ".youtube-view *::before", "YouTube reduced-motion contract no longer targets pseudo-elements");
+
+// Queue / Active / Completed / Failed sections mirror LinkedIn section tabs.
+matches(view, /queue-section-tabs youtube-queue-section-tabs/, "YouTube results do not mount LinkedIn-style section tabs");
+matches(view, /aria-label="YouTube download queue sections"/, "YouTube queue section tabs are not labeled");
+matches(view, /label="Queue"[\s\S]*label="Active"[\s\S]*label="Completed"[\s\S]*label="Failed"/, "YouTube section tabs do not cover Queue/Active/Completed/Failed");
+matches(view, /queueSectionForItemState/, "YouTube section mapping helper is missing");
+matches(view, /case "completed_with_warnings":[\s\S]*case "skipped_existing":[\s\S]*return "completed"/, "Completed section does not include warning/skipped-existing outcomes");
+matches(view, /case "failed":[\s\S]*case "cancelled":[\s\S]*return "failed"/, "Failed section does not include cancelled outcomes");
+matches(view, /case "running":[\s\S]*return "active"/, "Active section does not map running items");
+matches(view, /youtube-file-action/, "Completed File action control is missing");
+matches(view, />\s*File\s*</, "Completed File action label is missing");
+matches(view, /openYouTubeDownloadFolder\(/, "Completed File action does not call the typed open-folder adapter");
+matches(view, /occurrenceId[\s\S]*outputDir: fallbackPath/, "Open-folder request does not pass occurrence and outputDir fallback");
+matches(ipc, /"open_youtube_download_folder"/, "YouTube open-folder IPC command is missing");
+matches(ipc, /invoke<OpenYouTubeDownloadFolderResponse>\("open_youtube_download_folder"/, "YouTube open-folder IPC is not typed");
+matches(types, /interface OpenYouTubeDownloadFolderRequest/, "OpenYouTubeDownloadFolderRequest contract is missing");
+matches(types, /interface OpenYouTubeDownloadFolderResponse/, "OpenYouTubeDownloadFolderResponse contract is missing");
+matches(view, /V1 item snapshots omit per-occurrence media paths/, "Open-folder fallback comment documenting missing per-item paths is absent");
 
 // The route exposes a usable keyboard/screen-reader surface and a live progress channel.
 for (const fragment of [
@@ -220,7 +265,8 @@ matches(view, /onKeyDown=\{\(event\) => \{[\s\S]*?event\.key === "Enter"|functio
 matches(view, /disabled=\{availableVideos\.length === 0/, "Download all is not gated on a detected occurrence");
 assert.doesNotMatch(view, /disabled=\{[^}]*!outputDir\.trim\(\)/, "An empty output directory still greys the Start action instead of opening the folder picker");
 matches(view, /outputDir\.trim\(\) \|\| await pickOutputDirectory\(\)/, "Start does not request an output directory when one has not been chosen");
-matches(view, /mode !== "video_only"[\s\S]*?requestTranscriptInspection\(/, "Transcript modes do not satisfy native inspection admission before start");
+matches(view, /downloadMode !== "video_only"[\s\S]*?requestTranscriptInspection\(/, "Transcript modes do not satisfy native inspection admission before start");
+matches(view, /mode: downloadMode/, "Download request does not send downloadMode");
 matches(view, /disabled=\{!activeRun\}/, "Cancel action is not gated on an active run");
 matches(view, /inspectYouTubeTranscripts\(/, "Transcript inspection is not mounted through the typed adapter");
 matches(view, /transcriptInspectionGenerationRef\.current/, "Transcript inspection does not correlate responses with the active selection");
@@ -234,6 +280,7 @@ matches(view, />\s*Cancel\s*</, "Cancel control is not mounted on results");
 // Layout contracts are container-based and honor reduced-motion preferences.
 for (const fragment of [
   '.lv-content[data-active-view="youtube"]',
+  '.lv-content[data-active-view="youtube-history"]',
   "@container lv-main (max-width: 980px)",
   "@container lv-main (max-width: 720px)",
   "@container lv-main (max-width: 520px)",
@@ -244,6 +291,10 @@ for (const fragment of [
   ".youtube-option-language",
   ".youtube-result-row",
   ".youtube-result-overlay",
+  ".youtube-history-row",
+  ".download-history-workspace",
+  ".download-history-row",
+  ".download-history-file-action",
   "@media (prefers-reduced-motion: reduce)",
   ".youtube-view *::before",
   "min-width: 0",
@@ -257,5 +308,79 @@ assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are sti
 
 assert.equal(packageJson.scripts["verify:youtube-ui"], "node ./scripts/verify-youtube-ui.mjs", "Desktop YouTube UI verifier is not wired");
 assert.equal(rootPackageJson.scripts["verify:youtube-ui"], "npm --prefix apps/desktop run verify:youtube-ui", "Root YouTube UI verifier is not wired");
+
+// Item outcome warnings are Rust TransientWarning objects ({ code, message }), not bare string codes.
+// formatYouTubeWarning must accept unknown and never call .trim() on a non-string.
+matches(
+  types,
+  /interface YouTubeItemOutcomeSnapshot[\s\S]*?warnings: YouTubeProgressWarning\[\]/,
+  "YouTubeItemOutcomeSnapshot.warnings must be YouTubeProgressWarning[] to match Rust TransientWarning"
+);
+assert.doesNotMatch(
+  types,
+  /interface YouTubeItemOutcomeSnapshot[\s\S]*?warnings: YouTubeWarningCode\[\]/,
+  "YouTubeItemOutcomeSnapshot.warnings must not be typed as bare YouTubeWarningCode[]"
+);
+matches(view, /function formatYouTubeWarning\(value: unknown\)/, "formatYouTubeWarning must accept unknown IPC warning payloads");
+matches(view, /typeof value !== "string"/, "formatYouTubeWarning must guard before treating a warning as a string");
+matches(view, /readTrimmedString\(record\.code\)/, "formatYouTubeWarning must extract code from warning objects");
+matches(view, /readTrimmedString\(record\.message\)/, "formatYouTubeWarning must preserve message text from warning objects");
+assert.doesNotMatch(view, /function formatYouTubeWarning\(code: string\)/, "formatYouTubeWarning must not assume a string code argument");
+assert.doesNotMatch(
+  view,
+  /\.map\(\(warning\) => warning\.code\)[\s\S]*?items\.flatMap\(\(item\) => item\.warnings\)/,
+  "Toast path must not mix warning.code strings with raw item warning objects"
+);
+matches(
+  view,
+  /warnings\.find\(\(warning\) => warning\.code === "TRANSCRIPT_MISSING"\)/,
+  "Completed-with-warnings toast must select warnings by .code on warning objects"
+);
+matches(
+  view,
+  /formatYouTubeWarning\(outcome\.warnings\[0\]/,
+  "Result-row warning text must format the full warning payload, not a bare code string"
+);
+
+// Runtime contract: object payloads must never throw on .trim(), and useful messages are preferred.
+function formatYouTubeWarningContract(value) {
+  const readTrimmed = (candidate) => {
+    if (typeof candidate !== "string") return null;
+    const trimmed = candidate.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  };
+  let code = null;
+  let message = null;
+  if (typeof value === "string") {
+    code = readTrimmed(value);
+  } else if (typeof value === "object" && value !== null) {
+    code = readTrimmed(value.code);
+    message = readTrimmed(value.message);
+  }
+  switch (code) {
+    case "TRANSCRIPT_MISSING":
+      return "No captions were available on YouTube for this video, so only the media file was saved.";
+    default:
+      if (message && message !== code) return message;
+      return code ?? "Completed with warnings.";
+  }
+}
+assert.equal(
+  formatYouTubeWarningContract({ code: "PLAYBACK_COMPATIBILITY_WARNING", message: "WebM may not play in every player." }),
+  "WebM may not play in every player.",
+  "Object warning payloads must prefer useful message text"
+);
+assert.equal(
+  formatYouTubeWarningContract({ code: "TRANSCRIPT_MISSING", message: "TRANSCRIPT_MISSING" }),
+  "No captions were available on YouTube for this video, so only the media file was saved.",
+  "Known warning codes must keep friendly copy even when message mirrors the code"
+);
+assert.equal(
+  formatYouTubeWarningContract({ code: "ITEM_FAILED_CONTINUING", message: "ITEM_FAILED_CONTINUING" }),
+  "ITEM_FAILED_CONTINUING",
+  "Object payloads that only carry a code must not throw"
+);
+assert.equal(formatYouTubeWarningContract(null), "Completed with warnings.", "Null warning payloads must not throw");
+assert.equal(formatYouTubeWarningContract(42), "Completed with warnings.", "Non-string warning payloads must not throw");
 
 console.log("YouTube UI route, typed IPC, event reconciliation, search-first paste, accessibility, selection, and responsive contracts passed.");

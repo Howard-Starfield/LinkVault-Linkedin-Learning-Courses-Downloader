@@ -10,13 +10,15 @@ pub mod workflow;
 use app::cooperative_exit::{CooperativeExit, ExitReason, WaitOutcome};
 use app::updates as app_updates;
 use app::window_activation::{activate_existing_instance, restore_main_window, show_main_window};
-pub use app::{database as cache, security, storage};
+pub use app::{database as cache, dpapi, managed_process, security, shell, storage};
 pub use providers::linkedin::{
     artifact_downloader, auth, browser_cookies, course, download_orchestrator, exercise_archive,
     live_clients, quality, quiz_hints, token_store,
 };
-use providers::linkedin::{commands, linkedin};
-pub use providers::{coursera, newspaper};
+use providers::linkedin::{commands, executor, linkedin};
+pub use providers::{coursera, newspaper, youtube};
+
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::{Emitter, Manager};
@@ -160,6 +162,19 @@ pub fn run() {
             coursera::commands::list_coursera_history,
             coursera::commands::open_coursera_download_folder,
             coursera::commands::fetch_coursera_syllabus_preview,
+            youtube::commands::get_youtube_helper_status,
+            youtube::commands::get_youtube_preferences,
+            youtube::commands::save_youtube_preferences,
+            youtube::commands::scan_youtube_source,
+            youtube::commands::inspect_youtube_transcripts,
+            youtube::commands::cancel_youtube_discovery,
+            youtube::commands::start_youtube_download,
+            youtube::commands::get_youtube_download_state,
+            youtube::commands::pause_youtube_download,
+            youtube::commands::resume_youtube_download,
+            youtube::commands::cancel_youtube_download,
+            youtube::commands::open_youtube_download_folder,
+            youtube::commands::list_youtube_history,
             newspaper::commands::bootstrap_newspaper_state,
             newspaper::commands::list_newspaper_catalog,
             newspaper::commands::refresh_newspaper_catalog,
@@ -222,6 +237,7 @@ pub fn run() {
                 &connection,
                 commands::now_unix_timestamp(),
             )?;
+            coursera::job::reconcile_after_restart(&connection, commands::now_unix_timestamp())?;
             // Self-heal the built-in newspaper catalog on every startup.
             // Fresh databases and intact v0.2.7 installs hit the no-op path
             // (one COUNT(*)); v0.2.7 installs whose users clicked Reset
@@ -246,6 +262,54 @@ pub fn run() {
             drop(connection);
             let writer =
                 app::database_writer::DatabaseWriter::start(db_path.clone(), diagnostics.clone())?;
+            let workflow_runtime = workflow::WorkflowRuntime::new(writer.clone());
+            let coursera_cancellation = Arc::new(AtomicBool::new(false));
+            let coursera_data_dir =
+                db_path
+                    .parent()
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "database path has no parent directory",
+                        )
+                    })?;
+            workflow_runtime.register_executor(Arc::new(
+                coursera::executor::CourseraDownloadExecutor {
+                    data_dir: coursera_data_dir,
+                    cancellation: Arc::clone(&coursera_cancellation),
+                },
+            ));
+            let youtube_live = Arc::new(youtube::live::YouTubeLiveHandle::default());
+            youtube_live.bind_app(app.handle().clone());
+            workflow_runtime.register_executor(Arc::new(
+                youtube::kernel::YoutubeDownloadExecutor {
+                    live: Arc::clone(&youtube_live),
+                },
+            ));
+            let linkedin_cancellation = Arc::new(AtomicBool::new(false));
+            let linkedin_paused = Arc::new(AtomicBool::new(false));
+            let linkedin_session_token = Arc::new(Mutex::new(None));
+            let linkedin_token_path = db_path.with_file_name("linkvault.li_at.dpapi");
+            workflow_runtime.register_executor(Arc::new(executor::LinkedInDownloadExecutor {
+                db_path: db_path.clone(),
+                token_path: linkedin_token_path,
+                cancellation: Arc::clone(&linkedin_cancellation),
+                paused: Arc::clone(&linkedin_paused),
+                session_token: Arc::clone(&linkedin_session_token),
+            }));
+            let newspaper_cancellation = Arc::new(AtomicBool::new(false));
+            workflow_runtime.register_executor(Arc::new(
+                newspaper::executor::NewspaperDownloadExecutor {
+                    db_path: db_path.clone(),
+                    cancellation: Arc::clone(&newspaper_cancellation),
+                },
+            ));
+            workflow_runtime.reconcile_coursera_after_restart(commands::now_unix_timestamp())?;
+            workflow_runtime.reconcile_youtube_after_restart(commands::now_unix_timestamp())?;
+            workflow_runtime.reconcile_linkedin_after_restart(commands::now_unix_timestamp())?;
+            workflow_runtime.reconcile_newspaper_after_restart(commands::now_unix_timestamp())?;
+            workflow_runtime.start_supervisor()?;
             let clipping_layout = newspaper::clipping_assets::ClippingAssetLayout::new(
                 storage::resolve_newspaper_clippings_root()?,
             );
@@ -263,13 +327,28 @@ pub fn run() {
                 );
             app.manage(diagnostics);
             app.manage(writer);
+            app.manage(workflow_runtime);
             app.manage(clipping_service);
-            app.manage(commands::LinkVaultState::new(db_path.clone()));
-            app.manage(coursera::commands::CourseraState::new(db_path.clone()));
+            app.manage(commands::LinkVaultState::with_shared_flags(
+                db_path.clone(),
+                linkedin_cancellation,
+                linkedin_paused,
+                linkedin_session_token,
+            ));
+            app.manage(coursera::commands::CourseraState::with_cancellation(
+                db_path.clone(),
+                coursera_cancellation,
+            ));
+            app.manage(youtube::commands::YouTubeState::new(db_path.clone()));
+            app.manage(youtube::commands::YouTubePlanStore::default());
+            app.manage(youtube_live);
             app.manage(newspaper::thumbnails::ThumbnailCoordinator::new(
                 db_path.clone(),
             ));
-            app.manage(newspaper::commands::NewspaperState::new(db_path));
+            app.manage(newspaper::commands::NewspaperState::with_cancellation(
+                db_path,
+                newspaper_cancellation,
+            ));
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
             app.manage(CooperativeExit::default());
@@ -332,6 +411,7 @@ pub fn run() {
             }
         }
         tauri::RunEvent::Exit => {
+            handle.state::<workflow::WorkflowRuntime>().shutdown();
             handle
                 .state::<newspaper::clipping_service::ClippingService>()
                 .shutdown_crop_service();

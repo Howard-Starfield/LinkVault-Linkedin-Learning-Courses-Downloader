@@ -264,6 +264,33 @@ pub fn retry_failed_job(
     Ok(job)
 }
 
+pub fn reconcile_after_restart(conn: &Connection, updated_at: i64) -> CourseraResult<usize> {
+    let transaction = conn.unchecked_transaction()?;
+    let mut stmt =
+        transaction.prepare("SELECT id FROM coursera_jobs WHERE lower(status) = 'active'")?;
+    let job_ids: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let payload = serde_json::json!({
+        "message": "Coursera job was interrupted by an application restart"
+    })
+    .to_string();
+    for job_id in &job_ids {
+        transaction.execute(
+            "UPDATE coursera_jobs SET status = 'Failed', updated_at = ?2 WHERE id = ?1",
+            params![job_id, updated_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO coursera_job_events (job_id, event_type, payload_json, created_at)
+             VALUES (?1, 'restart_failed', ?2, ?3)",
+            params![job_id, payload, updated_at],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(job_ids.len())
+}
+
 pub fn clear_failed_jobs(conn: &Connection) -> CourseraResult<usize> {
     let transaction = conn.unchecked_transaction()?;
     transaction.execute(
@@ -485,5 +512,22 @@ mod tests {
         let conn = fresh_schema();
         let got = load_setting(&conn, "missing").unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn restart_reconciliation_marks_active_jobs_failed_and_leaves_others() {
+        let conn = fresh_schema();
+        insert_job(&conn, &fixture_job("active", "Active")).unwrap();
+        insert_job(&conn, &fixture_job("queued", "Queued")).unwrap();
+        insert_job(&conn, &fixture_job("done", "Completed")).unwrap();
+
+        let count = reconcile_after_restart(&conn, 400).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(get_job(&conn, "active").unwrap().unwrap().status, "Failed");
+        assert_eq!(get_job(&conn, "queued").unwrap().unwrap().status, "Queued");
+        assert_eq!(get_job(&conn, "done").unwrap().unwrap().status, "Completed");
+        let events = list_job_events(&conn, "active", 10).unwrap();
+        assert_eq!(events[0].event_type, "restart_failed");
+        assert_eq!(events[0].created_at, 400);
     }
 }

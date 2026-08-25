@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "targetTriple": "x86_64-pc-windows-msvc",
+  "status": "ready",
+  "lockDigest": "f2eb38349e71bd05b8da27807bc82e5eecb204cbf8b335952276bc1786527b7c",
+  "components": [
+    {
+      "name": "yt-dlp",
+      "filename": "yt-dlp-x86_64-pc-windows-msvc.exe",
+      "path": "yt-dlp-x86_64-pc-windows-msvc.exe",
+      "version": "2026.08.19",
+      "sourceUrl": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
+      "sourceArchiveUrl": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.tar.gz",
+      "sha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a",
+      "sizeBytes": 17840399,
+      "sourceArchiveSha256": "072aad4f2a7604e92155f61a275a4752dc64046c8f6d90df3710525d94cd37c1",
+      "sourceArchiveSizeBytes": 6020567,
+      "archiveMember": null,
+      "archiveFormat": null,
+      "sourceArchiveFormat": "tar.gz",
+      "compatibility": { "ytDlpEjsVersion": "0.8.0", "ffmpegBuildId": null },
+      "loadedAssets": [],
+      "licenseId": "Unlicense",
+      "licenseFile": "docs/third-party/youtube/yt-dlp-2026.08.19-LICENSE.txt",
+      "sourceRecord": {
+        "projectUrl": "https://github.com/yt-dlp/yt-dlp/tree/2026.08.19",
+        "releaseUrl": "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19",
+        "revision": "3a08bea",
+        "assetUrl": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
+        "assetSha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a",
+        "assetSizeBytes": 17840399,
+        "archiveUrl": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.tar.gz",
+        "archiveSha256": "072aad4f2a7604e92155f61a275a4752dc64046c8f6d90df3710525d94cd37c1",
+        "archiveSizeBytes": 6020567
+      },
+      "licenseRecord": {
+        "spdxExpression": "Unlicense",
+        "url": "https://raw.githubusercontent.com/yt-dlp/yt-dlp/2026.08.19/LICENSE",
+        "file": "docs/third-party/youtube/yt-dlp-2026.08.19-LICENSE.txt",
+        "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c"
+      },
+      "noticeRecord": {
+        "file": "docs/third-party/THIRD_PARTY_NOTICES.md",
+        "url": "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19",
+        "sha256": "57e7259dae3340534df6817163277ddccf33fe9528137d7d3881257b583b7af0"
+      }
+    },
+    {
+      "name": "deno",
+      "filename": "deno-x86_64-pc-windows-msvc.exe",
+      "path": "deno-x86_64-pc-windows-msvc.exe",
+      "version": "2.9.5",
+      "sourceUrl": "https://github.com/denoland/deno/releases/download/v2.9.5/deno-x86_64-pc-windows-msvc.zip",
+      "sourceArchiveUrl": "https://github.com/denoland/deno/archive/refs/tags/v2.9.5.tar.gz",
+      "sha256": "98f8c2a2d470e4ccb04c935c86ff8050817d877762aec5eaeeb9e409ccb3b9fd",
+      "sizeBytes": 97408288,
+      "sourceArchiveSha256": "9890ba7947c8db2f31a91a374471faf86d19c1682f623c170aeb2f86f58a2112",
+      "sourceArchiveSizeBytes": 32639976,
+      "archiveMember": "deno.exe",
+      "archiveFormat": "zip",
+      "sourceArchiveFormat": "tar.gz",
+      "distributionArchiveSha256": "171efab55ac6b9881fd53ee4c20f8bf3bb1340ffc618483746909014db12216a",
+      "distributionArchiveSizeBytes": 42691248,
+      "compatibility": { "ytDlpEjsVersion": null, "ffmpegBuildId": null },
+      "loadedAssets": [],
+      "licenseId": "MIT",
+      "licenseFile": "docs/third-party/youtube/deno-2.9.5-LICENSE.txt",
+      "sourceRecord": {
+        "projectUrl": "https://github.com/denoland/deno/tree/v2.9.5",
+        "releaseUrl": "https://github.com/denoland/deno/releases/tag/v2.9.5",
+        "revision": "v2.9.5",
+        "assetUrl": "https://github.com/denoland/deno/releases/download/v2.9.5/deno-x86_64-pc-windows-msvc.zip",
+        "assetSha256": "98f8c2a2d470e4ccb04c935c86ff8050817d877762aec5eaeeb9e409ccb3b9fd",
+        "assetSizeBytes": 97408288,
+        "archiveUrl": "https://github.com/denoland/deno/archive/refs/tags/v2.9.5.tar.gz",
+        "archiveSha256": "9890ba7947c8db2f31a91a374471faf86d19c1682f623c170aeb2f86f58a2112",
+        "archiveSizeBytes": 32639976
+      },
+      "licenseRecord": {
+        "spdxExpression": "MIT",
+        "url": "https://raw.githubusercontent.com/denoland/deno/v2.9.5/LICENSE.md",
+        "file": "docs/third-party/youtube/deno-2.9.5-LICENSE.txt",
+        "sha256": "f62497fffecc0852960c8d3e6934b9db86d16396e9b604072e923892cae3a588"
+      },
+      "noticeRecord": {
+        "file": "docs/third-party/THIRD_PARTY_NOTICES.md",
+        "url": "https://github.com/denoland/deno/releases/tag/v2.9.5",
+        "sha256": "57e7259dae3340534df6817163277ddccf33fe9528137d7d3881257b583b7af0"
+      }
+    },
+    {
+      "name": "ffmpeg",
+      "filename": "ffmpeg-x86_64-pc-windows-msvc.exe",
+      "path": "ffmpeg-x86_64-pc-windows-msvc.exe",
+      "version": "n9.0.1-6-g9d4ca21220-20260820",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
+      "sourceArchiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
+      "sha256": "b6b61f0d99c55e422bbd59fad6880a8d4f96d99a6c865f3bb58c8f1ce3ff7b31",
+      "sizeBytes": 114400768,
+      "sourceArchiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
+      "sourceArchiveSizeBytes": 17325951,
+      "archiveMember": "ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0/bin/ffmpeg.exe",
+      "archiveFormat": "zip",
+      "sourceArchiveFormat": "tar.gz",
+      "distributionArchiveSha256": "ccaa910db95451121482a5ebcb8c682123cb4f8a5bd5170fde4a814d7b437772",
+      "distributionArchiveSizeBytes": 147008035,
+      "compatibility": { "ytDlpEjsVersion": null, "ffmpegBuildId": "n9.0.1-6-g9d4ca21220-20260820" },
+      "loadedAssets": [],
+      "licenseId": "LGPL-3.0-or-later",
+      "licenseFile": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
+      "sourceRecord": {
+        "projectUrl": "https://github.com/FFmpeg/FFmpeg/tree/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611",
+        "releaseUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45",
+        "revision": "9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611",
+        "assetUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
+        "assetSha256": "b6b61f0d99c55e422bbd59fad6880a8d4f96d99a6c865f3bb58c8f1ce3ff7b31",
+        "assetSizeBytes": 114400768,
+        "archiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
+        "archiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
+        "archiveSizeBytes": 17325951
+      },
+      "licenseRecord": {
+        "spdxExpression": "LGPL-3.0-or-later",
+        "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611/COPYING.LGPLv3",
+        "file": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
+        "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
+      },
+      "noticeRecord": {
+        "file": "docs/third-party/THIRD_PARTY_NOTICES.md",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45",
+        "sha256": "57e7259dae3340534df6817163277ddccf33fe9528137d7d3881257b583b7af0"
+      }
+    },
+    {
+      "name": "ffprobe",
+      "filename": "ffprobe-x86_64-pc-windows-msvc.exe",
+      "path": "ffprobe-x86_64-pc-windows-msvc.exe",
+      "version": "n9.0.1-6-g9d4ca21220-20260820",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
+      "sourceArchiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
+      "sha256": "46da68bfe5a0b8983e67286a3e681ee05c19d4f2169f37410786e2177dff6aca",
+      "sizeBytes": 114197504,
+      "sourceArchiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
+      "sourceArchiveSizeBytes": 17325951,
+      "archiveMember": "ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0/bin/ffprobe.exe",
+      "archiveFormat": "zip",
+      "sourceArchiveFormat": "tar.gz",
+      "distributionArchiveSha256": "ccaa910db95451121482a5ebcb8c682123cb4f8a5bd5170fde4a814d7b437772",
+      "distributionArchiveSizeBytes": 147008035,
+      "compatibility": { "ytDlpEjsVersion": null, "ffmpegBuildId": "n9.0.1-6-g9d4ca21220-20260820" },
+      "loadedAssets": [],
+      "licenseId": "LGPL-3.0-or-later",
+      "licenseFile": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
+      "sourceRecord": {
+        "projectUrl": "https://github.com/FFmpeg/FFmpeg/tree/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611",
+        "releaseUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45",
+        "revision": "9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611",
+        "assetUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
+        "assetSha256": "46da68bfe5a0b8983e67286a3e681ee05c19d4f2169f37410786e2177dff6aca",
+        "assetSizeBytes": 114197504,
+        "archiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
+        "archiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
+        "archiveSizeBytes": 17325951
+      },
+      "licenseRecord": {
+        "spdxExpression": "LGPL-3.0-or-later",
+        "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611/COPYING.LGPLv3",
+        "file": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
+        "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
+      },
+      "noticeRecord": {
+        "file": "docs/third-party/THIRD_PARTY_NOTICES.md",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45",
+        "sha256": "57e7259dae3340534df6817163277ddccf33fe9528137d7d3881257b583b7af0"
+      }
+    }
+  ]
+}

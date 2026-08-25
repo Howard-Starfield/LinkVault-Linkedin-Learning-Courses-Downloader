@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
   Folder,
+  FolderOpen,
   Pause,
   Play,
   Square
@@ -20,6 +21,8 @@ import {
   getYouTubeHelperStatus,
   inspectYouTubeTranscripts,
   isTauriRuntime,
+  listYouTubeHistory,
+  openYouTubeDownloadFolder,
   pauseYouTubeDownload,
   readActiveYouTubePreviewScan,
   resumeYouTubeDownload,
@@ -45,6 +48,7 @@ import {
   type StartYouTubeDownloadRequest,
   type YouTubeDownloadMode,
   type YouTubeError,
+  type YouTubeHistoryEntry,
   type YouTubeItemState,
   type YouTubePlaylistMode,
   type YouTubeRunSnapshot,
@@ -54,6 +58,58 @@ import {
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
 
 type HelperStatus = "pending" | "ready" | "failed";
+type YouTubeQueueSection = "queue" | "active" | "completed" | "failed";
+
+function queueSectionForItemState(state: YouTubeItemState): YouTubeQueueSection {
+  switch (state) {
+    case "running":
+      return "active";
+    case "completed":
+    case "completed_with_warnings":
+    case "skipped_existing":
+      return "completed";
+    case "failed":
+    case "cancelled":
+      return "failed";
+    case "pending":
+    case "skipped":
+    default:
+      return "queue";
+  }
+}
+
+function YouTubeQueueSectionTab({
+  section,
+  label,
+  value,
+  tone,
+  selected,
+  onClick
+}: {
+  section: YouTubeQueueSection;
+  label: string;
+  value: number;
+  tone: "queue" | "primary" | "success" | "danger";
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`queue-section-tab${selected ? " is-selected" : ""}`}
+      data-section={section}
+      data-tone={tone}
+      aria-pressed={selected}
+      onClick={onClick}
+    >
+      <span className="queue-section-tab-label">
+        <span className="queue-section-tab-dot" aria-hidden="true" />
+        {label}
+      </span>
+      <strong>{value}</strong>
+    </button>
+  );
+}
 
 interface ResultVideo {
   scanPlanId: string;
@@ -219,16 +275,34 @@ function itemStatusText(state: YouTubeItemState, available: boolean): string | n
   }
 }
 
-function formatYouTubeWarning(code: string): string {
+function readTrimmedString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Accepts string codes or Rust `{ code, message }` warning objects from IPC. */
+function formatYouTubeWarning(value: unknown): string {
+  let code: string | null = null;
+  let message: string | null = null;
+  if (typeof value === "string") {
+    code = readTrimmedString(value);
+  } else if (typeof value === "object" && value !== null) {
+    const record = value as { code?: unknown; message?: unknown };
+    code = readTrimmedString(record.code);
+    message = readTrimmedString(record.message);
+  }
+
   switch (code) {
     case "TRANSCRIPT_MISSING":
       return "No captions were available on YouTube for this video, so only the media file was saved.";
     default:
-      return code.trim() || "Completed with warnings.";
+      if (message && message !== code) return message;
+      return code ?? "Completed with warnings.";
   }
 }
 
-export function YouTubeView() {
+export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "history" }) {
   const nativeRuntime = isTauriRuntime();
   const [helperStatus, setHelperStatus] = useState<HelperStatus>(nativeRuntime ? "pending" : "ready");
   const [helperError, setHelperError] = useState<YouTubeError | null>(null);
@@ -241,7 +315,7 @@ export function YouTubeView() {
   const [outputDir, setOutputDir] = useState(() => (nativeRuntime ? "" : readPreviewYouTubeOutputDir()));
   const [folderGateOpen, setFolderGateOpen] = useState(false);
   const [playlistMode, setPlaylistMode] = useState<YouTubePlaylistMode>("video");
-  const [mode, setMode] = useState<YouTubeDownloadMode>("video_and_transcript");
+  const [downloadMode, setDownloadMode] = useState<YouTubeDownloadMode>("video_and_transcript");
   const [maxHeight, setMaxHeight] = useState<StartYouTubeDownloadRequest["maxHeight"]>(1080);
   const [preferredLanguage, setPreferredLanguage] = useState<StartYouTubeDownloadRequest["preferredLanguage"]>(null);
   const [languageOptions, setLanguageOptions] = useState<TranscriptLanguageOption[]>([NO_CAPTION_OPTION]);
@@ -252,6 +326,10 @@ export function YouTubeView() {
   const [isResuming, setIsResuming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [runSnapshot, setRunSnapshot] = useState<YouTubeRunSnapshot | null>(null);
+  const [queueSection, setQueueSection] = useState<YouTubeQueueSection>("queue");
+  const [historyEntries, setHistoryEntries] = useState<YouTubeHistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(mode === "history");
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const sourceInputRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptInspectionGenerationRef = useRef(0);
   const latestRunIdRef = useRef<string | null>(null);
@@ -266,6 +344,8 @@ export function YouTubeView() {
   const warnedRunIdRef = useRef<string | null>(null);
   const autoScanTimerRef = useRef<number | null>(null);
   const lastHeightSyncKeyRef = useRef<string | null>(null);
+  /** Output dir used for the accepted run; File action falls back to this when paths are absent. */
+  const runOutputDirRef = useRef("");
   const hasDestinationFolder = outputDir.trim().length > 0;
   const ambiguousPlaylistSource = detectedLinks.some((link) => link.kind === "ambiguous")
     || scanPlans.some((plan) => isAmbiguousWatchPlaylist(plan.canonicalUrl));
@@ -346,6 +426,29 @@ export function YouTubeView() {
     };
   }, [nativeRuntime]);
 
+  useEffect(() => {
+    if (mode !== "history") return;
+    let disposed = false;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    void listYouTubeHistory()
+      .then((entries) => {
+        if (disposed) return;
+        setHistoryEntries(entries);
+      })
+      .catch((error: unknown) => {
+        if (disposed) return;
+        setHistoryError(formatYouTubeInvokeError(error));
+        setHistoryEntries([]);
+      })
+      .finally(() => {
+        if (!disposed) setHistoryLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [mode]);
+
   const applyRunSnapshot = useCallback((snapshot: YouTubeRunSnapshot | null, allowRunSwitch = false) => {
     if (!snapshot) return;
     const currentRunId = latestRunIdRef.current;
@@ -397,6 +500,9 @@ export function YouTubeView() {
 
   useEffect(() => {
     if (!runSnapshot?.runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX)) return;
+    if (!runOutputDirRef.current.trim()) {
+      runOutputDirRef.current = outputDir.trim() || "C:\\Users\\Public\\Videos";
+    }
     const scan = readActiveYouTubePreviewScan();
     if (scan) {
       setScanPlans([scan]);
@@ -421,7 +527,7 @@ export function YouTubeView() {
         metadataDigest: item.artifactFingerprint
       }
     })));
-  }, [runSnapshot?.runId]);
+  }, [runSnapshot?.runId, outputDir]);
 
   const availableVideos = useMemo(
     () => videos.filter((video) => video.item.availability === "available"),
@@ -431,6 +537,26 @@ export function YouTubeView() {
     () => new Map((runSnapshot?.items ?? []).map((item) => [item.occurrenceId, item])),
     [runSnapshot]
   );
+  const videosWithSection = useMemo(
+    () => videos.map((video) => {
+      const outcome = runItems.get(video.item.occurrenceId);
+      const available = video.item.availability === "available";
+      const state: YouTubeItemState = outcome?.state ?? (available ? "pending" : "skipped");
+      return { video, state, section: queueSectionForItemState(state) };
+    }),
+    [videos, runItems]
+  );
+  const queueCounts = useMemo(() => {
+    const counts = { queue: 0, active: 0, completed: 0, failed: 0 };
+    for (const entry of videosWithSection) {
+      counts[entry.section] += 1;
+    }
+    return counts;
+  }, [videosWithSection]);
+  const sectionVideos = useMemo(
+    () => videosWithSection.filter((entry) => entry.section === queueSection),
+    [videosWithSection, queueSection]
+  );
   const activeRun = runSnapshot !== null && !isYouTubeRunTerminal(runSnapshot.state);
   const canPauseRun = activeRun && runSnapshot?.state === "running";
   const canResumeRun = activeRun && (runSnapshot?.state === "paused" || runSnapshot?.state === "pause_requested");
@@ -438,6 +564,7 @@ export function YouTubeView() {
     ? 0
     : Math.max(0, Math.min(1, runSnapshot.progress.fraction)) * 100;
   const multipleResults = videos.length > 1;
+  const showQueueDownloads = queueSection === "queue" && !activeRun;
   const fallbackLanguages = useMemo(
     () => languageOptions
       .map((option) => option.tag)
@@ -457,11 +584,11 @@ export function YouTubeView() {
     if (!runSnapshot || runSnapshot.state !== "completed_with_warnings") return;
     if (warnedRunIdRef.current === runSnapshot.runId) return;
     warnedRunIdRef.current = runSnapshot.runId;
-    const codes = [
-      ...runSnapshot.warnings.map((warning) => warning.code),
+    const warnings = [
+      ...runSnapshot.warnings,
       ...runSnapshot.items.flatMap((item) => item.warnings)
     ];
-    const first = codes.find((code) => code === "TRANSCRIPT_MISSING") ?? codes[0] ?? null;
+    const first = warnings.find((warning) => warning.code === "TRANSCRIPT_MISSING") ?? warnings[0] ?? null;
     if (!first) return;
     toast.warning("Saved with warnings", { description: formatYouTubeWarning(first) });
   }, [runSnapshot]);
@@ -592,6 +719,7 @@ export function YouTubeView() {
     setPreferredLanguage(null);
     setIsDetectingLanguages(false);
     setIsScanning(true);
+    setQueueSection("queue");
     const generation = ++scanGenerationRef.current;
     const mergedPlans: ScanYouTubeSourceResponse[] = [];
     const mergedVideos: ResultVideo[] = [];
@@ -791,11 +919,11 @@ export function YouTubeView() {
     try {
       const resolvedOutputDir = outputDir.trim() || await pickOutputDirectory();
       if (!resolvedOutputDir) return false;
-      if (mode !== "video_only") {
+      if (downloadMode !== "video_only") {
         const inspected = await requestTranscriptInspection(group.scanPlanId, group.occurrenceIds);
         if (!inspected) return false;
         const missingCaptions = inspected.occurrences.some((occurrence) => occurrence.tracks.length === 0);
-        if (missingCaptions && mode === "video_and_transcript") {
+        if (missingCaptions && downloadMode === "video_and_transcript") {
           toast.message("No captions on YouTube", {
             description: "This video has no uploader or automatic captions. The download will continue and save the video only."
           });
@@ -806,7 +934,7 @@ export function YouTubeView() {
         scanPlanId: scan.scanPlanId,
         selectedOccurrenceIds: group.occurrenceIds,
         outputDir: resolvedOutputDir,
-        mode,
+        mode: downloadMode,
         maxHeight,
         preferredLanguage,
         fallbackLanguages,
@@ -815,6 +943,8 @@ export function YouTubeView() {
       });
       latestRunIdRef.current = response.receipt.runId;
       latestRevisionRef.current = 0;
+      runOutputDirRef.current = resolvedOutputDir;
+      setQueueSection("active");
       setRunSnapshot(null);
       const snapshot = await getYouTubeDownloadState({ runId: response.receipt.runId });
       applyRunSnapshot(snapshot, true);
@@ -900,6 +1030,33 @@ export function YouTubeView() {
     }
   }
 
+  async function openCompletedOccurrenceFolder(occurrenceId: string): Promise<void> {
+    const fallbackPath = (runOutputDirRef.current.trim() || outputDir).trim();
+    if (!fallbackPath) {
+      toast.warning("Folder unavailable", {
+        description: "Choose a download folder before opening completed files."
+      });
+      return;
+    }
+    try {
+      // V1 item snapshots omit per-occurrence media paths; open the run outputDir.
+      const opened = await openYouTubeDownloadFolder({
+        runId: runSnapshot?.runId ?? null,
+        occurrenceId,
+        outputDir: fallbackPath
+      });
+      if (isTauriRuntime() && !(runSnapshot?.runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX))) {
+        toast.success("Folder opened", { description: opened.path });
+      } else {
+        toast.info("Folder opener is only available in the Tauri desktop runtime", {
+          description: opened.path
+        });
+      }
+    } catch (error) {
+      toast.error("Open folder failed", { description: formatYouTubeInvokeError(error) });
+    }
+  }
+
   function handlePlaylistModeChange(nextMode: YouTubePlaylistMode): void {
     setPlaylistMode(nextMode);
     const complete = detectedLinks.filter((link) => link.complete);
@@ -925,6 +1082,27 @@ export function YouTubeView() {
       );
     }
     return null;
+  }
+
+  if (mode === "history") {
+    return (
+      <YouTubeHistoryPage
+        entries={historyEntries}
+        loading={historyLoading}
+        error={historyError}
+        onOpenFolder={async (entry) => {
+          try {
+            await openYouTubeDownloadFolder({
+              runId: entry.runId,
+              occurrenceId: null,
+              outputDir: entry.outputDir
+            });
+          } catch (error) {
+            toast.error("Could not open folder", { description: formatYouTubeInvokeError(error) });
+          }
+        }}
+      />
+    );
   }
 
   return (
@@ -958,7 +1136,7 @@ export function YouTubeView() {
         <div className="youtube-control-cluster youtube-options-row">
           <label className="youtube-cluster-field youtube-option-mode">
             <span>Mode</span>
-            <Select value={mode} onChange={(event) => setMode(event.target.value as YouTubeDownloadMode)} disabled={activeRun} aria-label="YouTube capture mode">
+            <Select value={downloadMode} onChange={(event) => setDownloadMode(event.target.value as YouTubeDownloadMode)} disabled={activeRun} aria-label="YouTube capture mode">
               <option value="video_and_transcript">Video + transcript</option>
               <option value="video_only">Video only</option>
               <option value="transcript_only">Transcript only</option>
@@ -1020,11 +1198,10 @@ export function YouTubeView() {
         </div>
       </div>
 
-      {videos.length > 0 || isScanning ? (
-        <section className="youtube-results" aria-label="Detected YouTube links">
+      <section className="youtube-results" aria-label="Detected YouTube links">
           {multipleResults || activeRun ? (
             <div className="youtube-results-toolbar">
-              {multipleResults && !activeRun ? (
+              {multipleResults && showQueueDownloads ? (
                 <Button
                   type="button"
                   size="xs"
@@ -1041,81 +1218,141 @@ export function YouTubeView() {
               {renderRunControls()}
             </div>
           ) : null}
-          <ol className="youtube-result-list" aria-label="Scanned YouTube occurrences">
-            {videos.map((video) => {
-              const outcome = runItems.get(video.item.occurrenceId);
-              const available = video.item.availability === "available";
-              const state: YouTubeItemState = outcome?.state ?? (available ? "pending" : "skipped");
-              const availabilityLabel = video.item.availability === "unknown" ? "Unconfirmed" : "Unavailable";
-              const status = itemStatusText(state, available);
-              const warningText = outcome?.warnings?.length
-                ? formatYouTubeWarning(outcome.warnings[0] ?? "")
-                : null;
-              const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
-              const duration = formatDuration(video.item.durationSeconds);
-              const plan = scanPlans.find((candidate) => candidate.scanPlanId === video.scanPlanId);
-              const kind = plan?.kind === "playlist" ? "playlist" : "video";
-              const meta = [detectedKindLabel(kind), video.item.channelName, duration].filter(Boolean).join(" · ");
-              const showRowDownload = !multipleResults && !activeRun;
-              return (
-                <li key={video.item.occurrenceId} className="youtube-result-row" data-state={state} data-unavailable={!available || undefined}>
-                  <div className="youtube-result-copy">
-                    <strong>{video.item.title}</strong>
-                    <span>{meta || video.item.sourceUrl}</span>
-                    {percent !== null ? (
-                      <div className="youtube-result-progress">
-                        <Progress value={percent} />
-                        <span>{status ?? "Downloading"}{percent > 0 ? ` · ${Math.round(percent)}%` : ""}</span>
-                      </div>
-                    ) : status ? <span className="youtube-result-status">{status}</span> : null}
-                    {warningText ? <span className="youtube-result-warning">{warningText}</span> : null}
-                    {!available ? <span className="youtube-result-status">{availabilityLabel}</span> : null}
-                  </div>
-                  <div className="youtube-result-overlay">
-                    {showRowDownload ? (
-                      <Button
-                        type="button"
-                        size="xs"
-                        variant="primary"
-                        className="youtube-download-overlay-button"
-                        onClick={() => void handleDownloadOne(video)}
-                        loading={isStarting}
-                        loadingLabel="Starting"
-                        disabled={!available || activeRun || !helperReady}
-                        aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
-                      >
-                        Download
-                      </Button>
-                    ) : null}
-                    {multipleResults && !activeRun && available ? (
-                      <Button
-                        type="button"
-                        size="xs"
-                        variant="ghost"
-                        onClick={() => void handleDownloadOne(video)}
-                        disabled={!available || activeRun || !helperReady}
-                        aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
-                      >
-                        Download
-                      </Button>
-                    ) : null}
-                    {!multipleResults ? renderRunControls() : null}
-                  </div>
+          <div className="queue-section-tabs youtube-queue-section-tabs" role="group" aria-label="YouTube download queue sections">
+            <YouTubeQueueSectionTab
+              section="queue"
+              label="Queue"
+              value={queueCounts.queue}
+              tone="queue"
+              selected={queueSection === "queue"}
+              onClick={() => setQueueSection("queue")}
+            />
+            <YouTubeQueueSectionTab
+              section="active"
+              label="Active"
+              value={queueCounts.active}
+              tone="primary"
+              selected={queueSection === "active"}
+              onClick={() => setQueueSection("active")}
+            />
+            <YouTubeQueueSectionTab
+              section="completed"
+              label="Completed"
+              value={queueCounts.completed}
+              tone="success"
+              selected={queueSection === "completed"}
+              onClick={() => setQueueSection("completed")}
+            />
+            <YouTubeQueueSectionTab
+              section="failed"
+              label="Failed"
+              value={queueCounts.failed}
+              tone="danger"
+              selected={queueSection === "failed"}
+              onClick={() => setQueueSection("failed")}
+            />
+          </div>
+          <div
+            className={`queue-section-panel queue-section-panel-${queueSection}`}
+            aria-label={`${queueSection} YouTube downloads`}
+          >
+            <ol className="youtube-result-list" aria-label="Scanned YouTube occurrences">
+              {sectionVideos.map(({ video, state }) => {
+                const outcome = runItems.get(video.item.occurrenceId);
+                const available = video.item.availability === "available";
+                const availabilityLabel = video.item.availability === "unknown" ? "Unconfirmed" : "Unavailable";
+                const status = itemStatusText(state, available);
+                const warningText = outcome?.warnings?.length
+                  ? formatYouTubeWarning(outcome.warnings[0] ?? "")
+                  : null;
+                const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
+                const duration = formatDuration(video.item.durationSeconds);
+                const plan = scanPlans.find((candidate) => candidate.scanPlanId === video.scanPlanId);
+                const kind = plan?.kind === "playlist" ? "playlist" : "video";
+                const meta = [detectedKindLabel(kind), video.item.channelName, duration].filter(Boolean).join(" · ");
+                const showRowDownload = showQueueDownloads && !multipleResults;
+                const showInlineDownload = showQueueDownloads && multipleResults && available;
+                const showFileAction = queueSection === "completed"
+                  && (state === "completed" || state === "completed_with_warnings" || state === "skipped_existing");
+                return (
+                  <li key={video.item.occurrenceId} className="youtube-result-row" data-state={state} data-unavailable={!available || undefined}>
+                    <div className="youtube-result-copy">
+                      <strong>{video.item.title}</strong>
+                      <span>{meta || video.item.sourceUrl}</span>
+                      {percent !== null ? (
+                        <div className="youtube-result-progress">
+                          <Progress value={percent} />
+                          <span>{status ?? "Downloading"}{percent > 0 ? ` · ${Math.round(percent)}%` : ""}</span>
+                        </div>
+                      ) : status ? <span className="youtube-result-status">{status}</span> : null}
+                      {warningText ? <span className="youtube-result-warning">{warningText}</span> : null}
+                      {!available ? <span className="youtube-result-status">{availabilityLabel}</span> : null}
+                    </div>
+                    <div className="youtube-result-overlay">
+                      {showFileAction ? (
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="ghost"
+                          className="youtube-file-action"
+                          onClick={() => void openCompletedOccurrenceFolder(video.item.occurrenceId)}
+                          aria-label={`Open download folder for ${video.item.title}`}
+                        >
+                          <FolderOpen aria-hidden="true" />
+                          File
+                        </Button>
+                      ) : null}
+                      {showRowDownload ? (
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="primary"
+                          className="youtube-download-overlay-button"
+                          onClick={() => void handleDownloadOne(video)}
+                          loading={isStarting}
+                          loadingLabel="Starting"
+                          disabled={!available || activeRun || !helperReady}
+                          aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
+                        >
+                          Download
+                        </Button>
+                      ) : null}
+                      {showInlineDownload ? (
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="ghost"
+                          onClick={() => void handleDownloadOne(video)}
+                          disabled={!available || activeRun || !helperReady}
+                          aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
+                        >
+                          Download
+                        </Button>
+                      ) : null}
+                      {!multipleResults && queueSection === "active" ? renderRunControls() : null}
+                    </div>
+                  </li>
+                );
+              })}
+              {queueSection === "queue" && isScanning && videos.length === 0 ? (
+                <YouTubeScanSkeletonRows count={YOUTUBE_SCAN_SKELETON_COUNT} />
+              ) : null}
+              {queueSection === "queue" && isScanning && videos.length > 0 ? (
+                <YouTubeScanSkeletonRows count={1} />
+              ) : null}
+              {!isScanning && sectionVideos.length === 0 ? (
+                <li className="youtube-result-empty" aria-live="polite">
+                  {queueSection === "queue" && videos.length === 0
+                    ? "Paste a URL to scan"
+                    : `No ${queueSection} videos`}
                 </li>
-              );
-            })}
-            {isScanning && videos.length === 0 ? (
-              <YouTubeScanSkeletonRows count={YOUTUBE_SCAN_SKELETON_COUNT} />
+              ) : null}
+            </ol>
+            {isScanning && queueSection === "queue" ? (
+              <p className="youtube-scanning" role="status">Finding videos…</p>
             ) : null}
-            {isScanning && videos.length > 0 ? (
-              <YouTubeScanSkeletonRows count={1} />
-            ) : null}
-          </ol>
-          {isScanning ? (
-            <p className="youtube-scanning" role="status">Finding videos…</p>
-          ) : null}
+          </div>
         </section>
-      ) : null}
 
       <Dialog
         open={folderGateOpen}
@@ -1134,6 +1371,89 @@ export function YouTubeView() {
           </Button>
         </div>
       </Dialog>
+    </div>
+  );
+}
+
+function formatYouTubeHistoryDate(timestamp: number): string {
+  if (!timestamp) return "—";
+  return new Date(timestamp * 1000).toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function formatYouTubeHistoryState(state: string): string {
+  return state.split("_").join(" ");
+}
+
+function YouTubeHistoryPage({
+  entries,
+  loading,
+  error,
+  onOpenFolder
+}: {
+  entries: YouTubeHistoryEntry[];
+  loading: boolean;
+  error: string | null;
+  onOpenFolder: (entry: YouTubeHistoryEntry) => void | Promise<void>;
+}) {
+  return (
+    <div className="lv-workspace download-history-workspace youtube-history-workspace">
+      <div className="download-history-header youtube-history-header">
+        <p className="download-history-count">
+          {loading
+            ? "Loading history…"
+            : `${entries.length} completed download${entries.length === 1 ? "" : "s"}`}
+        </p>
+      </div>
+      {error ? (
+        <div className="youtube-helper-error" role="alert">{error}</div>
+      ) : null}
+      {!loading && entries.length === 0 && !error ? (
+        <div className="download-history-empty youtube-history-empty" role="status">
+          No downloaded YouTube history yet.
+        </div>
+      ) : null}
+      {entries.length > 0 ? (
+        <ol className="download-history-list youtube-history-list" aria-label="YouTube download history">
+          {entries.map((entry) => {
+            const when = formatYouTubeHistoryDate(entry.completedAt ?? entry.createdAt);
+            const meta = [
+              formatYouTubeHistoryState(entry.state),
+              when,
+              `${entry.videoCount} video${entry.videoCount === 1 ? "" : "s"}`
+            ].join(" · ");
+            return (
+              <li key={entry.runId} className="download-history-row youtube-history-row">
+                <div className="download-history-copy">
+                  <strong>{entry.title}</strong>
+                  <span>{meta}</span>
+                  {entry.errorMessage ? (
+                    <span className="youtube-result-warning">{entry.errorMessage}</span>
+                  ) : null}
+                </div>
+                <div className="download-history-overlay">
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    className="download-history-file-action youtube-file-action"
+                    onClick={() => void onOpenFolder(entry)}
+                    aria-label={`Open folder for ${entry.title}`}
+                  >
+                    <FolderOpen aria-hidden="true" />
+                    Open Folder
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
     </div>
   );
 }

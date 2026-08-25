@@ -25,7 +25,7 @@ import {
 import { visibleVirtualIndexes } from "./newspaper-virtualization";
 
 const PAGE_SIZE = 50;
-const ROW_HEIGHT = 112;
+const ROW_HEIGHT = 80;
 export function NewspaperLibrary({
   clippingCapability,
   readerTarget,
@@ -304,7 +304,12 @@ export function NewspaperLibrary({
         </Select>
       </div>
       <div ref={scrollRef} className="newspaper-library-list" data-testid="newspaper-library-scroll">
-        {total === 0 ? <div className="newspaper-empty">Downloaded editions will appear here.</div> : null}
+        {total === 0 ? (
+          <div className="newspaper-library-empty" role="status">
+            <strong>No editions yet</strong>
+            <span>Downloaded editions will appear here.</span>
+          </div>
+        ) : null}
         <div className="newspaper-library-virtual" style={{ height: `${virtualizer.getTotalSize()}px` }}>
           {virtualItems.map((virtualItem) => {
             const item = items[virtualItem.index];
@@ -343,8 +348,8 @@ export function NewspaperLibrary({
                     <img
                       src={item.thumbnailUrl}
                       alt={`${item.editionName} front page preview`}
-                      width={420}
-                      height={176}
+                      width={240}
+                      height={144}
                       loading="lazy"
                       decoding="async"
                     />
@@ -355,30 +360,46 @@ export function NewspaperLibrary({
                   <span>{item.editionCode} · {item.publicationDate} · {item.completedCount}/{item.pageCount} pages</span>
                   {item.warning ? <small>{item.warning}</small> : null}
                 </div>
-                <StatusBadge tone={item.status === "completed" ? "success" : item.status === "optimizing" ? "primary" : "danger"}>
-                  {item.status === "optimizing" ? "optimizing images" : item.status}
-                </StatusBadge>
-                <div
-                  className="newspaper-reading-progress"
-                  role="progressbar"
-                  aria-label={`Reading progress for ${item.editionName}`}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={progressPercent}
-                  title={progressLabel}
-                  style={{ "--reading-progress": `${progressPercent}%` } as CSSProperties}
-                >
-                  <span>{progressPercent}%</span>
-                </div>
-                <div className="newspaper-row-actions">
-                  {item.status === "partial" ? (
-                    <Button size="xs" variant="ghost" onClick={() => void invoke("retry_newspaper_job", { jobId: item.jobId })}>
-                      <RotateCcw /> Retry missing
+                <div className="newspaper-library-trailing">
+                  <StatusBadge tone={item.status === "completed" ? "success" : item.status === "optimizing" ? "primary" : "danger"}>
+                    {item.status === "optimizing" ? "optimizing images" : item.status}
+                  </StatusBadge>
+                  <div
+                    className="newspaper-reading-progress"
+                    role="progressbar"
+                    aria-label={`Reading progress for ${item.editionName}`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={progressPercent}
+                    title={progressLabel}
+                    style={{ "--reading-progress": `${progressPercent}%` } as CSSProperties}
+                  >
+                    <span>{progressPercent}%</span>
+                  </div>
+                  <div className="newspaper-row-actions">
+                    {item.status === "partial" ? (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        className="newspaper-library-action"
+                        aria-label={`Retry missing pages for ${item.editionName}`}
+                        onClick={() => void invoke("retry_newspaper_job", { jobId: item.jobId })}
+                      >
+                        <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
+                        <span>Retry</span>
+                      </Button>
+                    ) : null}
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      className="newspaper-library-action"
+                      aria-label={`Open folder for ${item.editionName}`}
+                      onClick={() => void invoke("open_newspaper_download_folder", { path: item.outputDir })}
+                    >
+                      <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
+                      <span>Folder</span>
                     </Button>
-                  ) : null}
-                  <Button size="xs" variant="ghost" onClick={() => void invoke("open_newspaper_download_folder", { path: item.outputDir })}>
-                    <FolderOpen /> Folder
-                  </Button>
+                  </div>
                 </div>
               </article>
             );

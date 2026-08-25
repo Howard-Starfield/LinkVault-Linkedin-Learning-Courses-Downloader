@@ -167,6 +167,39 @@ export interface MutateYouTubeRunRequest {
   expectedRevision: number;
 }
 
+/**
+ * Open the download location for a completed occurrence.
+ * V1 snapshots do not expose per-item media paths, so the backend opens the
+ * run `outputDir` (or the client-provided fallback) rather than revealing a file.
+ */
+export interface OpenYouTubeDownloadFolderRequest {
+  runId: string | null;
+  /** Optional occurrence id for future per-item reveal; unused in V1. */
+  occurrenceId: string | null;
+  /** Fallback when the durable run record is unavailable (preview / mock / lost run). */
+  outputDir: string;
+}
+
+export interface OpenYouTubeDownloadFolderResponse {
+  path: string;
+}
+
+export interface YouTubeHistoryEntry {
+  runId: string;
+  state: string;
+  title: string;
+  sourceUrl: string;
+  videoCount: number;
+  outputDir: string;
+  createdAt: number;
+  completedAt: number | null;
+  errorMessage: string | null;
+}
+
+export interface ListYouTubeHistoryRequest {
+  limit?: number;
+}
+
 export interface YouTubeProgressItem {
   occurrenceId: string;
   artifactFingerprint: string;
@@ -216,7 +249,8 @@ export interface YouTubeItemOutcomeSnapshot {
   title: string;
   state: YouTubeItemState;
   phase: YouTubeItemPhase;
-  warnings: YouTubeWarningCode[];
+  /** Matches Rust `TransientWarning` objects on item outcomes (not bare string codes). */
+  warnings: YouTubeProgressWarning[];
   error: YouTubeError | null;
   publishedArtifactKinds: Array<"media" | "vtt" | "transcript_json" | "metadata">;
 }

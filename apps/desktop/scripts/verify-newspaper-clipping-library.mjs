@@ -56,6 +56,10 @@ assert.ok(list.includes("visibleItemIndexes") && list.includes("useVirtualizer")
 assert.ok(list.includes("return item.assetWidth / item.assetHeight"), "gallery does not preserve the full clipping aspect ratio");
 assert.ok(/\.clipping-gallery__thumb img\s*\{[^}]*object-fit:\s*contain/s.test(styles) && !styles.includes(".clipping-source-card::before"), "clipping images may crop or retain the source-card hairline");
 assert.ok(list.includes("ClippingSkeletonShelf") && list.includes("No clippings yet") && list.includes("Open Newspaper library"), "gallery first-use state is incomplete");
+assert.ok(list.includes("clipping-view-preferences") && list.includes("CLIPPING_VIEW_MODE_EVENT") && list.includes("ClippingEmptyState"), "clippings view mode sync or refined empty state is missing");
+assert.ok(list.includes("clipping-list-row"), "clippings list mode rows are missing");
+assert.ok(app.includes("Gallery view") && app.includes("List view") && app.includes("lv-global-search__aside"), "clippings count + view toggle are not stacked in the search row");
+assert.ok(styles.includes(".clipping-gallery__empty-card") && styles.includes(".clipping-list-row") && styles.includes(".lv-global-search__view-toggle"), "clippings empty/list/search-aside styles are missing");
 assert.ok(
   clippings.includes("hidden={selection.selectedId !== null}")
     && clippings.includes("selection.selectedId ?")

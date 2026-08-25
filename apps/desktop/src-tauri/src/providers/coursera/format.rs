@@ -59,22 +59,80 @@ pub fn build_resource_filename(title: &str, ext: &str, opts: &CourseraOptions) -
 }
 
 /// Join `root` with `parts` and reject any traversal attack.
+///
+/// Each part may contain `/` or `\` (section directories use `01_mod/01_lesson`).
+/// Those separators are split into segments; `.`, `..`, empty, and drive-letter
+/// segments are rejected. The result is always a descendant of `root`.
 pub fn safe_join(root: &Path, parts: &[&str]) -> Option<PathBuf> {
     let mut out = root.to_path_buf();
     for part in parts {
         if part.is_empty() {
             return None;
         }
-        if part.contains("..") || part.starts_with('/') || part.starts_with('\\') {
+        if part.starts_with('/') || part.starts_with('\\') {
             return None;
         }
         // Windows absolute path detection: `C:` or `C:\` or `C:/`.
         if part.len() >= 2 && part.as_bytes()[1] == b':' {
             return None;
         }
-        out.push(part);
+        for segment in part.split(['/', '\\']) {
+            if !is_allowed_segment(segment) {
+                return None;
+            }
+            out.push(segment);
+        }
+    }
+    if !out.starts_with(root) {
+        return None;
     }
     Some(out)
+}
+
+fn is_allowed_segment(segment: &str) -> bool {
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return false;
+    }
+    if segment.contains(':') {
+        return false;
+    }
+    if segment.ends_with('.') || segment.ends_with(' ') {
+        return false;
+    }
+    let stem = segment.split('.').next().unwrap_or(segment);
+    !matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Create the parent directory of `path` without panicking when `parent()` is `None`.
+pub fn create_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +201,56 @@ mod tests {
         let root = Path::new("/tmp/out");
         let p = safe_join(root, &["course", "module", "lesson"]).unwrap();
         assert_eq!(p, PathBuf::from("/tmp/out/course/module/lesson"));
+    }
+
+    #[test]
+    fn safe_join_accepts_section_dir_with_slash() {
+        let root = Path::new("/tmp/out");
+        let path = safe_join(root, &["ml-005", "01_Module/01_Welcome", "lecture.mp4"]).unwrap();
+        assert!(path.ends_with("lecture.mp4"));
+        assert!(path.starts_with(root));
+    }
+
+    #[test]
+    fn safe_join_rejects_nested_traversal_in_one_part() {
+        let root = Path::new("/tmp/out");
+        assert!(safe_join(root, &["course", "foo/../../etc", "passwd"]).is_none());
+        assert!(safe_join(root, &["course", r"foo\..\..\etc", "passwd"]).is_none());
+    }
+
+    #[test]
+    fn create_parent_dir_creates_nested_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("a").join("b").join("c.html");
+        create_parent_dir(&dest).unwrap();
+        assert!(dest.parent().unwrap().is_dir());
+        std::fs::write(&dest, "ok").unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ok");
+    }
+
+    #[test]
+    fn safe_join_rejects_windows_drive_filename() {
+        let root = Path::new(r"C:\out");
+        assert!(safe_join(root, &["course", r"D:\secret.txt"]).is_none());
+    }
+
+    #[test]
+    fn safe_join_rejects_ntfs_ads_colon() {
+        let root = Path::new("/tmp/out");
+        assert!(safe_join(root, &["course", "lecture.mp4:hidden"]).is_none());
+    }
+
+    #[test]
+    fn safe_join_rejects_trailing_dot_and_space() {
+        let root = Path::new("/tmp/out");
+        assert!(safe_join(root, &["course", "file.txt."]).is_none());
+        assert!(safe_join(root, &["course", "file.txt "]).is_none());
+    }
+
+    #[test]
+    fn safe_join_rejects_reserved_device_name() {
+        let root = Path::new("/tmp/out");
+        assert!(safe_join(root, &["course", "CON"]).is_none());
+        assert!(safe_join(root, &["course", "nul.txt"]).is_none());
     }
 }

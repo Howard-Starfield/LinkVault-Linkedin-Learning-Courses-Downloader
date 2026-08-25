@@ -35,7 +35,8 @@ pub fn save_token(path: &Path, token: &str) -> Result<(), TokenStoreError> {
         fs::create_dir_all(parent)?;
     }
 
-    let protected = protect(trimmed.as_bytes())?;
+    let protected = crate::dpapi::protect_bytes(trimmed.as_bytes(), "LinkVault LinkedIn session")
+        .map_err(map_dpapi_error)?;
     fs::write(path, BASE64.encode(protected))?;
     Ok(())
 }
@@ -49,7 +50,7 @@ pub fn load_token(path: &Path) -> Result<String, TokenStoreError> {
     let protected = BASE64
         .decode(encoded.trim())
         .map_err(|_| TokenStoreError::Decode)?;
-    let token = String::from_utf8(unprotect(&protected)?)?;
+    let token = String::from_utf8(unprotect_token(&protected)?)?;
     let trimmed = token.trim().to_string();
     if trimmed.is_empty() {
         return Err(TokenStoreError::MissingToken);
@@ -65,104 +66,15 @@ pub fn clear_token(path: &Path) -> Result<(), TokenStoreError> {
     }
 }
 
-#[cfg(windows)]
-fn protect(input: &[u8]) -> Result<Vec<u8>, TokenStoreError> {
-    use std::ptr;
-    use std::slice;
-    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-    };
-
-    let mut input_blob = CRYPT_INTEGER_BLOB {
-        cbData: input.len() as u32,
-        pbData: input.as_ptr() as *mut u8,
-    };
-    let mut output_blob = CRYPT_INTEGER_BLOB::default();
-    let description = wide_null("LinkVault LinkedIn session");
-
-    let ok = unsafe {
-        CryptProtectData(
-            &mut input_blob,
-            description.as_ptr(),
-            ptr::null(),
-            ptr::null(),
-            ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output_blob,
-        )
-    };
-
-    if ok == 0 {
-        return Err(TokenStoreError::Storage(
-            "Windows DPAPI could not protect the token".to_string(),
-        ));
+fn map_dpapi_error(error: crate::dpapi::DpapiError) -> TokenStoreError {
+    match error {
+        crate::dpapi::DpapiError::UnsupportedPlatform => TokenStoreError::UnsupportedPlatform,
+        crate::dpapi::DpapiError::Storage(message) => TokenStoreError::Storage(message),
     }
-
-    let bytes = unsafe {
-        let output =
-            slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec();
-        LocalFree(output_blob.pbData as HLOCAL);
-        output
-    };
-    Ok(bytes)
 }
 
-#[cfg(windows)]
-fn unprotect(input: &[u8]) -> Result<Vec<u8>, TokenStoreError> {
-    use std::ptr;
-    use std::slice;
-    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-    };
-
-    let mut input_blob = CRYPT_INTEGER_BLOB {
-        cbData: input.len() as u32,
-        pbData: input.as_ptr() as *mut u8,
-    };
-    let mut output_blob = CRYPT_INTEGER_BLOB::default();
-
-    let ok = unsafe {
-        CryptUnprotectData(
-            &mut input_blob,
-            ptr::null_mut(),
-            ptr::null(),
-            ptr::null(),
-            ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output_blob,
-        )
-    };
-
-    if ok == 0 {
-        return Err(TokenStoreError::Storage(
-            "Windows DPAPI could not unprotect the saved token".to_string(),
-        ));
-    }
-
-    let bytes = unsafe {
-        let output =
-            slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec();
-        LocalFree(output_blob.pbData as HLOCAL);
-        output
-    };
-    Ok(bytes)
-}
-
-#[cfg(windows)]
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(not(windows))]
-fn protect(_input: &[u8]) -> Result<Vec<u8>, TokenStoreError> {
-    Err(TokenStoreError::UnsupportedPlatform)
-}
-
-#[cfg(not(windows))]
-fn unprotect(_input: &[u8]) -> Result<Vec<u8>, TokenStoreError> {
-    Err(TokenStoreError::UnsupportedPlatform)
+fn unprotect_token(input: &[u8]) -> Result<Vec<u8>, TokenStoreError> {
+    crate::dpapi::unprotect_bytes(input).map_err(map_dpapi_error)
 }
 
 #[cfg(test)]
