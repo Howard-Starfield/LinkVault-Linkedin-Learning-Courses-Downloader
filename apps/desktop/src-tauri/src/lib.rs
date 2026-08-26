@@ -139,6 +139,7 @@ pub fn run() {
             commands::reset_linkedin_database,
             commands::retry_failed_download_job,
             commands::save_download_preferences,
+            commands::set_linkedin_video_wait_bounds,
             commands::save_li_at_token,
             commands::set_all_downloads_paused,
             commands::set_download_job_pause,
@@ -365,7 +366,8 @@ pub fn run() {
                     let _ = window.set_icon(taskbar_icon.clone());
                 }
 
-                let show_item = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+                let show_item =
+                    MenuItem::with_id(app, "show", "Show LinkedVault", true, None::<&str>)?;
                 let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
                 let separator = PredefinedMenuItem::separator(app)?;
                 let tray_menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
@@ -373,7 +375,7 @@ pub fn run() {
                 let _tray = tauri::tray::TrayIconBuilder::with_id("linkvault-main-tray")
                     .icon(taskbar_icon)
                     .icon_as_template(false)
-                    .tooltip("LinkVault")
+                    .tooltip("LinkedVault")
                     .menu(&tray_menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id().as_ref() {
@@ -400,7 +402,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error while building LinkVault");
+        .expect("error while building LinkedVault");
 
     app.run(|handle, event| match event {
         tauri::RunEvent::ExitRequested { api, .. } => {

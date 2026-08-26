@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chromium } from "playwright";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
-assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkVault preview.");
+assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkedVault preview.");
 
 const browser = await chromium.launch({
   channel: process.env.PLAYWRIGHT_CHANNEL || "chrome",

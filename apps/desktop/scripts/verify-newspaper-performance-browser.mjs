@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chromium } from "playwright";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
-assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkVault preview.");
+assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkedVault preview.");
 
 const browser = await chromium.launch({
   channel: process.env.PLAYWRIGHT_CHANNEL || "chrome",
@@ -169,11 +169,11 @@ try {
     await page.getByRole("button", { name: "Newspaper library" }).click();
     await page.locator(".newspaper-library-row:not(.newspaper-library-row-skeleton)").first().waitFor();
     await page.getByRole("button", { name: "Open settings" }).click();
-    const settingsDialog = page.getByRole("dialog", { name: "LinkVault settings" });
+    const settingsDialog = page.getByRole("dialog", { name: "LinkedVault settings" });
     const settingsGeometry = await settingsDialog.evaluate((dialog) => {
       const grid = dialog.querySelector(".settings-grid");
       const controls = [...dialog.querySelectorAll("input, select, button")]
-        .filter((control) => !control.getAttribute("aria-label")?.startsWith("Close LinkVault"));
+        .filter((control) => !control.getAttribute("aria-label")?.startsWith("Close LinkedVault"));
       return {
         dialogClientWidth: dialog.clientWidth,
         dialogScrollWidth: dialog.scrollWidth,

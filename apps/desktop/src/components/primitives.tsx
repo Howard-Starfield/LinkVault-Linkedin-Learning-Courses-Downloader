@@ -153,31 +153,6 @@ export function Panel({ className, children }: { className?: string; children: R
   return <section className={cn("rounded-lg border border-border bg-card text-card-foreground shadow-panel", className)}>{children}</section>;
 }
 
-export function SectionHeader({
-  icon,
-  title,
-  description,
-  actions,
-  className
-}: {
-  icon?: ReactNode;
-  title: string;
-  description?: string;
-  actions?: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={cn("section-heading", className)}>
-      {icon ? <span className="section-icon">{icon}</span> : null}
-      <div className="min-w-0">
-        <h3>{title}</h3>
-        {description ? <p>{description}</p> : null}
-      </div>
-      {actions ? <div className="ml-auto flex shrink-0 items-center gap-2">{actions}</div> : null}
-    </div>
-  );
-}
-
 export function SidebarItem({
   icon,
   trailing,
@@ -263,55 +238,6 @@ export function DataTableRow({ className, children, ...props }: HTMLAttributes<H
     <div className={cn("lv-table-row", className)} {...props}>
       {children}
     </div>
-  );
-}
-
-export function SummaryChip({
-  label,
-  value,
-  dotClassName,
-  tone,
-  selected = false,
-  onClick
-}: {
-  label: string;
-  value: number;
-  dotClassName: string;
-  tone: "primary" | "success" | "danger";
-  selected?: boolean;
-  onClick?: () => void;
-}) {
-  const content = (
-    <>
-      <span className={cn("summary-dot", dotClassName)} />
-      <span className="summary-label">{label}</span>
-      <strong>{value}</strong>
-    </>
-  );
-  const className = cn("summary-chip", `summary-chip-${tone}`, value > 0 && "summary-chip-live", onClick && "summary-chip-interactive", selected && "summary-chip-selected");
-
-  if (onClick) {
-    return (
-      <button type="button" className={className} aria-label={`${label}: ${value}`} aria-pressed={selected} onClick={onClick}>
-        {content}
-      </button>
-    );
-  }
-
-  return (
-    <div className={className} aria-label={`${label}: ${value}`}>
-      {content}
-    </div>
-  );
-}
-
-export function ActivityEventRow({ time, label, dotClassName }: { time: string; label: string; dotClassName: string }) {
-  return (
-    <li className="activity-row">
-      <span className={cn("activity-dot", dotClassName)} />
-      <time>{time}</time>
-      <span className="line-clamp-2">{label}</span>
-    </li>
   );
 }
 

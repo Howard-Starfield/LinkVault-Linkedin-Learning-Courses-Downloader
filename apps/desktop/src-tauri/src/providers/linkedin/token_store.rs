@@ -35,7 +35,7 @@ pub fn save_token(path: &Path, token: &str) -> Result<(), TokenStoreError> {
         fs::create_dir_all(parent)?;
     }
 
-    let protected = crate::dpapi::protect_bytes(trimmed.as_bytes(), "LinkVault LinkedIn session")
+    let protected = crate::dpapi::protect_bytes(trimmed.as_bytes(), "LinkedVault LinkedIn session")
         .map_err(map_dpapi_error)?;
     fs::write(path, BASE64.encode(protected))?;
     Ok(())

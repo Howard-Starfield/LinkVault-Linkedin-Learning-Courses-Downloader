@@ -335,7 +335,7 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
     let forceRedownload = false;
     if (alreadyDownloaded.length > 0) {
       const shouldDownloadAgain = window.confirm(
-        `LinkVault has already completed ${alreadyDownloaded.length} selected Coursera course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
+        `LinkedVault has already completed ${alreadyDownloaded.length} selected Coursera course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
       );
       if (!shouldDownloadAgain) return;
       forceRedownload = true;
@@ -946,13 +946,13 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
         open={authHelpOpen}
         onOpenChange={setAuthHelpOpen}
         title="Find your Coursera CAUTH cookie"
-        description="Use this only with a Coursera account you are allowed to access. LinkVault saves the cookie locally with Windows encryption."
+        description="Use this only with a Coursera account you are allowed to access. LinkedVault saves the cookie locally with Windows encryption."
       >
         <ol className="token-guide-steps">
           <li>Open coursera.org in your browser and sign in.</li>
           <li>Press F12, then open the Application tab.</li>
           <li>Under Storage, open Cookies and choose https://www.coursera.org.</li>
-          <li>Find CAUTH, copy its full Value, and paste it into LinkVault.</li>
+          <li>Find CAUTH, copy its full Value, and paste it into LinkedVault.</li>
         </ol>
         <div className="token-guide-actions">
           <Button type="button" variant="primary" onClick={() => setAuthHelpOpen(false)}>

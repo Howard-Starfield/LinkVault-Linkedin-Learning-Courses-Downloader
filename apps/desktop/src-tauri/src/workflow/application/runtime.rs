@@ -443,6 +443,45 @@ impl WorkflowRuntime {
         Ok(())
     }
 
+    /// Cancel a run and delete it once terminal. For in-flight Running work this
+    /// advances Cancelling → Cancelled immediately so Active-tab removal can
+    /// clear the row without waiting for the executor drain.
+    pub fn cancel_and_delete_run(&self, id: String, updated_at: i64) -> Result<bool, WorkflowError> {
+        let _ = self.cancel_run(id.clone(), updated_at);
+        if let Some(run) = self.get_run(id.clone())? {
+            if run.state == RunState::Cancelling {
+                let steps = self.inner.service.list_steps_for_run(id.clone())?;
+                for step in steps {
+                    if matches!(
+                        step.state,
+                        StepState::Pending
+                            | StepState::Ready
+                            | StepState::Running
+                            | StepState::RetryWait
+                    ) {
+                        self.inner.service.transition_step(
+                            step.id,
+                            StepState::Cancelled,
+                            Some("cancelled and removed by user".to_string()),
+                            "step_cancelled",
+                            "{}".to_string(),
+                            updated_at,
+                        )?;
+                    }
+                }
+                self.inner.service.transition_run(
+                    id.clone(),
+                    RunState::Cancelled,
+                    Some("cancelled and removed by user".to_string()),
+                    "run_cancelled",
+                    "{}".to_string(),
+                    updated_at,
+                )?;
+            }
+        }
+        self.delete_run_if_terminal(id)
+    }
+
     pub fn with_drain_lock<R>(&self, f: impl FnOnce() -> R) -> R {
         let _guard = self
             .inner

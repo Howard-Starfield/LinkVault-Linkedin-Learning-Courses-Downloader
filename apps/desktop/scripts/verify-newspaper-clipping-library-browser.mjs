@@ -5,7 +5,7 @@ import { installClippingInstanceActivationBrowserHarness } from "./clipping-inst
 import { measureClippingNoteDurabilityBrowser } from "./clipping-note-durability-browser-performance.mjs";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
-assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkVault preview.");
+assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkedVault preview.");
 
 const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome", headless: true });
 try {

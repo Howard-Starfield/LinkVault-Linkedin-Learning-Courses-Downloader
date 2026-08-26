@@ -6,6 +6,7 @@ use crate::exercise_archive::{extract_zip_and_delete_archive, ExerciseArchiveExt
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -21,7 +22,33 @@ const DEFAULT_VIDEO_WAIT_MIN_SECONDS: u32 = 0;
 #[cfg(test)]
 const DEFAULT_VIDEO_WAIT_MAX_SECONDS: u32 = 0;
 
+const MAX_VIDEO_WAIT_SECONDS: u32 = 600;
+
+static LIVE_VIDEO_WAIT_MIN_SECONDS: AtomicU32 = AtomicU32::new(DEFAULT_VIDEO_WAIT_MIN_SECONDS);
+static LIVE_VIDEO_WAIT_MAX_SECONDS: AtomicU32 = AtomicU32::new(DEFAULT_VIDEO_WAIT_MAX_SECONDS);
+
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Updates the live random wait between LinkedIn video downloads.
+/// An in-progress wait keeps its original deadline; the next wait uses these bounds.
+pub fn set_live_video_wait_bounds(min_seconds: u32, max_seconds: u32) {
+    let (min_seconds, max_seconds) = normalize_video_wait_bounds(min_seconds, max_seconds);
+    LIVE_VIDEO_WAIT_MIN_SECONDS.store(min_seconds, Ordering::SeqCst);
+    LIVE_VIDEO_WAIT_MAX_SECONDS.store(max_seconds, Ordering::SeqCst);
+}
+
+pub fn live_video_wait_bounds() -> (u32, u32) {
+    normalize_video_wait_bounds(
+        LIVE_VIDEO_WAIT_MIN_SECONDS.load(Ordering::SeqCst),
+        LIVE_VIDEO_WAIT_MAX_SECONDS.load(Ordering::SeqCst),
+    )
+}
+
+pub fn normalize_video_wait_bounds(min_seconds: u32, max_seconds: u32) -> (u32, u32) {
+    let min_seconds = min_seconds.min(MAX_VIDEO_WAIT_SECONDS);
+    let max_seconds = max_seconds.min(MAX_VIDEO_WAIT_SECONDS).max(min_seconds);
+    (min_seconds, max_seconds)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactDownloadSource {
@@ -134,11 +161,7 @@ pub fn download_artifacts_for_active_job(
     downloads: &[PlannedArtifactDownload],
     timestamp: i64,
 ) -> Result<ArtifactDownloadSummary, ArtifactDownloadError> {
-    let mut pacing = VideoPacingPolicy::new(
-        DEFAULT_VIDEO_WAIT_MIN_SECONDS,
-        DEFAULT_VIDEO_WAIT_MAX_SECONDS,
-        video_pacing_seed(job_id, timestamp),
-    );
+    let mut pacing = VideoPacingPolicy::live(video_pacing_seed(job_id, timestamp));
     download_artifacts_for_active_job_with_pacing(
         connection,
         client,
@@ -459,18 +482,43 @@ struct VideoPacingPolicy {
     min_seconds: u32,
     max_seconds: u32,
     state: u64,
+    follow_live_bounds: bool,
 }
 
 impl VideoPacingPolicy {
+    #[cfg(test)]
     fn new(min_seconds: u32, max_seconds: u32, seed: u64) -> Self {
+        Self::with_live_follow(min_seconds, max_seconds, seed, false)
+    }
+
+    fn live(seed: u64) -> Self {
+        let (min_seconds, max_seconds) = live_video_wait_bounds();
+        Self::with_live_follow(min_seconds, max_seconds, seed, true)
+    }
+
+    fn with_live_follow(min_seconds: u32, max_seconds: u32, seed: u64, follow_live_bounds: bool) -> Self {
+        let (min_seconds, max_seconds) = normalize_video_wait_bounds(min_seconds, max_seconds);
         Self {
-            min_seconds: min_seconds.min(max_seconds),
-            max_seconds: max_seconds.max(min_seconds),
+            min_seconds,
+            max_seconds,
             state: seed,
+            follow_live_bounds,
         }
     }
 
+    #[cfg(test)]
+    fn set_bounds(&mut self, min_seconds: u32, max_seconds: u32) {
+        let (min_seconds, max_seconds) = normalize_video_wait_bounds(min_seconds, max_seconds);
+        self.min_seconds = min_seconds;
+        self.max_seconds = max_seconds;
+    }
+
     fn next_wait_seconds(&mut self, artifact_id: &str) -> u32 {
+        if self.follow_live_bounds {
+            let (min_seconds, max_seconds) = live_video_wait_bounds();
+            self.min_seconds = min_seconds;
+            self.max_seconds = max_seconds;
+        }
         for byte in artifact_id.bytes() {
             self.state ^= u64::from(byte);
             self.state = self.state.wrapping_mul(0x100000001b3);
@@ -1163,6 +1211,26 @@ mod tests {
 
         assert!(waits.iter().all(|seconds| (20..=40).contains(seconds)));
         assert!(waits.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn live_video_wait_bounds_apply_to_next_wait_only() {
+        set_live_video_wait_bounds(20, 40);
+        assert_eq!(live_video_wait_bounds(), (20, 40));
+        set_live_video_wait_bounds(5, 8);
+        assert_eq!(live_video_wait_bounds(), (5, 8));
+
+        let mut pacing = VideoPacingPolicy::new(20, 40, 3);
+        pacing.follow_live_bounds = true;
+        pacing.set_bounds(5, 8);
+        let waits = (0..40)
+            .map(|index| pacing.next_wait_seconds(&format!("live-video-{index}")))
+            .collect::<Vec<_>>();
+        assert!(waits.iter().all(|seconds| (5..=8).contains(seconds)));
+        set_live_video_wait_bounds(5, 8);
+        let next = pacing.next_wait_seconds("live-video-after-refresh");
+        assert!((5..=8).contains(&next));
+        set_live_video_wait_bounds(DEFAULT_VIDEO_WAIT_MIN_SECONDS, DEFAULT_VIDEO_WAIT_MAX_SECONDS);
     }
 
     #[test]

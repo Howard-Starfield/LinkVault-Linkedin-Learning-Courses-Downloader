@@ -34,7 +34,7 @@ export function useClippingNoteExitBridge(
         else cleanups.push(cleanup);
       }, () => {
         if (!disposed) toast.error("Exit protection unavailable", {
-          description: "Keep LinkVault open while editing clipping notes and retry after restarting the app."
+          description: "Keep LinkedVault open while editing clipping notes and retry after restarting the app."
         });
       });
     };
@@ -47,14 +47,14 @@ export function useClippingNoteExitBridge(
         else await invoke("resolve_cooperative_exit", { token: payload.token, durable });
       } catch {
         if (!disposed) toast.error("Could not confirm note durability", {
-          description: "LinkVault will remain open so your clipping draft is not discarded."
+          description: "LinkedVault will remain open so your clipping draft is not discarded."
         });
       }
     };
     const blocked = ({ payload }: { payload: { reason: "close" | "exit" } }) => {
       if (!disposed) toast.info(payload.reason === "close"
-        ? "LinkVault stayed visible to protect an unsaved clipping note."
-        : "LinkVault stayed open to protect an unsaved clipping note.");
+        ? "LinkedVault stayed visible to protect an unsaved clipping note."
+        : "LinkedVault stayed open to protect an unsaved clipping note.");
     };
     retainCleanup(harness
       ? Promise.resolve(harness.listenPrepare(prepare))

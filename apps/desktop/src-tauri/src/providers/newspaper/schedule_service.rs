@@ -136,7 +136,7 @@ pub(super) fn validate_request(request: &CreateNewspaperScheduleRequest) -> Resu
     }
     if request.date_mode == DateMode::Custom {
         return Err(
-            "Daily schedules support Single date or Last 7 days. Use Download now for a custom range."
+            "Daily schedules support Single date or Last 7 days. Use Download for a custom range."
                 .to_string(),
         );
     }

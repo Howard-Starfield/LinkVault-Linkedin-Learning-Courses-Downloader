@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chromium } from "playwright";
 
 const url = process.env.LINKVAULT_PREVIEW_URL;
-assert.ok(url, "Set LINKVAULT_PREVIEW_URL to a running local LinkVault preview.");
+assert.ok(url, "Set LINKVAULT_PREVIEW_URL to a running local LinkedVault preview.");
 const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome", headless: true });
 const page = await browser.newPage({ viewport: { width: 1720, height: 960 } });
 await page.goto(url);
@@ -28,7 +28,7 @@ const panels = await page.locator(".newspaper-dispatch-panel").evaluateAll((elem
     return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
   })
 );
-assert.ok(sidebar, "LinkVault sidebar must remain visible.");
+assert.ok(sidebar, "LinkedVault sidebar must remain visible.");
 assert.equal(await page.locator(".newspaper-page-header").count(), 0, "Duplicate newspaper page header must stay removed.");
 assert.equal(await page.locator(".newspaper-panel-heading").count(), 0, "Dispatch panels must not render separate title rows.");
 assert.equal(await page.locator(".newspaper-panel-step").count(), 0, "Dispatch panels must not render numbered steps.");
@@ -50,7 +50,7 @@ const progressSurfaces = await page.locator(".newspaper-progress-panel, .newspap
 );
 assert.equal(progressSurfaces[0].borderWidth, "0px", "Progress outer wrapper must remain visually flat.");
 assert.notEqual(progressSurfaces[1].borderWidth, "0px", "Progress table must remain the single bounded surface.");
-const downloadButton = page.getByRole("button", { name: "Download now" });
+const downloadButton = page.getByRole("button", { name: "Download", exact: true });
 assert.equal(await downloadButton.count(), 1);
 const downloadButtonBox = await downloadButton.boundingBox();
 const downloadButtonClass = await downloadButton.getAttribute("class");
@@ -61,16 +61,16 @@ const downloadButtonStyle = await downloadButton.evaluate((element) => {
     fontSize: style.fontSize
   };
 });
-assert.equal(Math.round(downloadButtonBox?.height ?? 0), Math.round(linkedInButtonBox?.height ?? 0), "Download now must reuse the LinkedIn course button height.");
-assert.equal(downloadButtonClass, linkedInButtonClass, "Download now must reuse the LinkedIn course button classes.");
-assert.deepEqual(downloadButtonStyle, linkedInButtonStyle, "Download now must reuse the LinkedIn course button visual style.");
-assert.ok((downloadButtonBox?.width ?? 999) < 200, "Download now must reuse the compact LinkedIn course button width.");
+assert.equal(Math.round(downloadButtonBox?.height ?? 0), Math.round(linkedInButtonBox?.height ?? 0), "Download must reuse the LinkedIn course button height.");
+assert.equal(downloadButtonClass, linkedInButtonClass, "Download must reuse the LinkedIn course button classes.");
+assert.deepEqual(downloadButtonStyle, linkedInButtonStyle, "Download must reuse the LinkedIn course button visual style.");
+assert.ok((downloadButtonBox?.width ?? 999) < 200, "Download must reuse the compact LinkedIn course button width.");
 const scheduleButton = page.getByRole("button", { name: "Add schedule", exact: true });
 const scheduleButtonBox = await scheduleButton.boundingBox();
 assert.equal(Math.round(scheduleButtonBox?.height ?? 0), Math.round(linkedInScheduleButtonBox?.height ?? 0), "Add schedule must reuse the LinkedIn schedule button height.");
 assert.equal(await scheduleButton.getAttribute("class"), linkedInScheduleButtonClass, "Add schedule must reuse the LinkedIn schedule button classes.");
 assert.ok((scheduleButtonBox?.width ?? 999) < 200, "Add schedule must remain compact.");
-assert.ok(Math.abs((scheduleButtonBox?.y ?? 0) - (downloadButtonBox?.y ?? 999)) <= 1, "Add schedule and Download now must share one action row.");
+assert.ok(Math.abs((scheduleButtonBox?.y ?? 0) - (downloadButtonBox?.y ?? 999)) <= 1, "Add schedule and Download must share one action row.");
 assert.equal(await page.locator(".newspaper-options").getByText("Save location", { exact: true }).count(), 1);
 await page.setViewportSize({ width: 1400, height: 720 });
 const compactPanels = await page.locator(".newspaper-dispatch-panel").evaluateAll((elements) =>
@@ -90,9 +90,10 @@ assert.ok(compactScheduleAction && compactScheduleAction.y + compactScheduleActi
 assert.ok(compactDownloadAction && compactDownloadAction.y + compactDownloadAction.height <= compactPanels[2].bottom, "Download action must stay inside its card.");
 await page.locator(".newspaper-setting-field select").selectOption("last7_days");
 assert.equal(await page.getByLabel("System current date").isDisabled(), true, "Last 7 days must disable manual date editing.");
-await page.getByRole("tab", { name: "History" }).click();
-assert.equal(await page.locator(".newspaper-history-list").count(), 1, "History must remain inside the Schedule panel.");
-await page.getByRole("tab", { name: "Daily schedule" }).click();
+assert.equal(await page.locator(".newspaper-schedule-panel").count(), 0, "Separate Schedule/History panel must stay removed.");
+assert.equal(await page.locator(".newspaper-history-list").count(), 0, "History must not render as a separate list panel.");
+assert.ok(await page.getByRole("button", { name: /Queue/i }).count() >= 1, "Queue tab must remain for schedules and pending jobs.");
+assert.ok(await page.getByRole("button", { name: /Completed/i }).count() >= 1, "Completed tab must remain for finished downloads.");
 for (const width of [1920, 1760, 1600, 1451, 1450, 1449, 1366, 1280, 1366, 1449, 1451, 1600, 1920]) {
   await page.setViewportSize({ width, height: 720 });
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -147,7 +148,7 @@ console.log("  Testing brand logo invariance...");
 await page.setViewportSize({ width: 1720, height: 960 });
 await page.waitForTimeout(100);
 
-const brandLogoSelector = ".lv-brand-logo img";
+const brandLogoSelector = ".lv-brand-wordmark";
 const sidebarWidthsToTest = [208, 220, 320];
 let baselineBrandBox = null;
 

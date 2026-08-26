@@ -113,7 +113,7 @@ export function useNewspaperClippingSelection({
     let unlisten: (() => void) | undefined;
     void listenForClippingInstanceActivation(async () => {
       if (detailFlushRef.current && !(await detailFlushRef.current())) {
-        toast.error("LinkVault kept your current draft open", {
+        toast.error("LinkedVault kept your current draft open", {
           description: "Resolve or retry the note save before refreshing this clipping."
         });
         return;

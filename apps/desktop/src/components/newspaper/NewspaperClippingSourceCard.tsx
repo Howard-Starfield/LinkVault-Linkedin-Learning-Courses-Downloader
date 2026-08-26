@@ -50,7 +50,7 @@ export function NewspaperClippingSourceCard({
   const message = detail.storageStatus === "offline"
     ? "Snapshot storage is offline. Reconnect it in Settings; your note is still available."
     : detail.storageStatus === "marker_mismatch"
-      ? "This snapshot folder no longer has the expected LinkVault marker."
+      ? "This snapshot folder no longer has the expected LinkedVault marker."
       : detail.assetState === "missing" || imageFailed
         ? "The clipping image could not be verified. The saved note has been preserved."
         : "The clipping image is temporarily unavailable.";

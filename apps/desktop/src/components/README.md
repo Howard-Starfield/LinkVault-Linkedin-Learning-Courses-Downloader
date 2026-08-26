@@ -1,11 +1,11 @@
-# LinkVault UI system
+# LinkedVault UI system
 
-LinkVault uses local primitives in `primitives.tsx` for Jan-style desktop UI. New pages should compose these primitives before adding page-specific CSS.
+LinkedVault uses local primitives in `primitives.tsx` for Jan-style desktop UI. New pages should compose these primitives before adding page-specific CSS.
 
 Use these defaults:
 
 - `Button`, `IconButton`, `Input`, `Textarea`, `Select`, `Checkbox`, and `Switch` for controls.
-- `Panel`, `SectionHeader`, `DataTable`, `DataTableHeader`, `DataTableRow`, `EmptyRow`, `StatusBadge`, `SummaryChip`, and `ActivityEventRow` for app surfaces.
+- `Panel`, `DataTable`, `DataTableHeader`, `DataTableRow`, `EmptyRow`, and `StatusBadge` for app surfaces.
 - `Tooltip`, `Popover`, and `Dialog` for overlays. `Popover` is viewport-clamped and portal-rendered, so sidebar/footer popups do not clip past the window edge.
 - `SidebarItem` for navigation rows.
 - `cn` from `src/lib/cn.ts` for variants and conditional classes.

@@ -97,6 +97,10 @@ impl LinkVaultState {
         self.download_paused.store(paused, Ordering::SeqCst);
     }
 
+    fn is_download_paused(&self) -> bool {
+        self.download_paused.load(Ordering::SeqCst)
+    }
+
     fn session_token_slot(&self) -> Arc<Mutex<Option<String>>> {
         Arc::clone(&self.session_token)
     }
@@ -147,6 +151,10 @@ pub struct SavedDownloadPreferences {
     output_dir: String,
     selected_quality: String,
     delay_seconds: u32,
+    #[serde(default = "default_video_wait_min_seconds")]
+    video_wait_min_seconds: u32,
+    #[serde(default = "default_video_wait_max_seconds")]
+    video_wait_max_seconds: u32,
     browser_source: String,
     download_videos: bool,
     download_exercises: bool,
@@ -162,6 +170,10 @@ pub struct StartDownloadRequest {
     output_dir: String,
     selected_quality: String,
     delay_seconds: u32,
+    #[serde(default = "default_video_wait_min_seconds")]
+    video_wait_min_seconds: u32,
+    #[serde(default = "default_video_wait_max_seconds")]
+    video_wait_max_seconds: u32,
     browser_source: String,
     download_videos: bool,
     download_exercises: bool,
@@ -295,6 +307,7 @@ pub fn bootstrap_state(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -327,10 +340,53 @@ pub fn save_download_preferences(
     if preferences.output_dir.trim().is_empty() {
         return Err("Choose a download folder before saving settings.".to_string());
     }
+    let (video_wait_min_seconds, video_wait_max_seconds) =
+        crate::artifact_downloader::normalize_video_wait_bounds(
+            preferences.video_wait_min_seconds,
+            preferences.video_wait_max_seconds,
+        );
+    let preferences = SavedDownloadPreferences {
+        video_wait_min_seconds,
+        video_wait_max_seconds,
+        ..preferences
+    };
+    crate::artifact_downloader::set_live_video_wait_bounds(
+        preferences.video_wait_min_seconds,
+        preferences.video_wait_max_seconds,
+    );
 
     let connection = state.connection()?;
     persist_download_preferences(&connection, &preferences, now_unix_timestamp())?;
     Ok(preferences)
+}
+
+#[tauri::command]
+pub fn set_linkedin_video_wait_bounds(
+    state: tauri::State<'_, LinkVaultState>,
+    min_seconds: u32,
+    max_seconds: u32,
+) -> Result<(u32, u32), String> {
+    let (min_seconds, max_seconds) =
+        crate::artifact_downloader::normalize_video_wait_bounds(min_seconds, max_seconds);
+    crate::artifact_downloader::set_live_video_wait_bounds(min_seconds, max_seconds);
+
+    if let Ok(connection) = state.connection() {
+        if let Ok(Some(setting)) = get_setting(&connection, "download.preferences") {
+            if let Ok(mut preferences) =
+                serde_json::from_str::<SavedDownloadPreferences>(&setting.value_json)
+            {
+                preferences.video_wait_min_seconds = min_seconds;
+                preferences.video_wait_max_seconds = max_seconds;
+                let _ = persist_download_preferences(
+                    &connection,
+                    &preferences,
+                    now_unix_timestamp(),
+                );
+            }
+        }
+    }
+
+    Ok((min_seconds, max_seconds))
 }
 
 #[tauri::command]
@@ -360,8 +416,22 @@ pub fn set_download_job_pause(
         }
         Err(_) => {
             if let Some(run) = runtime.get_run(job_id).map_err(|error| error.to_string())? {
-                if matches!(run.state, RunState::Running | RunState::Cancelling) {
-                    state.set_download_paused(paused);
+                match run.state {
+                    RunState::Running | RunState::Cancelling => {
+                        // Cooperative pause for the in-flight LinkedIn executor. The
+                        // run stays Running so the job remains on the Active tab;
+                        // bootstrap overlays this flag onto projected jobs.
+                        state.set_download_paused(paused);
+                    }
+                    RunState::Queued | RunState::Paused | RunState::RetryWait => {
+                        // Queued workflow runs are not in the legacy jobs table.
+                        // Keep the atomic flag clear for idle queue pauses so a
+                        // later active download is not accidentally frozen.
+                        if !paused {
+                            state.set_download_paused(false);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -372,6 +442,7 @@ pub fn set_download_job_pause(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -391,6 +462,7 @@ pub fn set_all_downloads_paused(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -432,6 +504,7 @@ pub fn retry_failed_download_job(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -452,6 +525,7 @@ pub fn clear_failed_download_jobs(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -463,19 +537,35 @@ pub fn remove_download_queue_item(
 ) -> Result<BootstrapState, String> {
     let now = now_unix_timestamp();
     let mut removed_workflow = false;
-    if runtime
+    if let Some(run) = runtime
         .get_run(job_id.clone())
         .map_err(|error| error.to_string())?
-        .is_some()
     {
-        let _ = runtime.cancel_run(job_id.clone(), now);
-        removed_workflow = runtime
-            .delete_run_if_terminal(job_id.clone())
-            .map_err(|error| error.to_string())?;
+        if matches!(
+            run.state,
+            RunState::Running | RunState::Cancelling | RunState::Queued | RunState::Paused | RunState::RetryWait
+        ) {
+            if matches!(run.state, RunState::Running | RunState::Cancelling) {
+                state.request_download_cancellation();
+                state.set_download_paused(false);
+            }
+            removed_workflow = runtime
+                .cancel_and_delete_run(job_id.clone(), now)
+                .map_err(|error| error.to_string())?;
+        } else {
+            removed_workflow = runtime
+                .delete_run_if_terminal(job_id.clone())
+                .map_err(|error| error.to_string())?;
+        }
     }
     let connection = state.connection()?;
     match remove_download_job(&connection, &job_id) {
-        Ok(_) => {}
+        Ok(job) => {
+            if job.status == "active" {
+                state.request_download_cancellation();
+                state.set_download_paused(false);
+            }
+        }
         Err(_error) if removed_workflow => {}
         Err(error) => return Err(error.to_string()),
     }
@@ -486,6 +576,7 @@ pub fn remove_download_queue_item(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -516,6 +607,7 @@ pub fn delete_completed_download(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -557,6 +649,7 @@ pub fn download_scheduled_job_now(
         Some(&runtime),
         token_store::has_saved_token(&state.token_path),
         &history_file_path,
+        state.is_download_paused(),
     )
 }
 
@@ -968,20 +1061,20 @@ fn delete_completed_download_files(
     for artifact in artifacts {
         let artifact_path = PathBuf::from(artifact.path.trim());
         let relative = artifact_path.strip_prefix(&output_dir).map_err(|_| {
-            "LinkVault refused to delete files outside the saved download folder.".to_string()
+            "LinkedVault refused to delete files outside the saved download folder.".to_string()
         })?;
         let mut components = relative.components();
         let first = match components.next() {
             Some(Component::Normal(value)) => value,
             _ => {
                 return Err(
-                    "LinkVault could not identify a safe course folder to delete.".to_string(),
+                    "LinkedVault could not identify a safe course folder to delete.".to_string(),
                 )
             }
         };
         if components.any(|component| !matches!(component, Component::Normal(_))) {
             return Err(
-                "LinkVault refused to delete a course folder containing an unsafe path."
+                "LinkedVault refused to delete a course folder containing an unsafe path."
                     .to_string(),
             );
         }
@@ -990,13 +1083,13 @@ fn delete_completed_download_files(
 
     if course_folders.len() != 1 {
         return Err(
-            "LinkVault could not identify one safe course folder for this completed download."
+            "LinkedVault could not identify one safe course folder for this completed download."
                 .to_string(),
         );
     }
     let course_folder = course_folders.into_iter().next().expect("one folder");
     if course_folder == output_dir {
-        return Err("LinkVault will never delete the selected download root.".to_string());
+        return Err("LinkedVault will never delete the selected download root.".to_string());
     }
     if !course_folder.exists() {
         return Ok(Some(course_folder));
@@ -1011,7 +1104,7 @@ fn delete_completed_download_files(
         .map_err(|error| format!("Could not verify the completed course folder: {error}"))?;
     if canonical_course == canonical_output || !canonical_course.starts_with(&canonical_output) {
         return Err(
-            "LinkVault refused to delete files outside the saved download root.".to_string(),
+            "LinkedVault refused to delete files outside the saved download root.".to_string(),
         );
     }
 
@@ -1048,7 +1141,7 @@ fn write_download_history_file(
         fs::create_dir_all(parent)?;
     }
 
-    let mut markdown = String::from("# LinkVault Download History\n\n");
+    let mut markdown = String::from("# LinkedVault Download History\n\n");
     markdown.push_str("| Date downloaded | Course | URL |\n");
     markdown.push_str("| --- | --- | --- |\n");
     for entry in entries {
@@ -1164,6 +1257,10 @@ fn queue_download_jobs(
         &SavedDownloadPreferences::from(&request),
         created_at,
     )?;
+    crate::artifact_downloader::set_live_video_wait_bounds(
+        request.video_wait_min_seconds,
+        request.video_wait_max_seconds,
+    );
     let scheduled_times =
         scheduled_download_times(request.schedule.as_ref(), &courses, created_at)?;
 
@@ -1418,10 +1515,17 @@ fn course_quiz_hints_json(course: &CourseUrl) -> String {
 
 impl From<&StartDownloadRequest> for SavedDownloadPreferences {
     fn from(request: &StartDownloadRequest) -> Self {
+        let (video_wait_min_seconds, video_wait_max_seconds) =
+            crate::artifact_downloader::normalize_video_wait_bounds(
+                request.video_wait_min_seconds,
+                request.video_wait_max_seconds,
+            );
         Self {
             output_dir: request.output_dir.clone(),
             selected_quality: request.selected_quality.clone(),
             delay_seconds: request.delay_seconds,
+            video_wait_min_seconds,
+            video_wait_max_seconds,
             browser_source: request.browser_source.clone(),
             download_videos: request.download_videos,
             download_exercises: request.download_exercises,
@@ -1435,15 +1539,30 @@ fn default_download_quizzes() -> bool {
     true
 }
 
+fn default_video_wait_min_seconds() -> u32 {
+    20
+}
+
+fn default_video_wait_max_seconds() -> u32 {
+    40
+}
+
 fn load_bootstrap_state(
     connection: &Connection,
     runtime: Option<&WorkflowRuntime>,
     has_saved_token: bool,
     download_history_file_path: &Path,
+    download_paused: bool,
 ) -> Result<BootstrapState, String> {
     let saved_download_preferences = get_setting(connection, "download.preferences")
         .map_err(|error| error.to_string())?
-        .and_then(|setting| serde_json::from_str(&setting.value_json).ok());
+        .and_then(|setting| serde_json::from_str::<SavedDownloadPreferences>(&setting.value_json).ok());
+    if let Some(preferences) = saved_download_preferences.as_ref() {
+        crate::artifact_downloader::set_live_video_wait_bounds(
+            preferences.video_wait_min_seconds,
+            preferences.video_wait_max_seconds,
+        );
+    }
     let recent_jobs = {
         let legacy = bootstrap_jobs(connection).map_err(|error| error.to_string())?;
         if let Some(runtime) = runtime {
@@ -1510,6 +1629,7 @@ fn load_bootstrap_state(
         let thumbnail_url = cached_course
             .as_ref()
             .and_then(|entry| cached_course_thumbnail_url(&entry.payload_json));
+        let paused = effective_linkedin_job_paused(&job, download_paused);
         persisted_jobs.push(PersistedDownloadJob {
             source_url: if job.source_url.trim().is_empty() {
                 format!("https://www.linkedin.com/learning/{}", job.course_slug)
@@ -1523,7 +1643,7 @@ fn load_bootstrap_state(
             thumbnail_url,
             selected_quality: job.selected_quality,
             output_dir: job.output_dir,
-            paused: job.paused,
+            paused,
             scheduled_at: job.scheduled_at,
             created_at: job.created_at,
             updated_at: job.updated_at,
@@ -1544,6 +1664,10 @@ fn load_bootstrap_state(
         download_history,
         download_history_file_path: download_history_file_path.to_string_lossy().to_string(),
     })
+}
+
+fn effective_linkedin_job_paused(job: &JobRecord, download_paused: bool) -> bool {
+    job.paused || (download_paused && job.status == "active")
 }
 
 fn bootstrap_jobs(connection: &Connection) -> Result<Vec<JobRecord>, crate::cache::CacheError> {
@@ -1701,6 +1825,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 2,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -1763,6 +1889,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -1806,6 +1934,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "720".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -1842,6 +1972,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -1875,6 +2007,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -1925,6 +2059,8 @@ mod tests {
                 output_dir: " ".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -1953,6 +2089,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "720".to_string(),
                 delay_seconds: 5,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Firefox".to_string(),
                 download_videos: true,
                 download_exercises: false,
@@ -2012,6 +2150,7 @@ mod tests {
             Some(&runtime),
             true,
             Path::new("C:/downloads/download-history.md"),
+            false,
         )
         .unwrap();
         let preferences = bootstrap.saved_download_preferences.unwrap();
@@ -2090,6 +2229,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "720".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -2106,6 +2247,7 @@ mod tests {
             Some(&runtime),
             true,
             Path::new("C:/downloads/download-history.md"),
+            false,
         )
         .unwrap();
 
@@ -2186,6 +2328,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -2208,6 +2352,8 @@ mod tests {
                 output_dir: "C:/downloads".to_string(),
                 selected_quality: "1080".to_string(),
                 delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
                 browser_source: "Chrome".to_string(),
                 download_videos: true,
                 download_exercises: true,
@@ -2244,6 +2390,8 @@ mod tests {
             output_dir: "C:/downloads".to_string(),
             selected_quality: "1080".to_string(),
             delay_seconds: 0,
+            video_wait_min_seconds: 20,
+            video_wait_max_seconds: 40,
             browser_source: "Chrome".to_string(),
             download_videos: true,
             download_exercises: true,
@@ -2418,6 +2566,41 @@ mod tests {
     }
 
     #[test]
+    fn active_workflow_pause_flag_overlays_projected_jobs() {
+        let active = JobRecord {
+            id: "job-active".to_string(),
+            course_slug: "active-course".to_string(),
+            source_url: "https://www.linkedin.com/learning/active-course".to_string(),
+            status: "active".to_string(),
+            selected_quality: "720".to_string(),
+            download_videos: true,
+            download_exercises: true,
+            download_subtitles: true,
+            download_quizzes: true,
+            quiz_hints_json: "[]".to_string(),
+            output_dir: ".".to_string(),
+            paused: false,
+            scheduled_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let queued = JobRecord {
+            status: "queued".to_string(),
+            ..active.clone()
+        };
+        assert!(!effective_linkedin_job_paused(&active, false));
+        assert!(effective_linkedin_job_paused(&active, true));
+        assert!(!effective_linkedin_job_paused(&queued, true));
+        assert!(effective_linkedin_job_paused(
+            &JobRecord {
+                paused: true,
+                ..queued
+            },
+            false
+        ));
+    }
+
+    #[test]
     fn download_history_file_is_user_readable_markdown() {
         let temp = tempfile::tempdir().unwrap();
         let history_path = temp.path().join("download-history.md");
@@ -2436,7 +2619,7 @@ mod tests {
 
         let markdown = std::fs::read_to_string(history_path).unwrap();
 
-        assert!(markdown.contains("# LinkVault Download History"));
+        assert!(markdown.contains("# LinkedVault Download History"));
         assert!(markdown.contains("2023-11-14 22:13 UTC"));
         assert!(markdown.contains("Sample \\| Course"));
         assert!(markdown.contains("https://www.linkedin.com/learning/sample-course"));

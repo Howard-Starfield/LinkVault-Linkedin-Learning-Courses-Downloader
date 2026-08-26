@@ -2,9 +2,12 @@
 
 ## Architecture and stack
 
-LinkVault is a Windows-first **Tauri 2** desktop app: one React/Vite frontend
-and one Rust crate (`linkvault` / `linkvault_lib`) under `apps/desktop`. There
-is no Cargo workspace and no Python runtime.
+LinkedVault is a Windows-first **Tauri 2** desktop app: one React/Vite frontend
+and one Rust crate (`linkvault` / `linkvault_lib`) under `apps/desktop`. The
+product display name is LinkedVault; the crate, exe, bundle identifier, and
+`LinkVaultData` storage folder keep the historical `linkvault` / `LinkVault*`
+IDs so existing installs and prefs stay stable. There is no Cargo workspace and
+no Python runtime.
 
 | Layer | Stack |
 | --- | --- |

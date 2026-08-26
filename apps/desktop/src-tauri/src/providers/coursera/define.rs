@@ -90,9 +90,9 @@ partners.v1(squareLogo%2CrectangularLogo)%2C\
 instructors.v1(fullName)%2CoverridePartnerLogos%2CsessionsEnabledAt%2C\
 domainTypes%2CpremiumExperienceVariant%2CisRestrictedMembership";
 
-/// User agent sent with every request. Coursera is fine with the `LinkVault`
+/// User agent sent with every request. Coursera is fine with the `LinkedVault`
 /// token; no UA is required to match a particular string.
-pub const USER_AGENT: &str = "LinkVault/0.1 (+coursera; rust)";
+pub const USER_AGENT: &str = "LinkedVault/0.1 (+coursera; rust)";
 
 /// Marker used by the supplement extractor to flag an in-memory HTML body
 /// (rather than a remote URL) in the unified `ResourceLink::url` field.

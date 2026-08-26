@@ -30,7 +30,7 @@ use crate::coursera::error::{CourseraError, CourseraResult};
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build a `reqwest::Client` for Coursera. Cookie store enabled, rustls
-/// TLS, native roots, and a `LinkVault/0.1 (+coursera; rust)` user agent.
+/// TLS, native roots, and a `LinkedVault/0.1 (+coursera; rust)` user agent.
 ///
 /// Two `Client`s are constructed per app run: one for the LinkedIn side
 /// (in `live_clients.rs`) and this one for the Coursera side. Each has

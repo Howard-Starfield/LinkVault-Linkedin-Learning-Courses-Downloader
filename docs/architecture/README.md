@@ -1,6 +1,8 @@
-# LinkVault Architecture
+# LinkedVault Architecture
 
-This directory is the source of truth for LinkVault's desktop architecture.
+This directory is the source of truth for LinkedVault's desktop architecture.
+The product name is LinkedVault; the Rust crate and related internal IDs remain
+`linkvault` / `LinkVaultData` where renaming would break storage or tooling.
 Implementation plans and code reviews must begin here instead of inferring the
 design from whichever provider was implemented most recently.
 

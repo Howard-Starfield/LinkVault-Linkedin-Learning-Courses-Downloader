@@ -1,6 +1,6 @@
 # Work order: Phase 4A clipping-note editor compatibility spike
 
-**Status:** Blocked draft
+**Status:** Implemented (historical work order; editor shipped)
 
 **Assigned branch:** `spike/newspaper-clippings-phase-4a-editor`
 

@@ -148,6 +148,23 @@ pub(super) fn reorder(
             return Err("Only visible queued downloads can be reordered.".to_string());
         }
     }
+    // Promoting a job to the front (or any reorder) clears a future batch
+    // schedule so scheduled rows never block immediate downloads the user
+    // explicitly started.
+    if let Some(first_job_id) = job_ids.first() {
+        transaction
+            .execute(
+                "UPDATE newspaper_batches
+                 SET scheduled_at = NULL,
+                     status = CASE WHEN status = 'scheduled' THEN 'queued' ELSE status END,
+                     updated_at = ?2
+                 WHERE id = (SELECT batch_id FROM newspaper_jobs WHERE id = ?1)
+                   AND scheduled_at IS NOT NULL
+                   AND scheduled_at > ?2",
+                params![first_job_id, updated_at],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     transaction.commit().map_err(|error| error.to_string())
 }
 

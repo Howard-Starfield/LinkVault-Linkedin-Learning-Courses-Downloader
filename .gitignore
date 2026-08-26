@@ -200,6 +200,7 @@ docs/learning/
 docs/superpowers/
 .jez/
 coursera-dl-master/
+.tmp/
 
 # JavaScript / Tauri generated outputs
 apps/desktop/pnpm-lock.yaml
@@ -210,6 +211,21 @@ apps/desktop/.tauri/
 apps/desktop/npm-debug.log*
 apps/desktop/yarn-debug.log*
 apps/desktop/yarn-error.log*
+**/playwright-report/
+**/test-results/
+**/coverage/
+*.tsbuildinfo
+
+# SQLite sidecars (LinkVaultData next to exe or under target/)
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
 
 # Local configuration and secrets
 .env

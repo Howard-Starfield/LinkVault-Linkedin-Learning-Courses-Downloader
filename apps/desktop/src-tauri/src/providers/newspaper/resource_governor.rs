@@ -9,7 +9,7 @@ const AUTO_START_WORKERS: u8 = 2;
 /// Default memory budget per worker. Used when the caller does not pass
 /// `worker_memory_budget_mb`. Sized for typical 4K image decode/encode peaks.
 const DEFAULT_WORKER_MEMORY_BUDGET_BYTES: u64 = 160 * 1024 * 1024;
-/// Default memory reserve kept free for the rest of the OS, the LinkVault UI,
+/// Default memory reserve kept free for the rest of the OS, the LinkedVault UI,
 /// and concurrent download workers. The actual reserve is the larger of this
 /// constant and 10% of total RAM, matching the original conservative floor.
 const DEFAULT_MEMORY_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;

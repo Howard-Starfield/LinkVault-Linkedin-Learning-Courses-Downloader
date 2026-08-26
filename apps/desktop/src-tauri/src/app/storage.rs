@@ -12,9 +12,9 @@ const TOKEN_FILE_NAME: &str = "linkvault.li_at.dpapi";
 
 #[derive(Debug, Error)]
 pub enum StoragePathError {
-    #[error("LinkVault could not find the executable folder")]
+    #[error("LinkedVault could not find the executable folder")]
     MissingExecutableFolder,
-    #[error("LinkVault data folder is not writable: {path}. {message}")]
+    #[error("LinkedVault data folder is not writable: {path}. {message}")]
     NotWritable { path: PathBuf, message: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -273,13 +273,13 @@ mod tests {
 
     #[test]
     fn data_dir_sits_beside_executable() {
-        let exe_path = Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkVault\LinkVault.exe");
+        let exe_path = Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkedVault.exe");
 
         let data_dir = data_dir_for_exe_path(exe_path).unwrap();
 
         assert_eq!(
             data_dir,
-            PathBuf::from(r"C:\Users\howard\AppData\Local\Programs\LinkVault\LinkVaultData")
+            PathBuf::from(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkVaultData")
         );
     }
 
@@ -297,14 +297,14 @@ mod tests {
 
     #[test]
     fn resolved_db_path_uses_data_dir_name() {
-        let exe_path = Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkVault\LinkVault.exe");
+        let exe_path = Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkedVault.exe");
 
         let db_path = data_dir_for_exe_path(exe_path).unwrap().join(DB_FILE_NAME);
 
         assert_eq!(
             db_path,
             PathBuf::from(
-                r"C:\Users\howard\AppData\Local\Programs\LinkVault\LinkVaultData\linkvault.sqlite3"
+                r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkVaultData\linkvault.sqlite3"
             )
         );
     }

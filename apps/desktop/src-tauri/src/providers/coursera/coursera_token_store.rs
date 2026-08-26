@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use thiserror::Error;
 
-const COURSERA_TOKEN_DESCRIPTION: &str = "LinkVault Coursera session";
+const COURSERA_TOKEN_DESCRIPTION: &str = "LinkedVault Coursera session";
 
 #[derive(Debug, Error)]
 pub enum CourseraTokenStoreError {

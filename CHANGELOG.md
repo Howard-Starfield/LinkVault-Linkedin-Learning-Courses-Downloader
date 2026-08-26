@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.2.22 - 2026-08-26
+
+- **Product rebrand to LinkedVault.** User-facing UI, window title, tray labels, installer `productName`, and docs now say LinkedVault. The left sidebar drops the All-in-One / PNG wordmark for a theme-aware text wordmark. Crate name, exe, bundle identifier, localStorage keys, and the `LinkVaultData` folder are unchanged.
+- **Title bar follows the app theme.** Dark and light modes sync the Windows title bar via Tauri `setTheme`.
+- **LinkedIn video wait control.** Exposes the random 20–40s (configurable) pause between video downloads beside Quizzes. Changes apply to the next wait; an in-progress wait finishes first.
+- **Newspaper Download editions queue owns schedules and history.** Removed the separate Schedule/History panel. Daily schedules (enabled or paused) appear in Queue; finished and failed jobs stay in Completed/Failed. Empty “No schedules yet” placeholder is gone.
+- **Tightened newspaper Optimize row layout.** Optimize / Keep JPG size to content so Quality, Workers, and Max sit without dead space.
+- **LinkedIn active-row controls.** Pause/resume and delete work for active downloads; expanded course detail flushes under the rounded row without a sharp cutoff.
+- **Future scheduled newspaper jobs no longer block the queue.** Immediate work stays first; promoting a future job clears its wait when reordered.
+- **Open-source community docs.** Added `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1), and `SECURITY.md`, plus README documentation links and current Download / Add schedule wording.
+- **Repo hygiene.** Hardened `.gitignore` for `.tmp/`, SQLite wal/shm, and OS junk. Removed unused SVG wordmarks, obsolete one-shot Python icon/version scripts, and unused `SectionHeader` / `SummaryChip` / `ActivityEventRow` primitives with orphan CSS.
+
 ## 0.2.19 - 2026-08-19
 
 - **Hardened the desktop shell against sidebar and window resizes.** Resizing the native window or the left navigation rail now keeps the LinkVault wordmark visually fixed, keeps controls inside their layout owners, and reflows provider content from the space it actually receives instead of from viewport assumptions. The LinkVault desktop shell now behaves like a stable desktop application under repeated resizing.

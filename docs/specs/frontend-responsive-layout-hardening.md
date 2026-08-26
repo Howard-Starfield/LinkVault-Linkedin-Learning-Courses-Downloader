@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-19
 
-**Status:** Draft for implementation
+**Status:** Implemented (verify:no-any + responsive shell hardening shipped)
 
 **Reviewer:** TBD
 
@@ -20,7 +20,7 @@ This PRD is based on the current `main` implementation rather than assumptions:
 - Internal responsive rules are primarily viewport `@media` queries even though the width actually available to provider content is the viewport minus the sidebar and other fixed columns.
 - The native Tauri window is resizable but has `minWidth: 1280` and `minHeight: 720`. Native acceptance therefore must concentrate on the real 1280 px floor rather than treating 980 px or 520 px CSS breakpoints as the primary desktop path.
 - `scripts/verify-visual.mjs` already performs useful Playwright geometry sweeps for the Newspaper view, including a 1280 px viewport and horizontal-overflow checks. It does not currently exercise live sidebar dragging, logo invariance, LinkedIn/Coursera geometry with a wide sidebar, or concurrent React updates while a drag is in progress.
-- `tsconfig.json` enables TypeScript `strict`, but `strict` does not prohibit explicit `any`. There is no dedicated repository gate that fails on an explicit `any` keyword.
+- `tsconfig.json` enables TypeScript `strict`, but `strict` does not prohibit explicit `any`. The repository now has a dedicated AST gate (`npm run verify:no-any`) that fails on an explicit `any` keyword.
 - Rust ownership is already structured under `src-tauri/src/app`, `providers`, and `workflow`, with `verify-architecture.mjs` enforcing important backend boundaries. Frontend ownership is less explicit: visual concerns, IPC calls, input normalization, and some domain calculations are still mixed in large view components.
 
 A GitHub code-search pass and targeted inspection of `App.tsx`, `components/primitives.tsx`, `components/coursera/CourseraView.tsx`, and `components/newspaper/newspaper-api.ts` did not find explicit `: any` or `as any` in those inspected sources. Search-index coverage is not sufficient to treat that as a permanent repository-wide guarantee. The implementation phase must establish the definitive baseline with an AST-based source scan before other changes are accepted.

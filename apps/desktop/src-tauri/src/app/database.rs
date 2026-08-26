@@ -853,7 +853,7 @@ pub fn reconcile_active_jobs_after_restart(
                 &job.id,
                 "failed",
                 restarted_at,
-                Some("Job was active when LinkVault restarted and was marked failed for recovery."),
+                Some("Job was active when LinkedVault restarted and was marked failed for recovery."),
             )?;
             connection.execute(
                 r#"

@@ -14,7 +14,7 @@ export type NewspaperOptimizationPreferences = {
   /// editions may want 256-512 MB to avoid swap pressure on large pages.
   workerMemoryBudgetMb: number;
   /// Bytes the system should keep free for the rest of the OS and the
-  /// LinkVault UI. Larger values cap the optimization at fewer workers
+  /// LinkedVault UI. Larger values cap the optimization at fewer workers
   /// to leave room for downloads, the reader, and the rest of the app.
   memoryReserveMb: number;
 };

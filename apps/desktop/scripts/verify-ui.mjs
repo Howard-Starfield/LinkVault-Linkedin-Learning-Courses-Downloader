@@ -70,24 +70,22 @@ for (const required of [
   "Regional",
   "Weekly",
   "Special",
-  "Schedule",
   "Add schedule",
   "scheduleDateModeLabel",
   "dateMode,",
-  "History",
   "System current date",
   "Delay",
   "Folder",
   "Quality",
   "compressionLabel",
-  "92 · Clear",
-  "45 · Compact",
-  "35 · Tiny",
-  "25 · Max",
+  "92",
+  "45",
+  "35",
+  "25",
   "Keep JPG",
   "JPG remains only if WebP is larger or fails",
-  "Download now",
-  "command-actions newspaper-download-actions",
+  "Download",
+  "newspaper-action-row",
   "newspaper-delay-unit",
   ">sec<",
   "Awaiting release",
@@ -107,6 +105,13 @@ for (const required of [
   "reorder_newspaper_jobs",
   "remove_newspaper_job",
   "Drag to reorder",
+  "NewspaperQueueSectionTab",
+  "queue-section-tabs newspaper-queue-section-tabs",
+  "No ${queueSection} editions",
+  "Queued editions will appear here.",
+  "newspaper-schedule-queue-row",
+  "Does not block downloads",
+  "Waits until scheduled time · does not block downloads",
   "Permanently delete this downloaded edition?",
   "local files and progress history were removed",
   "Pause this download before deleting it",
@@ -193,8 +198,13 @@ assert.ok(css.includes("--newspaper-control-height: 32px"), "Newspaper controls 
 assert.ok(css.includes("border-radius: 10px"), "Newspaper download controls must use the shared 10px radius.");
 assert.ok(css.includes(".newspaper-editions") && css.includes("width: min(100%, 420px)"), "Edition picker must stay narrower than the workspace.");
 assert.ok(css.includes("minmax(90px, 140px)"), "Edition list height must stay compact (half of the prior 180–280 band).");
-assert.ok(view.includes("newspaper-schedule-section-tabs") && view.includes("queue-section-tab"), "Schedule/History must reuse one-row queue section tabs.");
+assert.ok(!view.includes("newspaper-schedule-panel"), "Separate Schedule/History panel must be removed.");
+assert.ok(!view.includes("newspaper-schedule-section-tabs"), "Schedule/History section tabs must be removed.");
 assert.ok(!view.includes("newspaper-schedule-tabs"), "Schedule/History must not keep underline-style newspaper schedule tabs.");
+assert.ok(!view.includes("No schedules yet"), "Empty schedule placeholder must not reserve UI.");
+assert.ok(!view.includes("newspaper-history-list"), "History must live in Completed/Failed queue tabs, not a separate panel.");
+assert.ok(view.includes("newspaper-schedule-queue-row"), "Enabled and paused schedules must appear inside the Queue tab.");
+assert.ok(css.includes(".newspaper-options-row") && css.includes("max-content"), "Optimize/Keep JPG column must size to content and avoid dead space.");
 assert.ok(css.includes(".newspaper-control-cluster") && css.includes("margin-inline: auto 0"), "Control cluster must sit asymmetrically.");
 assert.ok(!view.includes("Search editions"), "Edition search was removed to free vertical space.");
 assert.ok(!view.includes("Delay between editions"), "Option labels must stay concise.");
@@ -207,6 +217,9 @@ assert.ok(view.includes("newspaper-downloads-workspace"), "Newspaper download ma
 assert.ok(view.includes("newspaper-search-stage"), "Newspaper download markup must use the search stage.");
 assert.ok(view.includes("newspaper-control-cluster"), "Newspaper download markup must use the control cluster.");
 assert.ok(view.includes("newspaper-queue-panel"), "Newspaper download markup must use the queue panel.");
+assert.ok(view.includes("newspaper-queue-section-tabs"), "Newspaper queue must use Queue/Active/Completed/Failed section tabs.");
+assert.ok(view.includes("newspaper-action-row"), "Folder, schedule, and download actions must share one row.");
+assert.ok(!view.includes("Download now"), "Primary download action must use the shorter Download label.");
 assert.ok(!view.includes("newspaper-dispatch-grid"), "Newspaper download must not keep the three-panel dispatch grid.");
 assert.ok(!view.includes("newspaper-dispatch-panel"), "Newspaper download must not keep bordered dispatch panel chrome.");
 assert.ok(css.includes("width: 100vw") && css.includes("height: 100vh"), "Reader must occupy the full window.");
@@ -232,6 +245,6 @@ assert.ok(!view.includes("newspaper-progress-title"), "Progress table must not b
 assert.ok(!view.includes("<small>{compressionLabel}"), "Optimization guidance must not reserve layout height.");
 assert.ok(css.includes("contain: layout paint"), "Resize-heavy newspaper surfaces must contain layout and paint invalidation.");
 assert.ok(css.includes(':root[data-window-resizing="true"]'), "Rapid window resizing must temporarily disable expensive visual transitions.");
-assert.ok(!view.includes("<h1"), "Downloader should keep the LinkVault shell as the application-level heading.");
+assert.ok(!view.includes("<h1"), "Downloader should keep the LinkedVault shell as the application-level heading.");
 
 console.log("UI contract verification passed.");

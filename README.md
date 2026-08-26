@@ -1,4 +1,4 @@
-# LinkVault
+# LinkedVault
 
 ## An open-source local archive workspace
 
@@ -8,23 +8,23 @@ Click any screenshot to open the full-size image.
 
 ### Course download queue
 
-[![LinkVault course download queue](docs/images/linkvault-download-queue.webp)](docs/images/linkvault-download-queue.webp)
+[![LinkedVault course download queue](docs/images/linkvault-download-queue.webp)](docs/images/linkvault-download-queue.webp)
 
 ### Newspaper library
 
-[![LinkVault World Journal newspaper library](docs/images/linkvault-newspaper-library.webp)](docs/images/linkvault-newspaper-library.webp)
+[![LinkedVault World Journal newspaper library](docs/images/linkvault-newspaper-library.webp)](docs/images/linkvault-newspaper-library.webp)
 
 ### LinkedIn session guide
 
 [![How to find your LinkedIn li_at cookie](apps/desktop/src/assets/guide.png)](apps/desktop/src/assets/guide.png)
 
-LinkVault is a Windows-first desktop application for collecting, organizing,
+LinkedVault is a Windows-first desktop application for collecting, organizing,
 reading, and studying content you are allowed to access. It combines course
 archiving, newspaper retrieval and offline reading, and durable clipping notes
 in one local workspace.
 
 The product name is intentionally broader than the original repository slug:
-LinkVault is not limited to course downloads.
+LinkedVault is not limited to course downloads.
 
 ## What You Can Do
 
@@ -56,26 +56,30 @@ their authentication or delivery formats change.
 
 ## How To Use
 
-1. Install LinkVault with the Windows installer.
-2. Open LinkVault.
+1. Install LinkedVault with the Windows installer.
+2. Open LinkedVault.
 3. Paste one or more LinkedIn Learning course URLs.
 4. Choose the download folder and quality.
 5. Paste your LinkedIn `li_at` cookie once, or use a supported browser session.
-6. Click **Start Download**.
+6. Click **Download**.
 
 Queued courses are persisted independently of the current LinkedIn session. If
-the saved `li_at` cookie expires, LinkVault keeps the queue and shows a
+the saved `li_at` cookie expires, LinkedVault keeps the queue and shows a
 **Resume queue** action after you paste a fresh cookie. Right-click any queued
 course row to copy its normalized course URL for safekeeping or retrying later.
 
-For newspapers, open **World Journal → Download editions**, select editions and dates, then choose **Download now** or **Schedule downloads**. Completed and partial editions appear under **Newspaper library**.
+For newspapers, open **World Journal → Download editions**, select editions and
+dates, then choose **Download** or **Add schedule**. Scheduled work appears in
+the **Queue** section (with **Completed** and **Failed** for history). There are
+no separate Schedule or History tabs. Completed and partial editions also appear
+under **Newspaper library**.
 
 Your downloads are saved into the folder you picked. Your saved session is protected with Windows encryption and stored locally.
 
 ## Requirements
 
-- Node.js with npm
-- Rust toolchain
+- Node.js with npm (Node 20.19+ or 22.12+ recommended)
+- Rust toolchain (MSRV **1.77.2**)
 - Microsoft C++ Build Tools or Visual Studio Build Tools
 - Microsoft WebView2 Runtime
 
@@ -86,11 +90,22 @@ Your downloads are saved into the folder you picked. Your saved session is prote
 - React, TypeScript, and Vite for the desktop interface.
 - SQLite for durable local application state.
 
+## Documentation
+
+| Doc | Purpose |
+| --- | --- |
+| [docs/architecture/README.md](docs/architecture/README.md) | Architecture source of truth (ADRs, ownership, layout) |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Setup, verify commands, PR expectations |
+| [SECURITY.md](SECURITY.md) | Vulnerability reporting and supported versions |
+| [CHANGELOG.md](CHANGELOG.md) | Release notes |
+| [AGENTS.md](AGENTS.md) | Contributor and coding-agent invariants |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
+
 ## Privacy and responsible use
 
-LinkVault is designed for local archives. Saved sessions are protected with
+LinkedVault is designed for local archives. Saved sessions are protected with
 Windows encryption and application data stays on the machine unless you copy
-it elsewhere. Do not use LinkVault to bypass DRM, paid access controls,
+it elsewhere. Do not use LinkedVault to bypass DRM, paid access controls,
 robots.txt restrictions, rate limits, or a provider's terms. Only download,
 scrape, archive, or share material you have permission to access.
 
@@ -99,19 +114,21 @@ other content provider.
 
 ## Contributing
 
-Issues and pull requests are welcome. Before changing provider behavior, read
-the ownership and persistence contracts in
-[`docs/architecture`](docs/architecture/README.md). For newspaper clippings,
-the native Tauri window is required; the frontend-only preview cannot prove
-native persistence, window, tray, or input behavior.
+Issues and pull requests are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md). Before changing provider behavior, read the
+ownership and persistence contracts in
+[`docs/architecture`](docs/architecture/README.md) and the invariants in
+[AGENTS.md](AGENTS.md). For newspaper clippings, the native Tauri window is
+required; the frontend-only preview cannot prove native persistence, window,
+tray, or input behavior.
 
 ## Run Locally
 
 Use this when you want to work on the app from source.
 
 ```powershell
-git clone https://github.com/Howard-Starfield/LinkVault-Linkedin-Learning-Courses-Downloader.git LinkVault
-cd LinkVault
+git clone https://github.com/Howard-Starfield/LinkVault-Linkedin-Learning-Courses-Downloader.git LinkedVault
+cd LinkedVault
 npm --prefix apps\desktop install
 npm run dev
 ```
@@ -190,18 +207,18 @@ least one downloaded edition with a readable completed page.
     global snapshot-folder override.
 12. Add a unique title/body suffix and click the window **X** before the footer
     reaches **Saved**. The window should hide instead of exiting. Choose
-    **Show LinkVault** from the tray, reopen the clipping, and confirm the exact
+    **Show LinkedVault** from the tray, reopen the clipping, and confirm the exact
     suffix is canonical or appears in the explicit recovery state. There must
     still be only one main window.
 13. Type continuously, click **X** while the footer says **Saving…**, then show
-    LinkVault from the tray. Confirm the newest text—not an earlier keystroke—is
+    LinkedVault from the tray. Confirm the newest text—not an earlier keystroke—is
     present. Repeat the hide/show cycle once to catch duplicate close handlers.
-14. While LinkVault is running, launch it again from the Start menu or installed
+14. While LinkedVault is running, launch it again from the Start menu or installed
     executable. Confirm the existing window is shown and focused, Task Manager
     still reports one `linkvault.exe`, and the current clipping note remains
     visible after its durability flush/refresh.
 15. Add another unique suffix and immediately choose **Quit** from the tray.
-    Relaunch LinkVault and confirm the exact latest text is saved or explicitly
+    Relaunch LinkedVault and confirm the exact latest text is saved or explicitly
     offered for recovery. Tray Quit must exit; window X must only hide.
 16. Do not use Task Manager against a real user database to test crash recovery.
     Forced-termination and injected save/checkpoint failures belong to the
@@ -222,9 +239,11 @@ npm --prefix apps\desktop run verify:newspaper-clipping-library
 ## Architecture
 
 Backend ownership, the unified workflow decision, and the provider migration
-roadmap are documented in [`docs/architecture`](docs/architecture/README.md).
-Read that contract before adding a provider, queue, scheduler, background
-worker, or persisted job state.
+roadmap live only under
+[`docs/architecture`](docs/architecture/README.md) — that directory is the
+source of truth (there is no separate root `ARCHITECTURE.md`). Read that
+contract before adding a provider, queue, scheduler, background worker, or
+persisted job state.
 
 ## Build The App
 
@@ -238,7 +257,7 @@ Production outputs:
 
 ```text
 apps\desktop\src-tauri\target\release\linkvault.exe
-apps\desktop\src-tauri\target\release\bundle\nsis\LinkVault_<version>_x64-setup.exe
+apps\desktop\src-tauri\target\release\bundle\nsis\LinkedVault_<version>_x64-setup.exe
 ```
 
 ## Publish An Update
@@ -290,7 +309,7 @@ npm run verify:release-manifest
 
 ## License
 
-LinkVault's original code is licensed under the MIT License. See
+LinkedVault's original code is licensed under the MIT License. See
 [`LICENSE`](LICENSE) for the full text. Third-party dependencies retain their
 own licenses; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and the
 committed npm and Cargo lockfiles for dependency-specific information.

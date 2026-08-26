@@ -401,7 +401,7 @@ function buildUiMockScan(): ScanYouTubeSourceResponse {
       sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
       title,
       ordinal,
-      channelName: "LinkVault mock channel",
+      channelName: "LinkedVault mock channel",
       channelId: "mock-channel",
       durationSeconds: 240 + ordinal * 45,
       thumbnailAvailable: false,

@@ -39,7 +39,7 @@ jobs:
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
-          releaseName: LinkVault ${{ github.ref_name }}
+          releaseName: LinkedVault ${{ github.ref_name }}
           generateReleaseNotes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true

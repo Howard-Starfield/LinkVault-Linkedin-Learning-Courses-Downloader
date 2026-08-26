@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn round_trips_bytes_without_leaving_plaintext_in_ciphertext() {
         let plaintext = b"linkvault-dpapi-roundtrip";
-        let ciphertext = protect_bytes(plaintext, "LinkVault test").unwrap();
+        let ciphertext = protect_bytes(plaintext, "LinkedVault test").unwrap();
         assert!(!ciphertext.windows(plaintext.len()).any(|w| w == plaintext));
         assert_eq!(unprotect_bytes(&ciphertext).unwrap(), plaintext);
     }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
@@ -31,7 +32,6 @@ import {
 } from "lucide-react";
 import { IconBrandLinkedin, IconCertificate, IconMovie } from "@tabler/icons-react";
 import liAtCookieGuide from "./assets/guide.png";
-import linkvaultLogo from "./assets/linkvault-wordmark.png";
 import {
   Button,
   Checkbox,
@@ -180,6 +180,8 @@ type StartDownloadRequest = {
   outputDir: string;
   selectedQuality: string;
   delaySeconds: number;
+  videoWaitMinSeconds: number;
+  videoWaitMaxSeconds: number;
   browserSource: string;
   downloadVideos: boolean;
   downloadExercises: boolean;
@@ -215,6 +217,8 @@ type SavedDownloadPreferences = {
   outputDir: string;
   selectedQuality: string;
   delaySeconds: number;
+  videoWaitMinSeconds?: number;
+  videoWaitMaxSeconds?: number;
   browserSource: string;
   downloadVideos: boolean;
   downloadExercises: boolean;
@@ -260,7 +264,12 @@ const SIDEBAR_DEFAULT_WIDTH = 220;
 const SIDEBAR_WIDTH_STORAGE_KEY = "linkvault.sidebarWidth";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "linkvault.sidebarCollapsed";
 const DOWNLOAD_DELAY_STORAGE_KEY = "linkvault.downloadDelaySeconds";
+const VIDEO_WAIT_MIN_STORAGE_KEY = "linkvault.videoWaitMinSeconds";
+const VIDEO_WAIT_MAX_STORAGE_KEY = "linkvault.videoWaitMaxSeconds";
 const DOWNLOAD_DELAY_MAX_SECONDS = 86_400;
+const VIDEO_WAIT_MAX_SECONDS = 600;
+const DEFAULT_VIDEO_WAIT_MIN_SECONDS = 20;
+const DEFAULT_VIDEO_WAIT_MAX_SECONDS = 40;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
 const APP_VERSION = "0.2.21";
@@ -289,12 +298,40 @@ function normalizeDelaySeconds(value: unknown) {
   return Math.min(DOWNLOAD_DELAY_MAX_SECONDS, Math.max(0, Math.round(parsed)));
 }
 
+function normalizeVideoWaitSeconds(value: unknown, fallback: number) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(VIDEO_WAIT_MAX_SECONDS, Math.max(0, Math.round(parsed)));
+}
+
+function normalizeVideoWaitBounds(minValue: unknown, maxValue: unknown) {
+  const minSeconds = normalizeVideoWaitSeconds(minValue, DEFAULT_VIDEO_WAIT_MIN_SECONDS);
+  const maxSeconds = Math.max(
+    minSeconds,
+    normalizeVideoWaitSeconds(maxValue, DEFAULT_VIDEO_WAIT_MAX_SECONDS)
+  );
+  return { minSeconds, maxSeconds };
+}
+
 function readStoredDownloadDelaySeconds() {
   if (typeof window === "undefined") return null;
   const stored = window.localStorage.getItem(DOWNLOAD_DELAY_STORAGE_KEY);
   if (stored === null || stored.trim() === "") return null;
   const parsed = Number(stored);
   return Number.isFinite(parsed) ? normalizeDelaySeconds(parsed) : null;
+}
+
+function readStoredVideoWaitBounds() {
+  if (typeof window === "undefined") {
+    return {
+      minSeconds: DEFAULT_VIDEO_WAIT_MIN_SECONDS,
+      maxSeconds: DEFAULT_VIDEO_WAIT_MAX_SECONDS
+    };
+  }
+  return normalizeVideoWaitBounds(
+    window.localStorage.getItem(VIDEO_WAIT_MIN_STORAGE_KEY) ?? DEFAULT_VIDEO_WAIT_MIN_SECONDS,
+    window.localStorage.getItem(VIDEO_WAIT_MAX_STORAGE_KEY) ?? DEFAULT_VIDEO_WAIT_MAX_SECONDS
+  );
 }
 
 function calculateAutomaticScheduleWaitRange(windowMinutes: number, courseCount: number): AutomaticScheduleWaitRange {
@@ -319,6 +356,7 @@ function calculateAutomaticScheduleWaitRange(windowMinutes: number, courseCount:
 
 export default function App() {
   const initialStoredDelaySeconds = useRef(readStoredDownloadDelaySeconds());
+  const initialStoredVideoWait = useRef(readStoredVideoWaitBounds());
   const initialNewspaperReaderPreferences = useRef(readNewspaperReaderPreferences());
   const [courseUrls, setCourseUrls] = useState("");
   const [folder, setFolder] = useState("");
@@ -328,6 +366,8 @@ export default function App() {
   const [browserSource, setBrowserSource] = useState("Chrome");
   const [browserSources, setBrowserSources] = useState(["Chrome", "Edge", "Firefox"]);
   const [delaySeconds, setDelaySeconds] = useState(initialStoredDelaySeconds.current ?? 0);
+  const [videoWaitMinSeconds, setVideoWaitMinSeconds] = useState(initialStoredVideoWait.current.minSeconds);
+  const [videoWaitMaxSeconds, setVideoWaitMaxSeconds] = useState(initialStoredVideoWait.current.maxSeconds);
   const [downloadVideos, setDownloadVideos] = useState(true);
   const [downloadExercises, setDownloadExercises] = useState(true);
   const [downloadSubtitles, setDownloadSubtitles] = useState(true);
@@ -597,6 +637,12 @@ export default function App() {
   }, [delaySeconds]);
 
   useEffect(() => {
+    const bounds = normalizeVideoWaitBounds(videoWaitMinSeconds, videoWaitMaxSeconds);
+    window.localStorage.setItem(VIDEO_WAIT_MIN_STORAGE_KEY, String(bounds.minSeconds));
+    window.localStorage.setItem(VIDEO_WAIT_MAX_STORAGE_KEY, String(bounds.maxSeconds));
+  }, [videoWaitMinSeconds, videoWaitMaxSeconds]);
+
+  useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
     // Sync state to live ref and CSS variable for non-drag updates (e.g., keyboard resize)
     liveSidebarWidth.current = sidebarWidth;
@@ -611,6 +657,11 @@ export default function App() {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
     window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    if (isTauriRuntime()) {
+      void getCurrentWindow().setTheme(theme).catch(() => {
+        /* Title-bar theme sync is best-effort on older WebView2 builds. */
+      });
+    }
   }, [theme]);
 
   useEffect(() => {
@@ -839,10 +890,13 @@ export default function App() {
   }
 
   function currentDownloadPreferences(): SavedDownloadPreferences {
+    const videoWait = normalizeVideoWaitBounds(videoWaitMinSeconds, videoWaitMaxSeconds);
     return {
       outputDir: folder,
       selectedQuality: resolution,
       delaySeconds: normalizeDelaySeconds(delaySeconds),
+      videoWaitMinSeconds: videoWait.minSeconds,
+      videoWaitMaxSeconds: videoWait.maxSeconds,
       browserSource,
       downloadVideos,
       downloadExercises,
@@ -857,6 +911,12 @@ export default function App() {
     if (!preserveStoredDelay || initialStoredDelaySeconds.current === null) {
       setDelaySeconds(normalizeDelaySeconds(preferences.delaySeconds));
     }
+    const videoWait = normalizeVideoWaitBounds(
+      preferences.videoWaitMinSeconds ?? DEFAULT_VIDEO_WAIT_MIN_SECONDS,
+      preferences.videoWaitMaxSeconds ?? DEFAULT_VIDEO_WAIT_MAX_SECONDS
+    );
+    setVideoWaitMinSeconds(videoWait.minSeconds);
+    setVideoWaitMaxSeconds(videoWait.maxSeconds);
     setBrowserSource(preferences.browserSource);
     setDownloadVideos(preferences.downloadVideos);
     setDownloadExercises(preferences.downloadExercises);
@@ -1158,6 +1218,19 @@ export default function App() {
     setDelaySeconds(normalizeDelaySeconds(value));
   }
 
+  function updateVideoWaitBounds(nextMin: string | number, nextMax: string | number) {
+    const bounds = normalizeVideoWaitBounds(nextMin, nextMax);
+    setVideoWaitMinSeconds(bounds.minSeconds);
+    setVideoWaitMaxSeconds(bounds.maxSeconds);
+    if (!isTauriRuntime()) return;
+    void invoke<[number, number]>("set_linkedin_video_wait_bounds", {
+      minSeconds: bounds.minSeconds,
+      maxSeconds: bounds.maxSeconds
+    }).catch(() => {
+      /* Live pacing update is best-effort; next save/start also refreshes bounds. */
+    });
+  }
+
   async function removeQueueItem(job: QueuedDownloadJob) {
     if (isDownloadEmulatorJob(job)) {
       stopDownloadEmulator();
@@ -1165,9 +1238,20 @@ export default function App() {
     }
 
     if (job.status === "active") {
-      toast.warning("Active download cannot be removed", {
-        description: "Cancel the active download before removing it from the queue."
-      });
+      const shouldCancelAndRemove = window.confirm(
+        `Cancel and remove ${courseDisplayName(job)} from the download queue? In-progress work will stop at the next safe boundary.`
+      );
+      if (!shouldCancelAndRemove) return;
+      try {
+        const state = await removeDownloadQueueItem(job.id);
+        setQueuedJobs(state.persisted_jobs);
+        setHasSavedToken(state.has_saved_token);
+        toast.info("Active download cancelled", {
+          description: courseDisplayName(job)
+        });
+      } catch (error) {
+        toast.error("Could not remove active download", { description: String(error) });
+      }
       return;
     }
 
@@ -1280,7 +1364,7 @@ export default function App() {
       let outputDir = folder.trim();
       if (!outputDir) {
         toast.warning("Download folder required", {
-          description: "Choose where to save these courses, then LinkVault will continue."
+          description: "Choose where to save these courses, then LinkedVault will continue."
         });
         const selectedFolder = await browseDownloadFolder();
         outputDir = selectedFolder?.trim() ?? "";
@@ -1312,7 +1396,7 @@ export default function App() {
         return;
       } else if (!shouldUseSavedToken) {
         toast.info("Using browser session", {
-          description: `LinkVault will read the ${browserSource} LinkedIn session for this download.`
+          description: `LinkedVault will read the ${browserSource} LinkedIn session for this download.`
         });
       }
       const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
@@ -1321,7 +1405,7 @@ export default function App() {
         .filter((slug) => completedSlugs.has(slug));
       if (alreadyDownloaded.length > 0) {
         const shouldDownloadAgain = window.confirm(
-          `LinkVault has already completed ${alreadyDownloaded.length} selected LinkedIn course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
+          `LinkedVault has already completed ${alreadyDownloaded.length} selected LinkedIn course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
         );
         if (!shouldDownloadAgain) return;
       }
@@ -1331,6 +1415,8 @@ export default function App() {
         outputDir,
         selectedQuality: resolution,
         delaySeconds: normalizeDelaySeconds(delaySeconds),
+        videoWaitMinSeconds: normalizeVideoWaitBounds(videoWaitMinSeconds, videoWaitMaxSeconds).minSeconds,
+        videoWaitMaxSeconds: normalizeVideoWaitBounds(videoWaitMinSeconds, videoWaitMaxSeconds).maxSeconds,
         browserSource,
         downloadVideos,
         downloadExercises,
@@ -1566,7 +1652,7 @@ export default function App() {
         pageTone: newspaperPageTone
       });
       toast.success("Settings saved", {
-        description: "Download defaults will be restored the next time LinkVault opens."
+        description: "Download defaults will be restored the next time LinkedVault opens."
       });
     } catch (error) {
       toast.error("Settings save failed", { description: String(error) });
@@ -1627,7 +1713,7 @@ export default function App() {
         setUpdateBannerDismissed(false);
         return;
       }
-      toast.info("LinkVault is up to date", {
+      toast.info("LinkedVault is up to date", {
         description: `Current version ${APP_VERSION} is installed.`
       });
     } catch (error) {
@@ -1670,7 +1756,7 @@ export default function App() {
       toast.dismiss(UPDATE_TOAST_ID);
       setUpdateBannerDismissed(true);
       toast.success("Update installed", {
-        description: "Restart LinkVault to finish using the new version."
+        description: "Restart LinkedVault to finish using the new version."
       });
     } catch (error) {
       toast.error("Update install failed", { description: String(error) });
@@ -1690,7 +1776,7 @@ export default function App() {
       <div className="lv-toast lv-toast-update" role="status">
         <div className="lv-toast-copy">
           <strong className="lv-toast-title">Update available</strong>
-          <span className="lv-toast-description">LinkVault {version} is ready to install.</span>
+          <span className="lv-toast-description">LinkedVault {version} is ready to install.</span>
         </div>
         <div className="lv-toast-update-actions">
           <button
@@ -1753,7 +1839,7 @@ export default function App() {
           ? `${courseDisplayName(job)} will pause at the next safe boundary.`
           : `${courseDisplayName(job)} is available to continue.`
       });
-      if (!nextPaused && job.status === "queued" && (isTauriRuntime() || hasSavedToken)) {
+      if (!nextPaused && (job.status === "queued" || job.status === "active") && (isTauriRuntime() || hasSavedToken)) {
         cancellationRequestedRef.current = false;
         ensureDownloadProcessing(hasSavedToken);
       }
@@ -1951,7 +2037,7 @@ export default function App() {
         setQueueNeedsSessionRefresh(false);
       } else if (!shouldUseSavedToken) {
         toast.info("Using browser session", {
-          description: `LinkVault will read the ${browserSource} LinkedIn session for this retry.`
+          description: `LinkedVault will read the ${browserSource} LinkedIn session for this retry.`
         });
       }
       await retryFailedDownloadJob(job.id);
@@ -2056,10 +2142,10 @@ export default function App() {
           </Tooltip>
         </div>
         <div className="lv-sidebar-brand border-b border-sidebar-border">
-          <div className="lv-brand-logo" aria-label="LinkVault Archive Workspace">
-            <img src={linkvaultLogo} alt="" />
+          <div className="lv-brand-logo" aria-label="LinkedVault">
+            <span className="lv-brand-wordmark">LinkedVault</span>
           </div>
-          <h1 className="sr-only">LinkVault</h1>
+          <h1 className="sr-only">LinkedVault</h1>
         </div>
 
         <nav className="grid flex-1 content-start gap-1 px-3 py-3 text-xs">
@@ -2255,7 +2341,7 @@ export default function App() {
               </IconButton>
             </Tooltip>
             <Popover
-              label="LinkVault help"
+              label="LinkedVault help"
               open={isHelpOpen}
               onOpenChange={setIsHelpOpen}
               side="right"
@@ -2268,7 +2354,7 @@ export default function App() {
                 </Tooltip>
               }
             >
-              <div className="text-xs font-semibold text-muted-strong">LinkVault</div>
+              <div className="text-xs font-semibold text-muted-strong">LinkedVault</div>
               <p className="mt-2 text-xs leading-5 text-muted">
                 LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts through packaged helpers.
               </p>
@@ -2543,6 +2629,33 @@ export default function App() {
                   <Checkbox checked={downloadExercises} onChange={(event) => setDownloadExercises(event.target.checked)} label="Exercises" />
                   <Checkbox checked={downloadSubtitles} onChange={(event) => setDownloadSubtitles(event.target.checked)} label="Subtitles" />
                   <Checkbox checked={downloadQuizzes} onChange={(event) => setDownloadQuizzes(event.target.checked)} label="Quizzes" />
+                  <label className="linkedin-video-wait" title="Random wait between LinkedIn video downloads. Changing this applies to the next wait; an in-progress wait finishes first.">
+                    <span>Video wait</span>
+                    <div className="linkedin-video-wait-fields">
+                      <Input
+                        type="number"
+                        min={0}
+                        max={VIDEO_WAIT_MAX_SECONDS}
+                        step={1}
+                        value={videoWaitMinSeconds}
+                        onChange={(event) => updateVideoWaitBounds(event.target.value, videoWaitMaxSeconds)}
+                        aria-label="Minimum seconds between video downloads"
+                        className="linkedin-video-wait-input"
+                      />
+                      <span aria-hidden="true">–</span>
+                      <Input
+                        type="number"
+                        min={0}
+                        max={VIDEO_WAIT_MAX_SECONDS}
+                        step={1}
+                        value={videoWaitMaxSeconds}
+                        onChange={(event) => updateVideoWaitBounds(videoWaitMinSeconds, event.target.value)}
+                        aria-label="Maximum seconds between video downloads"
+                        className="linkedin-video-wait-input"
+                      />
+                      <span className="linkedin-video-wait-unit" aria-hidden="true">sec</span>
+                    </div>
+                  </label>
                 </div>
                 <div className="linkedin-primary-actions">
                   <Button type="button" variant="primary" className="linkedin-action-button" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
@@ -2685,8 +2798,8 @@ export default function App() {
       }}
       title={scheduleStep === "configure" ? "Schedule course downloads" : "Confirm automatic schedule"}
       description={scheduleStep === "configure"
-        ? `Choose a start window for ${scheduleCourseCount} course${scheduleCourseCount === 1 ? "" : "s"}. LinkVault calculates bounded randomized pacing.`
-        : "Review the queue behavior before LinkVault saves the schedule."}
+        ? `Choose a start window for ${scheduleCourseCount} course${scheduleCourseCount === 1 ? "" : "s"}. LinkedVault calculates bounded randomized pacing.`
+        : "Review the queue behavior before LinkedVault saves the schedule."}
       className="schedule-dialog"
     >
       {scheduleStep === "configure" ? (
@@ -2744,7 +2857,7 @@ export default function App() {
             <Clock3 aria-hidden="true" />
             <div>
               <strong>Persistent queue</strong>
-              <span>Schedules survive app restarts and new immediate downloads. LinkVault runs due work while open and resumes overdue items the next time it launches.</span>
+              <span>Schedules survive app restarts and new immediate downloads. LinkedVault runs due work while open and resumes overdue items the next time it launches.</span>
             </div>
           </div>
           <div className="schedule-actions">
@@ -2773,7 +2886,7 @@ export default function App() {
     <Dialog
       open={isSettingsOpen}
       onOpenChange={setIsSettingsOpen}
-      title="LinkVault settings"
+      title="LinkedVault settings"
       description="Save downloader defaults and session behavior without storing plaintext LinkedIn tokens." className="settings-dialog"
     >
       <div className="settings-grid">
@@ -2947,7 +3060,7 @@ export default function App() {
             Auto mode caps the optimization at 50% CPU and adjusts the worker
             pool every 3 seconds. 4K and other memory-hungry editions may
             need a larger per-worker budget; the reserve must stay large
-            enough for the rest of the OS, the LinkVault UI, and the active
+            enough for the rest of the OS, the LinkedVault UI, and the active
             download.
           </p>
         </section>
@@ -3070,7 +3183,7 @@ export default function App() {
       open={isTokenGuideOpen}
       onOpenChange={handleTokenGuideOpenChange}
       title="Find your LinkedIn li_at cookie"
-      description="Use this only with a LinkedIn Learning account you are allowed to access. LinkVault saves the cookie locally with Windows encryption."
+      description="Use this only with a LinkedIn Learning account you are allowed to access. LinkedVault saves the cookie locally with Windows encryption."
       className="token-guide-dialog"
     >
       <div className="token-guide-content">
@@ -3079,7 +3192,7 @@ export default function App() {
           <li>Open LinkedIn Learning in your browser and sign in.</li>
           <li>Press F12, then open the Application tab.</li>
           <li>Under Storage, open Cookies and choose https://www.linkedin.com.</li>
-          <li>Find li_at, copy its full Value, and paste it into LinkVault.</li>
+          <li>Find li_at, copy its full Value, and paste it into LinkedVault.</li>
         </ol>
         <div className="token-guide-actions">
           <Button type="button" variant="primary" onClick={() => handleTokenGuideOpenChange(false)}>
@@ -3137,7 +3250,7 @@ export default function App() {
           </ul>
           <p>
             {pendingResetProvider === "linkedin" && activeLinkedinJobCount() > 0
-              ? `${activeLinkedinJobCount()} download${activeLinkedinJobCount() === 1 ? " is" : "s are"} still in flight. LinkVault will pause them at the next safe boundary before wiping.`
+              ? `${activeLinkedinJobCount()} download${activeLinkedinJobCount() === 1 ? " is" : "s are"} still in flight. LinkedVault will pause them at the next safe boundary before wiping.`
               : "No active downloads detected for this provider."}
           </p>
           <div className="reset-confirm-actions">
@@ -3509,7 +3622,7 @@ function DownloadQueueTable({
       ) : (
         <EmptyRow
           title={emptyTitle}
-          description={emptyDescription ?? (hasPersistedJobs ? "Finished courses are in Completed. Failed jobs stay here until handled." : "Active jobs and items needing attention appear here after Start Download.")}
+          description={emptyDescription ?? (hasPersistedJobs ? "Finished courses are in Completed. Failed jobs stay here until handled." : "Active jobs and items needing attention appear here after Download.")}
         />
       )}
     </DataTable>
@@ -3550,16 +3663,18 @@ function QueueJobRow({
   const title = courseDisplayName(job);
   const queueLabel = queueCourseLabel(job, counts);
   const videoArtifacts = job.video_artifacts ?? [];
-  const canRemove = job.status !== "active";
+  const canRemove = true;
   const scheduled = isScheduledJob(job);
   const [clockMs, setClockMs] = useState(() => Date.now());
   const detailsId = `queue-details-${job.id}`;
   const pacing = showActiveDetails
     ? activeVideoPacingState(recentEvents, job.id, videoArtifacts, Math.floor(clockMs / 1000))
     : null;
-  const removeLabel = job.status === "failed" || job.status === "cancelled"
-    ? "Clear failed attempt"
-    : "Remove from queue";
+  const removeLabel = job.status === "active"
+    ? "Cancel and remove"
+    : job.status === "failed" || job.status === "cancelled"
+      ? "Clear failed attempt"
+      : "Remove from queue";
 
   useEffect(() => {
     if (!showActiveDetails || !isExpanded) return;
@@ -3570,7 +3685,7 @@ function QueueJobRow({
   return (
     <div className={`queue-job-stack${isExpanded ? " is-open" : ""}`}>
       <DataTableRow
-        className={`queue-table-row${showActiveDetails ? " is-expandable" : ""}`}
+        className={`queue-table-row${showActiveDetails ? " is-expandable" : ""}${job.status === "active" || job.paused ? " has-persistent-actions" : ""}`}
         title="Right-click to copy this course URL"
         onClick={(event) => {
           if (!showActiveDetails) return;

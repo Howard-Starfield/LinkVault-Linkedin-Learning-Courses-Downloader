@@ -86,7 +86,7 @@ export function NewspaperClippingDetail({
       return true;
     } catch {
       toast.error("The clipping image could not be recovered", {
-        description: "The note is still saved. LinkVault did not search other folders or recrop the page."
+        description: "The note is still saved. LinkedVault did not search other folders or recrop the page."
       });
       return false;
     } finally {

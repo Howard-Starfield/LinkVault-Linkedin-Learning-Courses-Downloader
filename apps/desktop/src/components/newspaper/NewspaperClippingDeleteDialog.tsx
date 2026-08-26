@@ -24,7 +24,7 @@ export function NewspaperClippingDeleteDialog({
       <div className="clipping-delete-dialog__copy">
         <AlertTriangle aria-hidden="true" />
         <p>
-          This removes the saved image and its note from LinkVault. The original
+          This removes the saved image and its note from LinkedVault. The original
           newspaper page is not deleted.
         </p>
       </div>

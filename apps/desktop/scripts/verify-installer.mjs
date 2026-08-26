@@ -14,7 +14,7 @@ for (const folder of ["nsis", "msi"]) {
     // One Windows bundle format may be disabled.
   }
 }
-const expected = join("nsis", `LinkVault_${packageJson.version}_x64-setup.exe`);
+const expected = join("nsis", `LinkedVault_${packageJson.version}_x64-setup.exe`);
 assert.ok(
   candidates.includes(expected),
   `Expected ${expected}, but found: ${candidates.join(", ") || "no Windows installers"}. Run npm run tauri build first.`

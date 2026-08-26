@@ -7,4 +7,14 @@ src-tauri/target
 src-tauri/gen
 output
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.db
+*.db-wal
+*.db-shm
+playwright-report/
+test-results/
+coverage/
+*.tsbuildinfo
+Thumbs.db
+.DS_Store

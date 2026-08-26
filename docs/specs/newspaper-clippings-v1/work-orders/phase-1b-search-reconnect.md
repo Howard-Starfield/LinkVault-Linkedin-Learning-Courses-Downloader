@@ -1,6 +1,6 @@
 # Phase 1B work order: ranked search and snapshot reconnect foundation
 
-**Status:** Approved for implementation after Phase 1A lands
+**Status:** Implemented (historical work order; search/reconnect shipped)
 
 **Branch:** `codex/newspaper-clippings-search-reconnect`
 

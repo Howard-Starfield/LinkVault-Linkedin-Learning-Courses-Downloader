@@ -332,7 +332,7 @@ pub struct OptimizationRunOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_memory_budget_mb: Option<u32>,
     /// Minimum bytes the system should keep free for the rest of the OS and
-    /// the LinkVault UI before the optimization workers are capped. `None`
+    /// the LinkedVault UI before the optimization workers are capped. `None`
     /// falls back to the governor's built-in default (4 GB or 10% of total
     /// RAM, whichever is larger).
     #[serde(default, skip_serializing_if = "Option::is_none")]
