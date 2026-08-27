@@ -26,7 +26,7 @@ fn stage_reviewed_helpers_beside_current_exe() {
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .expect("test executable directory must be available");
-    for name in ["yt-dlp", "deno", "ffmpeg", "ffprobe"] {
+    for name in ["yt-dlp", "deno", "ffmpeg"] {
         let source = binaries.join(format!("{name}-{TARGET_TRIPLE}.exe"));
         let destination = install.join(format!("{name}.exe"));
         if destination.is_file() {
@@ -47,7 +47,7 @@ fn reviewed_packaged_helpers_pass_the_production_identity_and_launch_path() {
         .expect("the embedded ready lock and packaged helper bytes must agree");
     assert_eq!(
         identity.digest,
-        "f2eb38349e71bd05b8da27807bc82e5eecb204cbf8b335952276bc1786527b7c"
+        "389e8126d37c83bf1221172cf4b4d9f0fd0c9103e7490e18a62586cdf66407f3"
     );
 
     let control = TransientRunControl::default();
@@ -64,8 +64,8 @@ fn reviewed_packaged_helpers_pass_the_production_identity_and_launch_path() {
     assert!(ytdlp.status.success());
     assert_eq!(ytdlp.stdout.trim(), "2026.08.19");
 
-    let ffprobe = run(
-        ManagedProcessSpec::youtube_ffprobe(
+    let ffmpeg = run(
+        ManagedProcessSpec::youtube_ffmpeg(
             vec![OsString::from("-version")],
             64 * 1024,
             4096,
@@ -73,9 +73,9 @@ fn reviewed_packaged_helpers_pass_the_production_identity_and_launch_path() {
         ),
         ManagedProcessContext::Run(&control),
     )
-    .expect("reviewed FFprobe must launch through the production supervisor");
-    assert!(ffprobe.status.success());
-    assert!(ffprobe
+    .expect("reviewed FFmpeg must launch through the production supervisor");
+    assert!(ffmpeg.status.success());
+    assert!(ffmpeg
         .stdout
         .lines()
         .next()

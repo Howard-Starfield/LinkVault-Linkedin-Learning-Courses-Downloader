@@ -4,8 +4,7 @@
     "externalBin": [
       "binaries/yt-dlp",
       "binaries/deno",
-      "binaries/ffmpeg",
-      "binaries/ffprobe"
+      "binaries/ffmpeg"
     ]
   }
 }

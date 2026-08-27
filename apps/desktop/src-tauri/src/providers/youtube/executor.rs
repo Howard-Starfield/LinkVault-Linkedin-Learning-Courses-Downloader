@@ -9,7 +9,7 @@ use crate::app::safe_output_filesystem::{
 };
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::helper::{
-    download_invocation, ffprobe_invocation, invocation, output_error, MAX_RECORD_STDOUT_BYTES,
+    download_invocation, invocation, media_probe_invocation, output_error, MAX_RECORD_STDOUT_BYTES,
 };
 use crate::providers::youtube::manifest_contract::{
     artifact_fingerprint, canonical_manifest_bytes, project_manifest, ArtifactFingerprintInput,
@@ -882,14 +882,18 @@ fn verify_media_with_ffprobe(
     attempt.revalidate().map_err(|error| error.to_string())?;
     let media_path = attempt.path().join(&media[0].name);
     let output = run(
-        ffprobe_invocation(vec![
+        media_probe_invocation(vec![
             "-v".to_string(),
             "error".to_string(),
             "-print_format".to_string(),
             "json".to_string(),
             "-show_format".to_string(),
             "-show_streams".to_string(),
+            "-i".to_string(),
             media_path.to_string_lossy().into_owned(),
+            "-f".to_string(),
+            "null".to_string(),
+            "-".to_string(),
         ]),
         ManagedProcessContext::Run(control),
     )
@@ -942,14 +946,18 @@ fn verify_existing_media_with_ffprobe(
     lease.revalidate().map_err(|error| error.to_string())?;
     let media_path = lease.path().join(&media[0].name);
     let output = run(
-        ffprobe_invocation(vec![
+        media_probe_invocation(vec![
             "-v".to_string(),
             "error".to_string(),
             "-print_format".to_string(),
             "json".to_string(),
             "-show_format".to_string(),
             "-show_streams".to_string(),
+            "-i".to_string(),
             media_path.to_string_lossy().into_owned(),
+            "-f".to_string(),
+            "null".to_string(),
+            "-".to_string(),
         ]),
         ManagedProcessContext::Run(control),
     )
@@ -2504,7 +2512,7 @@ mod tests {
 
     fn stage_reviewed_helpers_beside_current_exe() -> bool {
         let binaries = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
-        let names = ["yt-dlp", "deno", "ffmpeg", "ffprobe"];
+        let names = ["yt-dlp", "deno", "ffmpeg"];
         const TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
         if !names.iter().all(|name| {
             binaries

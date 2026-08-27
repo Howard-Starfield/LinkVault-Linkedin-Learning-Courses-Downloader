@@ -1277,6 +1277,15 @@ textarea {
  border-radius: 8px;
  font-size: 12px;
  padding: 8px 10px;
+ display: flex;
+ flex-wrap: wrap;
+ align-items: center;
+ gap: 8px 12px;
+}
+
+.youtube-helper-error p {
+ margin: 0;
+ flex: 1 1 220px;
 }
 
 .youtube-panel-heading {

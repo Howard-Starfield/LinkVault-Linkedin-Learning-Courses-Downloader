@@ -19,6 +19,7 @@ import {
   cancelYouTubeDownload,
   getYouTubeDownloadState,
   getYouTubeHelperStatus,
+  installMediaToolchain,
   inspectYouTubeTranscripts,
   isTauriRuntime,
   listYouTubeHistory,
@@ -306,7 +307,54 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const nativeRuntime = isTauriRuntime();
   const [helperStatus, setHelperStatus] = useState<HelperStatus>(nativeRuntime ? "pending" : "ready");
   const [helperError, setHelperError] = useState<YouTubeError | null>(null);
+  const [isInstallingHelpers, setIsInstallingHelpers] = useState(false);
   const helperReady = !nativeRuntime || helperStatus === "ready";
+
+  const refreshHelperStatus = useCallback(async () => {
+    if (!nativeRuntime) {
+      setHelperStatus("ready");
+      setHelperError(null);
+      return;
+    }
+    try {
+      const response = await getYouTubeHelperStatus();
+      const ready = response.status === "ready";
+      setHelperStatus(ready ? "ready" : "failed");
+      setHelperError(ready
+        ? null
+        : {
+            code: response.code ?? "HELPER_INTEGRITY_FAILED",
+            message: response.message || "YouTube helper integrity validation failed."
+          });
+    } catch (error: unknown) {
+      setHelperStatus("failed");
+      setHelperError(helperStatusFailure(error));
+    }
+  }, [nativeRuntime]);
+
+  async function installYouTubeHelpers() {
+    if (!nativeRuntime || isInstallingHelpers) return;
+    setIsInstallingHelpers(true);
+    try {
+      const status = await installMediaToolchain();
+      if (!status.ready) {
+        throw new Error(status.error ?? "Media toolchain install did not become ready.");
+      }
+      await refreshHelperStatus();
+      toast.success("YouTube helpers ready", {
+        description: status.active_version
+          ? `Media toolchain ${status.active_version} is installed.`
+          : "Signed helpers are ready for downloads."
+      });
+    } catch (error: unknown) {
+      toast.error("Could not install YouTube helpers", {
+        description: formatYouTubeInvokeError(error)
+      });
+      await refreshHelperStatus();
+    } finally {
+      setIsInstallingHelpers(false);
+    }
+  }
   const [sourceUrl, setSourceUrl] = useState("");
   const [detectedLinks, setDetectedLinks] = useState<DetectedYouTubeLink[]>([]);
   const [scanPlans, setScanPlans] = useState<ScanYouTubeSourceResponse[]>([]);
@@ -384,28 +432,8 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
 
   useEffect(() => {
     if (!nativeRuntime) return;
-    let disposed = false;
-    void getYouTubeHelperStatus()
-      .then((response) => {
-        if (disposed) return;
-        const ready = response.status === "ready";
-        setHelperStatus(ready ? "ready" : "failed");
-        setHelperError(ready
-          ? null
-          : {
-              code: response.code ?? "HELPER_INTEGRITY_FAILED",
-              message: response.message || "YouTube helper integrity validation failed."
-            });
-      })
-      .catch((error: unknown) => {
-        if (disposed) return;
-        setHelperStatus("failed");
-        setHelperError(helperStatusFailure(error));
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [nativeRuntime]);
+    void refreshHelperStatus();
+  }, [nativeRuntime, refreshHelperStatus]);
 
   useEffect(() => {
     if (!nativeRuntime) return;
@@ -1108,9 +1136,26 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   return (
     <div className="youtube-view" data-has-results={videos.length > 0 || isScanning || undefined}>
       <div className="youtube-live-announcer" role="status" aria-live="polite">{liveAnnouncement}</div>
-      {helperStatus === "failed" ? (
+      {helperStatus !== "ready" && nativeRuntime ? (
         <div className="youtube-helper-error" role="alert">
-          {helperError?.message ?? "YouTube helper integrity validation failed; native discovery remains blocked."}
+          {helperStatus === "pending" ? (
+            <p>Checking signed YouTube helpers…</p>
+          ) : (
+            <>
+              <p>
+                {helperError?.message ??
+                  "YouTube needs a one-time signed helper pack (~220 MB). It installs beside LinkVaultData and is not bundled in the app installer."}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isInstallingHelpers}
+                onClick={() => void installYouTubeHelpers()}
+              >
+                {isInstallingHelpers ? "Downloading helpers…" : "Download YouTube helpers"}
+              </Button>
+            </>
+          )}
         </div>
       ) : null}
 

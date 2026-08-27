@@ -164,6 +164,8 @@ pub fn run() {
             coursera::commands::open_coursera_download_folder,
             coursera::commands::fetch_coursera_syllabus_preview,
             youtube::commands::get_youtube_helper_status,
+            youtube::commands::get_media_toolchain_status,
+            youtube::commands::install_media_toolchain,
             youtube::commands::get_youtube_preferences,
             youtube::commands::save_youtube_preferences,
             youtube::commands::scan_youtube_source,

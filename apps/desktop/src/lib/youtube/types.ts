@@ -68,6 +68,27 @@ export interface GetYouTubeHelperStatusResponse {
   message: string;
 }
 
+export type MediaToolchainComponentKind = "yt_dlp" | "ffmpeg" | "deno";
+
+export interface MediaToolchainComponentStatus {
+  kind: MediaToolchainComponentKind;
+  available: boolean;
+  path: string | null;
+}
+
+export interface MediaToolchainStatus {
+  ready: boolean;
+  media_core_ready: boolean;
+  web_media_ready: boolean;
+  managed_install_present: boolean;
+  active_version: string | null;
+  previous_version: string | null;
+  last_checked_at: string | null;
+  latest_available: string | null;
+  components: MediaToolchainComponentStatus[];
+  error: string | null;
+}
+
 export interface YouTubeScanItem {
   occurrenceId: string;
   videoId: string;

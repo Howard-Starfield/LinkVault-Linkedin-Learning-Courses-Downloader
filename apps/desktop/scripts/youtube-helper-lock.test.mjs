@@ -12,7 +12,7 @@ const repositoryRoot = process.cwd();
 function makeAsset(name, archiveMember = null, role = null) {
   const filename = `${name}-x86_64-pc-windows-msvc.exe`;
   const ejsVersion = role === "yt-dlp" ? "0.8.0" : null;
-  const ffmpegBuildId = role === "ffmpeg" || role === "ffprobe" ? "ffmpeg-test-build-1" : null;
+  const ffmpegBuildId = role === "ffmpeg" ? "ffmpeg-test-build-1" : null;
   const asset = {
     name,
     version: "1.0.0",
@@ -157,10 +157,10 @@ test("compatibility fields are typed and role requirements are fail-closed", () 
   missingEjs.lockDigest = digestLock(missingEjs);
   assert.throws(() => validateLock(missingEjs, repositoryRoot), /ytDlpEjsVersion is required for yt-dlp/);
 
-  const mismatchedBuild = makeLock();
-  mismatchedBuild.components[3].compatibility.ffmpegBuildId = "other-build";
-  mismatchedBuild.lockDigest = digestLock(mismatchedBuild);
-  assert.throws(() => validateLock(mismatchedBuild, repositoryRoot), /ffmpeg and ffprobe must share one ffmpegBuildId/);
+  const missingFfmpegBuild = makeLock();
+  missingFfmpegBuild.components[2].compatibility.ffmpegBuildId = null;
+  missingFfmpegBuild.lockDigest = digestLock(missingFfmpegBuild);
+  assert.throws(() => validateLock(missingFfmpegBuild, repositoryRoot), /ffmpegBuildId is required for ffmpeg/);
 
   const mismatchedLoadedAsset = makeLock();
   const loadedAsset = makeAsset("yt-dlp-ejs");

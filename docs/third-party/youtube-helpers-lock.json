@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "targetTriple": "x86_64-pc-windows-msvc",
   "status": "ready",
-  "lockDigest": "f2eb38349e71bd05b8da27807bc82e5eecb204cbf8b335952276bc1786527b7c",
+  "lockDigest": "389e8126d37c83bf1221172cf4b4d9f0fd0c9103e7490e18a62586cdf66407f3",
   "components": [
     {
       "name": "yt-dlp",
@@ -18,7 +18,10 @@
       "archiveMember": null,
       "archiveFormat": null,
       "sourceArchiveFormat": "tar.gz",
-      "compatibility": { "ytDlpEjsVersion": "0.8.0", "ffmpegBuildId": null },
+      "compatibility": {
+        "ytDlpEjsVersion": "0.8.0",
+        "ffmpegBuildId": null
+      },
       "loadedAssets": [],
       "licenseId": "Unlicense",
       "licenseFile": "docs/third-party/youtube/yt-dlp-2026.08.19-LICENSE.txt",
@@ -61,7 +64,10 @@
       "sourceArchiveFormat": "tar.gz",
       "distributionArchiveSha256": "171efab55ac6b9881fd53ee4c20f8bf3bb1340ffc618483746909014db12216a",
       "distributionArchiveSizeBytes": 42691248,
-      "compatibility": { "ytDlpEjsVersion": null, "ffmpegBuildId": null },
+      "compatibility": {
+        "ytDlpEjsVersion": null,
+        "ffmpegBuildId": null
+      },
       "loadedAssets": [],
       "licenseId": "MIT",
       "licenseFile": "docs/third-party/youtube/deno-2.9.5-LICENSE.txt",
@@ -104,7 +110,10 @@
       "sourceArchiveFormat": "tar.gz",
       "distributionArchiveSha256": "ccaa910db95451121482a5ebcb8c682123cb4f8a5bd5170fde4a814d7b437772",
       "distributionArchiveSizeBytes": 147008035,
-      "compatibility": { "ytDlpEjsVersion": null, "ffmpegBuildId": "n9.0.1-6-g9d4ca21220-20260820" },
+      "compatibility": {
+        "ytDlpEjsVersion": null,
+        "ffmpegBuildId": "n9.0.1-6-g9d4ca21220-20260820"
+      },
       "loadedAssets": [],
       "licenseId": "LGPL-3.0-or-later",
       "licenseFile": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
@@ -115,49 +124,6 @@
         "assetUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
         "assetSha256": "b6b61f0d99c55e422bbd59fad6880a8d4f96d99a6c865f3bb58c8f1ce3ff7b31",
         "assetSizeBytes": 114400768,
-        "archiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
-        "archiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
-        "archiveSizeBytes": 17325951
-      },
-      "licenseRecord": {
-        "spdxExpression": "LGPL-3.0-or-later",
-        "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611/COPYING.LGPLv3",
-        "file": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
-        "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
-      },
-      "noticeRecord": {
-        "file": "docs/third-party/THIRD_PARTY_NOTICES.md",
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45",
-        "sha256": "57e7259dae3340534df6817163277ddccf33fe9528137d7d3881257b583b7af0"
-      }
-    },
-    {
-      "name": "ffprobe",
-      "filename": "ffprobe-x86_64-pc-windows-msvc.exe",
-      "path": "ffprobe-x86_64-pc-windows-msvc.exe",
-      "version": "n9.0.1-6-g9d4ca21220-20260820",
-      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
-      "sourceArchiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
-      "sha256": "46da68bfe5a0b8983e67286a3e681ee05c19d4f2169f37410786e2177dff6aca",
-      "sizeBytes": 114197504,
-      "sourceArchiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
-      "sourceArchiveSizeBytes": 17325951,
-      "archiveMember": "ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0/bin/ffprobe.exe",
-      "archiveFormat": "zip",
-      "sourceArchiveFormat": "tar.gz",
-      "distributionArchiveSha256": "ccaa910db95451121482a5ebcb8c682123cb4f8a5bd5170fde4a814d7b437772",
-      "distributionArchiveSizeBytes": 147008035,
-      "compatibility": { "ytDlpEjsVersion": null, "ffmpegBuildId": "n9.0.1-6-g9d4ca21220-20260820" },
-      "loadedAssets": [],
-      "licenseId": "LGPL-3.0-or-later",
-      "licenseFile": "docs/third-party/youtube/ffmpeg-9d4ca21220-LGPLv3.txt",
-      "sourceRecord": {
-        "projectUrl": "https://github.com/FFmpeg/FFmpeg/tree/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611",
-        "releaseUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45",
-        "revision": "9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611",
-        "assetUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-20-13-45/ffmpeg-n9.0.1-6-g9d4ca21220-win64-lgpl-9.0.zip",
-        "assetSha256": "46da68bfe5a0b8983e67286a3e681ee05c19d4f2169f37410786e2177dff6aca",
-        "assetSizeBytes": 114197504,
         "archiveUrl": "https://github.com/FFmpeg/FFmpeg/archive/9d4ca21220bfd3f06fc8bfc90ddf0f6d0a484611.tar.gz",
         "archiveSha256": "693b19b88c741aa9e02566a40c9c090ca64f808aefdd7fcbff8e5d8cc42db04f",
         "archiveSizeBytes": 17325951

@@ -130,10 +130,25 @@ pub fn get_youtube_helper_status() -> GetYouTubeHelperStatusResponse {
         Err(_) => GetYouTubeHelperStatusResponse {
             status: YouTubeHelperBackendStatus::Blocked,
             code: Some("HELPER_EXECUTION_BLOCKED".to_string()),
-            message: "YouTube helper execution is blocked because the reviewed packaged helper set is missing or failed integrity validation."
+            message: "YouTube helpers are missing or failed integrity validation. Install the signed media toolchain to continue."
                 .to_string(),
         },
     }
+}
+
+#[tauri::command]
+pub fn get_media_toolchain_status(
+) -> Result<crate::app::media_toolchain::MediaToolchainStatus, String> {
+    crate::app::media_toolchain::status().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn install_media_toolchain(
+) -> Result<crate::app::media_toolchain::MediaToolchainStatus, String> {
+    tauri::async_runtime::spawn_blocking(crate::app::media_toolchain::install_latest)
+        .await
+        .map_err(|error| format!("Media toolchain install task failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

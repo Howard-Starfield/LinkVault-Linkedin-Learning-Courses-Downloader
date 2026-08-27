@@ -52,8 +52,8 @@ fn download_timeout(source_duration_seconds: Option<u64>) -> Duration {
     requested.clamp(MIN_DOWNLOAD_TIMEOUT, MAX_DOWNLOAD_TIMEOUT)
 }
 
-pub fn ffprobe_invocation(args: Vec<String>) -> ManagedProcessSpec {
-    ManagedProcessSpec::youtube_ffprobe(
+pub fn media_probe_invocation(args: Vec<String>) -> ManagedProcessSpec {
+    ManagedProcessSpec::youtube_ffmpeg(
         args.into_iter().map(OsString::from).collect(),
         MAX_FFPROBE_STDOUT_BYTES,
         MAX_RETAINED_STDERR_BYTES,

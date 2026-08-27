@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.23 - 2026-08-26
+
+- **YouTube helpers install post-setup (~220 MB).** First YouTube use can download the signed Infield media toolchain into `LinkVaultData` instead of bundling helpers in the installer.
+- **Dropped ffprobe from the required helper set.** Media verification now uses the bundled `ffmpeg` probe path; the lock and installer expect yt-dlp, Deno, and ffmpeg only, matching toolchain v0.1.1.
+
 ## 0.2.22 - 2026-08-26
 
 - **Product rebrand to LinkedVault.** User-facing UI, window title, tray labels, installer `productName`, and docs now say LinkedVault. The left sidebar drops the All-in-One / PNG wordmark for a theme-aware text wordmark. Crate name, exe, bundle identifier, localStorage keys, and the `LinkVaultData` folder are unchanged.

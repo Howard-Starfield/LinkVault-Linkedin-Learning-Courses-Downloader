@@ -4,6 +4,7 @@ import type {
   CancelYouTubeRunRequest,
   GetYouTubeDownloadStateRequest,
   GetYouTubeHelperStatusResponse,
+  MediaToolchainStatus,
   InspectYouTubeTranscriptsRequest,
   InspectYouTubeTranscriptsResponse,
   ListYouTubeHistoryRequest,
@@ -94,6 +95,31 @@ export async function getYouTubeHelperStatus(): Promise<GetYouTubeHelperStatusRe
     return invoke<GetYouTubeHelperStatusResponse>("get_youtube_helper_status");
   }
   return { status: "ready", code: null, message: "" };
+}
+
+export async function getMediaToolchainStatus(): Promise<MediaToolchainStatus> {
+  if (!isTauriRuntime()) {
+    return {
+      ready: true,
+      media_core_ready: true,
+      web_media_ready: true,
+      managed_install_present: false,
+      active_version: null,
+      previous_version: null,
+      last_checked_at: null,
+      latest_available: null,
+      components: [],
+      error: null
+    };
+  }
+  return invoke<MediaToolchainStatus>("get_media_toolchain_status");
+}
+
+export async function installMediaToolchain(): Promise<MediaToolchainStatus> {
+  if (!isTauriRuntime()) {
+    return getMediaToolchainStatus();
+  }
+  return invoke<MediaToolchainStatus>("install_media_toolchain");
 }
 
 export async function getYouTubePreferences(): Promise<SavedYouTubePreferences> {

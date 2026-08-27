@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-export const REQUIRED_COMPONENTS = Object.freeze(["yt-dlp", "deno", "ffmpeg", "ffprobe"]);
+export const REQUIRED_COMPONENTS = Object.freeze(["yt-dlp", "deno", "ffmpeg"]);
 export const TARGET_TRIPLE = "x86_64-pc-windows-msvc";
 export const LOCK_RELATIVE_PATH = "docs/third-party/youtube-helpers-lock.json";
 export const BINARY_RELATIVE_PATH = "apps/desktop/src-tauri/binaries";
@@ -129,8 +129,8 @@ function validateCompatibility(asset, label, role) {
   if (role === "yt-dlp" && asset.compatibility.ytDlpEjsVersion === null) {
     fail(`${label}.compatibility.ytDlpEjsVersion is required for yt-dlp`);
   }
-  if ((role === "ffmpeg" || role === "ffprobe") && asset.compatibility.ffmpegBuildId === null) {
-    fail(`${label}.compatibility.ffmpegBuildId is required for ${role}`);
+  if (role === "ffmpeg" && asset.compatibility.ffmpegBuildId === null) {
+    fail(`${label}.compatibility.ffmpegBuildId is required for ffmpeg`);
   }
 }
 
@@ -258,13 +258,6 @@ export function validateLock(lock, repositoryRoot) {
         if (loadedAsset.compatibility[key] !== null && loadedAsset.compatibility[key] !== component.compatibility[key]) {
           fail(`component ${component.name}.loadedAssets compatibility.${key} must match the component`);
         }
-      }
-    }
-    if (component.name === "ffmpeg" || component.name === "ffprobe") {
-      const buildId = component.compatibility.ffmpegBuildId;
-      const peer = lock.components.find((candidate) => candidate.name === (component.name === "ffmpeg" ? "ffprobe" : "ffmpeg"));
-      if (peer && peer.compatibility.ffmpegBuildId !== buildId) {
-        fail(`components ffmpeg and ffprobe must share one ffmpegBuildId`);
       }
     }
     const licensePath = resolveInside(repositoryRoot, component.licenseFile, `${component.name}.licenseFile`);

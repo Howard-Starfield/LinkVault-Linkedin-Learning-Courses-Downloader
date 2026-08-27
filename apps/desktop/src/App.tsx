@@ -2356,7 +2356,7 @@ export default function App() {
             >
               <div className="text-xs font-semibold text-muted-strong">LinkedVault</div>
               <p className="mt-2 text-xs leading-5 text-muted">
-                LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts through packaged helpers.
+                LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts; the signed helper pack is downloaded once after install when you open YouTube.
               </p>
             </Popover>
           </div>

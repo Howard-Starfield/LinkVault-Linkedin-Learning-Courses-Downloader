@@ -42,7 +42,7 @@ const EXECUTION_HARDENING_COMPLETE: bool = true;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperKind {
     YouTubeYtDlp,
-    YouTubeFfprobe,
+    YouTubeFfmpeg,
 }
 
 /// Runtime-owned cancellation and cleanup-registration boundary for one
@@ -111,14 +111,14 @@ impl ManagedProcessSpec {
         }
     }
 
-    pub fn youtube_ffprobe(
+    pub fn youtube_ffmpeg(
         args: Vec<OsString>,
         stdout_limit: usize,
         stderr_limit: usize,
         timeout: Duration,
     ) -> Self {
         Self {
-            helper: HelperKind::YouTubeFfprobe,
+            helper: HelperKind::YouTubeFfmpeg,
             args,
             stdout_limit,
             stderr_limit,
@@ -277,7 +277,6 @@ struct VerifiedHelperSet {
     ytdlp: VerifiedExecutable,
     deno: VerifiedExecutable,
     ffmpeg: VerifiedExecutable,
-    ffprobe: VerifiedExecutable,
 }
 
 impl VerifiedHelperSet {
@@ -285,14 +284,14 @@ impl VerifiedHelperSet {
         &self.ytdlp.lock_digest
     }
 
-    fn identities(&self) -> [&VerifiedExecutable; 4] {
-        [&self.ytdlp, &self.deno, &self.ffmpeg, &self.ffprobe]
+    fn identities(&self) -> [&VerifiedExecutable; 3] {
+        [&self.ytdlp, &self.deno, &self.ffmpeg]
     }
 
     fn executable(&self, kind: HelperKind) -> &VerifiedExecutable {
         match kind {
             HelperKind::YouTubeYtDlp => &self.ytdlp,
-            HelperKind::YouTubeFfprobe => &self.ffprobe,
+            HelperKind::YouTubeFfmpeg => &self.ffmpeg,
         }
     }
 
@@ -688,14 +687,17 @@ impl TransientCleanupVerifier for HelperTempCleanupVerifier {
 }
 
 fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProcessError> {
-    if !matches!(kind, HelperKind::YouTubeYtDlp | HelperKind::YouTubeFfprobe) {
+    if !matches!(kind, HelperKind::YouTubeYtDlp | HelperKind::YouTubeFfmpeg) {
         return Err(ManagedProcessError::Integrity(
             "unsupported helper set".to_string(),
         ));
     }
+    if let Some(set) = resolve_from_media_toolchain()? {
+        return Ok(set);
+    }
     let mut locked = locked_helpers().ok_or_else(|| {
         ManagedProcessError::Integrity(
-            "the helper lock is absent; Y0 helper validation is required before execution"
+            "the helper lock is absent and no verified media-toolchain install is active; install YouTube helpers or use an internal helper-packaged build"
                 .to_string(),
         )
     })?;
@@ -723,8 +725,48 @@ fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProc
         ytdlp: open("yt-dlp")?,
         deno: open("deno")?,
         ffmpeg: open("ffmpeg")?,
-        ffprobe: open("ffprobe")?,
     })
+}
+
+fn resolve_from_media_toolchain() -> Result<Option<VerifiedHelperSet>, ManagedProcessError> {
+    let paths = match crate::app::media_toolchain::verified_component_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            return Err(ManagedProcessError::Integrity(error.to_string()));
+        }
+    };
+    let Some(paths) = paths else {
+        return Ok(None);
+    };
+    let lock_digest = format!("media-toolchain:{}", paths.version);
+    let size_or = |size: Option<u64>, path: &Path| -> Result<u64, ManagedProcessError> {
+        if let Some(size) = size {
+            return Ok(size);
+        }
+        Ok(fs::symlink_metadata(path)
+            .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?
+            .len())
+    };
+    Ok(Some(VerifiedHelperSet {
+        ytdlp: open_verified_executable(
+            paths.yt_dlp.clone(),
+            &paths.yt_dlp_sha256,
+            &lock_digest,
+            size_or(paths.yt_dlp_size_bytes, &paths.yt_dlp)?,
+        )?,
+        deno: open_verified_executable(
+            paths.deno.clone(),
+            &paths.deno_sha256,
+            &lock_digest,
+            size_or(paths.deno_size_bytes, &paths.deno)?,
+        )?,
+        ffmpeg: open_verified_executable(
+            paths.ffmpeg.clone(),
+            &paths.ffmpeg_sha256,
+            &lock_digest,
+            size_or(paths.ffmpeg_size_bytes, &paths.ffmpeg)?,
+        )?,
+    }))
 }
 
 struct LockedHelperDigest {
@@ -767,10 +809,10 @@ fn parse_locked_helpers(value: &Value) -> Option<LockedHelpers> {
         return None;
     }
     let components = value.get("components").and_then(Value::as_array)?;
-    if components.len() != 4 {
+    if components.len() != 3 {
         return None;
     }
-    let required = ["yt-dlp", "deno", "ffmpeg", "ffprobe"];
+    let required = ["yt-dlp", "deno", "ffmpeg"];
     if !required.iter().all(|required_name| {
         components
             .iter()
@@ -1072,7 +1114,7 @@ mod tests {
 
     #[test]
     fn ready_lock_requires_all_exact_sidecar_source_names() {
-        let components = ["yt-dlp", "deno", "ffmpeg", "ffprobe"]
+        let components = ["yt-dlp", "deno", "ffmpeg"]
             .into_iter()
             .map(|name| {
                 serde_json::json!({
@@ -1093,7 +1135,7 @@ mod tests {
         });
         seal_lock(&mut value);
         let locked = parse_locked_helpers(&value).expect("valid ready lock");
-        assert_eq!(locked.components.len(), 4);
+        assert_eq!(locked.components.len(), 3);
 
         value["components"][0]["filename"] = serde_json::json!("yt-dlp.exe");
         seal_lock(&mut value);
@@ -1131,7 +1173,6 @@ mod tests {
             ytdlp: open("yt-dlp"),
             deno: open("deno"),
             ffmpeg: open("ffmpeg"),
-            ffprobe: open("ffprobe"),
         };
         let mut spec = ManagedProcessSpec::youtube_ytdlp(
             vec![OsString::from("--ignore-config")],
