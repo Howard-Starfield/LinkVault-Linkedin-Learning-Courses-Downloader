@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.24 - 2026-08-29
+
+- **Per-provider save-to destinations.** LinkedIn, Coursera, Newspaper, and YouTube no longer share one download folder; empty destinations prompt before download or schedule.
+- **Recover LinkedIn completed courses from the save-to folder.** Choosing or saving a LinkedIn download folder scans for existing course layouts, imports completed jobs into History/Completed, and stays idempotent on re-open.
+- **LinkedIn/Coursera artifact rows stay on one line at mid widths.** Download and Schedule no longer wrap under the title until the intentional `@container` stack at 720px.
+- **Clearer newspaper recovery labels.** Settings actions read “Recover newspaper archive” and “Recover snapshot folder.”
+
 ## 0.2.23 - 2026-08-26
 
 - **YouTube helpers install post-setup (~220 MB).** First YouTube use can download the signed Infield media toolchain into `LinkVaultData` instead of bundling helpers in the installer.
