@@ -212,7 +212,12 @@ fn archive_import_prunes_newspaper_snapshot_tree() {
         .save(snapshots.join("NY_20260809_A02.png"))
         .unwrap();
 
-    assert_eq!(archive_service::import(&db_path, &archive).unwrap(), 1);
+    assert_eq!(
+        archive_service::import(&db_path, &archive)
+            .unwrap()
+            .imported,
+        1
+    );
     assert!(archive_service::import(
         &db_path,
         &archive.join(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
@@ -223,6 +228,57 @@ fn archive_import_prunes_newspaper_snapshot_tree() {
         .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row.get(0))
         .unwrap();
     assert_eq!(pages, 1, "snapshot crops must not be re-imported as pages");
+}
+
+#[test]
+fn archive_import_recognizes_edition_folder_layout() {
+    let directory = tempdir().unwrap();
+    let db_path = directory.path().join("test.db");
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    storage::initialize(&connection).unwrap();
+    drop(connection);
+
+    let archive = directory.path().join("archive");
+    let edition_pages = archive.join("波士頓 - BO").join("2026-08-09");
+    std::fs::create_dir_all(&edition_pages).unwrap();
+    std::fs::write(
+        edition_pages.join("A01.webp"),
+        super::clipping_assets::encode_test_webp(4, 4),
+    )
+    .unwrap();
+
+    let snapshots = archive.join(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME);
+    std::fs::create_dir_all(&snapshots).unwrap();
+    image::DynamicImage::new_rgb8(4, 4)
+        .save(snapshots.join("NY_20260809_A01.png"))
+        .unwrap();
+
+    let youtubes = archive.join("Youtubes");
+    std::fs::create_dir_all(&youtubes).unwrap();
+    image::DynamicImage::new_rgb8(4, 4)
+        .save(youtubes.join("LA_20260809_A01.png"))
+        .unwrap();
+
+    let counts = archive_service::import(&db_path, &archive).unwrap();
+    assert_eq!(counts.imported, 1);
+    assert_eq!(counts.already_known, 0);
+    assert_eq!(counts.skipped, 0);
+    let again = archive_service::import(&db_path, &archive).unwrap();
+    assert_eq!(again.imported, 0);
+    assert_eq!(again.already_known, 1);
+    assert_eq!(again.skipped, 0);
+
+    let connection = Connection::open(&db_path).unwrap();
+    let pages: usize = connection
+        .query_row("SELECT COUNT(*) FROM newspaper_pages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        pages, 1,
+        "snapshots/Youtubes files are not imported as editions"
+    );
 }
 
 #[test]

@@ -820,7 +820,7 @@ pub async fn import_existing_newspaper_archive(
 ) -> Result<usize, String> {
     let db_path = state.db_path.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        archive_service::import(&db_path, Path::new(&path))
+        archive_service::import(&db_path, Path::new(&path)).map(|counts| counts.imported)
     })
     .await
     .map_err(|error| error.to_string())?;

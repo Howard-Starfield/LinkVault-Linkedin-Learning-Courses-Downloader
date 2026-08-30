@@ -1,5 +1,6 @@
 //! Existing-archive registration and repair workflows.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, Utc};
@@ -208,21 +209,57 @@ fn remove_redundant_optimized_sources(
     Ok((removed, warnings))
 }
 
-pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
+pub struct EditionImportCounts {
+    pub imported: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub already_known: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub skipped: usize,
+}
+
+const YOUTUBES_DIRECTORY_NAME: &str = "Youtubes";
+
+pub(super) fn import(db_path: &Path, root: &Path) -> Result<EditionImportCounts, String> {
     if !root.is_dir() {
         return Err("The selected newspaper archive folder does not exist.".to_string());
     }
-    if root.file_name().is_some_and(|name| {
-        name.to_string_lossy()
-            .eq_ignore_ascii_case(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
-    }) {
+    if root
+        .file_name()
+        .is_some_and(|name| is_snapshot_directory_name(&name.to_string_lossy()))
+    {
         return Err(
             "The Newspaper snapshots folder cannot be imported as source pages.".to_string(),
         );
     }
+
+    let mut connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
+    let known_codes = load_catalog_codes(&connection)?;
+    let mut groups: BTreeMap<(String, String, PathBuf), Vec<PathBuf>> = BTreeMap::new();
+    let mut skipped = 0;
+
+    let root_entries = std::fs::read_dir(root).map_err(|error| error.to_string())?;
+    for entry in root_entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            skipped += 1;
+            continue;
+        };
+        if is_snapshot_directory_name(name) || is_youtubes_directory_name(name) {
+            continue;
+        }
+        match parse_edition_folder_name(name) {
+            Some((_, code)) if known_codes.contains(&code) => {
+                collect_edition_date_images(&path, &code, &mut groups)?;
+            }
+            _ => skipped += 1,
+        }
+    }
+
     let mut stack = vec![root.to_path_buf()];
-    let mut groups: std::collections::BTreeMap<(String, String, PathBuf), Vec<PathBuf>> =
-        std::collections::BTreeMap::new();
     while let Some(directory) = stack.pop() {
         let entries = std::fs::read_dir(&directory).map_err(|error| error.to_string())?;
         for entry in entries {
@@ -230,20 +267,15 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
             let path = entry.path();
             if path.is_dir() {
                 if path.file_name().is_some_and(|name| {
-                    name.to_string_lossy()
-                        .eq_ignore_ascii_case(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+                    let name = name.to_string_lossy();
+                    is_snapshot_directory_name(&name) || is_youtubes_directory_name(&name)
                 }) {
                     continue;
                 }
                 stack.push(path);
                 continue;
             }
-            let extension = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+            if !is_importable_image(&path) {
                 continue;
             }
             let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
@@ -259,7 +291,6 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
         }
     }
 
-    let mut connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
     let now = Utc::now().timestamp();
     let batch_id = naming::unique_id("newspaper-import");
     let transaction = connection
@@ -275,18 +306,13 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
         )
         .map_err(|error| error.to_string())?;
     let mut imported = 0;
+    let mut already_known = 0;
     for ((code, date, directory), mut files) in groups {
-        let edition_exists: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM newspaper_editions WHERE code = ?1 AND publication_date = '')",
-                params![code],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if !edition_exists {
+        if !known_codes.contains(&code) {
             continue;
         }
         files.sort();
+        files.dedup();
         let job_id = naming::unique_id("newspaper-import-job");
         let mut valid_pages = Vec::new();
         for file in files {
@@ -333,6 +359,7 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
             )
             .map_err(|error| error.to_string())?;
         if transaction.changes() == 0 {
+            already_known += 1;
             continue;
         }
         for (file, page_number, bytes, checksum, width, height) in valid_pages {
@@ -361,7 +388,89 @@ pub(super) fn import(db_path: &Path, root: &Path) -> Result<usize, String> {
         imported += 1;
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(imported)
+    Ok(EditionImportCounts {
+        imported,
+        already_known,
+        skipped,
+    })
+}
+
+fn load_catalog_codes(connection: &Connection) -> Result<HashSet<String>, String> {
+    let mut statement = connection
+        .prepare("SELECT code FROM newspaper_editions WHERE publication_date = ''")
+        .map_err(|error| error.to_string())?;
+    let codes = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(codes)
+}
+
+fn collect_edition_date_images(
+    edition_dir: &Path,
+    code: &str,
+    groups: &mut BTreeMap<(String, String, PathBuf), Vec<PathBuf>>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(edition_dir).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(date) = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let mut images = Vec::new();
+        let files = std::fs::read_dir(&path).map_err(|error| error.to_string())?;
+        for file_entry in files {
+            let file_entry = file_entry.map_err(|error| error.to_string())?;
+            let file_path = file_entry.path();
+            if file_path.is_dir() || !is_importable_image(&file_path) {
+                continue;
+            }
+            images.push(file_path);
+        }
+        if !images.is_empty() {
+            groups
+                .entry((code.to_string(), date, path))
+                .or_default()
+                .extend(images);
+        }
+    }
+    Ok(())
+}
+
+fn parse_edition_folder_name(name: &str) -> Option<(String, String)> {
+    let (left, code) = name.rsplit_once(" - ")?;
+    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        Some((left.to_string(), code.to_string()))
+    } else {
+        None
+    }
+}
+
+fn is_snapshot_directory_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(super::clipping_roots::SNAPSHOT_DIRECTORY_NAME)
+}
+
+fn is_youtubes_directory_name(name: &str) -> bool {
+    name == YOUTUBES_DIRECTORY_NAME
+}
+
+fn is_importable_image(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
 }
 
 pub(super) fn archive_identity(file_name: &str, parent: Option<&Path>) -> Option<(String, String)> {
