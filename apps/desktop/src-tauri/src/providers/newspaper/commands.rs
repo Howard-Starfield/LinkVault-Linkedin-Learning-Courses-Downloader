@@ -773,7 +773,7 @@ pub async fn reconnect_newspaper_snapshot_root(
         let Some(selection) = app
             .dialog()
             .file()
-            .set_title("Reconnect Newspaper snapshots folder")
+            .set_title("Recover Newspaper snapshots folder")
             .blocking_pick_folder()
         else {
             return Ok(ReconnectNewspaperSnapshotRootResult::Cancelled);

@@ -1724,15 +1724,15 @@ export default function App() {
     const picked = await open({
       directory: true,
       multiple: false,
-      title: "Register existing newspaper archive"
+      title: "Recover newspaper archive"
     });
     if (typeof picked !== "string") return;
     setIsRegisteringNewspaperArchive(true);
     try {
       const imported = await invoke<number>("import_existing_newspaper_archive", { path: picked });
-      toast.success(`Registered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
+      toast.success(`Recovered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
     } catch (error) {
-      toast.error("Could not register newspaper archive", { description: String(error) });
+      toast.error("Could not recover newspaper archive", { description: String(error) });
     } finally {
       setIsRegisteringNewspaperArchive(false);
     }
@@ -3035,10 +3035,10 @@ export default function App() {
               variant="outline"
               onClick={() => void registerNewspaperArchive()}
               loading={isRegisteringNewspaperArchive}
-              loadingLabel="Registering"
+              loadingLabel="Recovering"
             >
               <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
-              Register archive
+              Recover newspaper archive
             </Button>
             <Button
               type="button"

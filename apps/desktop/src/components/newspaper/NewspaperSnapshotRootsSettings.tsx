@@ -34,7 +34,7 @@ export function NewspaperSnapshotRootsSettings({ open }: { open: boolean }) {
     <div className="snapshot-root-settings">
       <div className="settings-section-subtitle">Snapshot folders</div>
       <p className="settings-hint">
-        Created automatically from Newspaper download destinations. Reconnect only when an existing
+        Created automatically from Newspaper download destinations. Recover only when an existing
         <strong> Newspaper snapshots</strong> folder has moved.
       </p>
       {error ? <p className="snapshot-root-settings__error" role="alert">Could not load snapshot folders. {error}</p> : null}
@@ -76,15 +76,15 @@ export function NewspaperSnapshotRootsSettings({ open }: { open: boolean }) {
                       .then((result) => {
                         if (result.status === "connected") {
                           replaceRoot(result.root);
-                          toast.success("Snapshot folder reconnected");
+                          toast.success("Snapshot folder recovered");
                         }
                       })
-                      .catch((cause) => toast.error("Reconnect failed", { description: String(cause) }))
+                      .catch((cause) => toast.error("Could not recover snapshot folder", { description: String(cause) }))
                       .finally(() => setBusy(null));
                   }}
                   size="xs"
                   variant="primary"
-                ><Link2 aria-hidden="true" /> Reconnect</Button>
+                ><Link2 aria-hidden="true" /> Recover snapshot folder</Button>
               ) : null}
             </div>
           </div>
