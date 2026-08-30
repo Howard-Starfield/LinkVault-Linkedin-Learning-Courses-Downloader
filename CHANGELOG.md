@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.25 - 2026-08-29
+
+- **One-button Newspaper library recovery.** Settings → Recover newspaper library imports edition pages from the live `{name} - CODE/date/*.webp` layout and clippings from `Newspaper snapshots` (image + `note.md`), registers the snapshot root, and skips already-known rows on re-run.
+- **Settings recovery cleanup.** Removed the separate Recover snapshot folder CTA; Repair existing stays as maintenance-only (legacy rename / optimize / redundant JPGs).
+
 ## 0.2.24 - 2026-08-29
 
 - **Per-provider save-to destinations.** LinkedIn, Coursera, Newspaper, and YouTube no longer share one download folder; empty destinations prompt before download or schedule.

@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "linkvault"
-version = "0.2.24"
+version = "0.2.25"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
