@@ -1,4 +1,4 @@
-import { FolderOpen, Link2, RefreshCw } from "lucide-react";
+import { FolderOpen, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button, StatusBadge } from "../primitives";
@@ -6,11 +6,16 @@ import {
   checkNewspaperSnapshotRoot,
   listNewspaperSnapshotRoots,
   openNewspaperSnapshotRoot,
-  reconnectNewspaperSnapshotRoot,
   type NewspaperSnapshotRoot
 } from "./newspaper-api";
 
-export function NewspaperSnapshotRootsSettings({ open }: { open: boolean }) {
+export function NewspaperSnapshotRootsSettings({
+  open,
+  refreshToken = 0
+}: {
+  open: boolean;
+  refreshToken?: number;
+}) {
   const [roots, setRoots] = useState<NewspaperSnapshotRoot[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -24,7 +29,7 @@ export function NewspaperSnapshotRootsSettings({ open }: { open: boolean }) {
 
   useEffect(() => {
     if (open) void refresh();
-  }, [open]);
+  }, [open, refreshToken]);
 
   const replaceRoot = (root: NewspaperSnapshotRoot) => {
     setRoots((current) => current.map((candidate) => candidate.rootId === root.rootId ? root : candidate));
@@ -34,8 +39,8 @@ export function NewspaperSnapshotRootsSettings({ open }: { open: boolean }) {
     <div className="snapshot-root-settings">
       <div className="settings-section-subtitle">Snapshot folders</div>
       <p className="settings-hint">
-        Created automatically from Newspaper download destinations. Recover only when an existing
-        <strong> Newspaper snapshots</strong> folder has moved.
+        Created automatically from Newspaper download destinations. Use Recover newspaper library above
+        to import editions and clippings when a folder has moved or gone offline.
       </p>
       {error ? <p className="snapshot-root-settings__error" role="alert">Could not load snapshot folders. {error}</p> : null}
       {!error && roots.length === 0 ? <p className="settings-hint">No snapshot folder exists yet. Saving the first clipping creates one beside its download destination.</p> : null}
@@ -67,25 +72,6 @@ export function NewspaperSnapshotRootsSettings({ open }: { open: boolean }) {
                 size="xs"
                 variant="outline"
               ><RefreshCw aria-hidden="true" /> Check again</Button>
-              {root.status === "offline" || root.status === "marker_mismatch" ? (
-                <Button
-                  disabled={busy === root.rootId}
-                  onClick={() => {
-                    setBusy(root.rootId);
-                    void reconnectNewspaperSnapshotRoot(root.rootId)
-                      .then((result) => {
-                        if (result.status === "connected") {
-                          replaceRoot(result.root);
-                          toast.success("Snapshot folder recovered");
-                        }
-                      })
-                      .catch((cause) => toast.error("Could not recover snapshot folder", { description: String(cause) }))
-                      .finally(() => setBusy(null));
-                  }}
-                  size="xs"
-                  variant="primary"
-                ><Link2 aria-hidden="true" /> Recover snapshot folder</Button>
-              ) : null}
             </div>
           </div>
         ))}
