@@ -26,6 +26,7 @@
     "dev:youtube-internal": "npm run verify:youtube-helpers && tauri dev --config src-tauri/tauri.youtube.conf.json",
     "build:youtube-internal": "npm run verify:youtube-helpers && tauri build --config src-tauri/tauri.youtube.conf.json",
     "verify:youtube-ui": "node ./scripts/verify-youtube-ui.mjs",
+    "verify:linkedin-artifact-row": "node ./scripts/verify-linkedin-artifact-row.mjs",
     "verify:persistence": "node ./scripts/verify-persistence.mjs && cargo test --manifest-path ./src-tauri/Cargo.toml persistence_gate_ -- --test-threads=1",
     "verify:persistence-baseline": "node ./scripts/verify-persistence-baseline.mjs",
     "verify:ui": "node ./scripts/verify-ui.mjs",

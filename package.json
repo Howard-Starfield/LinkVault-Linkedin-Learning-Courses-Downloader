@@ -13,6 +13,7 @@
     "verify:persistence-baseline": "npm --prefix apps/desktop run verify:persistence-baseline",
     "verify:ui": "npm --prefix apps/desktop run verify:ui",
     "verify:youtube-ui": "npm --prefix apps/desktop run verify:youtube-ui",
+    "verify:linkedin-artifact-row": "npm --prefix apps/desktop run verify:linkedin-artifact-row",
     "verify:no-any": "npm --prefix apps/desktop run verify:no-any",
     "verify:visual": "npm --prefix apps/desktop run verify:visual",
     "verify:tauri-smoke": "npm --prefix apps/desktop run verify:tauri-smoke",
