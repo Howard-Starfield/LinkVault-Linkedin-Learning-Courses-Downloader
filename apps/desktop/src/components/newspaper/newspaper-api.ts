@@ -209,6 +209,23 @@ export type ReconnectNewspaperSnapshotRootResult =
   | { status: "cancelled" }
   | { status: "connected"; root: NewspaperSnapshotRoot };
 
+export type RecoverNewspaperLibraryResult = {
+  editionsImported: number;
+  editionsAlreadyKnown: number;
+  editionsSkipped: number;
+  clippingsImported: number;
+  clippingsAlreadyKnown: number;
+  clippingsSkipped: number;
+  snapshotRoot:
+    | "registered"
+    | "reconnected"
+    | "alreadyConnected"
+    | "missing"
+    | "markerMismatch"
+    | "unavailable";
+  warnings: string[];
+};
+
 export type EnsureNewspaperClippingThumbnailResponse = {
   status: "ready" | "generated";
   thumbnailUrl: string;
@@ -379,6 +396,10 @@ export function openNewspaperSnapshotRoot(rootId: string) {
   const harness = clippingBrowserHarness()?.openRoot;
   if (harness) return harness(rootId);
   return invoke<void>("open_newspaper_snapshot_root", { rootId });
+}
+
+export function recoverNewspaperLibrary(path: string) {
+  return invoke<RecoverNewspaperLibraryResult>("recover_newspaper_library", { path });
 }
 
 export function clippingErrorCode(error: unknown) {

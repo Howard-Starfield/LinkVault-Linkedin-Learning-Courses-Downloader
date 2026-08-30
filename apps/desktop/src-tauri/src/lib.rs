@@ -221,6 +221,7 @@ pub fn run() {
             newspaper::commands::reconnect_newspaper_snapshot_root,
             newspaper::commands::open_newspaper_snapshot_root,
             newspaper::commands::open_newspaper_download_folder,
+            newspaper::commands::recover_newspaper_library,
             newspaper::commands::import_existing_newspaper_archive,
             newspaper::commands::repair_newspaper_library,
         ])

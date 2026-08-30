@@ -62,6 +62,7 @@ import { NewspaperView } from "./components/newspaper/NewspaperView";
 import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
 import { NewspaperSnapshotRootsSettings } from "./components/newspaper/NewspaperSnapshotRootsSettings";
+import { recoverNewspaperLibrary } from "./components/newspaper/newspaper-api";
 import { useClippingNoteExitBridge } from "./components/newspaper/useClippingNoteExitBridge";
 import { useNewspaperClippingNavigation } from "./components/newspaper/useNewspaperClippingNavigation";
 import {
@@ -384,7 +385,8 @@ export default function App() {
   const [pauseUpdatingTaskId, setPauseUpdatingTaskId] = useState<string | null>(null);
   const [isPausingAll, setIsPausingAll] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
-  const [isRegisteringNewspaperArchive, setIsRegisteringNewspaperArchive] = useState(false);
+  const [isRecoveringNewspaperLibrary, setIsRecoveringNewspaperLibrary] = useState(false);
+  const [newspaperSnapshotRootsRefreshToken, setNewspaperSnapshotRootsRefreshToken] = useState(0);
   const [isRepairingNewspaperLibrary, setIsRepairingNewspaperLibrary] = useState(false);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
@@ -1727,22 +1729,28 @@ export default function App() {
     }
   }
 
-  async function registerNewspaperArchive() {
+  async function handleRecoverNewspaperLibrary() {
     if (!isTauriRuntime()) return;
     const picked = await open({
       directory: true,
       multiple: false,
-      title: "Recover newspaper archive"
+      title: "Recover newspaper library"
     });
     if (typeof picked !== "string") return;
-    setIsRegisteringNewspaperArchive(true);
+    setIsRecoveringNewspaperLibrary(true);
     try {
-      const imported = await invoke<number>("import_existing_newspaper_archive", { path: picked });
-      toast.success(`Recovered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
+      const result = await recoverNewspaperLibrary(picked);
+      const description = [
+        `${result.editionsImported} edition${result.editionsImported === 1 ? "" : "s"} and ${result.clippingsImported} clipping${result.clippingsImported === 1 ? "" : "s"} imported`,
+        `${result.editionsAlreadyKnown} edition${result.editionsAlreadyKnown === 1 ? "" : "s"} and ${result.clippingsAlreadyKnown} clipping${result.clippingsAlreadyKnown === 1 ? "" : "s"} already known`,
+        result.warnings.length ? `${result.warnings.length} warning${result.warnings.length === 1 ? "" : "s"}` : null
+      ].filter(Boolean).join("; ");
+      toast.success("Newspaper library recovered.", { description });
+      setNewspaperSnapshotRootsRefreshToken((token) => token + 1);
     } catch (error) {
-      toast.error("Could not recover newspaper archive", { description: String(error) });
+      toast.error("Could not recover newspaper library", { description: String(error) });
     } finally {
-      setIsRegisteringNewspaperArchive(false);
+      setIsRecoveringNewspaperLibrary(false);
     }
   }
 
@@ -3041,12 +3049,12 @@ export default function App() {
             <Button
               type="button"
               variant="outline"
-              onClick={() => void registerNewspaperArchive()}
-              loading={isRegisteringNewspaperArchive}
+              onClick={() => void handleRecoverNewspaperLibrary()}
+              loading={isRecoveringNewspaperLibrary}
               loadingLabel="Recovering"
             >
               <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
-              Recover newspaper archive
+              Recover newspaper library
             </Button>
             <Button
               type="button"
@@ -3059,7 +3067,16 @@ export default function App() {
               Repair existing
             </Button>
           </div>
-          <NewspaperSnapshotRootsSettings open={isSettingsOpen} />
+          <p className="settings-hint">
+            Choose your Newspaper download folder. Imports editions and clippings from Newspaper snapshots.
+          </p>
+          <p className="settings-hint">
+            Maintenance: rename legacy pages / optimize / remove redundant JPGs.
+          </p>
+          <NewspaperSnapshotRootsSettings
+            open={isSettingsOpen}
+            refreshToken={newspaperSnapshotRootsRefreshToken}
+          />
           <div className="settings-section-subtitle">Optimization governor</div>
           <div className="settings-two-column">
             <Field label="Memory per worker (MB)">

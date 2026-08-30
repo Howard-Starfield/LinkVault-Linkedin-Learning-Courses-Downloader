@@ -641,7 +641,7 @@ fn user_display_locator(locator: &str) -> String {
         .unwrap_or_else(|| locator.to_owned())
 }
 
-fn existing_safe_directory(path: &Path) -> Result<PathBuf, ClippingError> {
+pub(super) fn existing_safe_directory(path: &Path) -> Result<PathBuf, ClippingError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
     if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_dir() {
