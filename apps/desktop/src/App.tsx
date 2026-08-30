@@ -1329,7 +1329,13 @@ export default function App() {
   }
 
   async function copyQueuedCourseUrl(job: QueuedDownloadJob) {
-    const url = job.source_url.trim() || `https://www.linkedin.com/learning/${job.course_slug}`;
+    const url = linkedinLearningSourceUrl(job);
+    if (!url) {
+      toast.info("No LinkedIn URL", {
+        description: "Recovered courses from a local folder do not have a LinkedIn Learning link."
+      });
+      return;
+    }
     try {
       await copyTextToClipboard(url);
       toast.success("Course URL copied", { description: url });
@@ -1705,6 +1711,8 @@ export default function App() {
         clickZoom: newspaperClickZoom,
         pageTone: newspaperPageTone
       });
+      // Recovery runs inside save_download_preferences; refresh so Completed reflects imports.
+      await refreshBootstrapState();
       toast.success("Settings saved", {
         description: "Download defaults will be restored the next time LinkedVault opens."
       });
@@ -5176,13 +5184,20 @@ function writePreviewState(jobs: QueuedDownloadJob[], events: PersistedJobEvent[
   window.sessionStorage.setItem(previewEventsStorageKey, JSON.stringify(events));
 }
 
+function linkedinLearningSourceUrl(job: Pick<QueuedDownloadJob, "source_url" | "course_slug">): string {
+  const trimmed = job.source_url.trim();
+  if (trimmed) return trimmed;
+  if (job.course_slug.startsWith("local:")) return "";
+  return `https://www.linkedin.com/learning/${job.course_slug}`;
+}
+
 function downloadHistoryFromJobs(jobs: QueuedDownloadJob[]): DownloadHistoryEntry[] {
   return jobs
     .filter((job) => job.status === "completed")
     .map((job) => ({
       job_id: job.id,
       course_slug: job.course_slug,
-      source_url: job.source_url || `https://www.linkedin.com/learning/${job.course_slug}`,
+      source_url: linkedinLearningSourceUrl(job),
       course_title: courseDisplayName(job),
       output_dir: job.output_dir || "",
       completed_at: job.updated_at ?? 0

@@ -139,12 +139,13 @@ pub struct ImportCounts {
 
 pub fn commit(writer: &DatabaseWriter, raw_path: &str, now: i64) -> Result<(String, ImportCounts), String> {
     let decision = resolve_scan_decision(raw_path)?;
-    let (root, courses) = scan_for_decision(&decision)?;
+    let (root, courses, skipped) = scan_for_decision(&decision)?;
     let output_dir = root.display_path().to_string();
     writer
         .execute(write_context("commit_linkedin_destination"), move |connection| {
             merge_download_preferences(connection, &output_dir, now).map_err(import_error_as_db)?;
-            let counts = import_courses(connection, &root, &courses, now, false).map_err(import_error_as_db)?;
+            let counts =
+                import_courses(connection, &root, &courses, skipped, now, false).map_err(import_error_as_db)?;
             Ok((output_dir, counts))
         })
         .map_err(map_database_write_error)
@@ -152,10 +153,10 @@ pub fn commit(writer: &DatabaseWriter, raw_path: &str, now: i64) -> Result<(Stri
 
 pub fn recover_into(writer: &DatabaseWriter, output_dir: &str, now: i64) -> Result<ImportCounts, String> {
     let root = LinkedInOutputRoot::parse(output_dir)?;
-    let courses = scan_output_root(&root)?;
+    let (courses, skipped) = scan_output_root(&root)?;
     writer
         .execute(write_context("recover_linkedin_folder"), move |connection| {
-            import_courses(connection, &root, &courses, now, false).map_err(import_error_as_db)
+            import_courses(connection, &root, &courses, skipped, now, false).map_err(import_error_as_db)
         })
         .map_err(map_database_write_error)
 }
@@ -201,22 +202,25 @@ fn resolve_scan_decision(raw_path: &str) -> Result<ScanDecision, String> {
     })
 }
 
-fn scan_for_decision(decision: &ScanDecision) -> Result<(LinkedInOutputRoot, Vec<LinkedInCourseDir>), String> {
+fn scan_for_decision(
+    decision: &ScanDecision,
+) -> Result<(LinkedInOutputRoot, Vec<LinkedInCourseDir>, usize), String> {
     match decision {
         ScanDecision::OutputRoot { root } => {
-            let courses = scan_output_root(root)?;
-            Ok((root.clone(), courses))
+            let (courses, skipped) = scan_output_root(root)?;
+            Ok((root.clone(), courses, skipped))
         }
         ScanDecision::SingleCourse { parent, course } => {
             let course_dir = classify_course_dir(course)?
                 .ok_or_else(|| "The selected folder does not look like a LinkedIn course.".to_string())?;
-            Ok((parent.clone(), vec![course_dir]))
+            Ok((parent.clone(), vec![course_dir], 0))
         }
     }
 }
 
-fn scan_output_root(root: &LinkedInOutputRoot) -> Result<Vec<LinkedInCourseDir>, String> {
+fn scan_output_root(root: &LinkedInOutputRoot) -> Result<(Vec<LinkedInCourseDir>, usize), String> {
     let mut courses = Vec::new();
+    let mut skipped = 0;
     for entry in fs::read_dir(root.as_path()).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
@@ -229,15 +233,18 @@ fn scan_output_root(root: &LinkedInOutputRoot) -> Result<Vec<LinkedInCourseDir>,
         }
         if let Some(course) = classify_course_dir(&path)? {
             courses.push(course);
+        } else {
+            skipped += 1;
         }
     }
-    Ok(courses)
+    Ok((courses, skipped))
 }
 
 fn import_courses(
     connection: &mut Connection,
     root: &LinkedInOutputRoot,
     courses: &[LinkedInCourseDir],
+    skipped: usize,
     now: i64,
     update_preferences: bool,
 ) -> Result<ImportCounts, String> {
@@ -255,7 +262,6 @@ fn import_courses(
         selected_quality_from_preferences_json(&preferences_json)
     };
     let mut imported = 0;
-    let skipped = 0;
     let mut already_known = 0;
 
     connection
@@ -660,7 +666,7 @@ fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     {
@@ -774,6 +780,7 @@ mod tests {
 
         let (_, counts) = commit(&writer, root.to_str().unwrap(), 1_700_000_000).unwrap();
         assert_eq!(counts.imported, 1);
+        assert_eq!(counts.skipped, 1);
         assert_eq!(list_jobs_by_status(&connection, "completed").unwrap().len(), 1);
     }
 
