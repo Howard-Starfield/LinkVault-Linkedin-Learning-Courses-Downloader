@@ -392,6 +392,30 @@ pub struct RepairNewspaperLibraryResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverNewspaperLibraryResult {
+    pub editions_imported: u32,
+    pub editions_already_known: u32,
+    pub editions_skipped: u32,
+    pub clippings_imported: u32,
+    pub clippings_already_known: u32,
+    pub clippings_skipped: u32,
+    pub snapshot_root: RecoverSnapshotRootStatus,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoverSnapshotRootStatus {
+    Registered,
+    Reconnected,
+    AlreadyConnected,
+    Missing,
+    MarkerMismatch,
+    Unavailable,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
