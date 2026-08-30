@@ -379,7 +379,6 @@ impl ClippingService {
         Ok((root, status))
     }
 
-    #[allow(dead_code)] // Wired by recover_newspaper_library (Task 6).
     pub(crate) fn import_discovered_clippings(
         &self,
         root: &ClippingRoot,
@@ -407,7 +406,6 @@ impl ClippingService {
         Ok((imported, known, skipped, warnings))
     }
 
-    #[allow(dead_code)] // Called from import_discovered_clippings.
     fn import_one_discovered_clipping(
         &self,
         root: &ClippingRoot,
@@ -1740,7 +1738,6 @@ impl ClippingService {
     }
 }
 
-#[allow(dead_code)] // Used by import_discovered_clippings (Task 6).
 enum DiscoveredImportOutcome {
     Imported(Vec<String>),
     Known,
@@ -1758,7 +1755,6 @@ fn snapshot_locator_matches(stored_locator: &str, snapshot: &Path) -> bool {
     download_locator_key(Path::new(stored_locator)) == download_locator_key(&canonical)
 }
 
-#[allow(dead_code)] // Used by import_discovered_clippings (Task 6).
 fn inspect_recovered_webp(bytes: &[u8]) -> Result<(u32, u32, u64, String), ClippingError> {
     let invalid = || ClippingError::new(ClippingErrorCode::AssetValidationFailed);
     let byte_count = u64::try_from(bytes.len()).map_err(|_| invalid())?;

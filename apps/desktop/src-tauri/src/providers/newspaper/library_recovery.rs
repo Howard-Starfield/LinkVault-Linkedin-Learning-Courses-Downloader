@@ -1,22 +1,27 @@
-//! Pure snapshot clipping discovery helpers for library recovery.
+//! Newspaper library recovery: path resolve, edition import, and clipping import.
 //!
-//! Walks an on-disk `Newspaper snapshots` tree and parses clipping folders.
-//! Root-marker inspection and recovered titles are used by `ClippingService`
-//! import; database writes stay in the service.
-
-#![cfg_attr(not(test), allow(dead_code))]
+//! Snapshot discovery stays filesystem-only; SQLite writes go through
+//! `archive_service` (editions) and `ClippingService` (roots + clippings).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
 use serde::Deserialize;
 
+use super::archive_service;
 use super::clipping_assets::{ASSETS_DIR, CANONICAL_FILE_NAME};
 use super::clipping_models::{
-    validate_clipping_id, validate_page_number, validate_publication_date,
+    validate_clipping_id, validate_page_number, validate_publication_date, ClippingError,
+    ClippingErrorCode,
 };
 use super::clipping_note_mirror::NOTE_MIRROR_FILE_NAME;
-use super::clipping_roots::{INTERNAL_DIRECTORY_NAME, ROOT_MARKER_FILE_NAME};
+use super::clipping_roots::{
+    existing_safe_directory, INTERNAL_DIRECTORY_NAME, ROOT_MARKER_FILE_NAME,
+    SNAPSHOT_DIRECTORY_NAME,
+};
+use super::clipping_service::ClippingService;
+use super::models::{RecoverNewspaperLibraryResult, RecoverSnapshotRootStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveredClipping {
@@ -194,6 +199,128 @@ fn read_note_markdown(path: &Path) -> (String, bool) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(_) => (String::new(), true),
     }
+}
+
+pub(super) fn recover(
+    db_path: &Path,
+    clipping_service: &ClippingService,
+    path: &str,
+) -> Result<RecoverNewspaperLibraryResult, String> {
+    let (save_to, snapshot) = resolve_recover_roots(Path::new(path))?;
+    let editions = archive_service::import(db_path, &save_to)?;
+    let mut result = RecoverNewspaperLibraryResult {
+        editions_imported: count_u32(editions.imported),
+        editions_already_known: count_u32(editions.already_known),
+        editions_skipped: count_u32(editions.skipped),
+        clippings_imported: 0,
+        clippings_already_known: 0,
+        clippings_skipped: 0,
+        snapshot_root: RecoverSnapshotRootStatus::Missing,
+        warnings: Vec::new(),
+    };
+
+    let Some(snapshot) = snapshot else {
+        return Ok(result);
+    };
+
+    let now = Utc::now().timestamp();
+    match clipping_service.ensure_snapshot_root_for_destination(&save_to, now) {
+        Ok((root, status)) => {
+            result.snapshot_root = status;
+            match discover_clippings(Path::new(&root.locator)) {
+                Ok(discovered) => {
+                    match clipping_service.import_discovered_clippings(&root, &discovered, now) {
+                        Ok((imported, known, skipped, warnings)) => {
+                            result.clippings_imported = imported;
+                            result.clippings_already_known = known;
+                            result.clippings_skipped = skipped;
+                            result.warnings.extend(warnings);
+                        }
+                        Err(error) => {
+                            result.warnings.push(format!(
+                                "Clipping import did not finish: {}.",
+                                error.as_safe_string()
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    result
+                        .warnings
+                        .push(format!("Could not scan Newspaper snapshots: {error}"));
+                }
+            }
+        }
+        Err(error) => {
+            result.snapshot_root = map_clipping_error_to_status(&error, &snapshot);
+            result.warnings.push(format!(
+                "Snapshot root could not be registered: {}.",
+                error.as_safe_string()
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn resolve_recover_roots(pick: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let unsafe_folder =
+        || "The selected newspaper library folder is not a usable directory.".to_string();
+    if is_snapshot_directory(pick) {
+        let snapshot = existing_safe_directory(pick).map_err(|_| unsafe_folder())?;
+        let parent = snapshot.parent().ok_or_else(|| {
+            "The Newspaper snapshots folder has no parent download folder.".to_string()
+        })?;
+        let save_to = existing_safe_directory(parent).map_err(|_| unsafe_folder())?;
+        return Ok((save_to, Some(snapshot)));
+    }
+
+    let save_to = existing_safe_directory(pick).map_err(|_| unsafe_folder())?;
+    let snapshot = save_to.join(SNAPSHOT_DIRECTORY_NAME);
+    let snapshot = snapshot_directory_if_present(&snapshot);
+    Ok((save_to, snapshot))
+}
+
+fn is_snapshot_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(SNAPSHOT_DIRECTORY_NAME))
+}
+
+fn snapshot_directory_if_present(snapshot: &Path) -> Option<PathBuf> {
+    match fs::symlink_metadata(snapshot) {
+        Ok(_) => Some(snapshot.to_path_buf()),
+        Err(_) => None,
+    }
+}
+
+fn map_clipping_error_to_status(
+    error: &ClippingError,
+    snapshot: &Path,
+) -> RecoverSnapshotRootStatus {
+    match error.code {
+        ClippingErrorCode::AssetRootUnavailable if !snapshot_path_present(snapshot) => {
+            RecoverSnapshotRootStatus::Missing
+        }
+        ClippingErrorCode::AssetRootUnavailable if snapshot_marker_present(snapshot) => {
+            RecoverSnapshotRootStatus::MarkerMismatch
+        }
+        _ => RecoverSnapshotRootStatus::Unavailable,
+    }
+}
+
+fn snapshot_path_present(snapshot: &Path) -> bool {
+    fs::symlink_metadata(snapshot).is_ok()
+}
+
+fn snapshot_marker_present(snapshot: &Path) -> bool {
+    snapshot
+        .join(INTERNAL_DIRECTORY_NAME)
+        .join(ROOT_MARKER_FILE_NAME)
+        .is_file()
+}
+
+fn count_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 pub(super) fn recovered_clipping_title(edition_name: &str, page_number: &str) -> String {

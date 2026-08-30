@@ -28,12 +28,13 @@ use super::{
         UpdateNewspaperClippingRequest,
     },
     clipping_service::ClippingService,
-    job_service, library_events, library_service,
+    job_service, library_events, library_recovery, library_service,
     models::{
         CreateNewspaperBatchRequest, CreateNewspaperBatchResponse, CreateNewspaperScheduleRequest,
         NewspaperActivitySnapshot, NewspaperBootstrap, NewspaperEdition, NewspaperJob,
         NewspaperLibraryPage, NewspaperPage, NewspaperReadingProgress, NewspaperSchedule,
-        OptimizationRunOptions, OptimizationRuntimeStatus, RepairNewspaperLibraryResult,
+        OptimizationRunOptions, OptimizationRuntimeStatus, RecoverNewspaperLibraryResult,
+        RepairNewspaperLibraryResult,
     },
     optimization_service, overview_service, page_metadata, queue_service, reader_service,
     schedule_service,
@@ -810,6 +811,30 @@ pub async fn open_newspaper_snapshot_root(
 #[tauri::command]
 pub fn open_newspaper_download_folder(path: String) -> Result<(), String> {
     crate::shell::open_folder_in_explorer(Path::new(&path))
+}
+
+#[tauri::command]
+pub async fn recover_newspaper_library(
+    app: tauri::AppHandle,
+    state: State<'_, NewspaperState>,
+    clipping: State<'_, ClippingService>,
+    path: String,
+) -> Result<RecoverNewspaperLibraryResult, String> {
+    let db_path = state.db_path.clone();
+    let clipping = clipping.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        library_recovery::recover(&db_path, &clipping, &path)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.is_ok() {
+        library_events::after_archive_change(&app, &state)?;
+        let _ = app.emit(
+            "newspaper://clipping-invalidated",
+            serde_json::json!({ "reason": "library_recovered" }),
+        );
+    }
+    result
 }
 
 #[tauri::command]

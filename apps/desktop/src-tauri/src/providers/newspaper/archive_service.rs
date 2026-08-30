@@ -211,9 +211,7 @@ fn remove_redundant_optimized_sources(
 
 pub struct EditionImportCounts {
     pub imported: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub already_known: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub skipped: usize,
 }
 

@@ -1,16 +1,23 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{Local, Utc};
 use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
 use super::{
-    archive_service, batch_service, catalog_service, job_repository, job_service, library_service,
+    archive_service, batch_service, catalog_service,
+    clipping_assets::{encode_test_webp, ClippingAssetLayout, CANONICAL_FILE_NAME},
+    clipping_note_mirror::NOTE_MIRROR_FILE_NAME,
+    clipping_roots::SNAPSHOT_DIRECTORY_NAME,
+    clipping_service::ClippingService,
+    job_repository, job_service, library_recovery, library_service,
     models::*,
     optimization_service,
     optimizer::{optimize_page, OptimizationOutcome},
     page_metadata, queue_service, reader_service, schedule_service, storage,
 };
+use crate::app::database_diagnostics::DatabaseDiagnostics;
+use crate::app::database_writer::DatabaseWriter;
 
 fn request(destination: &Path, date: &str) -> CreateNewspaperBatchRequest {
     CreateNewspaperBatchRequest {
@@ -1650,4 +1657,98 @@ fn clear_newspaper_provider_data_wipes_only_newspaper_tables() {
         settings_count, 1,
         "the shared download.folder setting must survive a newspaper reset"
     );
+}
+
+const RECOVER_CLIPPING_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+fn recover_service_harness(temp: &tempfile::TempDir) -> (PathBuf, ClippingService) {
+    let db_path = temp.path().join("linkvault.sqlite3");
+    let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    drop(connection);
+    let diagnostics = DatabaseDiagnostics::default();
+    let writer = DatabaseWriter::start(db_path.clone(), diagnostics.clone()).unwrap();
+    let layout = ClippingAssetLayout::new(temp.path().join("newspaper-clippings"));
+    (
+        db_path.clone(),
+        ClippingService::new(db_path, writer, layout, diagnostics),
+    )
+}
+
+fn write_recover_fixture_tree(save_to: &Path) {
+    let edition_pages = save_to.join("波士頓 - BO").join("2026-08-09");
+    std::fs::create_dir_all(&edition_pages).unwrap();
+    std::fs::write(edition_pages.join("A01.webp"), encode_test_webp(8, 8)).unwrap();
+    std::fs::write(edition_pages.join("A01.jpg"), b"redundant-source").unwrap();
+
+    let clipping_dir = save_to
+        .join(SNAPSHOT_DIRECTORY_NAME)
+        .join("波士頓 - BO")
+        .join("2026-08-09")
+        .join(format!("Page A01 - {RECOVER_CLIPPING_ID}"));
+    std::fs::create_dir_all(&clipping_dir).unwrap();
+    std::fs::write(
+        clipping_dir.join(CANONICAL_FILE_NAME),
+        encode_test_webp(24, 16),
+    )
+    .unwrap();
+    std::fs::write(
+        clipping_dir.join(NOTE_MIRROR_FILE_NAME),
+        "recovered clipping note",
+    )
+    .unwrap();
+}
+
+#[test]
+fn recover_newspaper_library_imports_editions_and_clippings() {
+    let directory = tempdir().unwrap();
+    let (db_path, service) = recover_service_harness(&directory);
+    let save_to = directory.path().join("Newpaper");
+    std::fs::create_dir(&save_to).unwrap();
+    write_recover_fixture_tree(&save_to);
+
+    let first = library_recovery::recover(&db_path, &service, save_to.to_str().unwrap()).unwrap();
+    assert_eq!(first.editions_imported, 1);
+    assert_eq!(first.editions_already_known, 0);
+    assert_eq!(first.clippings_imported, 1);
+    assert_eq!(first.clippings_already_known, 0);
+    assert_eq!(first.clippings_skipped, 0);
+    assert_eq!(first.snapshot_root, RecoverSnapshotRootStatus::Registered);
+    assert!(
+        save_to
+            .join("波士頓 - BO")
+            .join("2026-08-09")
+            .join("A01.jpg")
+            .exists(),
+        "recover must not run repair's redundant JPG cleanup"
+    );
+
+    let connection = Connection::open(&db_path).unwrap();
+    let jobs: i64 = connection
+        .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(jobs, 1);
+    let (note, title): (String, String) = connection
+        .query_row(
+            "SELECT note_markdown, title FROM newspaper_clippings WHERE id = ?1",
+            params![RECOVER_CLIPPING_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(note, "recovered clipping note");
+    assert!(title.contains("A01"));
+
+    let snapshots = save_to.join(SNAPSHOT_DIRECTORY_NAME);
+    let second =
+        library_recovery::recover(&db_path, &service, snapshots.to_str().unwrap()).unwrap();
+    assert_eq!(second.editions_imported, 0);
+    assert_eq!(second.editions_already_known, 1);
+    assert_eq!(second.clippings_imported, 0);
+    assert_eq!(second.clippings_already_known, 1);
+    assert_eq!(
+        second.snapshot_root,
+        RecoverSnapshotRootStatus::AlreadyConnected
+    );
+
+    let _ = service.writer.shutdown();
 }
