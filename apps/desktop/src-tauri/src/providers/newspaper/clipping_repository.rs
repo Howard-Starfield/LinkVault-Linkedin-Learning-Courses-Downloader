@@ -238,6 +238,60 @@ pub fn insert_creating(connection: &Connection, record: &NewClippingRecord) -> R
     finish_savepoint(connection, "clipping_insert_search_document", result)
 }
 
+pub fn insert_recovered_ready(
+    connection: &Connection,
+    record: &NewClippingRecord,
+    note_markdown: &str,
+) -> Result<()> {
+    connection.execute_batch("SAVEPOINT clipping_insert_search_document")?;
+    let result = (|| {
+        connection.execute(
+            &format!(
+                "INSERT INTO newspaper_clippings ({CLIPPING_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, 'image/webp', ?16, ?17, ?20, ?21,
+                     1, 'ready', NULL, ?22, ?23, 1, ?24, ?24)"
+            ),
+            params![
+                record.id,
+                record.source_job_id,
+                record.source_page_id,
+                record.source_media_version_snapshot,
+                record.source_kind_snapshot.as_sql(),
+                record.source_mime_type_snapshot,
+                record.source_checksum_snapshot,
+                record.edition_code_snapshot,
+                record.edition_name_snapshot,
+                record.publication_date_snapshot,
+                record.page_number_snapshot,
+                record.source_pixel_width,
+                record.source_pixel_height,
+                record.crop_x,
+                record.crop_y,
+                record.crop_width,
+                record.crop_height,
+                record.asset_root_id,
+                record.asset_relative_path,
+                record.asset_byte_count,
+                record.asset_checksum_sha256,
+                record.title,
+                note_markdown,
+                record.now,
+            ],
+        )?;
+        let rowid = connection.last_insert_rowid();
+        insert_normalized_search_document(
+            connection,
+            rowid,
+            &record.title,
+            note_markdown,
+            &record.edition_name_snapshot,
+            &record.edition_code_snapshot,
+        )
+    })();
+    finish_savepoint(connection, "clipping_insert_search_document", result)
+}
+
 fn insert_normalized_search_document(
     connection: &Connection,
     rowid: i64,
@@ -1724,4 +1778,80 @@ pub fn unlink_sources_for_job(connection: &Connection, job_id: &str) -> Result<u
             )",
         params![job_id],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::newspaper::storage::{self, LEGACY_CLIPPING_ROOT_ID};
+
+    fn initialized() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        storage::initialize(&connection).unwrap();
+        connection
+    }
+
+    fn recovered_record(id: &str) -> NewClippingRecord {
+        NewClippingRecord {
+            id: id.to_string(),
+            source_job_id: None,
+            source_page_id: None,
+            source_media_version_snapshot: 1,
+            source_kind_snapshot: ClippingSourceKind::Optimized,
+            source_mime_type_snapshot: "image/webp".to_string(),
+            source_checksum_snapshot: None,
+            edition_code_snapshot: "NY".to_string(),
+            edition_name_snapshot: "New York".to_string(),
+            publication_date_snapshot: "2026-08-08".to_string(),
+            page_number_snapshot: "A01".to_string(),
+            source_pixel_width: 24,
+            source_pixel_height: 16,
+            crop_x: 0,
+            crop_y: 0,
+            crop_width: 24,
+            crop_height: 16,
+            asset_root_id: LEGACY_CLIPPING_ROOT_ID.to_owned(),
+            asset_relative_path: format!("assets/{id}/clipping-v1.webp"),
+            asset_byte_count: 1,
+            asset_checksum_sha256: "a".repeat(64),
+            title: "Recovered clipping title".to_string(),
+            now: 100,
+        }
+    }
+
+    #[test]
+    fn insert_recovered_ready_stores_ready_note_and_fts() {
+        let connection = initialized();
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let note_markdown = "snapshotrecoverynote unique body";
+        insert_recovered_ready(&connection, &recovered_record(id), note_markdown).unwrap();
+
+        let clipping = load_by_id(&connection, id).unwrap().unwrap();
+        assert_eq!(clipping.asset_state, ClippingAssetState::Ready);
+        assert_eq!(clipping.asset_version, 1);
+        assert_eq!(clipping.note_markdown, note_markdown);
+
+        let content_hits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_fts
+                 WHERE newspaper_clippings_fts MATCH 'snapshotrecoverynote'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_hits, 1);
+
+        let normalized_hits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM newspaper_clippings_normalized_fts
+                 WHERE newspaper_clippings_normalized_fts MATCH 'snapshotrecoverynote'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized_hits, 1);
+    }
 }
