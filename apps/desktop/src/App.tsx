@@ -56,6 +56,8 @@ import {
 import { CourseraView } from "./components/coursera/CourseraView";
 import { YouTubeView } from "./components/youtube/YouTubeView";
 import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
+import { ensureDestination, parseDestination } from "./lib/destinations";
+import { commitLinkedInDestination } from "./lib/linkedin/ipc";
 import { NewspaperView } from "./components/newspaper/NewspaperView";
 import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
@@ -924,6 +926,62 @@ export default function App() {
     setDownloadQuizzes(preferences.downloadQuizzes ?? true);
   }
 
+  function applyBootstrapState(state: BootstrapState) {
+    if (state.saved_download_preferences) {
+      applyDownloadPreferences(state.saved_download_preferences);
+    }
+    setQueuedJobs((previous) =>
+      serializedStateEqual(previous, state.persisted_jobs) ? previous : state.persisted_jobs
+    );
+    setRecentEvents((previous) =>
+      serializedStateEqual(previous, state.recent_events) ? previous : state.recent_events
+    );
+    const nextHistory = state.download_history ?? [];
+    setDownloadHistory((previous) =>
+      serializedStateEqual(previous, nextHistory) ? previous : nextHistory
+    );
+    setDownloadHistoryFilePath(state.download_history_file_path ?? "");
+  }
+
+  async function chooseLinkedInFolder(current: string): Promise<string | null> {
+    if (!isTauriRuntime()) {
+      guardedToast("Folder picker unavailable in preview", "The native folder picker is available in the Tauri desktop runtime.");
+      return null;
+    }
+
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: parseDestination(current) ?? undefined
+      });
+      if (typeof picked !== "string" || !picked.trim()) {
+        return null;
+      }
+      const committed = await commitLinkedInDestination<BootstrapState>(picked);
+      applyBootstrapState(committed.bootstrap);
+      if (committed.imported > 0) {
+        toast.success(
+          `Recovered ${committed.imported} LinkedIn course${committed.imported === 1 ? "" : "s"}`
+        );
+      } else if (committed.alreadyKnown > 0) {
+        toast.info("LinkedIn folder updated", {
+          description: `${committed.alreadyKnown} course${committed.alreadyKnown === 1 ? "" : "s"} already in your library.`
+        });
+      } else if (committed.skipped > 0) {
+        toast.info("LinkedIn folder updated", {
+          description: `${committed.skipped} folder${committed.skipped === 1 ? "" : "s"} skipped because they did not match a LinkedIn layout.`
+        });
+      } else {
+        toast.success("LinkedIn download folder updated", { description: committed.outputDir });
+      }
+      return committed.outputDir;
+    } catch (error) {
+      toast.error("LinkedIn folder commit failed", { description: String(error) });
+      return null;
+    }
+  }
+
   function clearDownloadEmulatorTimers() {
     for (const timerId of emulatorTimersRef.current) {
       window.clearTimeout(timerId);
@@ -1361,17 +1419,13 @@ export default function App() {
       const addingToActiveQueue = Boolean(downloadProcessingPromiseRef.current) || isProcessingDownload;
       const parsed = await validateUrls();
       if (parsed.length === 0) return;
-      let outputDir = folder.trim();
+      const outputDir = await ensureDestination({
+        current: folder,
+        ask: () => chooseLinkedInFolder(folder)
+      });
       if (!outputDir) {
-        toast.warning("Download folder required", {
-          description: "Choose where to save these courses, then LinkedVault will continue."
-        });
-        const selectedFolder = await browseDownloadFolder();
-        outputDir = selectedFolder?.trim() ?? "";
-        if (!outputDir) {
-          document.querySelector<HTMLElement>('[aria-label="Download folder"]')?.focus();
-          return;
-        }
+        document.querySelector<HTMLElement>('[aria-label="LinkedIn folder"]')?.focus();
+        return;
       }
       const enteredToken = token.trim();
       let shouldUseSavedToken = Boolean(hasSavedToken);
@@ -1629,14 +1683,14 @@ export default function App() {
   }
 
   async function saveSettings() {
-    if (!folder.trim()) {
+    if (!parseDestination(folder)) {
       writeNewspaperReaderPreferences({
         defaultZoom: newspaperDefaultZoom,
         clickZoom: newspaperClickZoom,
         pageTone: newspaperPageTone
       });
       toast.success("Newspaper settings saved", {
-        description: "Choose a download folder before saving downloader defaults."
+        description: "Choose a LinkedIn download folder before saving downloader defaults."
       });
       return;
     }
@@ -2103,26 +2157,7 @@ export default function App() {
   }
 
   async function browseDownloadFolder(): Promise<string | null> {
-    if (!isTauriRuntime()) {
-      guardedToast("Folder picker unavailable in preview", "The native folder picker is available in the Tauri desktop runtime.");
-      return null;
-    }
-
-    try {
-      const selectedFolder = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: folder || undefined
-      });
-      if (typeof selectedFolder === "string" && selectedFolder.trim()) {
-        setFolder(selectedFolder);
-        toast.success("Download folder selected", { description: selectedFolder });
-        return selectedFolder;
-      }
-    } catch (error) {
-      toast.error("Folder picker failed", { description: String(error) });
-    }
-    return null;
+    return chooseLinkedInFolder(folder);
   }
 
   return (
@@ -2576,7 +2611,7 @@ export default function App() {
                     type="button"
                     className="linkedin-folder-field"
                     onClick={() => void browseDownloadFolder()}
-                    aria-label="Download folder"
+                    aria-label="LinkedIn folder"
                     title={folder || "Choose a folder"}
                   >
                     <Folder aria-hidden="true" />
@@ -2891,10 +2926,10 @@ export default function App() {
     >
       <div className="settings-grid">
         <section className="settings-section">
-          <div className="settings-section-title">Download defaults</div>
-          <Field label="Download folder">
+          <div className="settings-section-title">LinkedIn download defaults</div>
+          <Field label="LinkedIn download folder">
             <div className="field-action-grid">
-              <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Settings download folder" />
+              <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="LinkedIn download folder" />
               <Button type="button" onClick={browseDownloadFolder}>
                 <Folder aria-hidden="true" className="h-3.5 w-3.5" />
                 Browse

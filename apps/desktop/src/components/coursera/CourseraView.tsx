@@ -47,6 +47,7 @@ import {
   saveCourseraToken,
   startCourseraDownloadJobs
 } from "../../lib/coursera/ipc";
+import { ensureDestination, parseDestination } from "../../lib/destinations";
 import { parseCourseraArtifactCounts } from "../../lib/coursera/types";
 import type {
   AuthMethodKind,
@@ -325,7 +326,38 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
       return;
     }
 
-    if (!outputDir.trim()) {
+    const resolvedOutputDir = await ensureDestination({
+      current: parseDestination(outputDir),
+      ask: async () => {
+        if (!isTauriRuntime()) {
+          guardedToast("Folder picker unavailable in preview", "The native folder picker is only available in the Tauri desktop runtime.");
+          return null;
+        }
+        try {
+          const selected = await open({
+            directory: true,
+            multiple: false,
+            defaultPath: parseDestination(outputDir) ?? undefined
+          });
+          if (typeof selected !== "string" || !selected.trim()) {
+            return null;
+          }
+          const prefs = currentPreferences();
+          const nextPrefs = { ...prefs, outputDir: selected };
+          setOutputDir(selected);
+          writeLocalPrefs(nextPrefs);
+          try {
+            await saveCourseraPreferences(nextPrefs);
+          } catch {
+          }
+          return selected;
+        } catch (error) {
+          toast.error("Folder picker failed", { description: String(error) });
+          return null;
+        }
+      }
+    });
+    if (!resolvedOutputDir) {
       toast.warning("Output folder required", { description: "Choose where to save the downloads." });
       return;
     }
@@ -353,17 +385,16 @@ export function CourseraView({ mode = "downloads" }: { mode?: "downloads" | "his
       }
 
       const prefs = currentPreferences();
-      writeLocalPrefs(prefs);
-      // Best-effort persist; ignore failures in preview runtime.
+      writeLocalPrefs({ ...prefs, outputDir: resolvedOutputDir });
       try {
-        await saveCourseraPreferences(prefs);
+        await saveCourseraPreferences({ ...prefs, outputDir: resolvedOutputDir });
       } catch {
         // ignore
       }
 
       const response = await startCourseraDownloadJobs({
         classes: slugs,
-        outputDir: prefs.outputDir,
+        outputDir: resolvedOutputDir,
         forceRedownload,
         selectedResolution: prefs.selectedResolution,
         formats: prefs.formats,

@@ -16,6 +16,8 @@ import {
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
+import { ensureDestination, parseDestination } from "../../lib/destinations";
+import { writeNewspaperDestination } from "../../lib/newspaper/preferences";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
 import { readNewspaperOptimizationPreferences, type NewspaperOptimizationRunOptions } from "./newspaper-optimization-preferences";
@@ -376,23 +378,42 @@ export function NewspaperView({
 
   async function chooseFolder() {
     const picked = await open({ directory: true, multiple: false, title: "Choose newspaper folder" });
-    if (typeof picked === "string") setDestination(picked);
+    if (typeof picked === "string" && picked.trim()) {
+      writeNewspaperDestination(picked);
+      setDestination(picked);
+    }
   }
 
-  function validateSelection() {
-    if (!destination.trim()) {
+  async function ensureNewspaperDestination(): Promise<string | null> {
+    return ensureDestination({
+      current: parseDestination(destination),
+      ask: async () => {
+        const picked = await open({ directory: true, multiple: false, title: "Choose newspaper folder" });
+        if (typeof picked !== "string" || !picked.trim()) {
+          return null;
+        }
+        writeNewspaperDestination(picked);
+        setDestination(picked);
+        return picked;
+      }
+    });
+  }
+
+  async function validateSelection(): Promise<string | null> {
+    const resolvedDestination = await ensureNewspaperDestination();
+    if (!resolvedDestination) {
       toast.warning("Choose a download folder");
-      return false;
+      return null;
     }
     if (selected.size === 0) {
       toast.warning("Select at least one edition");
-      return false;
+      return null;
     }
     if (!isTauriRuntime()) {
       toast.info("Browser preview", { description: "Run the Tauri app to download newspapers." });
-      return false;
+      return null;
     }
-    return true;
+    return resolvedDestination;
   }
 
   async function saveSchedule() {
@@ -402,14 +423,15 @@ export function NewspaperView({
       });
       return;
     }
-    if (!validateSelection()) return;
+    const resolvedDestination = await validateSelection();
+    if (!resolvedDestination) return;
     setSavingSchedule(true);
     try {
       await invoke("create_newspaper_schedule", {
         request: {
           editionCodes: [...selected],
           cronTime,
-          destination,
+          destination: resolvedDestination,
           dateMode,
           delaySeconds,
           optimizeImages: optimize,
@@ -432,7 +454,8 @@ export function NewspaperView({
   }
 
   async function submitDownload() {
-    if (!validateSelection()) return;
+    const resolvedDestination = await validateSelection();
+    if (!resolvedDestination) return;
     setSubmitting(true);
     try {
       const response = await invoke<CreateBatchResponse>("create_newspaper_batch", {
@@ -441,7 +464,7 @@ export function NewspaperView({
           dateMode,
           startDate: dateMode === "last7_days" ? today() : startDate,
           endDate: dateMode === "custom" ? endDate : undefined,
-          destination,
+          destination: resolvedDestination,
           delaySeconds,
           optimizeImages: optimize,
           optimizationProfile,

@@ -138,6 +138,7 @@ pub fn run() {
             commands::remove_download_queue_item,
             commands::reset_linkedin_database,
             commands::retry_failed_download_job,
+            commands::commit_linkedin_destination,
             commands::save_download_preferences,
             commands::set_linkedin_video_wait_bounds,
             commands::save_li_at_token,
