@@ -1,20 +1,25 @@
 //! Pure snapshot clipping discovery helpers for library recovery.
 //!
 //! Walks an on-disk `Newspaper snapshots` tree and parses clipping folders.
-//! No database writes or `ClippingService` wiring — callers import in Task 5.
+//! Root-marker inspection and recovered titles are used by `ClippingService`
+//! import; database writes stay in the service.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::clipping_assets::{CANONICAL_FILE_NAME, ASSETS_DIR};
-use super::clipping_models::{validate_clipping_id, validate_page_number, validate_publication_date};
+use serde::Deserialize;
+
+use super::clipping_assets::{ASSETS_DIR, CANONICAL_FILE_NAME};
+use super::clipping_models::{
+    validate_clipping_id, validate_page_number, validate_publication_date,
+};
 use super::clipping_note_mirror::NOTE_MIRROR_FILE_NAME;
-use super::clipping_roots::INTERNAL_DIRECTORY_NAME;
+use super::clipping_roots::{INTERNAL_DIRECTORY_NAME, ROOT_MARKER_FILE_NAME};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DiscoveredClipping {
+pub(crate) struct DiscoveredClipping {
     pub id: String,
     pub edition_code: String,
     pub edition_name: String,
@@ -23,6 +28,7 @@ pub(super) struct DiscoveredClipping {
     pub asset_relative_path: String,
     pub absolute_webp: PathBuf,
     pub note_markdown: String,
+    pub note_read_failed: bool,
 }
 
 /// Parse a clipping directory name into `(page_number, clipping_id)`.
@@ -50,7 +56,11 @@ pub(super) fn discover_clippings(snapshot_root: &Path) -> Result<Vec<DiscoveredC
     let mut discovered = Vec::new();
     for edition_entry in fs::read_dir(snapshot_root).map_err(|error| error.to_string())? {
         let edition_entry = edition_entry.map_err(|error| error.to_string())?;
-        if !edition_entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+        if !edition_entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
             continue;
         }
         let edition_name_os = edition_entry.file_name();
@@ -58,24 +68,37 @@ pub(super) fn discover_clippings(snapshot_root: &Path) -> Result<Vec<DiscoveredC
         if should_skip_snapshot_child(&edition_dir_name) {
             continue;
         }
-        let Some((edition_name, edition_code)) = parse_edition_folder_name(&edition_dir_name) else {
+        let Some((edition_name, edition_code)) = parse_edition_folder_name(&edition_dir_name)
+        else {
             continue;
         };
 
         for date_entry in fs::read_dir(edition_entry.path()).map_err(|error| error.to_string())? {
             let date_entry = date_entry.map_err(|error| error.to_string())?;
-            if !date_entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+            if !date_entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
                 continue;
             }
             let date_name = date_entry.file_name();
             let publication_date = date_name.to_string_lossy();
-            if publication_date == INTERNAL_DIRECTORY_NAME || !validate_publication_date(&publication_date) {
+            if publication_date == INTERNAL_DIRECTORY_NAME
+                || !validate_publication_date(&publication_date)
+            {
                 continue;
             }
 
-            for clipping_entry in fs::read_dir(date_entry.path()).map_err(|error| error.to_string())? {
+            for clipping_entry in
+                fs::read_dir(date_entry.path()).map_err(|error| error.to_string())?
+            {
                 let clipping_entry = clipping_entry.map_err(|error| error.to_string())?;
-                if !clipping_entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+                if !clipping_entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_dir()
+                {
                     continue;
                 }
                 let clipping_dir_name = clipping_entry.file_name().to_string_lossy().into_owned();
@@ -91,9 +114,9 @@ pub(super) fn discover_clippings(snapshot_root: &Path) -> Result<Vec<DiscoveredC
                     continue;
                 };
                 let page_number = resolve_page_number(&parsed_page);
-                let asset_relative_path =
-                    relative_path_under_snapshot(snapshot_root, &webp_path)?;
-                let note_markdown = read_note_markdown(&clipping_dir.join(NOTE_MIRROR_FILE_NAME));
+                let asset_relative_path = relative_path_under_snapshot(snapshot_root, &webp_path)?;
+                let (note_markdown, note_read_failed) =
+                    read_note_markdown(&clipping_dir.join(NOTE_MIRROR_FILE_NAME));
                 discovered.push(DiscoveredClipping {
                     id,
                     edition_code: edition_code.clone(),
@@ -103,6 +126,7 @@ pub(super) fn discover_clippings(snapshot_root: &Path) -> Result<Vec<DiscoveredC
                     asset_relative_path,
                     absolute_webp: webp_path,
                     note_markdown,
+                    note_read_failed,
                 });
             }
         }
@@ -158,16 +182,57 @@ fn relative_path_under_snapshot(snapshot_root: &Path, absolute: &Path) -> Result
     let relative = absolute
         .strip_prefix(snapshot_root)
         .map_err(|_| "Clipping asset is outside the snapshot root.".to_string())?;
-    Ok(relative
-        .to_string_lossy()
-        .replace('\\', "/"))
+    Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn read_note_markdown(path: &Path) -> String {
-    match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => String::new(),
+fn read_note_markdown(path: &Path) -> (String, bool) {
+    match fs::read(path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(contents) => (contents, false),
+            Err(_) => (String::new(), true),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+        Err(_) => (String::new(), true),
+    }
+}
+
+pub(super) fn recovered_clipping_title(edition_name: &str, page_number: &str) -> String {
+    let edition = edition_name.trim();
+    let page = page_number.trim();
+    if page.is_empty() {
+        edition.to_string()
+    } else if edition.is_empty() {
+        page.to_string()
+    } else {
+        format!("{edition} · {page}")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotRootMarker {
+    schema_version: u32,
+    root_id: String,
+}
+
+pub(super) fn read_snapshot_marker_root_id(snapshot_root: &Path) -> Option<String> {
+    let bytes = fs::read(
+        snapshot_root
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(ROOT_MARKER_FILE_NAME),
+    )
+    .ok()?;
+    let marker: SnapshotRootMarker = serde_json::from_slice(&bytes).ok()?;
+    if marker.schema_version == 1
+        && marker.root_id.starts_with("clipping-root-")
+        && marker.root_id.len() <= 96
+        && marker
+            .root_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        Some(marker.root_id)
+    } else {
+        None
     }
 }
 
@@ -195,7 +260,7 @@ mod tests {
         );
         assert!(parse_clipping_dir_name("not-a-clipping-dir").is_none());
         assert!(parse_clipping_dir_name(&format!("A01 - {TEST_ID}")).is_none());
-        assert!(parse_clipping_dir_name(&format!("Page A01 - not-a-uuid")).is_none());
+        assert!(parse_clipping_dir_name("Page A01 - not-a-uuid").is_none());
     }
 
     #[test]
@@ -222,7 +287,9 @@ mod tests {
                 .join(CANONICAL_FILE_NAME),
         );
         fs::write(
-            edition.join(format!("Page B02 - {OTHER_ID}")).join(NOTE_MIRROR_FILE_NAME),
+            edition
+                .join(format!("Page B02 - {OTHER_ID}"))
+                .join(NOTE_MIRROR_FILE_NAME),
             "recovered note",
         )
         .unwrap();
@@ -240,13 +307,17 @@ mod tests {
         assert_eq!(bare.publication_date, "2026-08-09");
         assert_eq!(bare.page_number, "A01");
         assert_eq!(bare.note_markdown, "");
+        assert!(!bare.note_read_failed);
         assert!(bare.asset_relative_path.contains('/'));
         assert!(!bare.asset_relative_path.contains('\\'));
         assert_eq!(
             bare.asset_relative_path,
             format!("波士頓 - BO/2026-08-09/{TEST_ID}/clipping-v1.webp")
         );
-        assert_eq!(bare.absolute_webp, edition.join(TEST_ID).join(CANONICAL_FILE_NAME));
+        assert_eq!(
+            bare.absolute_webp,
+            edition.join(TEST_ID).join(CANONICAL_FILE_NAME)
+        );
 
         let prefixed = clippings
             .iter()
@@ -254,6 +325,7 @@ mod tests {
             .expect("page-prefixed clipping");
         assert_eq!(prefixed.page_number, "B02");
         assert_eq!(prefixed.note_markdown, "recovered note");
+        assert!(!prefixed.note_read_failed);
         assert_eq!(
             prefixed.asset_relative_path,
             format!("波士頓 - BO/2026-08-09/Page B02 - {OTHER_ID}/clipping-v1.webp")

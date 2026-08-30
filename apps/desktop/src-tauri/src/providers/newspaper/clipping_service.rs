@@ -4,7 +4,7 @@
 //! closure.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Condvar, Mutex,
@@ -20,7 +20,8 @@ use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
 use crate::cache::open_runtime;
 
 use super::clipping_assets::{
-    ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION, THUMBNAIL_MAX_HEIGHT, THUMBNAIL_MAX_WIDTH,
+    is_webp_container, sha256_hex, ClippingAssetLayout, THUMBNAIL_CACHE_SCHEMA_VERSION,
+    THUMBNAIL_MAX_HEIGHT, THUMBNAIL_MAX_WIDTH,
 };
 use super::clipping_crop;
 use super::clipping_draft_repository::DraftCheckpointAck;
@@ -28,20 +29,25 @@ use super::clipping_models::{
     normalize_search_query, normalize_search_text, normalize_title, validate_asset_byte_count,
     validate_clipping_id, validate_edition_code, validate_edition_name, validate_list_limit,
     validate_note_markdown, validate_page_number, validate_publication_date, validate_sha256_hex,
-    validate_source_mime, ClippingAssetState, ClippingError, ClippingErrorCode, ClippingRootStatus,
-    ClippingSummary, CreateNewspaperClippingRequest, CreateNewspaperClippingResponse,
-    EnsureNewspaperClippingThumbnailResponse, GetNewspaperClippingsPageRequest, NewspaperClipping,
-    NewspaperClippingDetail, NewspaperClippingListQuery, NewspaperClippingMatchField,
-    NewspaperClippingSearchResult, NewspaperClippingSearchSnippet,
-    NewspaperClippingSearchSnippetPart, NewspaperClippingSort, NewspaperClippingsPage,
-    NormalizedCropRect, SearchNewspaperClippingsPage, SearchNewspaperClippingsRequest,
-    SearchPossibleNewspaperClippingsRequest, SearchPossibleNewspaperClippingsResponse,
-    FUZZY_CANDIDATE_LIMIT, POSSIBLE_MATCH_LIMIT, SEARCH_PAGE_LIMIT, SEARCH_SNIPPET_MAX_CHARS,
+    validate_source_mime, ClippingAssetState, ClippingError, ClippingErrorCode, ClippingRoot,
+    ClippingRootStatus, ClippingSourceKind, ClippingSummary, CreateNewspaperClippingRequest,
+    CreateNewspaperClippingResponse, EnsureNewspaperClippingThumbnailResponse,
+    GetNewspaperClippingsPageRequest, NewspaperClipping, NewspaperClippingDetail,
+    NewspaperClippingListQuery, NewspaperClippingMatchField, NewspaperClippingSearchResult,
+    NewspaperClippingSearchSnippet, NewspaperClippingSearchSnippetPart, NewspaperClippingSort,
+    NewspaperClippingsPage, NormalizedCropRect, SearchNewspaperClippingsPage,
+    SearchNewspaperClippingsRequest, SearchPossibleNewspaperClippingsRequest,
+    SearchPossibleNewspaperClippingsResponse, CLIPPING_ASSET_MIME, FUZZY_CANDIDATE_LIMIT,
+    POSSIBLE_MATCH_LIMIT, SEARCH_PAGE_LIMIT, SEARCH_SNIPPET_MAX_CHARS,
 };
 use super::clipping_note_mirror;
 use super::clipping_recovery;
 use super::clipping_repository::{self as repository, ClippingDetail};
-use super::clipping_roots::ClippingRootRegistry;
+use super::clipping_roots::{ClippingRootRegistry, SNAPSHOT_DIRECTORY_NAME};
+use super::library_recovery::{
+    read_snapshot_marker_root_id, recovered_clipping_title, DiscoveredClipping,
+};
+use super::models::RecoverSnapshotRootStatus;
 
 type CanonicalNoteDurability = (i64, Option<DraftCheckpointAck>);
 
@@ -335,8 +341,209 @@ impl ClippingService {
         &self,
         destination: &std::path::Path,
         now: i64,
-    ) -> Result<super::clipping_models::ClippingRoot, ClippingError> {
+    ) -> Result<ClippingRoot, ClippingError> {
         self.roots.register_download_destination(destination, now)
+    }
+
+    pub fn ensure_snapshot_root_for_destination(
+        &self,
+        save_to_root: &Path,
+        now: i64,
+    ) -> Result<(ClippingRoot, RecoverSnapshotRootStatus), ClippingError> {
+        let snapshot = save_to_root.join(SNAPSHOT_DIRECTORY_NAME);
+        if let Some(marker_id) = read_snapshot_marker_root_id(&snapshot) {
+            if let Some(existing) = self.load_root_record(&marker_id)? {
+                if snapshot_locator_matches(&existing.locator, &snapshot) {
+                    return Ok((existing, RecoverSnapshotRootStatus::AlreadyConnected));
+                }
+                self.roots.reconnect(&marker_id, &snapshot, now)?;
+                let updated = self
+                    .load_root_record(&marker_id)?
+                    .ok_or_else(|| ClippingError::new(ClippingErrorCode::AssetRootUnavailable))?;
+                return Ok((updated, RecoverSnapshotRootStatus::Reconnected));
+            }
+        }
+
+        let prior = self.load_root_by_snapshot_path(&snapshot)?;
+        let root = self
+            .roots
+            .register_download_destination(save_to_root, now)?;
+        let status = if prior
+            .as_ref()
+            .is_some_and(|existing| existing.id == root.id)
+        {
+            RecoverSnapshotRootStatus::AlreadyConnected
+        } else {
+            RecoverSnapshotRootStatus::Registered
+        };
+        Ok((root, status))
+    }
+
+    #[allow(dead_code)] // Wired by recover_newspaper_library (Task 6).
+    pub(crate) fn import_discovered_clippings(
+        &self,
+        root: &ClippingRoot,
+        discovered: &[DiscoveredClipping],
+        now: i64,
+    ) -> Result<(u32, u32, u32, Vec<String>), ClippingError> {
+        let layout = self.roots.resolve(&root.id)?;
+        let mut imported = 0;
+        let mut known = 0;
+        let mut skipped = 0;
+        let mut warnings = Vec::new();
+        for item in discovered {
+            match self.import_one_discovered_clipping(root, &layout, item, now)? {
+                DiscoveredImportOutcome::Imported(extra_warnings) => {
+                    imported += 1;
+                    warnings.extend(extra_warnings);
+                }
+                DiscoveredImportOutcome::Known => known += 1,
+                DiscoveredImportOutcome::Skipped(warning) => {
+                    skipped += 1;
+                    warnings.push(warning);
+                }
+            }
+        }
+        Ok((imported, known, skipped, warnings))
+    }
+
+    #[allow(dead_code)] // Called from import_discovered_clippings.
+    fn import_one_discovered_clipping(
+        &self,
+        root: &ClippingRoot,
+        layout: &ClippingAssetLayout,
+        item: &DiscoveredClipping,
+        now: i64,
+    ) -> Result<DiscoveredImportOutcome, ClippingError> {
+        if self.read_by_id(&item.id)?.is_some() {
+            return Ok(DiscoveredImportOutcome::Known);
+        }
+        if let Err(code) = validate_note_markdown(&item.note_markdown) {
+            return Ok(DiscoveredImportOutcome::Skipped(format!(
+                "Skipped clipping {}: {}.",
+                item.id,
+                code.as_str()
+            )));
+        }
+        let mut warnings_for_row = Vec::new();
+        if item.note_read_failed {
+            warnings_for_row.push(format!(
+                "Clipping {}: note.md was not valid UTF-8; imported with an empty note.",
+                item.id
+            ));
+        }
+
+        let contained = match layout.contained_regular_file(&item.absolute_webp) {
+            Ok(path) => path,
+            Err(_) => {
+                return Ok(DiscoveredImportOutcome::Skipped(format!(
+                    "Skipped clipping {}: asset is missing or outside the snapshot root.",
+                    item.id
+                )));
+            }
+        };
+        if ClippingAssetLayout::validate_relative_path_for_id(&item.asset_relative_path, &item.id)
+            .is_err()
+        {
+            return Ok(DiscoveredImportOutcome::Skipped(format!(
+                "Skipped clipping {}: asset path is invalid.",
+                item.id
+            )));
+        }
+
+        let bytes = match std::fs::read(&contained) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(DiscoveredImportOutcome::Skipped(format!(
+                    "Skipped clipping {}: asset could not be read.",
+                    item.id
+                )));
+            }
+        };
+        let (width, height, byte_count, checksum) = match inspect_recovered_webp(&bytes) {
+            Ok(meta) => meta,
+            Err(_) => {
+                return Ok(DiscoveredImportOutcome::Skipped(format!(
+                    "Skipped clipping {}: asset failed webp validation.",
+                    item.id
+                )));
+            }
+        };
+
+        let mut record = repository::NewClippingRecord {
+            id: item.id.clone(),
+            source_job_id: None,
+            source_page_id: None,
+            source_media_version_snapshot: 1,
+            source_kind_snapshot: ClippingSourceKind::Optimized,
+            source_mime_type_snapshot: CLIPPING_ASSET_MIME.to_string(),
+            source_checksum_snapshot: None,
+            edition_code_snapshot: item.edition_code.clone(),
+            edition_name_snapshot: item.edition_name.clone(),
+            publication_date_snapshot: item.publication_date.clone(),
+            page_number_snapshot: item.page_number.clone(),
+            source_pixel_width: width,
+            source_pixel_height: height,
+            crop_x: 0,
+            crop_y: 0,
+            crop_width: width,
+            crop_height: height,
+            asset_root_id: root.id.clone(),
+            asset_relative_path: item.asset_relative_path.clone(),
+            asset_byte_count: byte_count,
+            asset_checksum_sha256: checksum,
+            title: recovered_clipping_title(&item.edition_name, &item.page_number),
+            now,
+        };
+        if let Err(error) = validate_record(&mut record) {
+            return Ok(DiscoveredImportOutcome::Skipped(format!(
+                "Skipped clipping {}: {}.",
+                item.id,
+                error.code.as_str()
+            )));
+        }
+
+        let insert_record = record.clone();
+        let note_markdown = item.note_markdown.clone();
+        match self.writer.execute(
+            Self::context("clipping_insert_recovered_ready"),
+            move |db| {
+                repository::insert_recovered_ready(db, &insert_record, &note_markdown)
+                    .map_err(Into::into)
+            },
+        ) {
+            Ok(()) => Ok(DiscoveredImportOutcome::Imported(warnings_for_row)),
+            Err(_) => {
+                if self.read_by_id(&record.id)?.is_some() {
+                    Ok(DiscoveredImportOutcome::Known)
+                } else {
+                    Ok(DiscoveredImportOutcome::Skipped(format!(
+                        "Skipped clipping {}: database write failed.",
+                        record.id
+                    )))
+                }
+            }
+        }
+    }
+
+    fn load_root_record(&self, root_id: &str) -> Result<Option<ClippingRoot>, ClippingError> {
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        repository::load_root_by_id(&connection, root_id)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))
+    }
+
+    fn load_root_by_snapshot_path(
+        &self,
+        snapshot: &Path,
+    ) -> Result<Option<ClippingRoot>, ClippingError> {
+        let Ok(canonical) = snapshot.canonicalize() else {
+            return Ok(None);
+        };
+        let connection = open_runtime(&self.db_path)
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))?;
+        repository::load_root_by_locator_key(&connection, &download_locator_key(&canonical))
+            .map_err(|_| ClippingError::new(ClippingErrorCode::DatabaseReadFailed))
     }
 
     fn context(operation: &'static str) -> DatabaseWriteContext {
@@ -1533,6 +1740,47 @@ impl ClippingService {
     }
 }
 
+#[allow(dead_code)] // Used by import_discovered_clippings (Task 6).
+enum DiscoveredImportOutcome {
+    Imported(Vec<String>),
+    Known,
+    Skipped(String),
+}
+
+fn download_locator_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn snapshot_locator_matches(stored_locator: &str, snapshot: &Path) -> bool {
+    let Ok(canonical) = snapshot.canonicalize() else {
+        return false;
+    };
+    download_locator_key(Path::new(stored_locator)) == download_locator_key(&canonical)
+}
+
+#[allow(dead_code)] // Used by import_discovered_clippings (Task 6).
+fn inspect_recovered_webp(bytes: &[u8]) -> Result<(u32, u32, u64, String), ClippingError> {
+    let invalid = || ClippingError::new(ClippingErrorCode::AssetValidationFailed);
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| invalid())?;
+    if !validate_asset_byte_count(byte_count) || !is_webp_container(bytes) {
+        return Err(invalid());
+    }
+    let features = webp::BitstreamFeatures::new(bytes).ok_or_else(invalid)?;
+    if features.has_animation() || features.width() == 0 || features.height() == 0 {
+        return Err(invalid());
+    }
+    let decoded = webp::Decoder::new(bytes).decode().ok_or_else(invalid)?;
+    if decoded.width() != features.width() || decoded.height() != features.height() {
+        return Err(invalid());
+    }
+    Ok((
+        features.width(),
+        features.height(),
+        byte_count,
+        sha256_hex(bytes),
+    ))
+}
+
 fn validate_record(record: &mut repository::NewClippingRecord) -> Result<(), ClippingError> {
     if !validate_clipping_id(&record.id) {
         return Err(ClippingError::new(ClippingErrorCode::InvalidId));
@@ -1575,10 +1823,14 @@ mod tests {
     #[path = "tests.rs"]
     mod clipping_draft_service_tests;
 
-    use super::super::clipping_assets::{encode_test_webp, sha256_hex};
+    use super::super::clipping_assets::{encode_test_webp, sha256_hex, CANONICAL_FILE_NAME};
     use super::super::clipping_models::{
-        ClippingSourceKind, NewspaperClippingSort, NormalizedCropRect,
+        ClippingAssetState, ClippingSourceKind, NewspaperClippingSort, NormalizedCropRect,
     };
+    use super::super::clipping_note_mirror::NOTE_MIRROR_FILE_NAME;
+    use super::super::clipping_roots::SNAPSHOT_DIRECTORY_NAME;
+    use super::super::library_recovery::discover_clippings;
+    use super::super::models::RecoverSnapshotRootStatus;
     use super::*;
     use crate::app::database::initialize_database;
     use crate::app::database_diagnostics::{
@@ -4240,6 +4492,162 @@ mod tests {
             startup.find("tokio::time::sleep").unwrap() < startup.find("spawn_blocking").unwrap(),
             "managed-folder enumeration must begin only after the startup quiet period"
         );
+    }
+
+    const RECOVER_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn write_snapshot_clipping_tree(
+        save_to: &Path,
+        id: &str,
+        page: &str,
+        note: &str,
+        webp: &[u8],
+    ) -> PathBuf {
+        let clipping_dir = save_to
+            .join(SNAPSHOT_DIRECTORY_NAME)
+            .join("波士頓 - BO")
+            .join("2026-08-09")
+            .join(format!("Page {page} - {id}"));
+        std::fs::create_dir_all(&clipping_dir).unwrap();
+        std::fs::write(clipping_dir.join(CANONICAL_FILE_NAME), webp).unwrap();
+        std::fs::write(clipping_dir.join(NOTE_MIRROR_FILE_NAME), note).unwrap();
+        save_to.to_path_buf()
+    }
+
+    #[test]
+    fn ensure_and_import_recovers_disk_clipping_with_note() {
+        let (temp, service, _diagnostics) = fixture();
+        let save_to = temp.path().join("downloads");
+        std::fs::create_dir(&save_to).unwrap();
+        let webp = encode_test_webp(24, 16);
+        write_snapshot_clipping_tree(
+            &save_to,
+            RECOVER_ID,
+            "A01",
+            "recovered clipping note",
+            &webp,
+        );
+
+        let (root, status) = service
+            .ensure_snapshot_root_for_destination(&save_to, 500)
+            .unwrap();
+        assert_eq!(status, RecoverSnapshotRootStatus::Registered);
+        assert_eq!(
+            root.kind,
+            super::super::clipping_models::ClippingRootKind::DownloadSnapshot
+        );
+
+        let discovered = discover_clippings(Path::new(&root.locator)).unwrap();
+        assert_eq!(discovered.len(), 1);
+        let (imported, known, skipped, warnings) = service
+            .import_discovered_clippings(&root, &discovered, 600)
+            .unwrap();
+        assert_eq!((imported, known, skipped), (1, 0, 0));
+        assert!(warnings.is_empty());
+
+        let clipping = service.read_by_id(RECOVER_ID).unwrap().unwrap();
+        assert_eq!(clipping.asset_state, ClippingAssetState::Ready);
+        assert_eq!(clipping.asset_version, 1);
+        assert_eq!(clipping.note_markdown, "recovered clipping note");
+        assert_eq!(clipping.source_job_id, None);
+        assert_eq!(clipping.source_page_id, None);
+        assert_eq!(clipping.source_kind_snapshot, ClippingSourceKind::Optimized);
+        assert_eq!(clipping.source_mime_type_snapshot, "image/webp");
+        assert_eq!(clipping.source_checksum_snapshot, None);
+        assert_eq!((clipping.crop_x, clipping.crop_y), (0, 0));
+        assert_eq!(
+            (clipping.crop_width, clipping.crop_height),
+            (clipping.source_pixel_width, clipping.source_pixel_height)
+        );
+        assert_eq!(clipping.asset_checksum_sha256, sha256_hex(&webp));
+        assert!(clipping.title.contains("A01"));
+    }
+
+    #[test]
+    fn import_discovered_clippings_does_not_overwrite_existing_note() {
+        let (temp, service, _diagnostics) = fixture();
+        let save_to = temp.path().join("downloads");
+        std::fs::create_dir(&save_to).unwrap();
+        let webp = encode_test_webp(24, 16);
+        write_snapshot_clipping_tree(&save_to, RECOVER_ID, "A01", "original note", &webp);
+        let (root, _) = service
+            .ensure_snapshot_root_for_destination(&save_to, 500)
+            .unwrap();
+        let discovered = discover_clippings(Path::new(&root.locator)).unwrap();
+        service
+            .import_discovered_clippings(&root, &discovered, 600)
+            .unwrap();
+        let first = service.read_by_id(RECOVER_ID).unwrap().unwrap();
+        assert_eq!(first.note_markdown, "original note");
+        let original_title = first.title.clone();
+
+        std::fs::write(
+            save_to
+                .join(SNAPSHOT_DIRECTORY_NAME)
+                .join("波士頓 - BO")
+                .join("2026-08-09")
+                .join(format!("Page A01 - {RECOVER_ID}"))
+                .join(NOTE_MIRROR_FILE_NAME),
+            "changed on disk",
+        )
+        .unwrap();
+        let discovered_again = discover_clippings(Path::new(&root.locator)).unwrap();
+        let (imported, known, skipped, _) = service
+            .import_discovered_clippings(&root, &discovered_again, 700)
+            .unwrap();
+        assert_eq!((imported, known, skipped), (0, 1, 0));
+        let clipping = service.read_by_id(RECOVER_ID).unwrap().unwrap();
+        assert_eq!(clipping.note_markdown, "original note");
+        assert_eq!(clipping.title, original_title);
+    }
+
+    #[test]
+    fn ensure_snapshot_root_reconnects_when_marker_moves() {
+        let (temp, service, _diagnostics) = fixture();
+        let first = temp.path().join("drive-a");
+        let second = temp.path().join("drive-b");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let webp = encode_test_webp(24, 16);
+        write_snapshot_clipping_tree(&first, RECOVER_ID, "B02", "note", &webp);
+
+        let (root, status) = service
+            .ensure_snapshot_root_for_destination(&first, 100)
+            .unwrap();
+        assert_eq!(status, RecoverSnapshotRootStatus::Registered);
+        let again = service
+            .ensure_snapshot_root_for_destination(&first, 150)
+            .unwrap();
+        assert_eq!(again.1, RecoverSnapshotRootStatus::AlreadyConnected);
+
+        let snapshots = first.join(SNAPSHOT_DIRECTORY_NAME);
+        let moved = second.join(SNAPSHOT_DIRECTORY_NAME);
+        std::fs::rename(&snapshots, &moved).unwrap();
+        let (reconnected, status) = service
+            .ensure_snapshot_root_for_destination(&second, 200)
+            .unwrap();
+        assert_eq!(status, RecoverSnapshotRootStatus::Reconnected);
+        assert_eq!(reconnected.id, root.id);
+        assert_ne!(reconnected.locator, root.locator);
+    }
+
+    #[test]
+    fn import_discovered_clippings_skips_invalid_webp() {
+        let (temp, service, _diagnostics) = fixture();
+        let save_to = temp.path().join("downloads");
+        std::fs::create_dir(&save_to).unwrap();
+        write_snapshot_clipping_tree(&save_to, RECOVER_ID, "A01", "note", b"not-a-webp");
+        let (root, _) = service
+            .ensure_snapshot_root_for_destination(&save_to, 500)
+            .unwrap();
+        let discovered = discover_clippings(Path::new(&root.locator)).unwrap();
+        assert_eq!(discovered.len(), 1);
+        let (imported, known, skipped, warnings) = service
+            .import_discovered_clippings(&root, &discovered, 600)
+            .unwrap();
+        assert_eq!((imported, known, skipped), (0, 0, 1));
+        assert_eq!(warnings.len(), 1);
+        assert!(service.read_by_id(RECOVER_ID).unwrap().is_none());
     }
 
     fn create_dir_link(target: &Path, link: &Path) -> bool {
