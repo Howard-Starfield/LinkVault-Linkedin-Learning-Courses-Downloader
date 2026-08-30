@@ -27,6 +27,7 @@ pub mod executor;
 mod job_repository;
 mod job_service;
 mod library_events;
+mod library_recovery;
 mod library_service;
 pub mod manifest;
 pub mod media_protocol;
