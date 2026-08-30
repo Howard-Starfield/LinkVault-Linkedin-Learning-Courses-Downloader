@@ -25,6 +25,7 @@ use crate::shell::open_folder_in_explorer;
 use crate::token_store;
 use crate::workflow::application::runtime::{DrainOutcome, WorkflowRuntime};
 use crate::workflow::domain::state::RunState;
+use crate::app::database_writer::DatabaseWriter;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -295,6 +296,16 @@ pub struct OpenDownloadFolderResponse {
     path: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedInDestinationCommit {
+    output_dir: String,
+    imported: usize,
+    skipped: usize,
+    already_known: usize,
+    bootstrap: BootstrapState,
+}
+
 #[tauri::command]
 pub fn bootstrap_state(
     state: tauri::State<'_, LinkVaultState>,
@@ -322,19 +333,32 @@ pub fn quality_fallback_order(selected: VideoQuality) -> Vec<VideoQuality> {
 }
 
 #[tauri::command]
-pub fn start_download_jobs(
+pub async fn start_download_jobs(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
+    writer: tauri::State<'_, DatabaseWriter>,
     request: StartDownloadRequest,
 ) -> Result<StartDownloadResponse, String> {
-    let connection = state.connection()?;
-    queue_download_jobs(&runtime, &connection, request, now_unix_timestamp())
-        .map_err(|error| error.to_string())
+    let output_dir = request.output_dir.clone();
+    let response = {
+        let connection = state.connection()?;
+        queue_download_jobs(&runtime, &connection, request, now_unix_timestamp())
+            .map_err(|error| error.to_string())?
+    };
+    recover_existing_linkedin_downloads(
+        writer.inner().clone(),
+        state.db_path.clone(),
+        output_dir,
+        now_unix_timestamp(),
+    )
+    .await;
+    Ok(response)
 }
 
 #[tauri::command]
-pub fn save_download_preferences(
+pub async fn save_download_preferences(
     state: tauri::State<'_, LinkVaultState>,
+    writer: tauri::State<'_, DatabaseWriter>,
     preferences: SavedDownloadPreferences,
 ) -> Result<SavedDownloadPreferences, String> {
     if preferences.output_dir.trim().is_empty() {
@@ -355,9 +379,70 @@ pub fn save_download_preferences(
         preferences.video_wait_max_seconds,
     );
 
-    let connection = state.connection()?;
-    persist_download_preferences(&connection, &preferences, now_unix_timestamp())?;
+    {
+        let connection = state.connection()?;
+        persist_download_preferences(&connection, &preferences, now_unix_timestamp())?;
+    }
+    recover_existing_linkedin_downloads(
+        writer.inner().clone(),
+        state.db_path.clone(),
+        preferences.output_dir.clone(),
+        now_unix_timestamp(),
+    )
+    .await;
     Ok(preferences)
+}
+
+async fn recover_existing_linkedin_downloads(
+    writer: DatabaseWriter,
+    db_path: std::path::PathBuf,
+    output_dir: String,
+    now: i64,
+) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        super::folder_import::recover_into(&writer, &output_dir, now)
+    })
+    .await;
+    if let Ok(connection) = crate::cache::open_runtime(&db_path) {
+        let history_file_path = download_history_file_path_for_db(&db_path);
+        let _ = sync_download_history_file(&connection, &history_file_path);
+    }
+}
+
+#[tauri::command]
+pub async fn commit_linkedin_destination(
+    state: tauri::State<'_, LinkVaultState>,
+    writer: tauri::State<'_, DatabaseWriter>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
+    path: String,
+) -> Result<LinkedInDestinationCommit, String> {
+    let writer = writer.inner().clone();
+    let now = now_unix_timestamp();
+    let (output_dir, counts) = tauri::async_runtime::spawn_blocking(move || {
+        super::folder_import::commit(&writer, &path, now)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+
+    let connection = state.connection()?;
+    let history_file_path = download_history_file_path_for_db(&state.db_path);
+    let _ = sync_download_history_file(&connection, &history_file_path);
+    let bootstrap = load_bootstrap_state(
+        &connection,
+        Some(&runtime),
+        token_store::has_saved_token(&state.token_path),
+        &history_file_path,
+        state.is_download_paused(),
+    )?;
+
+    Ok(LinkedInDestinationCommit {
+        output_dir,
+        imported: counts.imported,
+        skipped: counts.skipped,
+        already_known: counts.already_known,
+        bootstrap,
+    })
 }
 
 #[tauri::command]
@@ -1155,11 +1240,18 @@ fn write_download_history_file(
     fs::write(path, markdown)
 }
 
-fn history_source_url(entry: &DownloadHistoryEntry) -> String {
-    if entry.source_url.trim().is_empty() {
-        format!("https://www.linkedin.com/learning/{}", entry.course_slug)
+pub(crate) fn history_source_url(entry: &DownloadHistoryEntry) -> String {
+    persisted_job_source_url(&entry.course_slug, &entry.source_url)
+}
+
+fn persisted_job_source_url(course_slug: &str, source_url: &str) -> String {
+    if course_slug.starts_with("local:") {
+        return String::new();
+    }
+    if source_url.trim().is_empty() {
+        format!("https://www.linkedin.com/learning/{course_slug}")
     } else {
-        entry.source_url.clone()
+        source_url.to_string()
     }
 }
 
@@ -1631,11 +1723,7 @@ fn load_bootstrap_state(
             .and_then(|entry| cached_course_thumbnail_url(&entry.payload_json));
         let paused = effective_linkedin_job_paused(&job, download_paused);
         persisted_jobs.push(PersistedDownloadJob {
-            source_url: if job.source_url.trim().is_empty() {
-                format!("https://www.linkedin.com/learning/{}", job.course_slug)
-            } else {
-                job.source_url.clone()
-            },
+            source_url: persisted_job_source_url(&job.course_slug, &job.source_url),
             title: cached_course.and_then(|entry| entry.title),
             id: job.id,
             course_slug: job.course_slug,
@@ -1670,11 +1758,11 @@ fn effective_linkedin_job_paused(job: &JobRecord, download_paused: bool) -> bool
     job.paused || (download_paused && job.status == "active")
 }
 
-fn bootstrap_jobs(connection: &Connection) -> Result<Vec<JobRecord>, crate::cache::CacheError> {
+pub(crate) fn bootstrap_jobs(connection: &Connection) -> Result<Vec<JobRecord>, crate::cache::CacheError> {
     let mut jobs = Vec::new();
     let mut seen = HashSet::new();
 
-    for status in ["active", "queued", "failed", "cancelled"] {
+    for status in ["active", "queued", "failed", "cancelled", "completed"] {
         for job in list_jobs_by_status(connection, status)? {
             seen.insert(job.id.clone());
             jobs.push(job);

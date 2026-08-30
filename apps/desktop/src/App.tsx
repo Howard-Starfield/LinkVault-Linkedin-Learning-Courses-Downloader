@@ -56,6 +56,8 @@ import {
 import { CourseraView } from "./components/coursera/CourseraView";
 import { YouTubeView } from "./components/youtube/YouTubeView";
 import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
+import { ensureDestination, parseDestination } from "./lib/destinations";
+import { commitLinkedInDestination } from "./lib/linkedin/ipc";
 import { NewspaperView } from "./components/newspaper/NewspaperView";
 import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
@@ -924,6 +926,62 @@ export default function App() {
     setDownloadQuizzes(preferences.downloadQuizzes ?? true);
   }
 
+  function applyBootstrapState(state: BootstrapState) {
+    if (state.saved_download_preferences) {
+      applyDownloadPreferences(state.saved_download_preferences);
+    }
+    setQueuedJobs((previous) =>
+      serializedStateEqual(previous, state.persisted_jobs) ? previous : state.persisted_jobs
+    );
+    setRecentEvents((previous) =>
+      serializedStateEqual(previous, state.recent_events) ? previous : state.recent_events
+    );
+    const nextHistory = state.download_history ?? [];
+    setDownloadHistory((previous) =>
+      serializedStateEqual(previous, nextHistory) ? previous : nextHistory
+    );
+    setDownloadHistoryFilePath(state.download_history_file_path ?? "");
+  }
+
+  async function chooseLinkedInFolder(current: string): Promise<string | null> {
+    if (!isTauriRuntime()) {
+      guardedToast("Folder picker unavailable in preview", "The native folder picker is available in the Tauri desktop runtime.");
+      return null;
+    }
+
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: parseDestination(current) ?? undefined
+      });
+      if (typeof picked !== "string" || !picked.trim()) {
+        return null;
+      }
+      const committed = await commitLinkedInDestination<BootstrapState>(picked);
+      applyBootstrapState(committed.bootstrap);
+      if (committed.imported > 0) {
+        toast.success(
+          `Recovered ${committed.imported} LinkedIn course${committed.imported === 1 ? "" : "s"}`
+        );
+      } else if (committed.alreadyKnown > 0) {
+        toast.info("LinkedIn folder updated", {
+          description: `${committed.alreadyKnown} course${committed.alreadyKnown === 1 ? "" : "s"} already in your library.`
+        });
+      } else if (committed.skipped > 0) {
+        toast.info("LinkedIn folder updated", {
+          description: `${committed.skipped} folder${committed.skipped === 1 ? "" : "s"} skipped because they did not match a LinkedIn layout.`
+        });
+      } else {
+        toast.success("LinkedIn download folder updated", { description: committed.outputDir });
+      }
+      return committed.outputDir;
+    } catch (error) {
+      toast.error("LinkedIn folder commit failed", { description: String(error) });
+      return null;
+    }
+  }
+
   function clearDownloadEmulatorTimers() {
     for (const timerId of emulatorTimersRef.current) {
       window.clearTimeout(timerId);
@@ -1271,7 +1329,13 @@ export default function App() {
   }
 
   async function copyQueuedCourseUrl(job: QueuedDownloadJob) {
-    const url = job.source_url.trim() || `https://www.linkedin.com/learning/${job.course_slug}`;
+    const url = linkedinLearningSourceUrl(job);
+    if (!url) {
+      toast.info("No LinkedIn URL", {
+        description: "Recovered courses from a local folder do not have a LinkedIn Learning link."
+      });
+      return;
+    }
     try {
       await copyTextToClipboard(url);
       toast.success("Course URL copied", { description: url });
@@ -1361,17 +1425,13 @@ export default function App() {
       const addingToActiveQueue = Boolean(downloadProcessingPromiseRef.current) || isProcessingDownload;
       const parsed = await validateUrls();
       if (parsed.length === 0) return;
-      let outputDir = folder.trim();
+      const outputDir = await ensureDestination({
+        current: folder,
+        ask: () => chooseLinkedInFolder(folder)
+      });
       if (!outputDir) {
-        toast.warning("Download folder required", {
-          description: "Choose where to save these courses, then LinkedVault will continue."
-        });
-        const selectedFolder = await browseDownloadFolder();
-        outputDir = selectedFolder?.trim() ?? "";
-        if (!outputDir) {
-          document.querySelector<HTMLElement>('[aria-label="Download folder"]')?.focus();
-          return;
-        }
+        document.querySelector<HTMLElement>('[aria-label="LinkedIn folder"]')?.focus();
+        return;
       }
       const enteredToken = token.trim();
       let shouldUseSavedToken = Boolean(hasSavedToken);
@@ -1629,14 +1689,14 @@ export default function App() {
   }
 
   async function saveSettings() {
-    if (!folder.trim()) {
+    if (!parseDestination(folder)) {
       writeNewspaperReaderPreferences({
         defaultZoom: newspaperDefaultZoom,
         clickZoom: newspaperClickZoom,
         pageTone: newspaperPageTone
       });
       toast.success("Newspaper settings saved", {
-        description: "Choose a download folder before saving downloader defaults."
+        description: "Choose a LinkedIn download folder before saving downloader defaults."
       });
       return;
     }
@@ -1651,6 +1711,8 @@ export default function App() {
         clickZoom: newspaperClickZoom,
         pageTone: newspaperPageTone
       });
+      // Recovery runs inside save_download_preferences; refresh so Completed reflects imports.
+      await refreshBootstrapState();
       toast.success("Settings saved", {
         description: "Download defaults will be restored the next time LinkedVault opens."
       });
@@ -1670,15 +1732,15 @@ export default function App() {
     const picked = await open({
       directory: true,
       multiple: false,
-      title: "Register existing newspaper archive"
+      title: "Recover newspaper archive"
     });
     if (typeof picked !== "string") return;
     setIsRegisteringNewspaperArchive(true);
     try {
       const imported = await invoke<number>("import_existing_newspaper_archive", { path: picked });
-      toast.success(`Registered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
+      toast.success(`Recovered ${imported} newspaper edition${imported === 1 ? "" : "s"}.`);
     } catch (error) {
-      toast.error("Could not register newspaper archive", { description: String(error) });
+      toast.error("Could not recover newspaper archive", { description: String(error) });
     } finally {
       setIsRegisteringNewspaperArchive(false);
     }
@@ -2103,26 +2165,7 @@ export default function App() {
   }
 
   async function browseDownloadFolder(): Promise<string | null> {
-    if (!isTauriRuntime()) {
-      guardedToast("Folder picker unavailable in preview", "The native folder picker is available in the Tauri desktop runtime.");
-      return null;
-    }
-
-    try {
-      const selectedFolder = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: folder || undefined
-      });
-      if (typeof selectedFolder === "string" && selectedFolder.trim()) {
-        setFolder(selectedFolder);
-        toast.success("Download folder selected", { description: selectedFolder });
-        return selectedFolder;
-      }
-    } catch (error) {
-      toast.error("Folder picker failed", { description: String(error) });
-    }
-    return null;
+    return chooseLinkedInFolder(folder);
   }
 
   return (
@@ -2576,7 +2619,7 @@ export default function App() {
                     type="button"
                     className="linkedin-folder-field"
                     onClick={() => void browseDownloadFolder()}
-                    aria-label="Download folder"
+                    aria-label="LinkedIn folder"
                     title={folder || "Choose a folder"}
                   >
                     <Folder aria-hidden="true" />
@@ -2891,10 +2934,10 @@ export default function App() {
     >
       <div className="settings-grid">
         <section className="settings-section">
-          <div className="settings-section-title">Download defaults</div>
-          <Field label="Download folder">
+          <div className="settings-section-title">LinkedIn download defaults</div>
+          <Field label="LinkedIn download folder">
             <div className="field-action-grid">
-              <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Settings download folder" />
+              <Input value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="LinkedIn download folder" />
               <Button type="button" onClick={browseDownloadFolder}>
                 <Folder aria-hidden="true" className="h-3.5 w-3.5" />
                 Browse
@@ -3000,10 +3043,10 @@ export default function App() {
               variant="outline"
               onClick={() => void registerNewspaperArchive()}
               loading={isRegisteringNewspaperArchive}
-              loadingLabel="Registering"
+              loadingLabel="Recovering"
             >
               <FolderOpen aria-hidden="true" className="h-3.5 w-3.5" />
-              Register archive
+              Recover newspaper archive
             </Button>
             <Button
               type="button"
@@ -5141,13 +5184,20 @@ function writePreviewState(jobs: QueuedDownloadJob[], events: PersistedJobEvent[
   window.sessionStorage.setItem(previewEventsStorageKey, JSON.stringify(events));
 }
 
+function linkedinLearningSourceUrl(job: Pick<QueuedDownloadJob, "source_url" | "course_slug">): string {
+  const trimmed = job.source_url.trim();
+  if (trimmed) return trimmed;
+  if (job.course_slug.startsWith("local:")) return "";
+  return `https://www.linkedin.com/learning/${job.course_slug}`;
+}
+
 function downloadHistoryFromJobs(jobs: QueuedDownloadJob[]): DownloadHistoryEntry[] {
   return jobs
     .filter((job) => job.status === "completed")
     .map((job) => ({
       job_id: job.id,
       course_slug: job.course_slug,
-      source_url: job.source_url || `https://www.linkedin.com/learning/${job.course_slug}`,
+      source_url: linkedinLearningSourceUrl(job),
       course_title: courseDisplayName(job),
       output_dir: job.output_dir || "",
       completed_at: job.updated_at ?? 0
