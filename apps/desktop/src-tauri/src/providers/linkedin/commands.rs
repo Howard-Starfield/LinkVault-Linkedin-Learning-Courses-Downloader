@@ -183,6 +183,9 @@ pub struct StartDownloadRequest {
     download_quizzes: bool,
     #[serde(default)]
     schedule: Option<DownloadScheduleRequest>,
+    /// When true, completed DB/FS matches may be re-queued. Active/queued matches still skip.
+    #[serde(default)]
+    force_redownload: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -263,8 +266,15 @@ pub struct PersistedJobEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedDownloadCourse {
+    course_slug: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StartDownloadResponse {
     jobs: Vec<QueuedDownloadJob>,
+    skipped: Vec<SkippedDownloadCourse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -320,6 +330,17 @@ pub fn bootstrap_state(
         &history_file_path,
         state.is_download_paused(),
     )
+}
+
+/// Lean probe: any LinkedIn workflow/legacy job that is active or ready-queued.
+/// Avoids the N+1 artifact/event load of `bootstrap_state`.
+#[tauri::command]
+pub fn linkedin_queue_busy(
+    state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
+) -> Result<bool, String> {
+    let connection = state.connection()?;
+    linkedin_queue_is_busy(&runtime, &connection, now_unix_timestamp())
 }
 
 #[tauri::command]
@@ -580,6 +601,9 @@ pub fn retry_failed_download_job(
     runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
+    // Cancel applies to the in-flight job only. Clear so a retry is not
+    // immediately re-cancelled by a sticky shared flag.
+    state.reset_download_cancellation();
     let connection = state.connection()?;
     retry_failed_download_job_inner(&runtime, &connection, job_id, now_unix_timestamp())?;
     let history_file_path = download_history_file_path_for_db(&state.db_path);
@@ -622,6 +646,7 @@ pub fn remove_download_queue_item(
 ) -> Result<BootstrapState, String> {
     let now = now_unix_timestamp();
     let mut removed_workflow = false;
+    let mut requested_cancellation = false;
     if let Some(run) = runtime
         .get_run(job_id.clone())
         .map_err(|error| error.to_string())?
@@ -633,6 +658,7 @@ pub fn remove_download_queue_item(
             if matches!(run.state, RunState::Running | RunState::Cancelling) {
                 state.request_download_cancellation();
                 state.set_download_paused(false);
+                requested_cancellation = true;
             }
             removed_workflow = runtime
                 .cancel_and_delete_run(job_id.clone(), now)
@@ -649,10 +675,16 @@ pub fn remove_download_queue_item(
             if job.status == "active" {
                 state.request_download_cancellation();
                 state.set_download_paused(false);
+                requested_cancellation = true;
             }
         }
         Err(_error) if removed_workflow => {}
         Err(error) => return Err(error.to_string()),
+    }
+    // cancel_and_delete can remove the run without an executor unwind. Clear the
+    // shared flag so the next queued course is not sticky-cancelled.
+    if requested_cancellation {
+        state.reset_download_cancellation();
     }
     let history_file_path = download_history_file_path_for_db(&state.db_path);
     let _ = sync_download_history_file(&connection, &history_file_path);
@@ -1357,7 +1389,22 @@ fn queue_download_jobs(
         scheduled_download_times(request.schedule.as_ref(), &courses, created_at)?;
 
     let mut jobs = Vec::with_capacity(courses.len());
+    let mut skipped = Vec::new();
     for (index, course) in courses.iter().enumerate() {
+        if let Some(reason) = linkedin_course_dedupe_skip(
+            runtime,
+            connection,
+            &course.slug,
+            &request.output_dir,
+            request.force_redownload,
+        )? {
+            skipped.push(SkippedDownloadCourse {
+                course_slug: course.slug.clone(),
+                reason,
+            });
+            continue;
+        }
+
         let scheduled_at = scheduled_times[index];
         let job_id = unique_job_id(runtime, connection, created_at, &course.slug, index)?;
         let workflow_request = super::projection::LinkedInWorkflowRequest {
@@ -1393,7 +1440,177 @@ fn queue_download_jobs(
         });
     }
 
-    Ok(StartDownloadResponse { jobs })
+    Ok(StartDownloadResponse { jobs, skipped })
+}
+
+fn linkedin_queue_is_busy(
+    runtime: &WorkflowRuntime,
+    connection: &Connection,
+    now: i64,
+) -> Result<bool, String> {
+    for run in runtime
+        .list_linkedin_runs(250)
+        .map_err(|error| error.to_string())?
+    {
+        if linkedin_projected_job_is_busy(&super::projection::job_from_run(&run), now) {
+            return Ok(true);
+        }
+    }
+
+    for status in ["active", "queued"] {
+        for job in list_jobs_by_status(connection, status).map_err(|error| error.to_string())? {
+            if linkedin_projected_job_is_busy(&job, now) {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn linkedin_projected_job_is_busy(job: &JobRecord, now: i64) -> bool {
+    let status = job.status.to_ascii_lowercase();
+    if status == "active" {
+        return true;
+    }
+    status == "queued" && !job.paused && job.scheduled_at.map(|at| at <= now).unwrap_or(true)
+}
+
+fn linkedin_course_dedupe_skip(
+    runtime: &WorkflowRuntime,
+    connection: &Connection,
+    course_slug: &str,
+    output_dir: &str,
+    force_redownload: bool,
+) -> Result<Option<String>, String> {
+    if let Some(reason) =
+        linkedin_db_course_conflict(runtime, connection, course_slug, output_dir)?
+    {
+        let allow_completed = force_redownload && reason == "already_completed";
+        if !allow_completed {
+            return Ok(Some(reason));
+        }
+    }
+
+    if !force_redownload && linkedin_slug_course_folder_exists(output_dir, course_slug) {
+        return Ok(Some("folder_exists".to_string()));
+    }
+
+    Ok(None)
+}
+
+fn linkedin_db_course_conflict(
+    runtime: &WorkflowRuntime,
+    connection: &Connection,
+    course_slug: &str,
+    output_dir: &str,
+) -> Result<Option<String>, String> {
+    for run in runtime
+        .list_linkedin_runs(250)
+        .map_err(|error| error.to_string())?
+    {
+        let job = super::projection::job_from_run(&run);
+        if let Some(reason) = dedupe_reason_for_job(&job, course_slug, output_dir) {
+            return Ok(Some(reason));
+        }
+    }
+
+    for status in ["active", "queued", "completed"] {
+        for job in list_jobs_by_status(connection, status).map_err(|error| error.to_string())? {
+            if let Some(reason) = dedupe_reason_for_job(&job, course_slug, output_dir) {
+                return Ok(Some(reason));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn dedupe_reason_for_job(job: &JobRecord, course_slug: &str, output_dir: &str) -> Option<String> {
+    if job.course_slug != course_slug || !output_dirs_match(&job.output_dir, output_dir) {
+        return None;
+    }
+    match job.status.to_ascii_lowercase().as_str() {
+        "active" => Some("already_active".to_string()),
+        "queued" => Some("already_queued".to_string()),
+        "completed" => Some("already_completed".to_string()),
+        _ => None,
+    }
+}
+
+fn output_dirs_match(left: &str, right: &str) -> bool {
+    let left = left.trim().trim_end_matches(['/', '\\']);
+    let right = right.trim().trim_end_matches(['/', '\\']);
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Best-effort FS match: a child folder named exactly as the course slug that
+/// already looks like a LinkedIn course (Study.md or chapter media). Title-only
+/// folders cannot be matched by slug and are covered by DB dedupe instead.
+fn linkedin_slug_course_folder_exists(output_dir: &str, course_slug: &str) -> bool {
+    if course_slug.trim().is_empty() {
+        return false;
+    }
+    let folder = Path::new(output_dir).join(course_slug);
+    let Ok(metadata) = fs::symlink_metadata(&folder) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    if folder.join("Study.md").is_file() {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(&folder) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(entry_meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !entry_meta.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if directory_has_linkedin_media(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn directory_has_linkedin_media(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let file_path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&file_path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let file_name = file_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if file_name.ends_with(".mp4")
+            || file_name.ends_with(".srt")
+            || file_name.ends_with(".quiz.md")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn unique_job_id(
@@ -1453,16 +1670,18 @@ fn retry_failed_download_job_inner(
         let mut request: super::projection::LinkedInWorkflowRequest =
             serde_json::from_str(&run.request_json).map_err(|error| error.to_string())?;
         request.scheduled_at = None;
-        let new_id = unique_job_id(runtime, connection, now, &request.course_slug, 0)?;
+        let output_root = run.output_root.clone();
+        let course_slug = request.course_slug.clone();
+        let request_json =
+            serde_json::to_string(&request).map_err(|error| error.to_string())?;
+        // Drop the terminal run and any mirrored legacy row so Failed no longer
+        // lists this attempt after it returns to Queue.
         runtime
-            .submit_linkedin_download(
-                new_id,
-                request.course_slug.clone(),
-                serde_json::to_string(&request).map_err(|error| error.to_string())?,
-                run.output_root,
-                now,
-                None,
-            )
+            .delete_run_if_terminal(job_id.clone())
+            .map_err(|error| error.to_string())?;
+        let _ = remove_download_job(connection, &job_id);
+        runtime
+            .submit_linkedin_download(job_id, course_slug, request_json, output_root, now, None)
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -1487,16 +1706,12 @@ fn retry_failed_download_job_inner(
         quiz_hints_json: legacy.quiz_hints_json.clone(),
         scheduled_at: None,
     };
-    let new_id = unique_job_id(runtime, connection, now, &legacy.course_slug, 0)?;
+    let course_slug = legacy.course_slug.clone();
+    let output_dir = legacy.output_dir.clone();
+    let request_json = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    remove_download_job(connection, &job_id).map_err(|error| error.to_string())?;
     runtime
-        .submit_linkedin_download(
-            new_id,
-            legacy.course_slug,
-            serde_json::to_string(&request).map_err(|error| error.to_string())?,
-            legacy.output_dir,
-            now,
-            None,
-        )
+        .submit_linkedin_download(job_id, course_slug, request_json, output_dir, now, None)
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -1921,6 +2136,7 @@ mod tests {
                 download_subtitles: false,
                 download_quizzes: true,
                 schedule: None,
+                force_redownload: false,
             },
             1_700_000_000,
         )
@@ -1989,6 +2205,7 @@ mod tests {
                     min_wait_minutes: 10,
                     max_wait_minutes: 30,
                 }),
+                force_redownload: false,
             },
             created_at,
         )
@@ -2034,6 +2251,7 @@ mod tests {
                     min_wait_minutes: 5,
                     max_wait_minutes: 15,
                 }),
+                force_redownload: false,
             },
             created_at,
         )
@@ -2072,6 +2290,7 @@ mod tests {
                     min_wait_minutes: 15,
                     max_wait_minutes: 30,
                 }),
+                force_redownload: false,
             },
             100,
         )
@@ -2103,6 +2322,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: None,
+                force_redownload: false,
             },
             100,
         )
@@ -2155,6 +2375,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: None,
+                force_redownload: false,
             },
             100,
         )
@@ -2185,6 +2406,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: None,
+                force_redownload: false,
             },
             1_700_000_000,
         )
@@ -2325,6 +2547,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: None,
+                force_redownload: false,
             },
             1_700_000_000,
         )
@@ -2428,6 +2651,7 @@ mod tests {
                     min_wait_minutes: 30,
                     max_wait_minutes: 30,
                 }),
+                force_redownload: false,
             },
             created_at,
         )
@@ -2448,6 +2672,7 @@ mod tests {
                 download_subtitles: true,
                 download_quizzes: true,
                 schedule: None,
+                force_redownload: false,
             },
             created_at,
         )
@@ -2471,7 +2696,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_course_requests_in_the_same_second_keep_distinct_jobs() {
+    fn duplicate_course_requests_for_same_output_are_skipped() {
         let (_dir, runtime, connection) = workflow_harness();
         let request = || StartDownloadRequest {
             course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
@@ -2486,16 +2711,304 @@ mod tests {
             download_subtitles: true,
             download_quizzes: true,
             schedule: None,
+            force_redownload: false,
         };
 
         let first = queue_download_jobs(&runtime, &connection, request(), 100).unwrap();
         let second = queue_download_jobs(&runtime, &connection, request(), 100).unwrap();
 
-        assert_ne!(first.jobs[0].id, second.jobs[0].id);
-        assert_eq!(runtime.list_linkedin_runs(10).unwrap().len(), 2);
-        assert!(list_jobs_by_status(&connection, "queued")
-            .unwrap()
-            .is_empty());
+        assert_eq!(first.jobs.len(), 1);
+        assert!(second.jobs.is_empty());
+        assert_eq!(second.skipped.len(), 1);
+        assert_eq!(second.skipped[0].course_slug, "sample-course");
+        assert_eq!(second.skipped[0].reason, "already_queued");
+        assert_eq!(runtime.list_linkedin_runs(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queue_download_skips_completed_legacy_job_same_slug_and_output() {
+        let (_dir, runtime, connection) = workflow_harness();
+        crate::cache::insert_job(
+            &connection,
+            &JobRecord {
+                id: "legacy-completed-1".to_string(),
+                course_slug: "sample-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+                status: "completed".to_string(),
+                selected_quality: "720".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                quiz_hints_json: "[]".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                paused: false,
+                scheduled_at: None,
+                created_at: 50,
+                updated_at: 50,
+            },
+        )
+        .unwrap();
+
+        let response = queue_download_jobs(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: false,
+            },
+            100,
+        )
+        .unwrap();
+
+        assert!(response.jobs.is_empty());
+        assert_eq!(response.skipped.len(), 1);
+        assert_eq!(response.skipped[0].reason, "already_completed");
+        assert!(runtime.list_linkedin_runs(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn force_redownload_allows_completed_but_still_skips_queued() {
+        let (_dir, runtime, connection) = workflow_harness();
+        crate::cache::insert_job(
+            &connection,
+            &JobRecord {
+                id: "legacy-completed-2".to_string(),
+                course_slug: "sample-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+                status: "completed".to_string(),
+                selected_quality: "720".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                quiz_hints_json: "[]".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                paused: false,
+                scheduled_at: None,
+                created_at: 50,
+                updated_at: 50,
+            },
+        )
+        .unwrap();
+
+        let forced = queue_download_jobs(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: true,
+            },
+            100,
+        )
+        .unwrap();
+        assert_eq!(forced.jobs.len(), 1);
+        assert!(forced.skipped.is_empty());
+
+        let again = queue_download_jobs(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "1080".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: true,
+            },
+            110,
+        )
+        .unwrap();
+        assert!(again.jobs.is_empty());
+        assert_eq!(again.skipped[0].reason, "already_queued");
+    }
+
+    #[test]
+    fn linkedin_queue_is_busy_for_ready_workflow_run_and_clears_when_empty() {
+        let (_dir, runtime, connection) = workflow_harness();
+        assert!(!linkedin_queue_is_busy(&runtime, &connection, 1_000).unwrap());
+
+        queue_download_jobs(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: false,
+            },
+            200,
+        )
+        .unwrap();
+
+        assert!(linkedin_queue_is_busy(&runtime, &connection, 1_000).unwrap());
+    }
+
+    #[test]
+    fn linkedin_queue_is_busy_for_legacy_active_job() {
+        let (_dir, runtime, connection) = workflow_harness();
+        crate::cache::insert_job(
+            &connection,
+            &JobRecord {
+                id: "legacy-active-1".to_string(),
+                course_slug: "active-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/active-course".to_string(),
+                status: "active".to_string(),
+                selected_quality: "720".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                quiz_hints_json: "[]".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                paused: false,
+                scheduled_at: None,
+                created_at: 100,
+                updated_at: 100,
+            },
+        )
+        .unwrap();
+
+        assert!(linkedin_queue_is_busy(&runtime, &connection, 1_000).unwrap());
+    }
+
+    #[test]
+    fn linkedin_slug_course_folder_with_study_md_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let course_dir = temp.path().join("sample-course");
+        std::fs::create_dir_all(&course_dir).unwrap();
+        std::fs::write(course_dir.join("Study.md"), "# Sample\n").unwrap();
+
+        assert!(linkedin_slug_course_folder_exists(
+            temp.path().to_str().unwrap(),
+            "sample-course"
+        ));
+        assert!(!linkedin_slug_course_folder_exists(
+            temp.path().to_str().unwrap(),
+            "other-course"
+        ));
+    }
+
+    #[test]
+    fn retry_failed_download_removes_terminal_run_and_requeues_same_id() {
+        let (_dir, runtime, connection) = workflow_harness();
+        let response = queue_download_jobs(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/sample-course".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: false,
+            },
+            200,
+        )
+        .unwrap();
+        let job_id = response.jobs[0].id.clone();
+        runtime.cancel_run(job_id.clone(), 210).unwrap();
+        assert_eq!(
+            runtime.get_run(job_id.clone()).unwrap().unwrap().state,
+            RunState::Cancelled
+        );
+
+        retry_failed_download_job_inner(&runtime, &connection, job_id.clone(), 220).unwrap();
+
+        let runs = runtime.list_linkedin_runs(10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, job_id);
+        assert_eq!(runs[0].state, RunState::Queued);
+        assert!(get_job(&connection, &job_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn retry_legacy_failed_download_removes_failed_row_and_queues_workflow_run() {
+        let (_dir, runtime, connection) = workflow_harness();
+        let job_id = "legacy-failed-1".to_string();
+        crate::cache::insert_job(
+            &connection,
+            &JobRecord {
+                id: job_id.clone(),
+                course_slug: "sample-course".to_string(),
+                source_url: "https://www.linkedin.com/learning/sample-course".to_string(),
+                status: "failed".to_string(),
+                selected_quality: "720".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                quiz_hints_json: "[]".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                paused: false,
+                scheduled_at: None,
+                created_at: 100,
+                updated_at: 100,
+            },
+        )
+        .unwrap();
+
+        retry_failed_download_job_inner(&runtime, &connection, job_id.clone(), 300).unwrap();
+
+        assert!(get_job(&connection, &job_id).unwrap().is_none());
+        let run = runtime.get_run(job_id.clone()).unwrap().unwrap();
+        assert_eq!(run.state, RunState::Queued);
+        assert_eq!(
+            runtime
+                .list_linkedin_runs(10)
+                .unwrap()
+                .iter()
+                .filter(|candidate| {
+                    matches!(candidate.state, RunState::Failed | RunState::Cancelled)
+                })
+                .count(),
+            0
+        );
     }
 
     #[test]

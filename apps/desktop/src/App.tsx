@@ -176,6 +176,12 @@ type DownloadQueueSection = "queue" | ActivityFilter;
 
 type StartDownloadResponse = {
   jobs: QueuedDownloadJob[];
+  skipped: SkippedDownloadCourse[];
+};
+
+type SkippedDownloadCourse = {
+  course_slug: string;
+  reason: string;
 };
 
 type StartDownloadRequest = {
@@ -191,6 +197,7 @@ type StartDownloadRequest = {
   downloadSubtitles: boolean;
   downloadQuizzes: boolean;
   schedule?: DownloadScheduleRequest;
+  forceRedownload?: boolean;
 };
 
 type DownloadScheduleRequest = {
@@ -1465,11 +1472,13 @@ export default function App() {
       const alreadyDownloaded = parsed
         .map((course) => course.slug)
         .filter((slug) => completedSlugs.has(slug));
+      let forceRedownload = false;
       if (alreadyDownloaded.length > 0) {
         const shouldDownloadAgain = window.confirm(
           `LinkedVault has already completed ${alreadyDownloaded.length} selected LinkedIn course${alreadyDownloaded.length === 1 ? "" : "s"}:\n\n${alreadyDownloaded.join("\n")}\n\nDownload ${alreadyDownloaded.length === 1 ? "it" : "them"} again?`
         );
         if (!shouldDownloadAgain) return;
+        forceRedownload = true;
       }
 
       const response = await startDownloadJobs({
@@ -1484,30 +1493,59 @@ export default function App() {
         downloadExercises,
         downloadSubtitles,
         downloadQuizzes,
-        schedule
+        schedule,
+        forceRedownload
       });
-      setQueuedJobs((jobs) => mergeQueuedJobs(jobs, response.jobs));
-      setCourseUrls("");
-      setParsedCourses([]);
-      await refreshBootstrapState();
-      if (schedule) {
-        setIsScheduleOpen(false);
-        setScheduleStep("configure");
-        toast.success("Courses scheduled", {
-          description: `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will start automatically over the next ${formatScheduleDuration(schedule.windowMinutes)}.`
-        });
-      } else {
-        toast.success(addingToActiveQueue ? "Added to download queue" : "Download queued", {
-          description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} ${addingToActiveQueue ? "added behind the active download" : "persisted to the local queue"}.`
-        });
-        ensureDownloadProcessing(shouldUseSavedToken);
-      }
+      await finishQueueDownloads(response, schedule, addingToActiveQueue, shouldUseSavedToken);
     } catch (error) {
       await refreshBootstrapState();
       toast.error("Could not add download", { description: String(error) });
     } finally {
       queueSubmissionRef.current = false;
       setIsQueueingDownload(false);
+    }
+  }
+
+  async function finishQueueDownloads(
+    response: StartDownloadResponse,
+    schedule: DownloadScheduleRequest | undefined,
+    addingToActiveQueue: boolean,
+    shouldUseSavedToken: boolean
+  ) {
+    setQueuedJobs((jobs) => mergeQueuedJobs(jobs, response.jobs));
+    setCourseUrls("");
+    setParsedCourses([]);
+    await refreshBootstrapState();
+
+    const skipped = response.skipped ?? [];
+    if (skipped.length > 0) {
+      toast.info(skipped.length === 1 ? "Course already present" : "Courses already present", {
+        description: skipped
+          .map((entry) => `${entry.course_slug} (${skippedReasonLabel(entry.reason)})`)
+          .join("\n")
+      });
+    }
+
+    if (response.jobs.length === 0) {
+      if (skipped.length === 0) {
+        toast.info("No courses queued", {
+          description: "Nothing new was added to the LinkedIn download queue."
+        });
+      }
+      return;
+    }
+
+    if (schedule) {
+      setIsScheduleOpen(false);
+      setScheduleStep("configure");
+      toast.success("Courses scheduled", {
+        description: `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will start automatically over the next ${formatScheduleDuration(schedule.windowMinutes)}.`
+      });
+    } else {
+      toast.success(addingToActiveQueue ? "Added to download queue" : "Download queued", {
+        description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} ${addingToActiveQueue ? "added behind the active download" : "persisted to the local queue"}.`
+      });
+      ensureDownloadProcessing(shouldUseSavedToken);
     }
   }
 
@@ -1628,20 +1666,18 @@ export default function App() {
     let summary = emptyProcessQueuedDownloadResponse();
     for (let i = 0; i < 120; i += 1) {
       if (cancellationRequestedRef.current) {
+        await refreshBootstrapState();
         return summary;
       }
-      const state = await refreshBootstrapState();
-      const busy = Boolean(
-        state &&
-          (hasReadyQueuedJobs(state.persisted_jobs) ||
-            state.persisted_jobs.some((job) => job.status.toLowerCase() === "active"))
-      );
+      const busy = await probeLinkedInQueueBusy();
       if (!busy) {
+        await refreshBootstrapState();
         summary.processed = true;
         return summary;
       }
-      await sleep(500);
+      await sleep(1000);
     }
+    await refreshBootstrapState();
     return summary;
   }
 
@@ -2093,7 +2129,7 @@ export default function App() {
   }
 
   async function retryDownloadJob(job: QueuedDownloadJob) {
-    if (job.status !== "failed") return;
+    if (job.status !== "failed" && job.status !== "cancelled") return;
     const enteredToken = token.trim();
     let shouldUseSavedToken = Boolean(hasSavedToken);
 
@@ -2110,14 +2146,9 @@ export default function App() {
           description: `LinkedVault will read the ${browserSource} LinkedIn session for this retry.`
         });
       }
-      await retryFailedDownloadJob(job.id);
-      setQueuedJobs((jobs) =>
-        jobs.map((candidate) =>
-          candidate.id === job.id
-            ? { ...candidate, status: "queued", paused: false, artifact_counts: emptyArtifactCounts() }
-            : candidate
-        )
-      );
+      const state = await retryFailedDownloadJob(job.id);
+      setQueuedJobs(state.persisted_jobs);
+      setHasSavedToken(state.has_saved_token);
       toast.info("Retry queued", { description: courseDisplayName(job) });
 
       cancellationRequestedRef.current = false;
@@ -3334,7 +3365,7 @@ export default function App() {
 }
 
 function shouldShowInLiveQueue(status: string) {
-  return status !== "completed" && status !== "cancelled";
+  return status === "queued" || status === "active";
 }
 
 function isDownloadEmulatorJob(job: QueuedDownloadJob) {
@@ -3386,6 +3417,21 @@ function isScheduledJob(job: QueuedDownloadJob) {
 function hasReadyQueuedJobs(jobs: QueuedDownloadJob[]) {
   const now = Math.floor(Date.now() / 1000);
   return jobs.some((job) => job.status === "queued" && !job.paused && (!job.scheduled_at || job.scheduled_at <= now));
+}
+
+function skippedReasonLabel(reason: string) {
+  switch (reason) {
+    case "already_queued":
+      return "already queued";
+    case "already_active":
+      return "already downloading";
+    case "already_completed":
+      return "already completed";
+    case "folder_exists":
+      return "folder already on disk";
+    default:
+      return reason;
+  }
 }
 
 function formatScheduledDate(timestamp: number) {
@@ -3999,7 +4045,7 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
   return (
     <StatusBadge className={jobStatusBadgeClass(job.status)} dotClassName={activityDotClass(eventTone(job.status))}>
       <span>{jobStatusLabel(job.status, job.paused)}</span>
-      {job.status === "failed" ? (
+      {job.status === "failed" || job.status === "cancelled" ? (
         <button
           type="button"
           className="queue-status-retry"
@@ -4310,6 +4356,15 @@ async function startDownloadJobs(request: StartDownloadRequest) {
   }
 
   return startDownloadJobsForPreview(request);
+}
+
+async function probeLinkedInQueueBusy(): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("linkedin_queue_busy");
+  }
+
+  const jobs = readPreviewJobs();
+  return hasReadyQueuedJobs(jobs) || jobs.some((job) => job.status.toLowerCase() === "active");
 }
 
 async function requestActiveDownloadCancellation(jobId?: string) {
@@ -4640,22 +4695,51 @@ function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownlo
   const timestamp = Math.floor(Date.now() / 1000);
   const requestId = Date.now();
   const scheduledTimes = previewScheduledTimes(request.schedule, parsed.length, timestamp);
-  const jobs = parsed.map((course, index) => ({
-    id: `preview-job-${requestId}-${index + 1}-${course.slug}`,
-    course_slug: course.slug,
-    source_url: course.normalized_url,
-    status: "queued",
-    thumbnail_url: previewThumbnailForSlug(course.slug),
-    selected_quality: request.selectedQuality,
-    output_dir: request.outputDir,
-    paused: false,
-    scheduled_at: scheduledTimes[index],
-    updated_at: timestamp,
-    artifact_counts: emptyArtifactCounts()
-  }));
+  const existing = readPreviewJobs();
+  const outputDir = request.outputDir;
+  const forceRedownload = Boolean(request.forceRedownload);
+  const jobs: QueuedDownloadJob[] = [];
+  const skipped: SkippedDownloadCourse[] = [];
 
-  writePreviewState([...jobs, ...readPreviewJobs()], readPreviewEvents());
-  return { jobs };
+  for (const [index, course] of parsed.entries()) {
+    const conflict = existing.find(
+      (job) =>
+        job.course_slug === course.slug &&
+        job.output_dir === outputDir &&
+        (job.status === "active" ||
+          job.status === "queued" ||
+          (job.status === "completed" && !forceRedownload))
+    );
+    if (conflict) {
+      skipped.push({
+        course_slug: course.slug,
+        reason:
+          conflict.status === "active"
+            ? "already_active"
+            : conflict.status === "queued"
+              ? "already_queued"
+              : "already_completed"
+      });
+      continue;
+    }
+
+    jobs.push({
+      id: `preview-job-${requestId}-${index + 1}-${course.slug}`,
+      course_slug: course.slug,
+      source_url: course.normalized_url,
+      status: "queued",
+      thumbnail_url: previewThumbnailForSlug(course.slug),
+      selected_quality: request.selectedQuality,
+      output_dir: request.outputDir,
+      paused: false,
+      scheduled_at: scheduledTimes[index],
+      updated_at: timestamp,
+      artifact_counts: emptyArtifactCounts()
+    });
+  }
+
+  writePreviewState([...jobs, ...existing], readPreviewEvents());
+  return { jobs, skipped };
 }
 
 function previewScheduledTimes(schedule: DownloadScheduleRequest | undefined, courseCount: number, timestamp: number) {
@@ -4680,8 +4764,8 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
   if (!job) {
     throw new Error("Retry job was not found.");
   }
-  if (job.status !== "failed") {
-    throw new Error("Only failed jobs can be retried.");
+  if (job.status !== "failed" && job.status !== "cancelled") {
+    throw new Error("Only failed or cancelled jobs can be retried.");
   }
 
   const retriedJobs = jobs.map((candidate) =>
@@ -4689,6 +4773,7 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
       ? {
           ...candidate,
           status: "queued",
+          paused: false,
           updated_at: timestamp,
           artifact_counts: emptyArtifactCounts()
         }
