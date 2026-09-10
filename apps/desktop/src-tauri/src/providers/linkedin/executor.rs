@@ -45,34 +45,39 @@ impl StepExecutor for LinkedInDownloadExecutor {
     }
 
     fn execute(&self, run: &RunRecord, _step: &StepRecord) -> ExecutorOutcome {
-        if self.cancellation.load(Ordering::SeqCst) {
-            return ExecutorOutcome::cancelled("LinkedIn download was cancelled".to_string());
-        }
-        let request = match serde_json::from_str::<LinkedInWorkflowRequest>(&run.request_json) {
-            Ok(request) => request,
-            Err(error) => return ExecutorOutcome::failed(error.to_string()),
-        };
-        let token = match session_token(&self.session_token, &self.token_path) {
-            Ok(token) => token,
-            Err(error) => return ExecutorOutcome::failed(error),
-        };
-        match download_linkedin_run(
-            &self.db_path,
-            run,
-            &request,
-            &token,
-            &self.cancellation,
-            &self.paused,
-        ) {
-            Ok(()) => ExecutorOutcome::succeeded("{}".to_string()),
-            Err(error) => {
-                if self.cancellation.load(Ordering::SeqCst) {
-                    ExecutorOutcome::cancelled(error)
-                } else {
-                    ExecutorOutcome::failed(error)
-                }
+        let outcome = if self.cancellation.load(Ordering::SeqCst) {
+            ExecutorOutcome::cancelled("LinkedIn download was cancelled".to_string())
+        } else {
+            match serde_json::from_str::<LinkedInWorkflowRequest>(&run.request_json) {
+                Err(error) => ExecutorOutcome::failed(error.to_string()),
+                Ok(request) => match session_token(&self.session_token, &self.token_path) {
+                    Err(error) => ExecutorOutcome::failed(error),
+                    Ok(token) => {
+                        match download_linkedin_run(
+                            &self.db_path,
+                            run,
+                            &request,
+                            &token,
+                            &self.cancellation,
+                            &self.paused,
+                        ) {
+                            Ok(()) => ExecutorOutcome::succeeded("{}".to_string()),
+                            Err(error) => {
+                                if self.cancellation.load(Ordering::SeqCst) {
+                                    ExecutorOutcome::cancelled(error)
+                                } else {
+                                    ExecutorOutcome::failed(error)
+                                }
+                            }
+                        }
+                    }
+                },
             }
-        }
+        };
+        // Cancel applies to the in-flight job only. Clear so later queue items
+        // are not sticky-cancelled without a Failed retry path.
+        self.cancellation.store(false, Ordering::SeqCst);
+        outcome
     }
 }
 
@@ -152,10 +157,11 @@ mod tests {
     #[test]
     fn missing_token_fails_without_network() {
         let temp = tempfile::tempdir().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
         let executor = LinkedInDownloadExecutor {
             db_path: temp.path().join("linkvault.sqlite3"),
             token_path: temp.path().join("token.bin"),
-            cancellation: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::clone(&cancellation),
             paused: Arc::new(AtomicBool::new(false)),
             session_token: Arc::new(Mutex::new(None)),
         };
@@ -187,5 +193,48 @@ mod tests {
         let outcome = executor.execute(&run, &step);
         assert!(!outcome.succeeded);
         assert!(!outcome.cancelled);
+    }
+
+    #[test]
+    fn execute_clears_sticky_cancellation_after_cancelled_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let executor = LinkedInDownloadExecutor {
+            db_path: temp.path().join("linkvault.sqlite3"),
+            token_path: temp.path().join("token.bin"),
+            cancellation: Arc::clone(&cancellation),
+            paused: Arc::new(AtomicBool::new(false)),
+            session_token: Arc::new(Mutex::new(None)),
+        };
+        let run = RunRecord {
+            id: "job-1".to_string(),
+            workflow_type: WorkflowType::linkedin_download(),
+            provider: "linkedin".to_string(),
+            state: RunState::Running,
+            legacy_origin: None,
+            legacy_id: None,
+            request_json: "{\"schemaVersion\":1,\"courseSlug\":\"foo\",\"sourceUrl\":\"https://www.linkedin.com/learning/foo\",\"selectedQuality\":\"720p\",\"downloadVideos\":true,\"downloadExercises\":true,\"downloadSubtitles\":true,\"downloadQuizzes\":true,\"quizHintsJson\":\"[]\"}".to_string(),
+            output_root: ".".to_string(),
+            error_message: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        };
+        let step = StepRecord {
+            id: "step".to_string(),
+            run_id: run.id.clone(),
+            step_key: "execute".to_string(),
+            step_type: StepType::linkedin_execute(),
+            state: StepState::Running,
+            attempt: 1,
+            error_message: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let outcome = executor.execute(&run, &step);
+
+        assert!(outcome.cancelled);
+        assert!(!cancellation.load(Ordering::SeqCst));
     }
 }

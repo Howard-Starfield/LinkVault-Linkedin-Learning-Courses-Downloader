@@ -124,6 +124,7 @@ pub fn run() {
             app_updates::install_app_update,
             resolve_cooperative_exit,
             commands::bootstrap_state,
+            commands::linkedin_queue_busy,
             commands::cancel_active_download,
             commands::clear_failed_download_jobs,
             commands::clear_saved_li_at_token,
