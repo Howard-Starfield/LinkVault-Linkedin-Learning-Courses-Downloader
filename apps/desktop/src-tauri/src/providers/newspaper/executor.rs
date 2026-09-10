@@ -36,7 +36,10 @@ impl StepExecutor for NewspaperDownloadExecutor {
         };
         match download_newspaper_run(&self.db_path, run, &request, &self.cancellation) {
             Ok(status) => match status.as_str() {
-                "completed" | "partial" => {
+                // Download finished. `optimizing` means pages are on disk and the
+                // image pass is next; treat it as success so the workflow run
+                // does not fail before per-edition optimize can start.
+                "completed" | "partial" | "optimizing" => {
                     ExecutorOutcome::succeeded(serde_json::json!({ "status": status }).to_string())
                 }
                 "queued" | "awaiting_release" => ExecutorOutcome {
@@ -179,5 +182,23 @@ mod tests {
         let outcome = executor.execute(&run, &step);
         assert!(outcome.cancelled);
         assert!(!outcome.succeeded);
+    }
+
+    #[test]
+    fn optimizing_status_is_treated_as_download_success() {
+        let source = include_str!("executor.rs");
+        let match_arm = source
+            .split("Ok(status) => match status.as_str()")
+            .nth(1)
+            .and_then(|rest| rest.split("\"unavailable\"").next())
+            .unwrap_or_default();
+        assert!(
+            match_arm.contains("\"optimizing\""),
+            "workflow executor must treat optimizing as success so per-edition optimize can run"
+        );
+        assert!(
+            match_arm.contains("ExecutorOutcome::succeeded"),
+            "optimizing must map to succeeded, not failed"
+        );
     }
 }

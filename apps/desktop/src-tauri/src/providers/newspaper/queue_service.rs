@@ -129,7 +129,7 @@ pub(super) async fn process_queue(
 /// `run_optimization_pass` is the source of truth, so a manual "Optimize
 /// now" or a sibling per-edition trigger racing with this one resolves to a
 /// no-op rather than overlapping workers).
-fn spawn_per_edition_optimization(app: tauri::AppHandle, job_status: String) {
+pub(crate) fn spawn_per_edition_optimization(app: tauri::AppHandle, job_status: String) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<NewspaperState>();
         let result =
@@ -495,10 +495,19 @@ pub(super) fn update_job_terminal(
     warning: Option<&str>,
 ) -> Result<(), String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
+    let now = Utc::now().timestamp();
+    let completed_at = if matches!(status, "completed" | "partial") {
+        Some(now)
+    } else {
+        None
+    };
     connection
         .execute(
-            "UPDATE newspaper_jobs SET status = ?2, warning = ?3, updated_at = ?4 WHERE id = ?1",
-            params![job_id, status, warning, Utc::now().timestamp()],
+            "UPDATE newspaper_jobs
+             SET status = ?2, warning = ?3, updated_at = ?4,
+                 completed_at = CASE WHEN ?5 IS NOT NULL THEN ?5 ELSE completed_at END
+             WHERE id = ?1",
+            params![job_id, status, warning, now, completed_at],
         )
         .map_err(|error| error.to_string())?;
     Ok(())

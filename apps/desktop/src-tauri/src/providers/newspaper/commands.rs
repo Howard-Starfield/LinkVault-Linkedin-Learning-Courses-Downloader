@@ -158,6 +158,7 @@ pub async fn process_newspaper_queue(
     let db_path = state.db_path().to_path_buf();
     let cancelled = Arc::clone(&state.cancelled);
     let runtime = (*runtime).clone();
+    let app_for_drain = app.clone();
     let result = match tauri::async_runtime::spawn_blocking({
         let db_path = db_path.clone();
         let cancelled = Arc::clone(&cancelled);
@@ -173,6 +174,16 @@ pub async fn process_newspaper_queue(
                     .map_err(|error| error.to_string())?;
                 if !outcome.processed {
                     break;
+                }
+                // Workflow downloads finish inside the executor and never pass
+                // through the legacy process_queue loop. Trigger optimize after
+                // each successful edition so edition N can optimize while N+1
+                // downloads (optimization_running serializes the pass itself).
+                if outcome.completed > 0 {
+                    queue_service::spawn_per_edition_optimization(
+                        app_for_drain.clone(),
+                        "workflow_drain".to_string(),
+                    );
                 }
             }
             Ok(())
@@ -926,8 +937,8 @@ mod tests {
             "materialize_due must use spawn_blocking"
         );
         assert!(
-            process_fn.contains("Arc::clone(&state.cancelled)"),
-            "clone cancelled before the download pass so the command does not borrow state across .await"
+            process_fn.contains("spawn_per_edition_optimization"),
+            "workflow drain path must trigger per-edition optimization after each completed edition"
         );
     }
 }

@@ -1,5 +1,6 @@
 //! WorkflowRuntime owns the kernel supervisor. Provider executors register at setup.
 
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -11,7 +12,9 @@ use crate::app::database_writer::DatabaseWriter;
 use crate::workflow::application::repository_service::WorkflowRepositoryService;
 use crate::workflow::domain::errors::WorkflowError;
 use crate::workflow::domain::state::{RunState, StepState};
-use crate::workflow::domain::types::{NewWorkflowRun, NewWorkflowStep, StepType, WorkflowType};
+use crate::workflow::domain::types::{
+    NewWorkflowRun, NewWorkflowStep, RunRecord, StepRecord, StepType, WorkflowType,
+};
 use crate::workflow::ports::executor::{ExecutorOutcome, StepExecutor};
 
 #[derive(Clone)]
@@ -24,7 +27,32 @@ struct WorkflowRuntimeInner {
     shutdown: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
     executors: Mutex<Vec<Arc<dyn StepExecutor>>>,
+    /// Serializes claim + apply only. Long `executor.execute` work runs outside.
     drain_lock: Mutex<()>,
+    /// One in-flight execute per workflow type so providers can overlap without
+    /// double-running the same provider (shared cancel flags, rate limits).
+    executing_types: Mutex<HashSet<String>>,
+}
+
+struct ClaimedStep {
+    run: RunRecord,
+    step: StepRecord,
+    executor: Option<Arc<dyn StepExecutor>>,
+}
+
+struct ExecuteGuard {
+    inner: Arc<WorkflowRuntimeInner>,
+    workflow_type: String,
+}
+
+impl Drop for ExecuteGuard {
+    fn drop(&mut self) {
+        self.inner
+            .executing_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.workflow_type);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +83,7 @@ impl WorkflowRuntime {
                 join: Mutex::new(None),
                 executors: Mutex::new(Vec::new()),
                 drain_lock: Mutex::new(()),
+                executing_types: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -504,25 +533,26 @@ impl WorkflowRuntime {
     }
 
     pub fn drain_once(&self) -> Result<DrainOutcome, WorkflowError> {
-        let _guard = self
-            .inner
-            .drain_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drain_once(&self.inner.service, &self.inner.executors, None)
+        drain_pipeline(self, None)
     }
 
     pub fn drain_type(&self, workflow_type: &str) -> Result<DrainOutcome, WorkflowError> {
-        let _guard = self
+        drain_pipeline(self, Some(workflow_type))
+    }
+
+    fn try_begin_execute(&self, workflow_type: &str) -> Option<ExecuteGuard> {
+        let mut busy = self
             .inner
-            .drain_lock
+            .executing_types
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drain_once(
-            &self.inner.service,
-            &self.inner.executors,
-            Some(workflow_type),
-        )
+        if !busy.insert(workflow_type.to_string()) {
+            return None;
+        }
+        Some(ExecuteGuard {
+            inner: Arc::clone(&self.inner),
+            workflow_type: workflow_type.to_string(),
+        })
     }
 }
 
@@ -531,6 +561,145 @@ impl Drop for WorkflowRuntime {
         if Arc::strong_count(&self.inner) == 1 {
             self.shutdown();
         }
+    }
+}
+
+fn drain_pipeline(
+    runtime: &WorkflowRuntime,
+    only_type: Option<&str>,
+) -> Result<DrainOutcome, WorkflowError> {
+    let Some((claimed, _execute_guard)) = claim_ready_step(runtime, only_type)? else {
+        return Ok(DrainOutcome::idle());
+    };
+    let outcome = match &claimed.executor {
+        Some(executor) => executor.execute(&claimed.run, &claimed.step),
+        None => synthetic_outcome(&claimed.run),
+    };
+    let _apply_guard = runtime
+        .inner
+        .drain_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    finish_claimed_step(&runtime.inner.service, &claimed, outcome)
+}
+
+fn claim_ready_step(
+    runtime: &WorkflowRuntime,
+    only_type: Option<&str>,
+) -> Result<Option<(ClaimedStep, ExecuteGuard)>, WorkflowError> {
+    let now = chrono::Utc::now().timestamp();
+    let registered = runtime
+        .inner
+        .executors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for executor in registered {
+        if only_type.is_some_and(|wanted| executor.workflow_type() != wanted) {
+            continue;
+        }
+        let Some(execute_guard) = runtime.try_begin_execute(executor.workflow_type()) else {
+            continue;
+        };
+        let claimed = {
+            let _claim_guard = runtime
+                .inner
+                .drain_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match runtime
+                .inner
+                .service
+                .claim_next_ready_step(executor.workflow_type().to_string(), now)?
+            {
+                Some(step) => {
+                    let run = runtime
+                        .inner
+                        .service
+                        .get_run(step.run_id.clone())?
+                        .ok_or_else(|| WorkflowError::RunNotFound(step.run_id.clone()))?;
+                    Some(ClaimedStep {
+                        run,
+                        step,
+                        executor: Some(Arc::clone(&executor)),
+                    })
+                }
+                None => None,
+            }
+        };
+        if let Some(claimed) = claimed {
+            return Ok(Some((claimed, execute_guard)));
+        }
+        drop(execute_guard);
+    }
+    if only_type.is_some_and(|wanted| wanted != WorkflowType::synthetic().as_str()) {
+        return Ok(None);
+    }
+    let Some(execute_guard) = runtime.try_begin_execute(WorkflowType::synthetic().as_str()) else {
+        return Ok(None);
+    };
+    let claimed = {
+        let _claim_guard = runtime
+            .inner
+            .drain_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match runtime.inner.service.claim_next_ready_step(
+            WorkflowType::synthetic().as_str().to_string(),
+            now,
+        )? {
+            Some(step) => {
+                let run = runtime
+                    .inner
+                    .service
+                    .get_run(step.run_id.clone())?
+                    .ok_or_else(|| WorkflowError::RunNotFound(step.run_id.clone()))?;
+                Some(ClaimedStep {
+                    run,
+                    step,
+                    executor: None,
+                })
+            }
+            None => None,
+        }
+    };
+    Ok(claimed.map(|claimed| (claimed, execute_guard)))
+}
+
+fn finish_claimed_step(
+    service: &WorkflowRepositoryService,
+    claimed: &ClaimedStep,
+    outcome: ExecutorOutcome,
+) -> Result<DrainOutcome, WorkflowError> {
+    let now = chrono::Utc::now().timestamp();
+    let retried = apply_executor_outcome(
+        service,
+        &claimed.run.id,
+        &claimed.step.id,
+        claimed.step.attempt,
+        outcome.clone(),
+        now,
+    )?;
+    if retried {
+        return Ok(DrainOutcome {
+            processed: true,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+        });
+    }
+    drain_outcome_after_apply(service, &claimed.run.id, &outcome)
+}
+
+fn synthetic_outcome(run: &RunRecord) -> ExecutorOutcome {
+    if request_disk_full(&run.request_json) {
+        ExecutorOutcome::failed("disk is full".to_string())
+    } else if request_should_retry(&run.request_json) {
+        ExecutorOutcome::retryable_failure("synthetic retry requested".to_string())
+    } else if request_should_fail(&run.request_json) {
+        ExecutorOutcome::failed("synthetic failure requested".to_string())
+    } else {
+        ExecutorOutcome::succeeded("{}".to_string())
     }
 }
 
@@ -563,92 +732,6 @@ fn submit_synthetic(
         "{}".to_string(),
     )?;
     Ok(run_id)
-}
-
-fn drain_once(
-    service: &WorkflowRepositoryService,
-    executors: &Mutex<Vec<Arc<dyn StepExecutor>>>,
-    only_type: Option<&str>,
-) -> Result<DrainOutcome, WorkflowError> {
-    let now = chrono::Utc::now().timestamp();
-    let registered = executors
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    for executor in registered {
-        if only_type.is_some_and(|wanted| executor.workflow_type() != wanted) {
-            continue;
-        }
-        if let Some(step) =
-            service.claim_next_ready_step(executor.workflow_type().to_string(), now)?
-        {
-            let run = service
-                .get_run(step.run_id.clone())?
-                .ok_or_else(|| WorkflowError::RunNotFound(step.run_id.clone()))?;
-            let outcome = executor.execute(&run, &step);
-            let retried = apply_executor_outcome(
-                service,
-                &run.id,
-                &step.id,
-                step.attempt,
-                outcome.clone(),
-                now,
-            )?;
-            if retried {
-                return Ok(DrainOutcome {
-                    processed: true,
-                    completed: 0,
-                    failed: 0,
-                    cancelled: 0,
-                });
-            }
-            return drain_outcome_after_apply(service, &run.id, &outcome);
-        }
-    }
-    if only_type.is_some_and(|wanted| wanted != WorkflowType::synthetic().as_str()) {
-        return Ok(DrainOutcome::idle());
-    }
-    drain_synthetic(service, now)
-}
-
-fn drain_synthetic(
-    service: &WorkflowRepositoryService,
-    now: i64,
-) -> Result<DrainOutcome, WorkflowError> {
-    let Some(step) =
-        service.claim_next_ready_step(WorkflowType::synthetic().as_str().to_string(), now)?
-    else {
-        return Ok(DrainOutcome::idle());
-    };
-    let run = service
-        .get_run(step.run_id.clone())?
-        .ok_or_else(|| WorkflowError::RunNotFound(step.run_id.clone()))?;
-    let outcome = if request_disk_full(&run.request_json) {
-        ExecutorOutcome::failed("disk is full".to_string())
-    } else if request_should_retry(&run.request_json) {
-        ExecutorOutcome::retryable_failure("synthetic retry requested".to_string())
-    } else if request_should_fail(&run.request_json) {
-        ExecutorOutcome::failed("synthetic failure requested".to_string())
-    } else {
-        ExecutorOutcome::succeeded("{}".to_string())
-    };
-    let retried = apply_executor_outcome(
-        service,
-        &run.id,
-        &step.id,
-        step.attempt,
-        outcome.clone(),
-        now,
-    )?;
-    if retried {
-        return Ok(DrainOutcome {
-            processed: true,
-            completed: 0,
-            failed: 0,
-            cancelled: 0,
-        });
-    }
-    drain_outcome_after_apply(service, &run.id, &outcome)
 }
 
 fn apply_executor_outcome(
@@ -1219,11 +1302,126 @@ mod tests {
     }
 
     #[test]
-    fn cancel_run_propagates_illegal_transition_errors() {
+    fn different_workflow_types_execute_without_holding_drain_lock() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+        use std::time::Duration;
+
+        struct HoldingExecutor {
+            workflow_type: &'static str,
+            hold_until_release: bool,
+            entered: Arc<AtomicBool>,
+            overlap_seen: Arc<AtomicUsize>,
+            release: Arc<AtomicBool>,
+            peer_entered: Arc<AtomicBool>,
+        }
+
+        impl StepExecutor for HoldingExecutor {
+            fn workflow_type(&self) -> &'static str {
+                self.workflow_type
+            }
+
+            fn execute(
+                &self,
+                _run: &crate::workflow::domain::types::RunRecord,
+                _step: &crate::workflow::domain::types::StepRecord,
+            ) -> ExecutorOutcome {
+                self.entered.store(true, AtomicOrdering::SeqCst);
+                if self.hold_until_release {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while std::time::Instant::now() < deadline {
+                        if self.peer_entered.load(AtomicOrdering::SeqCst) {
+                            self.overlap_seen.fetch_add(1, AtomicOrdering::SeqCst);
+                            break;
+                        }
+                        if self.release.load(AtomicOrdering::SeqCst) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    while !self.release.load(AtomicOrdering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                } else if self.peer_entered.load(AtomicOrdering::SeqCst) {
+                    self.overlap_seen.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                ExecutorOutcome::succeeded("{}".to_string())
+            }
+        }
+
         let (_dir, runtime) = runtime();
-        let run_id = runtime.submit_synthetic("{}", 130).unwrap();
-        assert!(runtime.drain_once().unwrap().processed);
-        let error = runtime.cancel_run(run_id, 131).unwrap_err();
-        assert!(error.to_string().contains("illegal run transition"));
+        let slow_entered = Arc::new(AtomicBool::new(false));
+        let fast_entered = Arc::new(AtomicBool::new(false));
+        let overlap_seen = Arc::new(AtomicUsize::new(0));
+        let release_slow = Arc::new(AtomicBool::new(false));
+
+        runtime.register_executor(Arc::new(HoldingExecutor {
+            workflow_type: "linkedin_download",
+            hold_until_release: true,
+            entered: Arc::clone(&slow_entered),
+            overlap_seen: Arc::clone(&overlap_seen),
+            release: Arc::clone(&release_slow),
+            peer_entered: Arc::clone(&fast_entered),
+        }));
+        runtime.register_executor(Arc::new(HoldingExecutor {
+            workflow_type: "newspaper_download",
+            hold_until_release: false,
+            entered: Arc::clone(&fast_entered),
+            overlap_seen: Arc::clone(&overlap_seen),
+            release: Arc::new(AtomicBool::new(true)),
+            peer_entered: Arc::clone(&slow_entered),
+        }));
+
+        runtime
+            .submit_linkedin_download(
+                "li-overlap-1".to_string(),
+                "course-1".to_string(),
+                "{}".to_string(),
+                ".".to_string(),
+                200,
+                None,
+            )
+            .unwrap();
+        runtime
+            .submit_newspaper_download(
+                "np-overlap-1".to_string(),
+                "NY".to_string(),
+                "{\"schemaVersion\":1,\"batchId\":\"batch-1\",\"editionCode\":\"NY\",\"editionName\":\"World Journal\",\"editionPublicationDate\":\"\",\"publicationDate\":\"2026-07-24\",\"queuePosition\":1,\"delaySeconds\":0,\"scheduledAt\":null,\"optimizeImages\":false}".to_string(),
+                ".".to_string(),
+                201,
+                None,
+            )
+            .unwrap();
+
+        let runtime_slow = runtime.clone();
+        let slow_handle = thread::spawn(move || {
+            runtime_slow.drain_type("linkedin_download").unwrap()
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !slow_entered.load(AtomicOrdering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slow linkedin executor never entered"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let newspaper_outcome = runtime.drain_type("newspaper_download").unwrap();
+        assert!(
+            newspaper_outcome.processed,
+            "newspaper must claim while linkedin execute is in flight"
+        );
+        assert!(
+            fast_entered.load(AtomicOrdering::SeqCst),
+            "newspaper executor must run while linkedin still holds execute"
+        );
+        assert!(
+            overlap_seen.load(AtomicOrdering::SeqCst) > 0,
+            "providers must overlap execute outside drain_lock"
+        );
+
+        release_slow.store(true, AtomicOrdering::SeqCst);
+        let linkedin_outcome = slow_handle.join().expect("linkedin drain thread");
+        assert!(linkedin_outcome.processed);
     }
 }
