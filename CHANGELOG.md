@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.26 - 2026-09-10
+
+- **LinkedIn failed queue and retry.** Failed attempts leave Queue and land on Failed with Retry (including cancelled). Retry clears the terminal attempt and requeues the same job.
+- **LinkedIn duplicate skip and lean idle probe.** Queue submit skips courses already present in the DB or a slug-named folder; saved-token idle wait uses a lean busy probe instead of full bootstrap every 500ms.
+- **World Journal can download while LinkedIn runs.** The shared workflow drain lock is held only for claim/apply, not the long execute body.
+- **Per-edition World Journal optimize.** Each finished edition can start image optimization before the rest of the queue finishes downloading.
+- **Faster schedule start.** Saving a daily newspaper schedule kicks queue processing immediately instead of waiting for the 15s poll.
+
 ## 0.2.25 - 2026-08-29
 
 - **One-button Newspaper library recovery.** Settings → Recover newspaper library imports edition pages from the live `{name} - CODE/date/*.webp` layout and clippings from `Newspaper snapshots` (image + `note.md`), registers the snapshot root, and skips already-known rows on re-run.
