@@ -446,6 +446,14 @@ export function NewspaperView({
           : "The current local calendar date will be checked on every run."
       });
       await refresh();
+      // Kick materialize+download immediately instead of waiting for the 15s poll.
+      setProcessing(true);
+      try {
+        await onRequestQueueProcess?.(buildOptimizationRunOptions());
+        await refresh();
+      } finally {
+        setProcessing(false);
+      }
     } catch (error) {
       toast.error("Could not save newspaper schedule", { description: String(error) });
     } finally {
