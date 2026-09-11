@@ -8,7 +8,7 @@ use super::topic::parse_topic_listing;
 use super::{ExpandedCourseCatalog, ExpansionError, ExpansionSummary, LearningUrlRef};
 
 pub fn expand_learning_urls(
-    client: &mut impl CourseApiClient,
+    client: &mut (impl CourseApiClient + ?Sized),
     refs: &[LearningUrlRef],
 ) -> Result<ExpandedCourseCatalog, ExpansionError> {
     let mut courses = BTreeMap::new();
@@ -61,7 +61,7 @@ pub fn expand_learning_urls(
 }
 
 fn expand_path(
-    client: &mut impl CourseApiClient,
+    client: &mut (impl CourseApiClient + ?Sized),
     path_slug: &str,
     courses: &mut BTreeMap<String, CourseUrl>,
     failed_paths: &mut Vec<String>,
@@ -82,7 +82,7 @@ fn expand_path(
 }
 
 fn fetch_path_courses(
-    client: &mut impl CourseApiClient,
+    client: &mut (impl CourseApiClient + ?Sized),
     url: &str,
 ) -> Result<Vec<CourseUrl>, String> {
     let html = client.get(url).map_err(|error| error.to_string())?;
@@ -90,7 +90,7 @@ fn fetch_path_courses(
 }
 
 fn expand_topic_path_slugs(
-    client: &mut impl CourseApiClient,
+    client: &mut (impl CourseApiClient + ?Sized),
     topic_slug: &str,
 ) -> Result<Vec<String>, ExpansionError> {
     let mut url = format!("https://www.linkedin.com/learning/topics/{topic_slug}");

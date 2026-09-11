@@ -9,6 +9,7 @@ mod path;
 mod topic;
 
 pub use classify::classify_learning_urls;
+pub use expand::expand_learning_urls;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -69,6 +70,16 @@ impl ClassifiedPaste {
             topic_count,
             schedule_policy,
         }
+    }
+
+    pub fn course_urls(&self) -> Vec<CourseUrl> {
+        self.refs
+            .iter()
+            .filter_map(|learning_ref| match learning_ref {
+                LearningUrlRef::Course(course) => Some(course.clone()),
+                LearningUrlRef::Path { .. } | LearningUrlRef::Topic { .. } => None,
+            })
+            .collect()
     }
 }
 
