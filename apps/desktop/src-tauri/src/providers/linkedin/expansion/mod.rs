@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::linkedin::CourseUrl;
 
 mod classify;
+mod path;
 
 pub use classify::classify_learning_urls;
 
