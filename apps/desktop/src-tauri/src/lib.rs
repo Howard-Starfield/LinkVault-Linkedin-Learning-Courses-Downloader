@@ -132,6 +132,7 @@ pub fn run() {
             commands::download_scheduled_job_now,
             commands::open_download_folder,
             commands::parse_linkedin_course_urls,
+            commands::expand_linkedin_learning_urls,
             commands::process_next_queued_download_from_browser_source,
             commands::process_next_queued_download_with_saved_token,
             commands::process_queued_download_batch_with_saved_token,

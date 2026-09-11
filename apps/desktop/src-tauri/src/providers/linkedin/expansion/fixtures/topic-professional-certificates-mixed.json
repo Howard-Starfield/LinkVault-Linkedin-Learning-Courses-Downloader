@@ -1,0 +1,28 @@
+{
+  "elements": [
+    {
+      "entityType": "COURSE",
+      "slug": "career-essentials-in-system-administration-by-microsoft-and-linkedin",
+      "url": "https://www.linkedin.com/learning/career-essentials-in-system-administration-by-microsoft-and-linkedin"
+    },
+    {
+      "entityType": "COURSE",
+      "slug": "practical-github-actions",
+      "url": "https://www.linkedin.com/learning/practical-github-actions"
+    },
+    {
+      "entityType": "VIDEO",
+      "slug": "welcome",
+      "url": "https://www.linkedin.com/learning/practical-github-actions/welcome"
+    },
+    {
+      "entityType": "LEARNING_PATH",
+      "slug": "career-essentials-in-github-professional-certificate",
+      "url": "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate"
+    },
+    {
+      "type": "LEARNING_PATH",
+      "url": "https://www.linkedin.com/learning/paths/career-essentials-in-software-development-by-microsoft-and-linkedin"
+    }
+  ]
+}

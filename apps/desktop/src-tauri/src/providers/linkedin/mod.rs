@@ -9,6 +9,7 @@ pub mod browser_cookies;
 pub(crate) mod commands;
 pub mod course;
 pub mod download_orchestrator;
+pub(crate) mod expansion;
 pub(crate) mod folder_import;
 pub mod executor;
 pub mod exercise_archive;

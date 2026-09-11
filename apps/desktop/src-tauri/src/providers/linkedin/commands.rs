@@ -1,3 +1,8 @@
+use super::expansion::{
+    classify_learning_urls, expand_learning_urls, ClassifiedPaste, ExpansionError,
+    ExpansionSummary, SchedulePolicy,
+};
+use crate::app::database_writer::DatabaseWriter;
 use crate::artifact_downloader::{ArtifactHttpClient, CancellationFlag};
 use crate::auth::{
     select_first_valid_browser_token, validate_li_at_with_client, BrowserSource,
@@ -17,7 +22,7 @@ use crate::cache::{
 };
 use crate::course::CourseApiClient;
 use crate::download_orchestrator::process_next_queued_job_and_download_artifacts_with_quiz_assessments;
-use crate::linkedin::{parse_course_urls, CourseUrl};
+use crate::linkedin::CourseUrl;
 use crate::live_clients::AuthenticatedLinkedInClient;
 use crate::quality::{fallback_order, VideoQuality};
 use crate::quiz_hints::{quiz_hints_from_json, quiz_hints_json, QuizHints};
@@ -25,7 +30,6 @@ use crate::shell::open_folder_in_explorer;
 use crate::token_store;
 use crate::workflow::application::runtime::{DrainOutcome, WorkflowRuntime};
 use crate::workflow::domain::state::RunState;
-use crate::app::database_writer::DatabaseWriter;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -275,6 +279,8 @@ pub struct SkippedDownloadCourse {
 pub struct StartDownloadResponse {
     jobs: Vec<QueuedDownloadJob>,
     skipped: Vec<SkippedDownloadCourse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expansion: Option<ExpansionSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -344,8 +350,47 @@ pub fn linkedin_queue_busy(
 }
 
 #[tauri::command]
-pub fn parse_linkedin_course_urls(input: String) -> Result<Vec<CourseUrl>, String> {
-    parse_course_urls(&input).map_err(|error| error.to_string())
+pub fn parse_linkedin_course_urls(input: String) -> Result<ClassifiedPaste, String> {
+    classify_learning_urls(&input).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpandLearningUrlsRequest {
+    input: String,
+    #[serde(default)]
+    browser_source: Option<String>,
+}
+
+#[tauri::command]
+pub async fn expand_linkedin_learning_urls(
+    state: tauri::State<'_, LinkVaultState>,
+    request: ExpandLearningUrlsRequest,
+) -> Result<ExpansionSummary, String> {
+    let classified = classify_learning_urls(&request.input).map_err(|error| error.to_string())?;
+    if classified.schedule_policy == SchedulePolicy::KnownCount {
+        return Ok(ExpansionSummary {
+            paste_ref_count: classified.refs.len(),
+            path_count: 0,
+            unique_course_count: classified.course_count as usize,
+            failed_paths: Vec::new(),
+        });
+    }
+
+    let token_path = state.token_path.clone();
+    let browser_source = request
+        .browser_source
+        .unwrap_or_else(|| "Chrome".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        let (token, session) = resolve_linkedin_session(&token_path, &browser_source)?;
+        let mut client = AuthenticatedLinkedInClient::new(&token, &session)
+            .map_err(|error| error.to_string())?;
+        let catalog = expand_learning_urls(&mut client, &classified.refs)
+            .map_err(|error| error.to_string())?;
+        Ok(catalog.summary)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -361,7 +406,29 @@ pub async fn start_download_jobs(
     request: StartDownloadRequest,
 ) -> Result<StartDownloadResponse, String> {
     let output_dir = request.output_dir.clone();
-    let response = {
+    let classified =
+        classify_learning_urls(&request.course_urls).map_err(|error| error.to_string())?;
+    let response = if classified.schedule_policy == SchedulePolicy::Discovering {
+        let db_path = state.db_path.clone();
+        let token_path = state.token_path.clone();
+        let browser_source = request.browser_source.clone();
+        let runtime = (*runtime).clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let connection = open_runtime(&db_path).map_err(|error| error.to_string())?;
+            let (token, session) = resolve_linkedin_session(&token_path, &browser_source)?;
+            let mut client = AuthenticatedLinkedInClient::new(&token, &session)
+                .map_err(|error| error.to_string())?;
+            queue_download_jobs_with_expander(
+                &runtime,
+                &connection,
+                request,
+                now_unix_timestamp(),
+                Some(&mut client),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())??
+    } else {
         let connection = state.connection()?;
         queue_download_jobs(&runtime, &connection, request, now_unix_timestamp())
             .map_err(|error| error.to_string())?
@@ -483,11 +550,8 @@ pub fn set_linkedin_video_wait_bounds(
             {
                 preferences.video_wait_min_seconds = min_seconds;
                 preferences.video_wait_max_seconds = max_seconds;
-                let _ = persist_download_preferences(
-                    &connection,
-                    &preferences,
-                    now_unix_timestamp(),
-                );
+                let _ =
+                    persist_download_preferences(&connection, &preferences, now_unix_timestamp());
             }
         }
     }
@@ -653,7 +717,11 @@ pub fn remove_download_queue_item(
     {
         if matches!(
             run.state,
-            RunState::Running | RunState::Cancelling | RunState::Queued | RunState::Paused | RunState::RetryWait
+            RunState::Running
+                | RunState::Cancelling
+                | RunState::Queued
+                | RunState::Paused
+                | RunState::RetryWait
         ) {
             if matches!(run.state, RunState::Running | RunState::Cancelling) {
                 state.request_download_cancellation();
@@ -1368,7 +1436,19 @@ fn queue_download_jobs(
     request: StartDownloadRequest,
     created_at: i64,
 ) -> Result<StartDownloadResponse, String> {
-    let courses = parse_course_urls(&request.course_urls).map_err(|error| error.to_string())?;
+    queue_download_jobs_with_expander(runtime, connection, request, created_at, None)
+}
+
+fn queue_download_jobs_with_expander(
+    runtime: &WorkflowRuntime,
+    connection: &Connection,
+    request: StartDownloadRequest,
+    created_at: i64,
+    expander: Option<&mut dyn CourseApiClient>,
+) -> Result<StartDownloadResponse, String> {
+    let classified =
+        classify_learning_urls(&request.course_urls).map_err(|error| error.to_string())?;
+    let (courses, expansion) = resolve_download_catalog(classified, expander)?;
     if courses.is_empty() {
         return Err("Paste at least one LinkedIn Learning course URL.".to_string());
     }
@@ -1440,7 +1520,63 @@ fn queue_download_jobs(
         });
     }
 
-    Ok(StartDownloadResponse { jobs, skipped })
+    Ok(StartDownloadResponse {
+        jobs,
+        skipped,
+        expansion,
+    })
+}
+
+fn resolve_download_catalog(
+    classified: ClassifiedPaste,
+    expander: Option<&mut dyn CourseApiClient>,
+) -> Result<(Vec<CourseUrl>, Option<ExpansionSummary>), String> {
+    match classified.schedule_policy {
+        SchedulePolicy::KnownCount => {
+            let courses = classified.course_urls();
+            Ok((courses, None))
+        }
+        SchedulePolicy::Discovering => {
+            let client = expander.ok_or_else(|| ExpansionError::SessionRequired.to_string())?;
+            let catalog = expand_learning_urls(client, &classified.refs)
+                .map_err(|error| error.to_string())?;
+            Ok((catalog.courses, Some(catalog.summary)))
+        }
+    }
+}
+
+fn resolve_linkedin_session(
+    token_path: &Path,
+    browser_source_label: &str,
+) -> Result<(String, ValidatedLinkedInSession), String> {
+    if let Ok(token) = token_store::load_token(token_path) {
+        if let Ok(mut home_client) = ReqwestLinkedInHomeClient::new() {
+            if let Ok(session) = validate_li_at_with_client(&token, &mut home_client) {
+                return Ok((token, session));
+            }
+        }
+    }
+
+    let source = browser_source_from_label(browser_source_label)?;
+    let roots = BrowserCookieRoots::from_env();
+    let decoder = chromium_user_data_path_for_source(source, &roots)
+        .map(|path| ChromiumCookieDecoder::from_user_data_path(&path))
+        .unwrap_or_else(ChromiumCookieDecoder::disabled);
+    let candidates =
+        read_li_at_candidates(source, &roots, &decoder).map_err(|error| error.to_string())?;
+    let mut home_client = ReqwestLinkedInHomeClient::new().map_err(|error| error.to_string())?;
+    select_first_valid_browser_token(&candidates, &mut home_client)
+        .map(|(candidate, session)| (candidate.value, session))
+        .map_err(|_| ExpansionError::SessionRequired.to_string())
+}
+
+fn browser_source_from_label(label: &str) -> Result<BrowserSource, String> {
+    match label.trim() {
+        "Chrome" => Ok(BrowserSource::Chrome),
+        "Edge" => Ok(BrowserSource::Edge),
+        "Firefox" => Ok(BrowserSource::Firefox),
+        _ => Err(ExpansionError::SessionRequired.to_string()),
+    }
 }
 
 fn linkedin_queue_is_busy(
@@ -1483,8 +1619,7 @@ fn linkedin_course_dedupe_skip(
     output_dir: &str,
     force_redownload: bool,
 ) -> Result<Option<String>, String> {
-    if let Some(reason) =
-        linkedin_db_course_conflict(runtime, connection, course_slug, output_dir)?
+    if let Some(reason) = linkedin_db_course_conflict(runtime, connection, course_slug, output_dir)?
     {
         let allow_completed = force_redownload && reason == "already_completed";
         if !allow_completed {
@@ -1672,8 +1807,7 @@ fn retry_failed_download_job_inner(
         request.scheduled_at = None;
         let output_root = run.output_root.clone();
         let course_slug = request.course_slug.clone();
-        let request_json =
-            serde_json::to_string(&request).map_err(|error| error.to_string())?;
+        let request_json = serde_json::to_string(&request).map_err(|error| error.to_string())?;
         // Drop the terminal run and any mirrored legacy row so Failed no longer
         // lists this attempt after it returns to Queue.
         runtime
@@ -1863,7 +1997,9 @@ fn load_bootstrap_state(
 ) -> Result<BootstrapState, String> {
     let saved_download_preferences = get_setting(connection, "download.preferences")
         .map_err(|error| error.to_string())?
-        .and_then(|setting| serde_json::from_str::<SavedDownloadPreferences>(&setting.value_json).ok());
+        .and_then(|setting| {
+            serde_json::from_str::<SavedDownloadPreferences>(&setting.value_json).ok()
+        });
     if let Some(preferences) = saved_download_preferences.as_ref() {
         crate::artifact_downloader::set_live_video_wait_bounds(
             preferences.video_wait_min_seconds,
@@ -1973,7 +2109,9 @@ fn effective_linkedin_job_paused(job: &JobRecord, download_paused: bool) -> bool
     job.paused || (download_paused && job.status == "active")
 }
 
-pub(crate) fn bootstrap_jobs(connection: &Connection) -> Result<Vec<JobRecord>, crate::cache::CacheError> {
+pub(crate) fn bootstrap_jobs(
+    connection: &Connection,
+) -> Result<Vec<JobRecord>, crate::cache::CacheError> {
     let mut jobs = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2094,6 +2232,21 @@ mod tests {
         ArtifactRecord,
     };
     use crate::course::CourseFetchError;
+    use std::collections::HashMap;
+
+    struct ScriptedClient {
+        pages: HashMap<String, Result<String, u16>>,
+    }
+
+    impl CourseApiClient for ScriptedClient {
+        fn get(&mut self, url: &str) -> Result<String, CourseFetchError> {
+            match self.pages.get(url) {
+                Some(Ok(body)) => Ok(body.clone()),
+                Some(Err(status)) => Err(CourseFetchError::Http { status: *status }),
+                None => Err(CourseFetchError::Http { status: 404 }),
+            }
+        }
+    }
 
     fn initialized_connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
@@ -2114,6 +2267,94 @@ mod tests {
         let runtime = WorkflowRuntime::new(writer);
         let connection = crate::cache::open_runtime(&db_path).unwrap();
         (directory, runtime, connection)
+    }
+
+    #[test]
+    fn discovering_paste_without_expander_requires_a_session() {
+        let (_dir, runtime, connection) = workflow_harness();
+        let error = queue_download_jobs(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: false,
+            },
+            1_700_000_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("session"));
+    }
+
+    #[test]
+    fn queue_download_jobs_schedules_two_slots_for_an_expanded_catalog() {
+        let (_dir, runtime, connection) = workflow_harness();
+        let created_at = 1_700_000_000;
+        let path_html = r#"
+            <script type="application/ld+json">
+            {"@type":"ItemList","itemListElement":[
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/practical-github-actions"}},
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/practical-github-copilot"}}
+            ]}
+            </script>
+        "#;
+        let mut client = ScriptedClient {
+            pages: HashMap::from([(
+                "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate"
+                    .to_string(),
+                Ok(path_html.to_string()),
+            )]),
+        };
+
+        let response = queue_download_jobs_with_expander(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: Some(DownloadScheduleRequest {
+                    window_minutes: 120,
+                    min_wait_minutes: 10,
+                    max_wait_minutes: 30,
+                }),
+                force_redownload: false,
+            },
+            created_at,
+            Some(&mut client),
+        )
+        .unwrap();
+
+        assert_eq!(response.jobs.len(), 2);
+        assert_eq!(
+            response
+                .expansion
+                .as_ref()
+                .map(|summary| summary.unique_course_count),
+            Some(2)
+        );
+        assert!(response.jobs.iter().all(|job| job.scheduled_at.is_some()));
+        assert!(response.jobs[0].scheduled_at.unwrap() >= created_at + 10 * 60);
+        assert!(response.jobs[1].scheduled_at.unwrap() > response.jobs[0].scheduled_at.unwrap());
+        assert_ne!(response.jobs[0].course_slug, response.jobs[1].course_slug);
     }
 
     #[test]
