@@ -2,16 +2,18 @@ use regex::Regex;
 use serde_json::Value;
 use url::Url;
 
-use crate::linkedin::is_reserved_or_hub_prefix;
+use crate::linkedin::{is_reserved_or_hub_prefix, parse_course_url, parse_learning_url, CourseUrl};
 
-// Topic listings mix Course, Video, and LEARNING_PATH cards. Keep paths only.
-// Prefer JSON entities typed LEARNING_PATH, then /learning/paths/{slug} in HTML
-// or JSON. Follow an explicit next URL when the body includes one. Do not
-// synthesize guest ?start= paging or GraphQL queryIds.
+// Topic listings mix Course, Video, and LEARNING_PATH cards. Keep path and
+// standalone course result URLs. Drop videos, topics, and reserved prefixes.
+// Prefer JSON entities typed LEARNING_PATH or COURSE, then matching hrefs.
+// Follow an explicit next URL when the body includes one. Do not synthesize
+// guest ?start= paging or GraphQL queryIds.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicPage {
     pub path_slugs: Vec<String>,
+    pub courses: Vec<CourseUrl>,
     pub has_more: bool,
     pub next: Option<String>,
 }
@@ -25,13 +27,16 @@ pub fn parse_topic_listing(body: &str) -> TopicPage {
     }
 
     let mut path_slugs = harvest_path_slugs(body);
+    let mut courses = harvest_course_urls(body);
     for script in json_script_bodies(body) {
         if let Ok(value) = serde_json::from_str::<Value>(script) {
             let page = topic_page_from_json(&value, script);
             merge_slugs(&mut path_slugs, page.path_slugs);
+            merge_courses(&mut courses, page.courses);
             if page.next.is_some() || page.has_more {
                 return TopicPage {
                     path_slugs,
+                    courses,
                     has_more: page.has_more,
                     next: page.next,
                 };
@@ -41,6 +46,7 @@ pub fn parse_topic_listing(body: &str) -> TopicPage {
 
     TopicPage {
         path_slugs,
+        courses,
         has_more: false,
         next: None,
     }
@@ -48,21 +54,28 @@ pub fn parse_topic_listing(body: &str) -> TopicPage {
 
 fn topic_page_from_json(value: &Value, raw: &str) -> TopicPage {
     let mut path_slugs = Vec::new();
-    collect_learning_path_slugs(value, &mut path_slugs);
+    let mut courses = Vec::new();
+    collect_listing_entities(value, &mut path_slugs, &mut courses);
     merge_slugs(&mut path_slugs, harvest_path_slugs(raw));
+    merge_courses(&mut courses, harvest_course_urls(raw));
     let next = explicit_next_url(value);
     TopicPage {
         has_more: next.is_some(),
         next,
         path_slugs,
+        courses,
     }
 }
 
-fn collect_learning_path_slugs(value: &Value, path_slugs: &mut Vec<String>) {
+fn collect_listing_entities(
+    value: &Value,
+    path_slugs: &mut Vec<String>,
+    courses: &mut Vec<CourseUrl>,
+) {
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_learning_path_slugs(item, path_slugs);
+                collect_listing_entities(item, path_slugs, courses);
             }
         }
         Value::Object(map) => {
@@ -70,9 +83,13 @@ fn collect_learning_path_slugs(value: &Value, path_slugs: &mut Vec<String>) {
                 if let Some(slug) = path_slug_from_object(map) {
                     push_slug(path_slugs, slug);
                 }
+            } else if is_course_entity(value) {
+                if let Some(course) = course_from_object(map) {
+                    push_course(courses, course);
+                }
             }
             for nested in map.values() {
-                collect_learning_path_slugs(nested, path_slugs);
+                collect_listing_entities(nested, path_slugs, courses);
             }
         }
         _ => {}
@@ -80,15 +97,21 @@ fn collect_learning_path_slugs(value: &Value, path_slugs: &mut Vec<String>) {
 }
 
 fn is_learning_path_entity(value: &Value) -> bool {
+    entity_type_flags(value).contains("LEARNING_PATH")
+}
+
+fn is_course_entity(value: &Value) -> bool {
+    let flags = entity_type_flags(value);
+    flags.contains("COURSE") && !flags.contains("LEARNING_PATH") && !flags.contains("VIDEO")
+}
+
+fn entity_type_flags(value: &Value) -> String {
     ["entityType", "type", "$type", "contentType"]
         .iter()
-        .any(|key| {
-            value
-                .get(key)
-                .and_then(Value::as_str)
-                .map(|type_name| type_name.to_ascii_uppercase().contains("LEARNING_PATH"))
-                .unwrap_or(false)
-        })
+        .filter_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn path_slug_from_object(map: &serde_json::Map<String, Value>) -> Option<String> {
@@ -162,6 +185,70 @@ fn path_href_regex() -> Option<Regex> {
     Regex::new(r#"(?i)(?:https?://(?:www\.)?linkedin\.com)?/learning/paths/([A-Za-z0-9_-]+)"#).ok()
 }
 
+fn harvest_course_urls(body: &str) -> Vec<CourseUrl> {
+    let Some(regex) = course_href_regex() else {
+        return Vec::new();
+    };
+    let mut courses = Vec::new();
+    for matched in regex.find_iter(body) {
+        if !listing_href_is_course_card(body, matched.end()) {
+            continue;
+        }
+        if let Some(course) = listing_course_from_href(matched.as_str()) {
+            push_course(&mut courses, course);
+        }
+    }
+    courses
+}
+
+fn course_href_regex() -> Option<Regex> {
+    Regex::new(r"(?i)(?:https?://(?:www\.)?linkedin\.com)?/learning/[A-Za-z0-9_-]+").ok()
+}
+
+fn listing_href_is_course_card(body: &str, match_end: usize) -> bool {
+    let rest = body.get(match_end..).unwrap_or("").trim_start_matches('/');
+    match rest.chars().next() {
+        None => true,
+        Some(character) => matches!(
+            character,
+            '"' | '\'' | '?' | '#' | '<' | '>' | '&' | ' ' | '\n' | '\r' | '\t'
+        ),
+    }
+}
+
+fn course_from_object(map: &serde_json::Map<String, Value>) -> Option<CourseUrl> {
+    for key in ["url", "canonicalUrl", "publicUrl", "trackingUrl"] {
+        if let Some(url) = map.get(key).and_then(Value::as_str) {
+            if let Some(course) = listing_course_from_href(url) {
+                return Some(course);
+            }
+        }
+    }
+    let slug = map.get("slug").and_then(Value::as_str).map(str::trim)?;
+    if slug.is_empty() || is_reserved_or_hub_prefix(slug) {
+        return None;
+    }
+    listing_course_from_href(&format!("https://www.linkedin.com/learning/{slug}"))
+}
+
+fn listing_course_from_href(href: &str) -> Option<CourseUrl> {
+    let normalized = if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else if href.starts_with('/') {
+        format!("https://www.linkedin.com{href}")
+    } else {
+        return None;
+    };
+    let parsed = parse_learning_url(&normalized, 1).ok()?;
+    if is_reserved_or_hub_prefix(&parsed.first_segment) {
+        return None;
+    }
+    if !parsed.remaining_segments.is_empty() {
+        return None;
+    }
+    parse_course_url(&normalized, 1).ok()
+}
+
 fn json_script_bodies(html: &str) -> Vec<&str> {
     let Some(regex) = json_script_regex() else {
         return Vec::new();
@@ -213,6 +300,18 @@ fn merge_slugs(target: &mut Vec<String>, incoming: Vec<String>) {
     }
 }
 
+fn push_course(courses: &mut Vec<CourseUrl>, course: CourseUrl) {
+    if !courses.iter().any(|existing| existing.slug == course.slug) {
+        courses.push(course);
+    }
+}
+
+fn merge_courses(target: &mut Vec<CourseUrl>, incoming: Vec<CourseUrl>) {
+    for course in incoming {
+        push_course(target, course);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_topic_listing;
@@ -221,7 +320,7 @@ mod tests {
         include_str!("fixtures/topic-professional-certificates-mixed.json");
 
     #[test]
-    fn mixed_course_video_and_path_keeps_paths_only() {
+    fn mixed_listing_keeps_paths_and_standalone_courses_and_drops_videos() {
         let page = parse_topic_listing(MIXED_TOPIC_JSON);
         assert_eq!(
             page.path_slugs,
@@ -230,15 +329,28 @@ mod tests {
                 "career-essentials-in-software-development-by-microsoft-and-linkedin",
             ]
         );
+        let course_slugs: Vec<&str> = page
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert_eq!(
+            course_slugs,
+            vec![
+                "career-essentials-in-system-administration-by-microsoft-and-linkedin",
+                "practical-github-actions",
+            ]
+        );
         assert!(!page.path_slugs.iter().any(|slug| slug == "topics"));
+        assert!(!course_slugs.contains(&"welcome"));
         assert!(!page.has_more);
         assert!(page.next.is_none());
     }
 
     #[test]
-    fn html_listing_keeps_path_hrefs_and_ignores_course_and_video() {
+    fn html_listing_keeps_path_and_course_hrefs_and_ignores_video() {
         let html = r#"
-            <a href="https://www.linkedin.com/learning/practical-github-actions">Course</a>
+            <a href="https://www.linkedin.com/learning/career-essentials-in-system-administration-by-microsoft-and-linkedin">Course</a>
             <a href="/learning/practical-github-actions/welcome">Video</a>
             <a href="https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate">Path</a>
             <a href="/learning/topics/professional-certificates">Topic</a>
@@ -247,6 +359,13 @@ mod tests {
         assert_eq!(
             page.path_slugs,
             vec!["career-essentials-in-github-professional-certificate"]
+        );
+        assert_eq!(
+            page.courses
+                .iter()
+                .map(|course| course.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["career-essentials-in-system-administration-by-microsoft-and-linkedin"]
         );
     }
 

@@ -2,6 +2,11 @@
   "elements": [
     {
       "entityType": "COURSE",
+      "slug": "career-essentials-in-system-administration-by-microsoft-and-linkedin",
+      "url": "https://www.linkedin.com/learning/career-essentials-in-system-administration-by-microsoft-and-linkedin"
+    },
+    {
+      "entityType": "COURSE",
       "slug": "practical-github-actions",
       "url": "https://www.linkedin.com/learning/practical-github-actions"
     },

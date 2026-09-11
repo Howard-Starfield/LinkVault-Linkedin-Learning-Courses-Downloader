@@ -30,16 +30,13 @@ pub fn expand_learning_urls(
                 );
             }
             LearningUrlRef::Topic { topic_slug, .. } => {
-                let path_slugs = expand_topic_path_slugs(client, topic_slug)?;
-                for path_slug in path_slugs {
-                    expand_path(
-                        client,
-                        &path_slug,
-                        &mut courses,
-                        &mut failed_paths,
-                        &mut attempted_paths,
-                    );
-                }
+                expand_topic(
+                    client,
+                    topic_slug,
+                    &mut courses,
+                    &mut failed_paths,
+                    &mut attempted_paths,
+                )?;
             }
         }
     }
@@ -89,14 +86,18 @@ fn fetch_path_courses(
     parse_path_html(&html).map_err(|error| error.to_string())
 }
 
-fn expand_topic_path_slugs(
+fn expand_topic(
     client: &mut (impl CourseApiClient + ?Sized),
     topic_slug: &str,
-) -> Result<Vec<String>, ExpansionError> {
+    courses: &mut BTreeMap<String, CourseUrl>,
+    failed_paths: &mut Vec<String>,
+    attempted_paths: &mut BTreeSet<String>,
+) -> Result<(), ExpansionError> {
     let mut url = format!("https://www.linkedin.com/learning/topics/{topic_slug}");
     let mut seen_urls = HashSet::new();
     let mut path_slugs = Vec::new();
-    let mut seen_slugs = HashSet::new();
+    let mut seen_path_slugs = HashSet::new();
+    let mut harvested_any = false;
 
     loop {
         if !seen_urls.insert(url.clone()) {
@@ -109,28 +110,42 @@ fn expand_topic_path_slugs(
                 detail: error.to_string(),
             })?;
         let page = parse_topic_listing(&body);
+        if !page.path_slugs.is_empty() || !page.courses.is_empty() {
+            harvested_any = true;
+        }
         let mut added = 0_usize;
         for slug in page.path_slugs {
-            if seen_slugs.insert(slug.clone()) {
+            if seen_path_slugs.insert(slug.clone()) {
                 path_slugs.push(slug);
                 added += 1;
             }
         }
+        for course in page.courses {
+            if courses.contains_key(&course.slug) {
+                continue;
+            }
+            courses.insert(course.slug.clone(), course);
+            added += 1;
+        }
         match (page.has_more, page.next) {
-            (true, Some(next)) if added > 0 || path_slugs.is_empty() => {
+            (true, Some(next)) if added > 0 || !harvested_any => {
                 url = next;
             }
             _ => break,
         }
     }
 
-    if path_slugs.is_empty() {
+    if !harvested_any {
         return Err(ExpansionError::TopicExpandFailed {
             topic_slug: topic_slug.to_string(),
-            detail: "listing did not include learning paths".to_string(),
+            detail: "listing did not include learning paths or courses".to_string(),
         });
     }
-    Ok(path_slugs)
+
+    for path_slug in path_slugs {
+        expand_path(client, &path_slug, courses, failed_paths, attempted_paths);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -261,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn topic_listing_expands_learning_paths_only() {
+    fn topic_listing_expands_paths_and_keeps_standalone_courses() {
         let software_html = r#"
             <script type="application/ld+json">
             {"@type":"ItemList","itemListElement":[
@@ -289,12 +304,46 @@ mod tests {
         let catalog =
             expand_learning_urls(&mut client, &[topic_ref("professional-certificates")]).unwrap();
 
+        let slugs: Vec<&str> = catalog
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
         assert_eq!(catalog.summary.path_count, 2);
-        assert_eq!(catalog.summary.unique_course_count, 4);
+        assert_eq!(catalog.summary.unique_course_count, 5);
+        assert!(
+            slugs.contains(&"career-essentials-in-system-administration-by-microsoft-and-linkedin")
+        );
         assert!(catalog
             .courses
             .iter()
             .all(|course| course.slug != "welcome" && course.slug != "topics"));
+    }
+
+    #[test]
+    fn topic_listing_of_only_standalone_courses_still_expands() {
+        let listing = r#"{
+            "elements": [{
+                "entityType": "COURSE",
+                "url": "https://www.linkedin.com/learning/career-essentials-in-system-administration-by-microsoft-and-linkedin"
+            }]
+        }"#;
+        let mut client = ScriptedClient {
+            pages: HashMap::from([(
+                "https://www.linkedin.com/learning/topics/professional-certificates".to_string(),
+                Ok(listing.to_string()),
+            )]),
+        };
+
+        let catalog =
+            expand_learning_urls(&mut client, &[topic_ref("professional-certificates")]).unwrap();
+
+        assert_eq!(catalog.summary.path_count, 0);
+        assert_eq!(catalog.summary.unique_course_count, 1);
+        assert_eq!(
+            catalog.courses[0].slug,
+            "career-essentials-in-system-administration-by-microsoft-and-linkedin"
+        );
     }
 
     #[test]
