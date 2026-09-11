@@ -30,6 +30,7 @@ pub enum CourseUrlError {
     ReservedSegment { line: usize, segment: String },
 }
 
+#[cfg(test)]
 pub fn parse_course_urls(input: &str) -> Result<Vec<CourseUrl>, CourseUrlError> {
     let mut courses = Vec::new();
 
