@@ -1,20 +1,22 @@
 {
-  "version": 17,
+  "version": 18,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover. Coursera, YouTube, LinkedIn, and newspaper start/process now write through the workflow kernel.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 0,
     "src-tauri/src/providers/coursera/job.rs": 18,
+    "src-tauri/src/providers/linkedin/folder_import.rs": 5,
+    "src-tauri/src/providers/linkedin/path_library.rs": 6,
     "src-tauri/src/providers/newspaper/archive_service.rs": 6,
     "src-tauri/src/providers/newspaper/batch_service.rs": 11,
     "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
     "src-tauri/src/providers/newspaper/clipping_recovery.rs": 3,
     "src-tauri/src/providers/newspaper/clipping_draft_repository.rs": 5,
     "src-tauri/src/providers/newspaper/clipping_draft_service.rs": 3,
-    "src-tauri/src/providers/newspaper/clipping_repository.rs": 23,
+    "src-tauri/src/providers/newspaper/clipping_repository.rs": 25,
     "src-tauri/src/providers/newspaper/clipping_roots.rs": 2,
-    "src-tauri/src/providers/newspaper/clipping_service.rs": 5,
+    "src-tauri/src/providers/newspaper/clipping_service.rs": 6,
     "src-tauri/src/providers/newspaper/executor.rs": 1,
-    "src-tauri/src/providers/newspaper/job_service.rs": 9,
+    "src-tauri/src/providers/newspaper/job_service.rs": 10,
     "src-tauri/src/providers/newspaper/media_protocol.rs": 0,
     "src-tauri/src/providers/newspaper/optimization_service.rs": 3,
     "src-tauri/src/providers/newspaper/optimization_tasks.rs": 19,
@@ -35,6 +37,11 @@
       "clear_failed_jobs": 1,
       "insert_job": 1,
       "retry_failed_job": 1
+    },
+    "src-tauri/src/providers/linkedin/folder_import.rs": {
+      "insert_job": 1,
+      "upsert_artifact": 1,
+      "upsert_course_cache_entry": 1
     },
     "src-tauri/src/providers/linkedin/executor.rs": {
       "insert_job": 1
@@ -79,6 +86,7 @@
     "14": "YouTube queue/process commands now persist through workflow_runs only. Production youtube/commands.rs has zero insert_job helpers; youtube/job.rs remains a legacy read/reconcile projection.",
     "15": "LinkedIn start, retry, process, and reset now persist through workflow_runs. Production commands.rs no longer calls insert_job or retry_failed_job; the executor materializes a jobs row at execute time for artifact parent keys. Legacy jobs remain a read/cleanup projection.",
     "16": "Newspaper batch create, schedule materialize, process, and reset now persist through workflow_runs. Production create() does not insert newspaper_jobs; the executor materializes a newspaper_jobs row at execute time for page/library parent keys. create_with_connection remains the test fixture path. Legacy newspaper_jobs remain a read/progress projection that wins on merge.",
-    "17": "YouTube V1 now submits durable youtube_download runs and publishes verified media plus raw VTT and normalized transcript JSON. The legacy youtube_jobs write surface is gone; helper launches go through app::managed_process."
+    "17": "YouTube V1 now submits durable youtube_download runs and publishes verified media plus raw VTT and normalized transcript JSON. The legacy youtube_jobs write surface is gone; helper launches go through app::managed_process.",
+    "18": "LinkedIn path-history capture writes membership and standalone rows through PathLibrary on DatabaseWriter. Direct SQL primitives stay inside writer closures. Also records PR 50 folder_import writer closures so the stacked branch has a complete LinkedIn baseline; no fourth scheduler was added."
   }
 }

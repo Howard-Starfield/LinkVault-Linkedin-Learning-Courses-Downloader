@@ -1,7 +1,8 @@
 use super::expansion::{
     classify_learning_urls, expand_learning_urls, ClassifiedPaste, ExpansionError,
-    ExpansionSummary, SchedulePolicy,
+    ExpansionSummary, PathCapture, SchedulePolicy,
 };
+use super::path_library::{CourseSlug, PathLibrary};
 use crate::app::database_writer::DatabaseWriter;
 use crate::artifact_downloader::{ArtifactHttpClient, CancellationFlag};
 use crate::auth::{
@@ -408,6 +409,7 @@ pub async fn start_download_jobs(
     let output_dir = request.output_dir.clone();
     let classified =
         classify_learning_urls(&request.course_urls).map_err(|error| error.to_string())?;
+    let path_library = PathLibrary::new(writer.inner().clone());
     let response = if classified.schedule_policy == SchedulePolicy::Discovering {
         let db_path = state.db_path.clone();
         let token_path = state.token_path.clone();
@@ -424,14 +426,22 @@ pub async fn start_download_jobs(
                 request,
                 now_unix_timestamp(),
                 Some(&mut client),
+                Some(&path_library),
             )
         })
         .await
         .map_err(|error| error.to_string())??
     } else {
         let connection = state.connection()?;
-        queue_download_jobs(&runtime, &connection, request, now_unix_timestamp())
-            .map_err(|error| error.to_string())?
+        queue_download_jobs_with_expander(
+            &runtime,
+            &connection,
+            request,
+            now_unix_timestamp(),
+            None,
+            Some(&path_library),
+        )
+        .map_err(|error| error.to_string())?
     };
     recover_existing_linkedin_downloads(
         writer.inner().clone(),
@@ -1430,13 +1440,14 @@ fn record_quiz_metadata_discovery_for_next_job(
     Vec::new()
 }
 
+#[cfg(test)]
 fn queue_download_jobs(
     runtime: &WorkflowRuntime,
     connection: &Connection,
     request: StartDownloadRequest,
     created_at: i64,
 ) -> Result<StartDownloadResponse, String> {
-    queue_download_jobs_with_expander(runtime, connection, request, created_at, None)
+    queue_download_jobs_with_expander(runtime, connection, request, created_at, None, None)
 }
 
 fn queue_download_jobs_with_expander(
@@ -1445,10 +1456,14 @@ fn queue_download_jobs_with_expander(
     request: StartDownloadRequest,
     created_at: i64,
     expander: Option<&mut dyn CourseApiClient>,
+    path_library: Option<&PathLibrary>,
 ) -> Result<StartDownloadResponse, String> {
     let classified =
         classify_learning_urls(&request.course_urls).map_err(|error| error.to_string())?;
-    let (courses, expansion) = resolve_download_catalog(classified, expander)?;
+    let (courses, expansion, paths, standalone) = resolve_download_catalog(classified, expander)?;
+    if let Some(path_library) = path_library {
+        capture_expanded_catalog(path_library, paths, standalone)?;
+    }
     if courses.is_empty() {
         return Err("Paste at least one LinkedIn Learning course URL.".to_string());
     }
@@ -1530,19 +1545,51 @@ fn queue_download_jobs_with_expander(
 fn resolve_download_catalog(
     classified: ClassifiedPaste,
     expander: Option<&mut dyn CourseApiClient>,
-) -> Result<(Vec<CourseUrl>, Option<ExpansionSummary>), String> {
+) -> Result<
+    (
+        Vec<CourseUrl>,
+        Option<ExpansionSummary>,
+        Vec<PathCapture>,
+        Vec<String>,
+    ),
+    String,
+> {
     match classified.schedule_policy {
         SchedulePolicy::KnownCount => {
             let courses = classified.course_urls();
-            Ok((courses, None))
+            let standalone = courses.iter().map(|course| course.slug.clone()).collect();
+            Ok((courses, None, Vec::new(), standalone))
         }
         SchedulePolicy::Discovering => {
             let client = expander.ok_or_else(|| ExpansionError::SessionRequired.to_string())?;
             let catalog = expand_learning_urls(client, &classified.refs)
                 .map_err(|error| error.to_string())?;
-            Ok((catalog.courses, Some(catalog.summary)))
+            Ok((
+                catalog.courses,
+                Some(catalog.summary),
+                catalog.paths,
+                catalog.standalone,
+            ))
         }
     }
+}
+
+fn capture_expanded_catalog(
+    path_library: &PathLibrary,
+    paths: Vec<PathCapture>,
+    standalone: Vec<String>,
+) -> Result<(), String> {
+    for path in paths {
+        path_library
+            .capture_path(path)
+            .map_err(|error| error.to_string())?;
+    }
+    for course in standalone {
+        path_library
+            .capture_standalone(CourseSlug::parse(&course).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn resolve_linkedin_session(
@@ -2255,6 +2302,16 @@ mod tests {
     }
 
     fn workflow_harness() -> (tempfile::TempDir, WorkflowRuntime, Connection) {
+        let (directory, runtime, connection, _writer) = workflow_harness_with_writer();
+        (directory, runtime, connection)
+    }
+
+    fn workflow_harness_with_writer() -> (
+        tempfile::TempDir,
+        WorkflowRuntime,
+        Connection,
+        crate::app::database_writer::DatabaseWriter,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
         let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
@@ -2264,9 +2321,9 @@ mod tests {
             crate::app::database_diagnostics::DatabaseDiagnostics::default(),
         )
         .unwrap();
-        let runtime = WorkflowRuntime::new(writer);
+        let runtime = WorkflowRuntime::new(writer.clone());
         let connection = crate::cache::open_runtime(&db_path).unwrap();
-        (directory, runtime, connection)
+        (directory, runtime, connection, writer)
     }
 
     #[test]
@@ -2340,6 +2397,7 @@ mod tests {
             },
             created_at,
             Some(&mut client),
+            None,
         )
         .unwrap();
 
@@ -2355,6 +2413,80 @@ mod tests {
         assert!(response.jobs[0].scheduled_at.unwrap() >= created_at + 10 * 60);
         assert!(response.jobs[1].scheduled_at.unwrap() > response.jobs[0].scheduled_at.unwrap());
         assert_ne!(response.jobs[0].course_slug, response.jobs[1].course_slug);
+    }
+
+    #[test]
+    fn overlapping_path_capture_keeps_one_job_and_two_memberships() {
+        let (_dir, runtime, connection, writer) = workflow_harness_with_writer();
+        let path_library = PathLibrary::new(writer);
+        let path_a = r#"
+            <script type="application/ld+json">
+            {"@type":"ItemList","name":"Path A","itemListElement":[
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/shared-course"}},
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/only-a"}}
+            ]}
+            </script>
+        "#;
+        let path_b = r#"
+            <script type="application/ld+json">
+            {"@type":"ItemList","name":"Path B","itemListElement":[
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/shared-course"}},
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/only-b"}}
+            ]}
+            </script>
+        "#;
+        let mut client = ScriptedClient {
+            pages: HashMap::from([
+                (
+                    "https://www.linkedin.com/learning/paths/path-a".to_string(),
+                    Ok(path_a.to_string()),
+                ),
+                (
+                    "https://www.linkedin.com/learning/paths/path-b".to_string(),
+                    Ok(path_b.to_string()),
+                ),
+            ]),
+        };
+
+        let response = queue_download_jobs_with_expander(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/paths/path-a\nhttps://www.linkedin.com/learning/paths/path-b".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: false,
+                download_subtitles: false,
+                download_quizzes: false,
+                schedule: None,
+                force_redownload: false,
+            },
+            1_700_000_000,
+            Some(&mut client),
+            Some(&path_library),
+        )
+        .unwrap();
+
+        assert_eq!(response.jobs.len(), 3);
+        let memberships: Vec<String> = connection
+            .prepare(
+                "SELECT path_slug FROM linkedin_path_membership
+                 WHERE course_slug = 'shared-course' ORDER BY path_slug",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            memberships,
+            vec!["path-a".to_string(), "path-b".to_string()]
+        );
     }
 
     #[test]
