@@ -10,22 +10,32 @@ pub enum PathParseError {
     Empty,
 }
 
-pub fn parse_path_html(html: &str) -> Result<Vec<CourseUrl>, PathParseError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPath {
+    pub title: Option<String>,
+    pub courses: Vec<CourseUrl>,
+}
+
+pub fn parse_path_document(html: &str) -> Result<ParsedPath, PathParseError> {
     let mut courses = Vec::new();
-    collect_json_ld_courses(html, &mut courses);
+    let title = collect_json_ld_courses(html, &mut courses);
     if courses.is_empty() {
         collect_anchor_courses(html, &mut courses);
     }
     if courses.is_empty() {
         return Err(PathParseError::Empty);
     }
-    Ok(dedupe_courses(courses))
+    Ok(ParsedPath {
+        title,
+        courses: dedupe_courses(courses),
+    })
 }
 
-fn collect_json_ld_courses(html: &str, courses: &mut Vec<CourseUrl>) {
+fn collect_json_ld_courses(html: &str, courses: &mut Vec<CourseUrl>) -> Option<String> {
     let Some(script_re) = json_ld_script_regex() else {
-        return;
+        return None;
     };
+    let mut title = None;
     for capture in script_re.captures_iter(html) {
         let Some(body) = capture.get(1).map(|matched| matched.as_str().trim()) else {
             continue;
@@ -33,28 +43,37 @@ fn collect_json_ld_courses(html: &str, courses: &mut Vec<CourseUrl>) {
         let Ok(value) = serde_json::from_str::<Value>(body) else {
             continue;
         };
-        walk_json_ld(&value, courses);
+        walk_json_ld(&value, courses, &mut title);
     }
+    title
 }
 
 fn json_ld_script_regex() -> Option<Regex> {
     Regex::new(r#"(?is)<script[^>]*type=["']application/ld\+json["'][^>]*>(.*?)</script>"#).ok()
 }
 
-fn walk_json_ld(value: &Value, courses: &mut Vec<CourseUrl>) {
+fn walk_json_ld(value: &Value, courses: &mut Vec<CourseUrl>, title: &mut Option<String>) {
     match value {
         Value::Array(items) => {
             for item in items {
-                walk_json_ld(item, courses);
+                walk_json_ld(item, courses, title);
             }
         }
         Value::Object(map) => {
             if let Some(graph) = map.get("@graph") {
-                walk_json_ld(graph, courses);
+                walk_json_ld(graph, courses, title);
             }
             if type_contains(value, "itemlist") {
+                if title.is_none() {
+                    if let Some(name) = map.get("name").and_then(Value::as_str) {
+                        let trimmed = name.trim();
+                        if !trimmed.is_empty() {
+                            *title = Some(trimmed.to_string());
+                        }
+                    }
+                }
                 if let Some(elements) = map.get("itemListElement") {
-                    walk_json_ld(elements, courses);
+                    walk_json_ld(elements, courses, title);
                 }
             }
             if type_contains(value, "listitem") {
@@ -62,7 +81,7 @@ fn walk_json_ld(value: &Value, courses: &mut Vec<CourseUrl>) {
                     if let Some(course) = course_from_json_value(item) {
                         courses.push(course);
                     } else {
-                        walk_json_ld(item, courses);
+                        walk_json_ld(item, courses, title);
                     }
                 }
             } else if let Some(course) = course_from_json_value(value) {
@@ -143,14 +162,14 @@ fn dedupe_courses(courses: Vec<CourseUrl>) -> Vec<CourseUrl> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_path_html, PathParseError};
+    use super::{parse_path_document, PathParseError};
 
     const GITHUB_CERT_HTML: &str =
         include_str!("fixtures/career-essentials-in-github-professional-certificate.html");
 
     #[test]
     fn github_cert_json_ld_yields_literal_course_slugs() {
-        let courses = parse_path_html(GITHUB_CERT_HTML).unwrap();
+        let courses = parse_path_document(GITHUB_CERT_HTML).unwrap().courses;
         let slugs: Vec<&str> = courses.iter().map(|course| course.slug.as_str()).collect();
         assert_eq!(
             slugs,
@@ -164,6 +183,15 @@ mod tests {
     }
 
     #[test]
+    fn github_cert_json_ld_name_is_path_title() {
+        let parsed = parse_path_document(GITHUB_CERT_HTML).unwrap();
+        assert_eq!(
+            parsed.title.as_deref(),
+            Some("Career Essentials in GitHub Professional Certificate")
+        );
+    }
+
+    #[test]
     fn anchor_fallback_skips_reserved_prefixes() {
         let html = r#"
             <a href="https://www.linkedin.com/learning/practical-github-actions">Actions</a>
@@ -172,7 +200,7 @@ mod tests {
             <a href="/learning/search/foo">Search</a>
             <a href="https://www.linkedin.com/learning/practical-github-copilot">Copilot</a>
         "#;
-        let courses = parse_path_html(html).unwrap();
+        let courses = parse_path_document(html).unwrap().courses;
         let slugs: Vec<&str> = courses.iter().map(|course| course.slug.as_str()).collect();
         assert_eq!(
             slugs,
@@ -183,7 +211,7 @@ mod tests {
     #[test]
     fn empty_html_is_a_path_parse_failure() {
         assert_eq!(
-            parse_path_html("<html></html>").unwrap_err(),
+            parse_path_document("<html></html>").unwrap_err(),
             PathParseError::Empty
         );
     }

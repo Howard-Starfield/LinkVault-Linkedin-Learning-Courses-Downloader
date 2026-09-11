@@ -91,9 +91,19 @@ pub struct ExpansionSummary {
     pub failed_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathCapture {
+    pub path_slug: String,
+    pub title: String,
+    pub source_url: String,
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedCourseCatalog {
     pub courses: Vec<CourseUrl>,
+    pub paths: Vec<PathCapture>,
+    pub standalone: Vec<String>,
     pub summary: ExpansionSummary,
 }
 
