@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::linkedin::CourseUrl;
 
 mod classify;
+mod expand;
 mod path;
+mod topic;
 
 pub use classify::classify_learning_urls;
 
@@ -69,9 +72,35 @@ impl ClassifiedPaste {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpansionSummary {
+    pub paste_ref_count: usize,
+    pub path_count: usize,
+    pub unique_course_count: usize,
+    pub failed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedCourseCatalog {
+    pub courses: Vec<CourseUrl>,
+    pub summary: ExpansionSummary,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ExpansionError {
+    #[error("could not expand learning path '{path_slug}': {detail}")]
+    PathExpandFailed { path_slug: String, detail: String },
+    #[error("could not expand topic '{topic_slug}': {detail}")]
+    TopicExpandFailed { topic_slug: String, detail: String },
+    #[error("expansion produced no LinkedIn Learning courses")]
+    EmptyCatalog,
+    #[error("a LinkedIn Learning session is required to expand paths or topics")]
+    SessionRequired,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classify_learning_urls, LearningUrlRef, SchedulePolicy};
+    use super::{classify_learning_urls, ExpansionError, LearningUrlRef, SchedulePolicy};
     use crate::linkedin::CourseUrlError;
 
     #[test]
@@ -181,5 +210,21 @@ mod tests {
         assert_eq!(classified.path_count, 1);
         assert_eq!(classified.topic_count, 1);
         assert_eq!(classified.schedule_policy, SchedulePolicy::Discovering);
+    }
+
+    #[test]
+    fn expansion_error_messages_include_path_slug_and_session() {
+        assert_eq!(
+            ExpansionError::PathExpandFailed {
+                path_slug: "broken-path".to_string(),
+                detail: "HTTP status 500".to_string(),
+            }
+            .to_string(),
+            "could not expand learning path 'broken-path': HTTP status 500"
+        );
+        assert_eq!(
+            ExpansionError::SessionRequired.to_string(),
+            "a LinkedIn Learning session is required to expand paths or topics"
+        );
     }
 }
