@@ -35,7 +35,7 @@ for (const pageCount of [8, 50, 500]) {
 
 for (const editionCount of [8, 50, 500]) {
   const visibleRows = 8;
-  const overscan = 4;
+  const overscan = 1;
   const firstVisible = Math.max(0, Math.floor(editionCount / 2) - 4);
   const mountedRows = boundedLibraryRange(firstVisible, visibleRows, editionCount, overscan);
   assert.ok(
@@ -45,6 +45,16 @@ for (const editionCount of [8, 50, 500]) {
   const pageOffsets = pageOffsetsForRange(mountedRows, 50);
   assert.ok(pageOffsets.length <= 2, `${editionCount}-edition viewport requested more than two 50-row pages`);
 }
+
+assert.ok(
+  boundedLibraryRange(0, 8, 150, 1).length <= 10,
+  "A 150-edition library start viewport must stay near 10 mounted rows"
+);
+assert.equal(
+  boundedLibraryRange(70, 8, 150, 1).length,
+  10,
+  "A 150-edition library mid viewport must mount 10 rows"
+);
 
 const visibleRowsOnly = visibleVirtualIndexes(
   Array.from({ length: 16 }, (_, index) => ({
@@ -85,7 +95,7 @@ assert.ok(readerSource.includes("const PAGE_GAP = 2"), "Reader page seam must re
 assert.ok(readerSource.includes("panGestureRef"), "Reader panning must stay on the stable virtual scroll container");
 assert.ok(readerSource.includes("data-page-tone"), "Virtual Reader pages must inherit one root-level tone");
 assert.ok(librarySource.includes("PAGE_SIZE = 50"), "Library queries must remain paged");
-assert.ok(librarySource.includes("overscan: 4"), "Library row overscan contract changed unexpectedly");
+assert.ok(librarySource.includes("overscan: 1"), "Library row overscan must stay at one extra row (~10 mounted)");
 assert.ok(
   librarySource.includes("prefetchOffset < total && !items[prefetchOffset]"),
   "Sparse deep Library scrolling must not reload an already populated page"

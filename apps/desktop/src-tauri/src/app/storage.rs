@@ -273,7 +273,8 @@ mod tests {
 
     #[test]
     fn data_dir_sits_beside_executable() {
-        let exe_path = Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkedVault.exe");
+        let exe_path =
+            Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkedVault.exe");
 
         let data_dir = data_dir_for_exe_path(exe_path).unwrap();
 
@@ -297,7 +298,8 @@ mod tests {
 
     #[test]
     fn resolved_db_path_uses_data_dir_name() {
-        let exe_path = Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkedVault.exe");
+        let exe_path =
+            Path::new(r"C:\Users\howard\AppData\Local\Programs\LinkedVault\LinkedVault.exe");
 
         let db_path = data_dir_for_exe_path(exe_path).unwrap().join(DB_FILE_NAME);
 

@@ -20,7 +20,7 @@ use thiserror::Error;
 // Bump this whenever any provider-owned schema changes. Provider migrations run
 // only while advancing this global version, so leaving it unchanged would make
 // existing installations skip new columns that fresh databases already have.
-pub const CURRENT_SCHEMA_VERSION: i32 = 7;
+pub const CURRENT_SCHEMA_VERSION: i32 = 9;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -853,7 +853,9 @@ pub fn reconcile_active_jobs_after_restart(
                 &job.id,
                 "failed",
                 restarted_at,
-                Some("Job was active when LinkedVault restarted and was marked failed for recovery."),
+                Some(
+                    "Job was active when LinkedVault restarted and was marked failed for recovery.",
+                ),
             )?;
             connection.execute(
                 r#"

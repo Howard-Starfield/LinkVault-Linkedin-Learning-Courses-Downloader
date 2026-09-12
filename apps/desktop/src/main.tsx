@@ -4,6 +4,18 @@ import { Toaster } from "sonner";
 import App from "./App";
 import "./index.css";
 
+document.addEventListener("contextmenu", (event) => {
+  const target = event.target;
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  ) {
+    return;
+  }
+  event.preventDefault();
+});
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <App />

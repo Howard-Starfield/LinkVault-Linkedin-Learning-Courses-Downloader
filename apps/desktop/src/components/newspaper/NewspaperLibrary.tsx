@@ -168,7 +168,7 @@ export function NewspaperLibrary({
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_HEIGHT,
     getItemKey: (index) => items[index]?.jobId ?? `newspaper-placeholder-${index}`,
-    overscan: 4
+    overscan: 1
   });
   const virtualItems = virtualizer.getVirtualItems();
   const visibleIndexes = visibleVirtualIndexes(

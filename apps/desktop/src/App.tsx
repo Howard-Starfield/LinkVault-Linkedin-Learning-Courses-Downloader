@@ -58,6 +58,22 @@ import { YouTubeView } from "./components/youtube/YouTubeView";
 import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
 import { ensureDestination, parseDestination } from "./lib/destinations";
 import { commitLinkedInDestination } from "./lib/linkedin/ipc";
+import { LinkedinHistory } from "./components/linkedin/LinkedinHistory";
+import { MiniCourseArt } from "./components/linkedin/MiniCourseArt";
+import {
+  classifiedPasteToast,
+  classifyLinkedInLearningUrls,
+  classifyLinkedInLearningUrlsForPreview,
+  courseSlugsForHistoryConfirm,
+  emptyClassifiedPaste,
+  expandLinkedInLearningUrls,
+  expansionToastSuffix,
+  knownCourseCount,
+  learningRefPreview,
+  type ClassifiedPaste,
+  type ExpansionSummary,
+  type LearningUrlRef
+} from "./lib/linkedin/expansion";
 import { NewspaperView } from "./components/newspaper/NewspaperView";
 import { NewspaperClippings, type ClippingFlush } from "./components/newspaper/NewspaperClippings";
 import { NewspaperClippingSearch } from "./components/newspaper/NewspaperClippingSearch";
@@ -98,14 +114,6 @@ const NEWSPAPER_PAGE_TONE_LABELS: Record<NewspaperPageTone, string> = {
   soft: "Soft paper",
   dim: "Dim paper",
   inverted: "Inverted"
-};
-
-type ParsedCourse = {
-  original: string;
-  normalized_url: string;
-  slug: string;
-  quiz_urls: string[];
-  assessment_urns: string[];
 };
 
 type QueuedDownloadJob = {
@@ -177,6 +185,7 @@ type DownloadQueueSection = "queue" | ActivityFilter;
 type StartDownloadResponse = {
   jobs: QueuedDownloadJob[];
   skipped: SkippedDownloadCourse[];
+  expansion?: ExpansionSummary | null;
 };
 
 type SkippedDownloadCourse = {
@@ -236,15 +245,6 @@ type SavedDownloadPreferences = {
   downloadQuizzes?: boolean;
 };
 
-type DownloadHistoryEntry = {
-  job_id: string;
-  course_slug: string;
-  source_url: string;
-  course_title: string;
-  output_dir: string;
-  completed_at: number;
-};
-
 type BootstrapState = {
   default_resolution: string;
   browser_sources: string[];
@@ -253,7 +253,6 @@ type BootstrapState = {
   saved_download_preferences: SavedDownloadPreferences | null;
   persisted_jobs: QueuedDownloadJob[];
   recent_events: PersistedJobEvent[];
-  download_history: DownloadHistoryEntry[];
   download_history_file_path: string;
 };
 
@@ -261,12 +260,6 @@ type UpdateMetadata = {
   version: string;
   current_version: string;
 };
-
-type PreviewCourseUrlError =
-  | { type: "empty" }
-  | { type: "notLinkedInLearning"; line: number }
-  | { type: "missingSlug"; line: number }
-  | { type: "invalidUrl"; line: number };
 
 const SIDEBAR_MIN_WIDTH = 208;
 const SIDEBAR_MAX_WIDTH = 320;
@@ -282,7 +275,7 @@ const DEFAULT_VIDEO_WAIT_MIN_SECONDS = 20;
 const DEFAULT_VIDEO_WAIT_MAX_SECONDS = 40;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
-const APP_VERSION = "0.2.21";
+const APP_VERSION = "0.2.27";
 const UPDATE_TOAST_ID = "linkvault-update";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings" | "youtube" | "youtube-history";
@@ -382,7 +375,7 @@ export default function App() {
   const [downloadExercises, setDownloadExercises] = useState(true);
   const [downloadSubtitles, setDownloadSubtitles] = useState(true);
   const [downloadQuizzes, setDownloadQuizzes] = useState(true);
-  const [parsedCourses, setParsedCourses] = useState<ParsedCourse[]>([]);
+  const [parsedPaste, setParsedPaste] = useState<ClassifiedPaste>(emptyClassifiedPaste);
   const [hasSavedToken, setHasSavedToken] = useState(false);
   const [queueNeedsSessionRefresh, setQueueNeedsSessionRefresh] = useState(false);
   const [isValidatingToken, setIsValidatingToken] = useState(false);
@@ -419,8 +412,6 @@ export default function App() {
   const [recentEvents, setRecentEvents] = useState<PersistedJobEvent[]>([]);
   const [emulatorJobs, setEmulatorJobs] = useState<QueuedDownloadJob[]>([]);
   const [emulatorEvents, setEmulatorEvents] = useState<PersistedJobEvent[]>([]);
-  const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
-  const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
   const [queueSection, setQueueSection] = useState<DownloadQueueSection>("queue");
   const [activeView, setActiveView] = useState<AppView>("downloads");
   const [clippingGallerySummary, setClippingGallerySummary] = useState<{
@@ -438,9 +429,11 @@ export default function App() {
   const [theme, setTheme] = useState<AppTheme>(readInitialTheme);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [linkedinCinema, setLinkedinCinema] = useState(false);
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
   const cancellationRequestedRef = useRef(false);
   const queueSubmissionRef = useRef(false);
+  const queueSubmissionIdRef = useRef(0);
   const startupUpdateCheckedRef = useRef(false);
   const downloadPreferencesHydratedRef = useRef(false);
   const downloadProcessingPromiseRef = useRef<Promise<ProcessQueuedDownloadResponse> | null>(null);
@@ -825,8 +818,6 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setRecentEvents((previous) => serializedStateEqual(previous, previewState.events) ? previous : previewState.events);
         setHasSavedToken(hasPreviewSavedToken());
-        setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
-        setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
           default_resolution: "P720",
           browser_sources: ["Chrome", "Edge", "Firefox"],
@@ -835,7 +826,6 @@ export default function App() {
           saved_download_preferences: previewPreferences,
           persisted_jobs: previewState.jobs,
           recent_events: previewState.events,
-          download_history: downloadHistoryFromJobs(previewState.jobs),
           download_history_file_path: previewDownloadHistoryFilePath()
         };
       }
@@ -859,9 +849,6 @@ export default function App() {
       setQueuedJobs((previous) => serializedStateEqual(previous, state.persisted_jobs) ? previous : state.persisted_jobs);
       setRecentEvents((previous) => serializedStateEqual(previous, state.recent_events) ? previous : state.recent_events);
       setHasSavedToken(state.has_saved_token);
-      const nextHistory = state.download_history ?? [];
-      setDownloadHistory((previous) => serializedStateEqual(previous, nextHistory) ? previous : nextHistory);
-      setDownloadHistoryFilePath(state.download_history_file_path ?? "");
       return state;
     } catch {
       // Browser-only Vite previews do not expose Tauri commands.
@@ -870,8 +857,6 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setRecentEvents((previous) => serializedStateEqual(previous, previewState.events) ? previous : previewState.events);
         setHasSavedToken(hasPreviewSavedToken());
-        setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
-        setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
           default_resolution: "P720",
           browser_sources: ["Chrome", "Edge", "Firefox"],
@@ -880,7 +865,6 @@ export default function App() {
           saved_download_preferences: readPreviewPreferences(),
           persisted_jobs: previewState.jobs,
           recent_events: previewState.events,
-          download_history: downloadHistoryFromJobs(previewState.jobs),
           download_history_file_path: previewDownloadHistoryFilePath()
         };
       }
@@ -945,11 +929,6 @@ export default function App() {
     setRecentEvents((previous) =>
       serializedStateEqual(previous, state.recent_events) ? previous : state.recent_events
     );
-    const nextHistory = state.download_history ?? [];
-    setDownloadHistory((previous) =>
-      serializedStateEqual(previous, nextHistory) ? previous : nextHistory
-    );
-    setDownloadHistoryFilePath(state.download_history_file_path ?? "");
   }
 
   async function chooseLinkedInFolder(current: string): Promise<string | null> {
@@ -1226,10 +1205,17 @@ export default function App() {
     });
   }
 
+  const hasLinkedInSession = hasSavedToken || token.trim().length > 0;
   const canStart = useMemo(
-    () => courseUrls.trim().length > 0 && !isQueueingDownload,
-    [courseUrls, isQueueingDownload]
+    () => courseUrls.trim().length > 0 && !isQueueingDownload && hasLinkedInSession,
+    [courseUrls, isQueueingDownload, hasLinkedInSession]
   );
+
+  function warnLinkedInSessionRequired(action: string) {
+    toast.warning("LinkedIn session required", {
+      description: `Paste your li_at cookie before ${action}.`
+    });
+  }
 
   const syncLinkedInUrlHeight = useCallback(() => {
     const el = courseUrlsInputRef.current;
@@ -1254,7 +1240,7 @@ export default function App() {
   const activeJobs = jobsForActivityFilter(allQueueJobs, "active");
   const failedJobs = jobsForActivityFilter(allQueueJobs, "failed");
   const displayedQueueJobs = liveQueueJobs;
-  const queueSectionCount = displayedQueueJobs.length > 0 ? displayedQueueJobs.length : parsedCourses.length;
+  const queueSectionCount = displayedQueueJobs.length > 0 ? displayedQueueJobs.length : parsedPaste.refs.length;
   const pausableQueueJobs = liveQueueJobs.filter((job) =>
     !isDownloadEmulatorJob(job) && (job.status === "active" || job.status === "queued")
   );
@@ -1358,7 +1344,6 @@ export default function App() {
     try {
       const state = await downloadScheduledJobNow(job.id);
       setQueuedJobs(state.persisted_jobs);
-      setDownloadHistory(state.download_history ?? []);
       toast.info("Moved to immediate queue", { description: courseDisplayName(job) });
       ensureDownloadProcessing(state.has_saved_token);
     } catch (error) {
@@ -1376,30 +1361,42 @@ export default function App() {
   async function validateUrls() {
     if (!courseUrls.trim()) {
       toast.warning("Course URL required", { description: "Paste at least one LinkedIn Learning course URL." });
-      setParsedCourses([]);
-      return [];
+      setParsedPaste(emptyClassifiedPaste());
+      return emptyClassifiedPaste();
     }
 
     try {
-      const parsed = await parseLinkedInCourseUrls(courseUrls);
-      setParsedCourses(parsed);
-      toast.success("Course URLs validated", {
-        description: `${parsed.length} LinkedIn Learning course${parsed.length === 1 ? "" : "s"} ready to queue.`
+      const parsed = await classifyLinkedInLearningUrls(courseUrls);
+      setParsedPaste(parsed);
+      toast.success("URLs validated", {
+        description: classifiedPasteToast(parsed)
       });
       return parsed;
     } catch (error) {
-      setParsedCourses([]);
-      toast.error("Invalid course URL", { description: String(error) });
-      return [];
+      setParsedPaste(emptyClassifiedPaste());
+      toast.error("Invalid LinkedIn Learning URL", { description: String(error) });
+      return emptyClassifiedPaste();
     }
   }
 
+  async function scheduleCountForPaste(parsed: ClassifiedPaste) {
+    if (parsed.schedule_policy === "discovering") {
+      const summary = await expandLinkedInLearningUrls(courseUrls, browserSource);
+      return summary.unique_course_count;
+    }
+    return knownCourseCount(parsed);
+  }
+
   async function openScheduleDialog() {
-    const parsed = parsedCourses.length > 0 ? parsedCourses : await validateUrls();
-    if (parsed.length === 0) return;
-    setScheduleCourseCount(parsed.length);
-    setScheduleStep("configure");
-    setIsScheduleOpen(true);
+    const parsed = parsedPaste.refs.length > 0 ? parsedPaste : await validateUrls();
+    if (parsed.refs.length === 0) return;
+    try {
+      setScheduleCourseCount(await scheduleCountForPaste(parsed));
+      setScheduleStep("configure");
+      setIsScheduleOpen(true);
+    } catch (error) {
+      toast.error("Could not expand listing", { description: String(error) });
+    }
   }
 
   async function reviewDownloadSchedule() {
@@ -1414,26 +1411,43 @@ export default function App() {
       return;
     }
     const parsed = await validateUrls();
-    if (parsed.length === 0) return;
-    if (scheduleMinWaitMinutes * parsed.length > scheduleWindowTotalMinutes) {
+    if (parsed.refs.length === 0) return;
+    let courseCount = knownCourseCount(parsed);
+    try {
+      courseCount = await scheduleCountForPaste(parsed);
+    } catch (error) {
+      toast.error("Could not expand listing", { description: String(error) });
+      return;
+    }
+    if (scheduleMinWaitMinutes * courseCount > scheduleWindowTotalMinutes) {
       toast.warning("Schedule window is too short", {
-        description: `At least ${scheduleMinWaitMinutes * parsed.length} minutes are needed for ${parsed.length} courses at this minimum wait.`
+        description: `At least ${scheduleMinWaitMinutes * courseCount} minutes are needed for ${courseCount} courses at this minimum wait.`
       });
       return;
     }
-    setScheduleCourseCount(parsed.length);
+    setScheduleCourseCount(courseCount);
     setScheduleStep("confirm");
   }
 
   async function queueDownloads(schedule?: DownloadScheduleRequest) {
     if (queueSubmissionRef.current) return;
+    if (!hasLinkedInSession) {
+      warnLinkedInSessionRequired(schedule ? "confirming an automatic schedule" : "starting a download");
+      return;
+    }
+    const submissionId = queueSubmissionIdRef.current + 1;
+    queueSubmissionIdRef.current = submissionId;
+    cancellationRequestedRef.current = false;
     queueSubmissionRef.current = true;
     setIsQueueingDownload(true);
+
+    const isCurrentSubmission = () =>
+      queueSubmissionIdRef.current === submissionId && !cancellationRequestedRef.current;
 
     try {
       const addingToActiveQueue = Boolean(downloadProcessingPromiseRef.current) || isProcessingDownload;
       const parsed = await validateUrls();
-      if (parsed.length === 0) return;
+      if (parsed.refs.length === 0) return;
       const outputDir = await ensureDestination({
         current: folder,
         ask: () => chooseLinkedInFolder(folder)
@@ -1448,30 +1462,28 @@ export default function App() {
         setIsValidatingToken(true);
         try {
           await saveLinkedInToken(enteredToken);
+          if (!isCurrentSubmission()) return;
           setHasSavedToken(true);
           shouldUseSavedToken = true;
           setToken("");
           setQueueNeedsSessionRefresh(false);
         } catch (error) {
+          if (!isCurrentSubmission() || String(error).toLowerCase().includes("cancelled")) {
+            return;
+          }
           toast.error("Token validation failed", { description: String(error) });
           return;
-        } finally {
-          setIsValidatingToken(false);
         }
-      } else if (schedule && !shouldUseSavedToken) {
-        toast.warning("Saved session required", {
-          description: "Paste and save your LinkedIn token before confirming an automatic schedule."
-        });
-        return;
       } else if (!shouldUseSavedToken) {
-        toast.info("Using browser session", {
-          description: `LinkedVault will read the ${browserSource} LinkedIn session for this download.`
-        });
+        warnLinkedInSessionRequired(schedule ? "confirming an automatic schedule" : "starting a download");
+        return;
       }
-      const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
-      const alreadyDownloaded = parsed
-        .map((course) => course.slug)
-        .filter((slug) => completedSlugs.has(slug));
+      const completedSlugs = new Set(
+        queuedJobs.filter((job) => job.status === "completed").map((job) => job.course_slug)
+      );
+      const alreadyDownloaded = courseSlugsForHistoryConfirm(parsed).filter((slug) =>
+        completedSlugs.has(slug)
+      );
       let forceRedownload = false;
       if (alreadyDownloaded.length > 0) {
         const shouldDownloadAgain = window.confirm(
@@ -1481,6 +1493,7 @@ export default function App() {
         forceRedownload = true;
       }
 
+      if (!isCurrentSubmission()) return;
       const response = await startDownloadJobs({
         courseUrls,
         outputDir,
@@ -1496,13 +1509,30 @@ export default function App() {
         schedule,
         forceRedownload
       });
+      if (!isCurrentSubmission()) {
+        await refreshBootstrapState();
+        return;
+      }
       await finishQueueDownloads(response, schedule, addingToActiveQueue, shouldUseSavedToken);
     } catch (error) {
       await refreshBootstrapState();
-      toast.error("Could not add download", { description: String(error) });
+      if (!isCurrentSubmission() || String(error).toLowerCase().includes("cancelled")) {
+        return;
+      }
+      if (isLinkedInSessionError(error)) {
+        setQueueNeedsSessionRefresh(true);
+        toast.warning("LinkedIn session required", {
+          description: "Queued work was not started. Paste your li_at cookie, then try again."
+        });
+      } else {
+        toast.error("Could not add download", { description: String(error) });
+      }
     } finally {
-      queueSubmissionRef.current = false;
-      setIsQueueingDownload(false);
+      if (queueSubmissionIdRef.current === submissionId) {
+        queueSubmissionRef.current = false;
+        setIsQueueingDownload(false);
+        setIsValidatingToken(false);
+      }
     }
   }
 
@@ -1514,10 +1544,11 @@ export default function App() {
   ) {
     setQueuedJobs((jobs) => mergeQueuedJobs(jobs, response.jobs));
     setCourseUrls("");
-    setParsedCourses([]);
+    setParsedPaste(emptyClassifiedPaste());
     await refreshBootstrapState();
 
     const skipped = response.skipped ?? [];
+    const expansion = response.expansion;
     if (skipped.length > 0) {
       toast.info(skipped.length === 1 ? "Course already present" : "Courses already present", {
         description: skipped
@@ -1529,7 +1560,7 @@ export default function App() {
     if (response.jobs.length === 0) {
       if (skipped.length === 0) {
         toast.info("No courses queued", {
-          description: "Nothing new was added to the LinkedIn download queue."
+          description: expansionToastSuffix(expansion, "Nothing new was added to the LinkedIn download queue.")
         });
       }
       return;
@@ -1539,11 +1570,17 @@ export default function App() {
       setIsScheduleOpen(false);
       setScheduleStep("configure");
       toast.success("Courses scheduled", {
-        description: `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will start automatically over the next ${formatScheduleDuration(schedule.windowMinutes)}.`
+        description: expansionToastSuffix(
+          expansion,
+          `${response.jobs.length} course${response.jobs.length === 1 ? "" : "s"} will start automatically over the next ${formatScheduleDuration(schedule.windowMinutes)}.`
+        )
       });
     } else {
       toast.success(addingToActiveQueue ? "Added to download queue" : "Download queued", {
-        description: `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} ${addingToActiveQueue ? "added behind the active download" : "persisted to the local queue"}.`
+        description: expansionToastSuffix(
+          expansion,
+          `${response.jobs.length} LinkedIn course${response.jobs.length === 1 ? "" : "s"} ${addingToActiveQueue ? "added behind the active download" : "persisted to the local queue"}.`
+        )
       });
       ensureDownloadProcessing(shouldUseSavedToken);
     }
@@ -1610,6 +1647,10 @@ export default function App() {
 
   async function resumeQueuedDownloads() {
     if (downloadProcessingPromiseRef.current) return;
+    if (!hasLinkedInSession) {
+      warnLinkedInSessionRequired("resuming the queued courses");
+      return;
+    }
 
     const enteredToken = token.trim();
     let shouldUseSavedToken = Boolean(hasSavedToken);
@@ -1621,10 +1662,8 @@ export default function App() {
         setHasSavedToken(true);
         setToken("");
         shouldUseSavedToken = true;
-      } else if (!shouldUseSavedToken && !isTauriRuntime()) {
-        toast.info("LinkedIn session required", {
-          description: "Paste a fresh li_at cookie before resuming the queued courses."
-        });
+      } else if (!shouldUseSavedToken) {
+        warnLinkedInSessionRequired("resuming the queued courses");
         return;
       }
 
@@ -1682,7 +1721,10 @@ export default function App() {
   }
 
   async function processQueuedDownloadBatchWithLiveRefresh(courseDelaySeconds: number, useSavedToken: boolean) {
-    if (isTauriRuntime() && useSavedToken) {
+    if (!useSavedToken) {
+      throw new Error("a LinkedIn Learning session is required");
+    }
+    if (isTauriRuntime()) {
       return waitForLinkedInQueueIdle();
     }
 
@@ -1690,7 +1732,7 @@ export default function App() {
 
     while (!cancellationRequestedRef.current) {
       const response = await processQueuedDownloadWithLiveRefresh(() =>
-        useSavedToken ? processNextQueuedDownloadWithSavedToken() : processNextQueuedDownloadWithBrowserSource(browserSource)
+        processNextQueuedDownloadWithSavedToken()
       );
       summary = mergeProcessQueuedDownloadResponses(summary, response);
 
@@ -1914,7 +1956,28 @@ export default function App() {
     });
   }, [isInstallingUpdate, pendingUpdate, updateBannerDismissed]);
 
+  async function cancelQueueSubmission() {
+    cancellationRequestedRef.current = true;
+    queueSubmissionIdRef.current += 1;
+    try {
+      await requestActiveDownloadCancellation();
+    } catch {
+      // The in-flight validate/queue command still observes the shared flag.
+    }
+    queueSubmissionRef.current = false;
+    setIsValidatingToken(false);
+    setIsQueueingDownload(false);
+    toast.info("Cancelled", {
+      description: "Nothing was added to the LinkedIn download queue."
+    });
+    await refreshBootstrapState();
+  }
+
   async function cancelDownload() {
+    if (isValidatingToken || isQueueingDownload) {
+      await cancelQueueSubmission();
+      return;
+    }
     if (!activeDownloadJob) return;
     cancellationRequestedRef.current = true;
     setIsCancellingDownload(true);
@@ -1945,9 +2008,13 @@ export default function App() {
           ? `${courseDisplayName(job)} will pause at the next safe boundary.`
           : `${courseDisplayName(job)} is available to continue.`
       });
-      if (!nextPaused && (job.status === "queued" || job.status === "active") && (isTauriRuntime() || hasSavedToken)) {
-        cancellationRequestedRef.current = false;
-        ensureDownloadProcessing(hasSavedToken);
+      if (!nextPaused && (job.status === "queued" || job.status === "active")) {
+        if (hasSavedToken) {
+          cancellationRequestedRef.current = false;
+          ensureDownloadProcessing(true);
+        } else {
+          warnLinkedInSessionRequired("resuming this download");
+        }
       }
     } catch (error) {
       toast.error(nextPaused ? "Pause failed" : "Resume failed", { description: String(error) });
@@ -1968,9 +2035,13 @@ export default function App() {
           ? "Active work will pause at the next safe boundary. Queued and scheduled courses will wait."
           : "Queued downloads are available to continue."
       });
-      if (!nextPaused && (isTauriRuntime() || hasSavedToken)) {
-        cancellationRequestedRef.current = false;
-        ensureDownloadProcessing(hasSavedToken);
+      if (!nextPaused) {
+        if (hasSavedToken) {
+          cancellationRequestedRef.current = false;
+          ensureDownloadProcessing(true);
+        } else {
+          warnLinkedInSessionRequired("resuming the queued courses");
+        }
       }
     } catch (error) {
       toast.error(nextPaused ? "Pause all failed" : "Resume all failed", { description: String(error) });
@@ -2130,6 +2201,10 @@ export default function App() {
 
   async function retryDownloadJob(job: QueuedDownloadJob) {
     if (job.status !== "failed" && job.status !== "cancelled") return;
+    if (!hasLinkedInSession) {
+      warnLinkedInSessionRequired("retrying this course");
+      return;
+    }
     const enteredToken = token.trim();
     let shouldUseSavedToken = Boolean(hasSavedToken);
 
@@ -2142,9 +2217,8 @@ export default function App() {
         setToken("");
         setQueueNeedsSessionRefresh(false);
       } else if (!shouldUseSavedToken) {
-        toast.info("Using browser session", {
-          description: `LinkedVault will read the ${browserSource} LinkedIn session for this retry.`
-        });
+        warnLinkedInSessionRequired("retrying this course");
+        return;
       }
       const state = await retryFailedDownloadJob(job.id);
       setQueuedJobs(state.persisted_jobs);
@@ -2214,6 +2288,7 @@ export default function App() {
       className="lv-shell"
       data-sidebar-dragging={isDraggingSidebar || undefined}
       data-sidebar-state={isSidebarCollapsed ? "collapsed" : "expanded"}
+      data-cinema={linkedinCinema ? "true" : undefined}
     >
       <aside className="lv-sidebar" aria-label="Primary navigation">
         <div className="lv-sidebar-trigger-wrap">
@@ -2484,7 +2559,7 @@ export default function App() {
           }}
         />
       </aside>
-      <main className="lv-main" data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>
+      <main className="lv-main" data-active-view={activeView} data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>
         <button
           type="button"
           className="lv-sidebar-reopen"
@@ -2600,10 +2675,9 @@ export default function App() {
               registerFlush={registerClippingFlush}
             />
           ) : activeView === "linkedin-history" ? (
-            <HistoryPage
-              entries={downloadHistory}
-              historyFilePath={downloadHistoryFilePath}
-              onOpenFolderByJobId={openCompletedFolderByJobId}
+            <LinkedinHistory
+              historyRevision={queuedJobs.map((job) => `${job.id}:${job.status}:${job.updated_at}`).join("|")}
+              onPlayerOpenChange={setLinkedinCinema}
             />
           ) : (
           <>
@@ -2615,7 +2689,7 @@ export default function App() {
                   value={courseUrls}
                   onChange={(event) => {
                     setCourseUrls(event.target.value);
-                    setParsedCourses([]);
+                    setParsedPaste(emptyClassifiedPaste());
                   }}
                   onBlur={validateUrls}
                   placeholder="Paste LinkedIn Learning course URLs"
@@ -2740,7 +2814,7 @@ export default function App() {
                   </label>
                 </div>
                 <div className="linkedin-primary-actions">
-                  <Button type="button" variant="primary" className="linkedin-action-button" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                  <Button type="button" variant="primary" className="linkedin-action-button" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload} title={courseUrls.trim().length > 0 && !hasLinkedInSession ? "Paste your li_at cookie before downloading" : undefined}>
                     {isProcessingDownload ? <Plus aria-hidden="true" className="h-3.5 w-3.5" /> : <Play aria-hidden="true" className="h-3.5 w-3.5" />}
                     {isValidatingToken
                       ? "Validating"
@@ -2748,10 +2822,16 @@ export default function App() {
                         ? isProcessingDownload ? "Adding" : "Queueing"
                         : isProcessingDownload ? "Add to queue" : "Download"}
                   </Button>
-                  <Button type="button" variant="outline" className="linkedin-action-button" onClick={() => void openScheduleDialog()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                  <Button type="button" variant="outline" className="linkedin-action-button" onClick={() => void openScheduleDialog()} disabled={!canStart || isValidatingToken || isQueueingDownload} title={courseUrls.trim().length > 0 && !hasLinkedInSession ? "Paste your li_at cookie before scheduling" : undefined}>
                     <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
                     Schedule
                   </Button>
+                  {isValidatingToken || isQueueingDownload ? (
+                    <Button type="button" variant="outline" className="linkedin-action-button" onClick={() => void cancelQueueSubmission()}>
+                      <X aria-hidden="true" className="h-3.5 w-3.5" />
+                      Cancel
+                    </Button>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -2839,7 +2919,7 @@ export default function App() {
                       size="xs"
                       variant="outline"
                       onClick={() => void resumeQueuedDownloads()}
-                      disabled={isProcessingDownload || isValidatingToken}
+                      disabled={isProcessingDownload || isValidatingToken || !hasLinkedInSession}
                     >
                       <RotateCcw aria-hidden="true" className="h-3 w-3" />
                       {isValidatingToken ? "Validating" : "Resume queue"}
@@ -2848,7 +2928,7 @@ export default function App() {
                 ) : null}
                 <DownloadQueueTable
                   jobs={queueSection === "queue" ? displayedQueueJobs : queueSection === "active" ? activeJobs : queueSection === "completed" ? completedJobs : failedJobs}
-                  parsedCourses={queueSection === "queue" ? parsedCourses : []}
+                  parsedRefs={queueSection === "queue" ? parsedPaste.refs : []}
                   hasPersistedJobs={queuedJobs.length > 0}
                   emptyTitle={queueSection === "queue" ? "No active downloads" : `No ${queueSection} downloads`}
                   emptyDescription=""
@@ -3505,16 +3585,6 @@ function mergeQueuedJobs(currentJobs: QueuedDownloadJob[], addedJobs: QueuedDown
   );
 }
 
-function formatEventTime(timestamp: number) {
-  if (!timestamp) return "--:--";
-  return new Date(timestamp * 1000).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
-}
-
 function activeVideoPacingState(
   events: PersistedJobEvent[],
   jobId: string,
@@ -3640,7 +3710,7 @@ function QueueSectionTab({
 
 function DownloadQueueTable({
   jobs,
-  parsedCourses,
+  parsedRefs,
   hasPersistedJobs,
   emptyTitle = "No active downloads",
   emptyDescription,
@@ -3657,7 +3727,7 @@ function DownloadQueueTable({
   recentEvents
 }: {
   jobs: QueuedDownloadJob[];
-  parsedCourses: ParsedCourse[];
+  parsedRefs: LearningUrlRef[];
   hasPersistedJobs: boolean;
   emptyTitle?: string;
   emptyDescription?: string;
@@ -3723,8 +3793,10 @@ function DownloadQueueTable({
             recentEvents={recentEvents}
           />
         ))
-      ) : parsedCourses.length > 0 ? (
-        parsedCourses.map((course, index) => <ValidatedQueueRow key={`${course.slug}-${index}`} course={course} />)
+      ) : parsedRefs.length > 0 ? (
+        parsedRefs.map((learningRef, index) => (
+          <ValidatedQueueRow key={`${learningRef.kind}-${index}`} learningRef={learningRef} />
+        ))
       ) : (
         <EmptyRow
           title={emptyTitle}
@@ -4000,16 +4072,16 @@ function ActiveQueueDetails({
   );
 }
 
-function ValidatedQueueRow({ course }: { course: ParsedCourse }) {
-  const title = courseDisplayNameFromSlug(course.slug);
+function ValidatedQueueRow({ learningRef }: { learningRef: LearningUrlRef }) {
+  const preview = learningRefPreview(learningRef);
   return (
     <DataTableRow className="queue-table-row">
       <StatusBadge tone="primary" dotClassName="bg-primary">Validated</StatusBadge>
       <div className="table-course-cell">
         <span className="course-status-mark bg-primary" />
         <div className="min-w-0">
-          <div className="truncate font-medium" title={title}>Ready to queue</div>
-          <div className="truncate text-soft" title={course.normalized_url}>{course.normalized_url}</div>
+          <div className="truncate font-medium" title={preview.heading}>{preview.heading}</div>
+          <div className="truncate text-soft" title={preview.url}>{preview.url}</div>
         </div>
       </div>
       <span className="text-muted">Waiting</span>
@@ -4056,74 +4128,6 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
         </button>
       ) : null}
     </StatusBadge>
-  );
-}
-
-function HistoryPage({
-  entries,
-  historyFilePath,
-  onOpenFolderByJobId
-}: {
-  entries: DownloadHistoryEntry[];
-  historyFilePath: string;
-  onOpenFolderByJobId: (jobId: string, fallbackPath?: string) => void | Promise<void>;
-}) {
-  return (
-    <div className="lv-workspace download-history-workspace">
-      <div className="download-history-header">
-        <p className="download-history-count">
-          {entries.length} completed course{entries.length === 1 ? "" : "s"}
-        </p>
-        {historyFilePath ? (
-          <p className="download-history-meta" title={historyFilePath}>
-            {historyFilePath}
-          </p>
-        ) : null}
-      </div>
-      {entries.length === 0 ? (
-        <div className="download-history-empty" role="status">
-          <span>No downloaded courses</span>
-          <span>Completed course downloads will appear here and in download-history.md.</span>
-        </div>
-      ) : (
-        <ol className="download-history-list" aria-label="LinkedIn download history">
-          {entries.map((entry) => {
-            const when = formatEventTime(entry.completed_at);
-            return (
-              <li key={entry.job_id} className="download-history-row">
-                <div className="download-history-copy">
-                  <strong title={entry.course_title}>{entry.course_title}</strong>
-                  <span title={entry.source_url}>
-                    {[when, entry.source_url].filter(Boolean).join(" · ")}
-                  </span>
-                </div>
-                <div className="download-history-overlay">
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="ghost"
-                    className="download-history-file-action"
-                    onClick={() => void onOpenFolderByJobId(entry.job_id, entry.output_dir)}
-                    aria-label={`Open folder for ${entry.course_title}`}
-                  >
-                    <FolderOpen aria-hidden="true" />
-                    Open Folder
-                  </Button>
-                </div>
-              </li>
-            );
-          })}
-        </ol>
-      )}
-    </div>
-  );
-}
-
-function MiniCourseArt({ title, thumbnailUrl }: { title: string; thumbnailUrl: string }) {
-  return (
-    <span className="mini-course-art" title={title}>
-      <img src={thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
-    </span>
   );
 }
 
@@ -4269,17 +4273,6 @@ function mergeProcessQueuedDownloadResponses(
   };
 }
 
-async function parseLinkedInCourseUrls(input: string) {
-  try {
-    return await invoke<ParsedCourse[]>("parse_linkedin_course_urls", { input });
-  } catch (error) {
-    if (isTauriRuntime()) {
-      throw error;
-    }
-    return parseLinkedInCourseUrlsForPreview(input);
-  }
-}
-
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -4294,6 +4287,7 @@ function isLinkedInSessionError(error: unknown) {
     "csrf check failed",
     "linkedin session expired",
     "rejected the saved session",
+    "session is required",
     "http 401",
     "http 403",
     "status 401",
@@ -4474,7 +4468,6 @@ async function clearFailedDownloadJobs() {
     stores_plaintext_tokens_in_sqlite: false,
     browser_sources: ["Chrome", "Edge", "Firefox"],
     default_resolution: "P720",
-    download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
 }
@@ -4506,7 +4499,6 @@ function previewBootstrapState(jobs: QueuedDownloadJob[], events: PersistedJobEv
     saved_download_preferences: readPreviewPreferences(),
     persisted_jobs: jobs,
     recent_events: events,
-    download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   };
 }
@@ -4527,7 +4519,6 @@ async function removeDownloadQueueItem(jobId: string) {
     stores_plaintext_tokens_in_sqlite: false,
     browser_sources: ["Chrome", "Edge", "Firefox"],
     default_resolution: "P720",
-    download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
 }
@@ -4570,116 +4561,6 @@ async function processNextQueuedDownloadWithSavedToken() {
   return processNextQueuedDownloadForPreview();
 }
 
-async function processNextQueuedDownloadWithBrowserSource(source: string) {
-  if (isTauriRuntime()) {
-    return invoke<ProcessQueuedDownloadResponse>("process_next_queued_download_from_browser_source", { source });
-  }
-
-  throw new Error("Browser session downloads are only available in the desktop app");
-}
-
-function parseLinkedInCourseUrlsForPreview(input: string): ParsedCourse[] {
-  const courses: ParsedCourse[] = [];
-  for (const [index, rawLine] of input.split(/\r?\n/).entries()) {
-    const line = index + 1;
-    const candidates = courseUrlCandidatesForPreview(rawLine);
-    if (candidates.length === 0) {
-      if (!rawLine.trim()) continue;
-      throw previewCourseUrlErrorMessage({ type: "notLinkedInLearning", line });
-    }
-    courses.push(...candidates.map((candidate) => parseLinkedInCourseUrlForPreview(candidate, line)));
-  }
-
-  if (courses.length === 0) {
-    throw previewCourseUrlErrorMessage({ type: "empty" });
-  }
-
-  return courses;
-}
-
-function courseUrlCandidatesForPreview(line: string): string[] {
-  const trimmed = line.trim();
-  if (!trimmed) return [];
-  const parts = trimmed.split(/\s+/);
-  if (parts.length === 1) return [trimCourseUrlTokenForPreview(parts[0])];
-  return parts
-    .map(trimCourseUrlTokenForPreview)
-    .filter((part) => part.toLowerCase().includes("linkedin.com/learning/"));
-}
-
-function trimCourseUrlTokenForPreview(token: string) {
-  return token.replace(/^[\s"'`<({\[]+|[\s"'`,>)}\]]+$/g, "");
-}
-
-function parseLinkedInCourseUrlForPreview(value: string, line: number): ParsedCourse {
-  const withProtocol = value.startsWith("http://") || value.startsWith("https://") ? value : `https://${value}`;
-  let url: URL;
-  try {
-    url = new URL(withProtocol);
-  } catch {
-    throw previewCourseUrlErrorMessage({ type: "invalidUrl", line });
-  }
-
-  const host = url.hostname.toLowerCase();
-  const isLinkedIn = host === "linkedin.com" || host.endsWith(".linkedin.com");
-  if (!isLinkedIn) {
-    throw previewCourseUrlErrorMessage({ type: "notLinkedInLearning", line });
-  }
-
-  const segments = url.pathname.split("/").filter(Boolean);
-  if (segments[0] !== "learning") {
-    throw previewCourseUrlErrorMessage({ type: "notLinkedInLearning", line });
-  }
-
-  const slug = segments[1]?.trim();
-  if (!slug) {
-    throw previewCourseUrlErrorMessage({ type: "missingSlug", line });
-  }
-
-  return {
-    original: value,
-    normalized_url: `https://www.linkedin.com/learning/${slug}`,
-    slug,
-    quiz_urls: extractQuizUrlsForPreview(url, slug),
-    assessment_urns: extractAssessmentUrnsForPreview(url)
-  };
-}
-
-function extractQuizUrlsForPreview(url: URL, slug: string): string[] {
-  const segments = url.pathname.split("/").filter(Boolean);
-  const quizIndex = segments.findIndex((segment) => segment.toLowerCase() === "quiz");
-  const assessment = quizIndex >= 0 ? segments[quizIndex + 1] : undefined;
-  if (!assessment) return [];
-
-  const normalized = new URL(`https://www.linkedin.com/learning/${slug}/quiz/${assessment}`);
-  for (const key of ["resume", "u"]) {
-    const value = url.searchParams.get(key);
-    if (value) normalized.searchParams.set(key, value);
-  }
-  return [normalized.toString()];
-}
-
-function extractAssessmentUrnsForPreview(url: URL): string[] {
-  const segments = url.pathname.split("/").filter(Boolean);
-  return segments
-    .flatMap((segment, index) => (segment.toLowerCase() === "quiz" ? [segments[index + 1]] : []))
-    .filter((segment): segment is string => Boolean(segment))
-    .filter((segment) => segment.startsWith("urn:li:learningApiAssessment:") || segment.startsWith("urn%3Ali%3AlearningApiAssessment%3A"));
-}
-
-function previewCourseUrlErrorMessage(error: PreviewCourseUrlError) {
-  if (error.type === "empty") {
-    return new Error("no LinkedIn Learning course URLs were provided");
-  }
-  if (error.type === "notLinkedInLearning") {
-    return new Error(`line ${error.line}: expected a linkedin.com/learning course URL`);
-  }
-  if (error.type === "missingSlug") {
-    return new Error(`line ${error.line}: missing course slug`);
-  }
-  return new Error(`line ${error.line}: could not parse URL`);
-}
-
 const previewJobsStorageKey = "linkvault.preview.jobs";
 const previewEventsStorageKey = "linkvault.preview.events";
 const previewSavedTokenStorageKey = "linkvault.preview.saved-token";
@@ -4691,7 +4572,11 @@ function getPreviewScenario() {
 }
 
 function startDownloadJobsForPreview(request: StartDownloadRequest): StartDownloadResponse {
-  const parsed = parseLinkedInCourseUrlsForPreview(request.courseUrls);
+  const classified = classifyLinkedInLearningUrlsForPreview(request.courseUrls);
+  if (classified.schedule_policy === "discovering") {
+    throw new Error("a LinkedIn Learning session is required to expand paths or topics");
+  }
+  const parsed = classified.refs.filter((learningRef) => learningRef.kind === "course");
   const timestamp = Math.floor(Date.now() / 1000);
   const requestId = Date.now();
   const scheduledTimes = previewScheduledTimes(request.schedule, parsed.length, timestamp);
@@ -4797,7 +4682,6 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
     saved_download_preferences: readPreviewPreferences(),
     persisted_jobs: retriedJobs,
     recent_events: events,
-    download_history: downloadHistoryFromJobs(retriedJobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   };
 }
@@ -5291,20 +5175,6 @@ function linkedinLearningSourceUrl(job: Pick<QueuedDownloadJob, "source_url" | "
   if (trimmed) return trimmed;
   if (job.course_slug.startsWith("local:")) return "";
   return `https://www.linkedin.com/learning/${job.course_slug}`;
-}
-
-function downloadHistoryFromJobs(jobs: QueuedDownloadJob[]): DownloadHistoryEntry[] {
-  return jobs
-    .filter((job) => job.status === "completed")
-    .map((job) => ({
-      job_id: job.id,
-      course_slug: job.course_slug,
-      source_url: linkedinLearningSourceUrl(job),
-      course_title: courseDisplayName(job),
-      output_dir: job.output_dir || "",
-      completed_at: job.updated_at ?? 0
-    }))
-    .sort((left, right) => right.completed_at - left.completed_at);
 }
 
 function previewDownloadHistoryFilePath() {

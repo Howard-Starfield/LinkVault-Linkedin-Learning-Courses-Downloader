@@ -21,7 +21,7 @@ import {
 
 const PAGE_SIZE = 50;
 const GRID_GAP = 16;
-const MAX_MOUNTED_CARDS = 48;
+const MAX_MOUNTED_CARDS = 12;
 const LIST_ROW_HEIGHT = 72;
 
 function columnCountForWidth(width: number) {
@@ -256,18 +256,19 @@ export function NewspaperClippingList({
     getScrollElement: () => scrollRef.current,
     estimateSize: () => Math.max(180, (viewportWidth - (columnCount + 1) * GRID_GAP) / columnCount / 1.45 + GRID_GAP),
     getItemKey: (rowIndex) => `clipping-grid-row-${rowIndex}-${columnCount}`,
-    overscan: 2
+    overscan: 1
   });
   const listVirtualizer = useVirtualizer({
     count: isGallery ? 0 : total,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => LIST_ROW_HEIGHT,
     getItemKey: (index) => items[index]?.id ?? `clipping-list-${index}`,
-    overscan: 6
+    overscan: 1
   });
 
   const galleryVirtualRows = galleryVirtualizer.getVirtualItems();
   const listVirtualRows = listVirtualizer.getVirtualItems();
+  const boundedListRows = listVirtualRows.slice(0, MAX_MOUNTED_CARDS);
   const boundedVirtualRows = useMemo(() => {
     const maxRows = Math.max(1, Math.ceil(MAX_MOUNTED_CARDS / columnCount));
     const scrollTop = galleryVirtualizer.scrollOffset ?? scrollRef.current?.scrollTop ?? 0;
@@ -282,13 +283,13 @@ export function NewspaperClippingList({
 
   const visibleItemIndexes = useMemo(() => {
     if (!isGallery) {
-      return listVirtualRows.map((row) => row.index).filter((index) => index < total);
+      return boundedListRows.map((row) => row.index).filter((index) => index < total);
     }
     return boundedVirtualRows.flatMap((row) => {
       const start = row.index * columnCount;
       return Array.from({ length: columnCount }, (_, column) => start + column).filter((index) => index < total);
     });
-  }, [boundedVirtualRows, columnCount, isGallery, listVirtualRows, total]);
+  }, [boundedListRows, boundedVirtualRows, columnCount, isGallery, total]);
 
   useEffect(() => {
     if (!visibleItemIndexes.length) return;
@@ -341,6 +342,7 @@ export function NewspaperClippingList({
           }}
           onLoad={(event) => { event.currentTarget.dataset.loaded = "true"; }}
           src={item.thumbnailUrl}
+          loading="lazy"
         />
       ) : (
         <span
@@ -412,7 +414,7 @@ export function NewspaperClippingList({
           </div>
         ) : (
           <div className="clipping-list" style={{ height: `${listVirtualizer.getTotalSize()}px` }} aria-label="Clipping list">
-            {listVirtualRows.map((row) => {
+            {boundedListRows.map((row) => {
               const item = items[row.index];
               return (
                 <button

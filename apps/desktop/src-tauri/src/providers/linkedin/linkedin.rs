@@ -1,8 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) const RESERVED_LEARNING_PREFIXES: &[&str] = &["search", "me", "login", "browse", "in"];
+pub(crate) const HUB_LEARNING_PREFIXES: &[&str] = &["paths", "topics"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CourseUrl {
     pub original: String,
     pub normalized_url: String,
@@ -21,8 +24,13 @@ pub enum CourseUrlError {
     MissingSlug { line: usize },
     #[error("line {line}: could not parse URL")]
     InvalidUrl { line: usize },
+    #[error(
+        "line {line}: '{segment}' is a LinkedIn Learning listing or account page, not a course"
+    )]
+    ReservedSegment { line: usize, segment: String },
 }
 
+#[cfg(test)]
 pub fn parse_course_urls(input: &str) -> Result<Vec<CourseUrl>, CourseUrlError> {
     let mut courses = Vec::new();
 
@@ -48,7 +56,7 @@ pub fn parse_course_urls(input: &str) -> Result<Vec<CourseUrl>, CourseUrlError> 
     Ok(courses)
 }
 
-fn course_url_candidates(line: &str) -> Vec<String> {
+pub(crate) fn course_url_candidates(line: &str) -> Vec<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -77,7 +85,38 @@ fn trim_course_url_token(token: &str) -> &str {
     })
 }
 
-fn parse_course_url(value: &str, line: usize) -> Result<CourseUrl, CourseUrlError> {
+pub(crate) fn parse_course_url(value: &str, line: usize) -> Result<CourseUrl, CourseUrlError> {
+    let parsed = parse_learning_url(value, line)?;
+    if is_reserved_or_hub_prefix(&parsed.first_segment) {
+        return Err(CourseUrlError::ReservedSegment {
+            line,
+            segment: parsed.first_segment,
+        });
+    }
+
+    let remaining_segments = parsed.remaining_segments;
+    let quiz_urls = extract_quiz_urls(&parsed.url, &parsed.first_segment, &remaining_segments);
+    let assessment_urns = extract_assessment_urns(&remaining_segments);
+
+    Ok(CourseUrl {
+        original: value.to_string(),
+        normalized_url: format!("https://www.linkedin.com/learning/{}", parsed.first_segment),
+        slug: parsed.first_segment,
+        quiz_urls,
+        assessment_urns,
+    })
+}
+
+pub(crate) struct ParsedLearningUrl {
+    pub url: Url,
+    pub first_segment: String,
+    pub remaining_segments: Vec<String>,
+}
+
+pub(crate) fn parse_learning_url(
+    value: &str,
+    line: usize,
+) -> Result<ParsedLearningUrl, CourseUrlError> {
     let with_protocol = if value.starts_with("http://") || value.starts_with("https://") {
         value.to_string()
     } else {
@@ -101,25 +140,39 @@ fn parse_course_url(value: &str, line: usize) -> Result<CourseUrl, CourseUrlErro
         return Err(CourseUrlError::NotLinkedInLearning { line });
     }
 
-    let slug = segments
+    let first_segment = segments
         .next()
         .filter(|segment| !segment.trim().is_empty())
-        .ok_or(CourseUrlError::MissingSlug { line })?;
+        .ok_or(CourseUrlError::MissingSlug { line })?
+        .to_string();
 
-    let remaining_segments = segments.collect::<Vec<_>>();
-    let quiz_urls = extract_quiz_urls(&url, slug, &remaining_segments);
-    let assessment_urns = extract_assessment_urns(&remaining_segments);
+    let remaining_segments = segments
+        .filter(|segment| !segment.trim().is_empty())
+        .map(ToString::to_string)
+        .collect();
 
-    Ok(CourseUrl {
-        original: value.to_string(),
-        normalized_url: format!("https://www.linkedin.com/learning/{slug}"),
-        slug: slug.to_string(),
-        quiz_urls,
-        assessment_urns,
+    Ok(ParsedLearningUrl {
+        url,
+        first_segment,
+        remaining_segments,
     })
 }
 
-fn extract_quiz_urls(url: &Url, slug: &str, remaining_segments: &[&str]) -> Vec<String> {
+pub(crate) fn is_reserved_learning_prefix(segment: &str) -> bool {
+    matches_prefix_list(segment, RESERVED_LEARNING_PREFIXES)
+}
+
+pub(crate) fn is_reserved_or_hub_prefix(segment: &str) -> bool {
+    is_reserved_learning_prefix(segment) || matches_prefix_list(segment, HUB_LEARNING_PREFIXES)
+}
+
+fn matches_prefix_list(segment: &str, prefixes: &[&str]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| segment.eq_ignore_ascii_case(prefix))
+}
+
+fn extract_quiz_urls(url: &Url, slug: &str, remaining_segments: &[String]) -> Vec<String> {
     let Some(quiz_index) = remaining_segments
         .iter()
         .position(|segment| segment.eq_ignore_ascii_case("quiz"))
@@ -140,7 +193,7 @@ fn extract_quiz_urls(url: &Url, slug: &str, remaining_segments: &[&str]) -> Vec<
     vec![quiz_url]
 }
 
-fn extract_assessment_urns(remaining_segments: &[&str]) -> Vec<String> {
+fn extract_assessment_urns(remaining_segments: &[String]) -> Vec<String> {
     remaining_segments
         .windows(2)
         .filter(|segments| segments[0].eq_ignore_ascii_case("quiz"))
@@ -267,5 +320,48 @@ mod tests {
         assert_eq!(parsed.len(), 105);
         assert_eq!(parsed[0].slug, "course-000");
         assert_eq!(parsed[104].slug, "course-104");
+    }
+
+    #[test]
+    fn rejects_topic_and_path_prefixes_as_course_slugs() {
+        let topic =
+            parse_course_urls("https://www.linkedin.com/learning/topics/professional-certificates")
+                .unwrap_err();
+        assert_eq!(
+            topic,
+            CourseUrlError::ReservedSegment {
+                line: 1,
+                segment: "topics".to_string(),
+            }
+        );
+
+        let path = parse_course_urls(
+            "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate",
+        )
+        .unwrap_err();
+        assert_eq!(
+            path,
+            CourseUrlError::ReservedSegment {
+                line: 1,
+                segment: "paths".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_account_and_search_prefixes() {
+        for prefix in ["search", "me", "login", "browse", "in"] {
+            let error = parse_course_urls(&format!(
+                "https://www.linkedin.com/learning/{prefix}/something"
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error,
+                CourseUrlError::ReservedSegment {
+                    line: 1,
+                    segment: prefix.to_string(),
+                }
+            );
+        }
     }
 }

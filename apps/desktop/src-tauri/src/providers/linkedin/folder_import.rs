@@ -117,6 +117,7 @@ struct LinkedInCourseDir {
     title: String,
     mtime_unix: i64,
     artifacts: Vec<DiscoveredArtifact>,
+    nested_parent: Option<super::placement::LayoutName>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,27 +138,43 @@ pub struct ImportCounts {
     pub already_known: usize,
 }
 
-pub fn commit(writer: &DatabaseWriter, raw_path: &str, now: i64) -> Result<(String, ImportCounts), String> {
+pub fn commit(
+    writer: &DatabaseWriter,
+    raw_path: &str,
+    now: i64,
+) -> Result<(String, ImportCounts), String> {
     let decision = resolve_scan_decision(raw_path)?;
     let (root, courses, skipped) = scan_for_decision(&decision)?;
     let output_dir = root.display_path().to_string();
     writer
-        .execute(write_context("commit_linkedin_destination"), move |connection| {
-            merge_download_preferences(connection, &output_dir, now).map_err(import_error_as_db)?;
-            let counts =
-                import_courses(connection, &root, &courses, skipped, now, false).map_err(import_error_as_db)?;
-            Ok((output_dir, counts))
-        })
+        .execute(
+            write_context("commit_linkedin_destination"),
+            move |connection| {
+                merge_download_preferences(connection, &output_dir, now)
+                    .map_err(import_error_as_db)?;
+                let counts = import_courses(connection, &root, &courses, skipped, now, false)
+                    .map_err(import_error_as_db)?;
+                Ok((output_dir, counts))
+            },
+        )
         .map_err(map_database_write_error)
 }
 
-pub fn recover_into(writer: &DatabaseWriter, output_dir: &str, now: i64) -> Result<ImportCounts, String> {
+pub fn recover_into(
+    writer: &DatabaseWriter,
+    output_dir: &str,
+    now: i64,
+) -> Result<ImportCounts, String> {
     let root = LinkedInOutputRoot::parse(output_dir)?;
     let (courses, skipped) = scan_output_root(&root)?;
     writer
-        .execute(write_context("recover_linkedin_folder"), move |connection| {
-            import_courses(connection, &root, &courses, skipped, now, false).map_err(import_error_as_db)
-        })
+        .execute(
+            write_context("recover_linkedin_folder"),
+            move |connection| {
+                import_courses(connection, &root, &courses, skipped, now, false)
+                    .map_err(import_error_as_db)
+            },
+        )
         .map_err(map_database_write_error)
 }
 
@@ -211,8 +228,9 @@ fn scan_for_decision(
             Ok((root.clone(), courses, skipped))
         }
         ScanDecision::SingleCourse { parent, course } => {
-            let course_dir = classify_course_dir(course)?
-                .ok_or_else(|| "The selected folder does not look like a LinkedIn course.".to_string())?;
+            let course_dir = classify_course_dir(course)?.ok_or_else(|| {
+                "The selected folder does not look like a LinkedIn course.".to_string()
+            })?;
             Ok((parent.clone(), vec![course_dir], 0))
         }
     }
@@ -233,11 +251,51 @@ fn scan_output_root(root: &LinkedInOutputRoot) -> Result<(Vec<LinkedInCourseDir>
         }
         if let Some(course) = classify_course_dir(&path)? {
             courses.push(course);
-        } else {
-            skipped += 1;
+            continue;
         }
+        let nested = scan_nested_courses(&path)?;
+        if nested.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        courses.extend(nested);
     }
     Ok((courses, skipped))
+}
+
+fn scan_nested_courses(parent: &Path) -> Result<Vec<LinkedInCourseDir>, String> {
+    let parent_name = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "Certificate folder name is missing.".to_string())?;
+    let layout_name = super::placement::LayoutName::from_title(parent_name);
+    let mut courses = Vec::new();
+    for entry in fs::read_dir(parent).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+            continue;
+        }
+        if let Some(mut course) = classify_course_dir(&path)? {
+            course.artifacts = course
+                .artifacts
+                .into_iter()
+                .map(|mut artifact| {
+                    artifact.relative = PathBuf::from(parent_name).join(artifact.relative);
+                    artifact
+                })
+                .collect();
+            course.nested_parent = Some(layout_name.clone());
+            courses.push(course);
+        }
+    }
+    Ok(courses)
 }
 
 fn import_courses(
@@ -271,7 +329,12 @@ fn import_courses(
         for course in courses {
             let job_id = RecoveredJobId::from_canonical_course_dir(&course.absolute);
             let slug = LocalCourseSlug::from_folder(&course.folder);
-            if job_exists(connection, job_id.as_str(), root.display_path(), slug.as_str())? {
+            if job_exists(
+                connection,
+                job_id.as_str(),
+                root.display_path(),
+                slug.as_str(),
+            )? {
                 already_known += 1;
                 continue;
             }
@@ -284,6 +347,18 @@ fn import_courses(
                 &selected_quality,
                 now,
             )?;
+            let output_root = super::placement::OutputRoot::parse(root.display_path())
+                .map_err(|error| error.to_string())?;
+            let course_slug = super::path_library::CourseSlug::parse(slug.as_str())
+                .map_err(|error| error.to_string())?;
+            super::path_library::record_imported_layout_on_connection(
+                connection,
+                &output_root,
+                &course_slug,
+                course.nested_parent.as_ref(),
+                now,
+            )
+            .map_err(|error| error.to_string())?;
             imported += 1;
         }
         Ok(ImportCounts {
@@ -319,7 +394,10 @@ fn merge_download_preferences(
     Ok(merged)
 }
 
-fn merge_download_preferences_json(existing_json: &str, output_dir: &str) -> Result<String, String> {
+fn merge_download_preferences_json(
+    existing_json: &str,
+    output_dir: &str,
+) -> Result<String, String> {
     let mut value = serde_json::from_str::<serde_json::Value>(existing_json)
         .unwrap_or_else(|_| serde_json::json!({}));
     if !value.is_object() {
@@ -513,6 +591,7 @@ fn classify_course_dir(path: &Path) -> Result<Option<LinkedInCourseDir>, String>
         title,
         mtime_unix,
         artifacts,
+        nested_parent: None,
     }))
 }
 
@@ -680,12 +759,18 @@ use rusqlite::OptionalExtension;
 mod tests {
     use super::*;
     use crate::cache::{
-        get_job, get_setting, initialize_database, list_artifacts_for_job, list_jobs_by_status, open_runtime,
+        get_job, get_setting, initialize_database, list_artifacts_for_job, list_jobs_by_status,
+        open_runtime,
     };
     use crate::providers::linkedin::commands::{bootstrap_jobs, history_source_url};
     use crate::workflow::application::runtime::WorkflowRuntime;
 
-    fn import_harness() -> (tempfile::TempDir, DatabaseWriter, Connection, WorkflowRuntime) {
+    fn import_harness() -> (
+        tempfile::TempDir,
+        DatabaseWriter,
+        Connection,
+        WorkflowRuntime,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
         let (connection, _) = initialize_database(&db_path).unwrap();
@@ -700,15 +785,16 @@ mod tests {
         (directory, writer, connection, runtime)
     }
 
-    fn write_course_tree(root: &Path, title: &str, with_study_md: bool, with_video: bool) -> PathBuf {
+    fn write_course_tree(
+        root: &Path,
+        title: &str,
+        with_study_md: bool,
+        with_video: bool,
+    ) -> PathBuf {
         let course_dir = root.join(title);
         fs::create_dir_all(course_dir.join("01 - Intro")).unwrap();
         if with_study_md {
-            fs::write(
-                course_dir.join("Study.md"),
-                format!("# {}\n", title),
-            )
-            .unwrap();
+            fs::write(course_dir.join("Study.md"), format!("# {}\n", title)).unwrap();
         }
         if with_video {
             fs::write(course_dir.join("01 - Intro/01 - Welcome.mp4"), b"video").unwrap();
@@ -727,7 +813,10 @@ mod tests {
         assert_eq!(counts.imported, 1);
         assert_eq!(counts.skipped, 0);
         assert_eq!(counts.already_known, 0);
-        assert_eq!(output_dir, fs::canonicalize(&root).unwrap().to_string_lossy());
+        assert_eq!(
+            output_dir,
+            fs::canonicalize(&root).unwrap().to_string_lossy()
+        );
 
         let jobs = list_jobs_by_status(&connection, "completed").unwrap();
         assert_eq!(jobs.len(), 1);
@@ -739,13 +828,15 @@ mod tests {
         assert_eq!(job.status, "completed");
 
         let artifacts = list_artifacts_for_job(&connection, &job.id).unwrap();
-        assert!(artifacts.iter().any(|artifact| artifact.artifact_type == "study_guide"));
-        assert!(artifacts.iter().any(|artifact| artifact.artifact_type == "video"));
-        assert!(
-            artifacts
-                .iter()
-                .any(|artifact| artifact.path.replace('\\', "/").contains("/Title/"))
-        );
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "study_guide"));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "video"));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.path.replace('\\', "/").contains("/Title/")));
 
         let (output_dir_again, second_counts) =
             commit(&writer, root.to_str().unwrap(), 1_700_000_010).unwrap();
@@ -781,7 +872,10 @@ mod tests {
         let (_, counts) = commit(&writer, root.to_str().unwrap(), 1_700_000_000).unwrap();
         assert_eq!(counts.imported, 1);
         assert_eq!(counts.skipped, 1);
-        assert_eq!(list_jobs_by_status(&connection, "completed").unwrap().len(), 1);
+        assert_eq!(
+            list_jobs_by_status(&connection, "completed").unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -792,8 +886,12 @@ mod tests {
         write_course_tree(&root, "Title", true, true);
         commit(&writer, root.to_str().unwrap(), 1_700_000_000).unwrap();
 
-        assert!(get_setting(&connection, "download.folder").unwrap().is_none());
-        assert!(get_setting(&connection, "youtube.preferences").unwrap().is_none());
+        assert!(get_setting(&connection, "download.folder")
+            .unwrap()
+            .is_none());
+        assert!(get_setting(&connection, "youtube.preferences")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -804,7 +902,10 @@ mod tests {
         write_course_tree(&root, "Title", true, true);
         commit(&writer, root.to_str().unwrap(), 1_700_000_000).unwrap();
         assert!(runtime.list_linkedin_runs(10).unwrap().is_empty());
-        assert_eq!(list_jobs_by_status(&connection, "completed").unwrap().len(), 1);
+        assert_eq!(
+            list_jobs_by_status(&connection, "completed").unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -816,11 +917,9 @@ mod tests {
         commit(&writer, root.to_str().unwrap(), 1_700_000_000).unwrap();
 
         let bootstrapped = bootstrap_jobs(&connection).unwrap();
-        assert!(
-            bootstrapped
-                .iter()
-                .any(|job| job.status == "completed" && job.course_slug == "local:Title")
-        );
+        assert!(bootstrapped
+            .iter()
+            .any(|job| job.status == "completed" && job.course_slug == "local:Title"));
     }
 
     #[test]
@@ -835,6 +934,38 @@ mod tests {
         });
         assert!(!url.contains("linkedin.com/learning/local:"));
         assert!(url.is_empty());
+    }
+
+    #[test]
+    fn folder_import_depth_two_records_layout_only_certificate() {
+        let (temp, writer, connection, _runtime) = import_harness();
+        let root = temp.path().join("downloads");
+        let cert = root.join("GitHub Certificate");
+        fs::create_dir_all(&cert).unwrap();
+        write_course_tree(&cert, "Practical GitHub Actions", true, true);
+
+        let (output_dir, counts) = commit(&writer, root.to_str().unwrap(), 1_700_000_000).unwrap();
+        assert_eq!(counts.imported, 1);
+        let jobs = list_jobs_by_status(&connection, "completed").unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].output_dir, output_dir);
+        assert_eq!(jobs[0].course_slug, "local:Practical GitHub Actions");
+        let home: (String, Option<String>, String) = connection
+            .query_row(
+                "SELECT home_kind, path_slug, layout_name FROM linkedin_course_placement
+                 WHERE course_slug = 'local:Practical GitHub Actions'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(home.0, "certificate");
+        assert_eq!(home.1, None);
+        assert_eq!(home.2, "GitHub Certificate");
+        let artifacts = list_artifacts_for_job(&connection, &jobs[0].id).unwrap();
+        assert!(artifacts.iter().any(|artifact| artifact
+            .path
+            .replace('\\', "/")
+            .contains("/GitHub Certificate/Practical GitHub Actions/")));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::placement::{CourseLayout, PlacementError};
 use crate::artifact_downloader::{
     download_artifacts_for_active_job, ArtifactDownloadError, ArtifactDownloadSource,
     ArtifactDownloadSummary, ArtifactHttpClient, CancellationFlag, PlannedArtifactDownload,
@@ -42,6 +43,8 @@ pub enum DownloadOrchestrationError {
     Serialize(#[from] serde_json::Error),
     #[error("unsupported selected quality: {0}")]
     InvalidQuality(String),
+    #[error(transparent)]
+    Placement(#[from] PlacementError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,7 +400,8 @@ fn plan_active_job_downloads(
         },
     )?;
 
-    let downloads = build_initial_artifact_downloads(job, &course, timestamp);
+    let layout = CourseLayout::load(connection, &job.output_dir, &job.course_slug)?;
+    let downloads = build_initial_artifact_downloads(job, &course, &layout, timestamp);
     for download in &downloads {
         upsert_artifact(connection, &download.artifact)?;
     }
@@ -490,6 +494,7 @@ fn parse_selected_quality(value: &str) -> Result<VideoQuality, DownloadOrchestra
 fn build_initial_artifact_downloads(
     job: &JobRecord,
     course: &Course,
+    layout: &CourseLayout,
     timestamp: i64,
 ) -> Vec<PlannedArtifactDownload> {
     let mut text_downloads = Vec::new();
@@ -497,7 +502,8 @@ fn build_initial_artifact_downloads(
     let mut exercise_downloads = Vec::new();
     let mut study_videos = Vec::new();
     let mut study_assessments = Vec::new();
-    let course_dir = safe_file_name(&course.title);
+    let course_dir = layout.course_folder(&course.title);
+    let course_dir = course_dir.as_str();
 
     let mut video_artifact_index = 0;
     for (chapter_index, chapter) in course.chapters.iter().enumerate() {
@@ -514,9 +520,9 @@ fn build_initial_artifact_downloads(
             );
             if job.download_videos {
                 if let Some(download_url) = &video.download_url {
-                    let video_path = planned_path(
-                        &job.output_dir,
-                        &[&course_dir, &chapter_dir, &format!("{video_name}.mp4")],
+                    let video_path = planned_layout_path(
+                        layout,
+                        &[course_dir, &chapter_dir, &format!("{video_name}.mp4")],
                     );
                     video_downloads.push(PlannedArtifactDownload {
                         artifact: ArtifactRecord {
@@ -530,6 +536,7 @@ fn build_initial_artifact_downloads(
                             updated_at: timestamp,
                         },
                         source: ArtifactDownloadSource::Url(download_url.clone()),
+                        video_slug: Some(video.slug.clone()),
                     });
                     ensure_study_video(
                         &mut study_videos,
@@ -547,9 +554,9 @@ fn build_initial_artifact_downloads(
                             id: format!("artifact-{}-subtitle-{video_artifact_index}", job.id),
                             job_id: job.id.clone(),
                             artifact_type: "subtitle".to_string(),
-                            path: planned_path(
-                                &job.output_dir,
-                                &[&course_dir, &chapter_dir, &format!("{video_name}.srt")],
+                            path: planned_layout_path(
+                                layout,
+                                &[course_dir, &chapter_dir, &format!("{video_name}.srt")],
                             ),
                             status: "pending".to_string(),
                             size_bytes: None,
@@ -557,6 +564,7 @@ fn build_initial_artifact_downloads(
                             updated_at: timestamp,
                         },
                         source: ArtifactDownloadSource::Text(transcript_srt.clone()),
+                        video_slug: None,
                     });
                 }
             }
@@ -580,9 +588,9 @@ fn build_initial_artifact_downloads(
                             id: format!("artifact-{}-quiz-{video_artifact_index}", job.id),
                             job_id: job.id.clone(),
                             artifact_type: "quiz".to_string(),
-                            path: planned_path(
-                                &job.output_dir,
-                                &[&course_dir, &chapter_dir, &quiz_file_name],
+                            path: planned_layout_path(
+                                layout,
+                                &[course_dir, &chapter_dir, &quiz_file_name],
                             ),
                             status: "pending".to_string(),
                             size_bytes: None,
@@ -590,6 +598,7 @@ fn build_initial_artifact_downloads(
                             updated_at: timestamp,
                         },
                         source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                        video_slug: None,
                     });
                     ensure_study_video(
                         &mut study_videos,
@@ -619,13 +628,14 @@ fn build_initial_artifact_downloads(
                         id: format!("artifact-{}-assessment-{assessment_index}", job.id),
                         job_id: job.id.clone(),
                         artifact_type: "quiz".to_string(),
-                        path: planned_path(&job.output_dir, &artifact_segment_refs),
+                        path: planned_layout_path(layout, &artifact_segment_refs),
                         status: "pending".to_string(),
                         size_bytes: None,
                         created_at: timestamp,
                         updated_at: timestamp,
                     },
                     source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                    video_slug: None,
                 });
                 study_assessments.push(StudyGuideQuiz {
                     title: assessment.title.clone(),
@@ -641,13 +651,14 @@ fn build_initial_artifact_downloads(
                 id: format!("artifact-{}-study-guide", job.id),
                 job_id: job.id.clone(),
                 artifact_type: "study_guide".to_string(),
-                path: planned_path(&job.output_dir, &[&course_dir, "Study.md"]),
+                path: planned_layout_path(layout, &[course_dir, "Study.md"]),
                 status: "pending".to_string(),
                 size_bytes: None,
                 created_at: timestamp,
                 updated_at: timestamp,
             },
             source: ArtifactDownloadSource::Text(study_markdown),
+            video_slug: None,
         });
     }
 
@@ -659,13 +670,14 @@ fn build_initial_artifact_downloads(
                     id: format!("artifact-{}-exercise-{exercise_index}", job.id),
                     job_id: job.id.clone(),
                     artifact_type: exercise_artifact_type(&file_name).to_string(),
-                    path: planned_path(&job.output_dir, &[&course_dir, &file_name]),
+                    path: planned_layout_path(layout, &[course_dir, &file_name]),
                     status: "pending".to_string(),
                     size_bytes: None,
                     created_at: timestamp,
                     updated_at: timestamp,
                 },
                 source: ArtifactDownloadSource::Urls(exercise_download_urls(exercise_file)),
+                video_slug: None,
             });
         }
     }
@@ -985,6 +997,14 @@ fn exercise_download_urls(exercise_file: &crate::course::ExerciseFile) -> Vec<St
     urls
 }
 
+fn planned_layout_path(layout: &CourseLayout, extra: &[&str]) -> String {
+    let prefixes = layout.prefix_segments();
+    let mut segments = Vec::with_capacity(prefixes.len() + extra.len());
+    segments.extend(prefixes);
+    segments.extend(extra.iter().copied());
+    planned_path(layout.output_root().as_str(), &segments)
+}
+
 fn planned_path(output_dir: &str, segments: &[&str]) -> String {
     let mut path = PathBuf::from(output_dir);
     for segment in segments {
@@ -1108,6 +1128,8 @@ impl<'a> From<&'a Course> for CachedCoursePayload<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::path_library::PathLibrary;
+    use super::super::placement::CourseHome;
     use super::*;
     use crate::artifact_downloader::{ArtifactHttpResponse, NeverCancelled};
     use crate::cache::{
@@ -1478,7 +1500,14 @@ mod tests {
             }],
         };
 
-        let downloads = build_initial_artifact_downloads(&job, &course, 200);
+        let downloads = build_initial_artifact_downloads(
+            &job,
+            &course,
+            &CourseLayout::standalone(
+                crate::providers::linkedin::placement::OutputRoot::parse(&job.output_dir).unwrap(),
+            ),
+            200,
+        );
         let types = downloads
             .iter()
             .map(|download| download.artifact.artifact_type.as_str())
@@ -1558,7 +1587,14 @@ mod tests {
             exercise_files: Vec::new(),
         };
 
-        let downloads = build_initial_artifact_downloads(&job, &course, 200);
+        let downloads = build_initial_artifact_downloads(
+            &job,
+            &course,
+            &CourseLayout::standalone(
+                crate::providers::linkedin::placement::OutputRoot::parse(&job.output_dir).unwrap(),
+            ),
+            200,
+        );
 
         assert_eq!(downloads.len(), 1);
         assert_eq!(downloads[0].artifact.artifact_type, "video");
@@ -1592,7 +1628,14 @@ mod tests {
             exercise_files: Vec::new(),
         };
 
-        let downloads = build_initial_artifact_downloads(&job, &course, 200);
+        let downloads = build_initial_artifact_downloads(
+            &job,
+            &course,
+            &CourseLayout::standalone(
+                crate::providers::linkedin::placement::OutputRoot::parse(&job.output_dir).unwrap(),
+            ),
+            200,
+        );
         let types = downloads
             .iter()
             .map(|download| download.artifact.artifact_type.as_str())
@@ -1649,6 +1692,80 @@ mod tests {
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             vec!["job.active", "job.cancelled"]
+        );
+    }
+
+    #[test]
+    fn legacy_job_without_placement_plans_flat_course_title() {
+        let connection = initialized_connection();
+        insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
+        let mut client = FakeCourseApiClient::new(vec![
+            ("fields=chapters,title,exerciseFiles", metadata_fixture()),
+            (
+                "https://www.linkedin.com/learning/sample-course",
+                r#"https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh"#,
+            ),
+            ("resolution=_1080", selected_video_fixture()),
+        ]);
+
+        process_next_queued_job(&connection, &mut client, 200)
+            .unwrap()
+            .unwrap();
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        assert!(artifacts.iter().any(|artifact| {
+            let normalized = artifact.path.replace('\\', "/");
+            normalized.contains("/Sample Course/") && !normalized.contains("/Certificate/")
+        }));
+        let home: String = connection
+            .query_row(
+                "SELECT home_kind FROM linkedin_course_placement
+                 WHERE course_slug = 'sample-course' AND output_root = 'C:/downloads'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(home, "standalone");
+        assert!(matches!(
+            PathLibrary::layout_for_course(&connection, "C:/downloads", "sample-course")
+                .unwrap()
+                .home(),
+            CourseHome::Standalone
+        ));
+    }
+
+    #[test]
+    fn planned_artifacts_include_path_prefix_segment() {
+        let connection = initialized_connection();
+        let job = sample_job("job-1", "queued", 100);
+        insert_job(&connection, &job).unwrap();
+        connection
+            .execute(
+                "INSERT INTO linkedin_course_placement (
+                    course_slug, output_root, home_kind, path_slug, layout_name, created_at
+                 ) VALUES ('sample-course', 'C:/downloads', 'certificate', 'github-cert',
+                    'GitHub Certificate', 10)",
+                [],
+            )
+            .unwrap();
+        let mut client = FakeCourseApiClient::new(vec![
+            ("fields=chapters,title,exerciseFiles", metadata_fixture()),
+            (
+                "https://www.linkedin.com/learning/sample-course",
+                r#"https://files3.lynda.com/secure/courses/123/exercises/exercise.zip?token=fresh"#,
+            ),
+            ("resolution=_1080", selected_video_fixture()),
+        ]);
+
+        process_next_queued_job(&connection, &mut client, 200)
+            .unwrap()
+            .unwrap();
+        let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
+        assert!(
+            artifacts.iter().any(|artifact| {
+                let normalized = artifact.path.replace('\\', "/");
+                normalized.contains("/GitHub Certificate/Sample Course/")
+            }),
+            "planned artifacts must include the frozen certificate folder, got {artifacts:?}"
         );
     }
 
