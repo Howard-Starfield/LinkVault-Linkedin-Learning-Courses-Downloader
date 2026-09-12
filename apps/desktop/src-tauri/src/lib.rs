@@ -116,6 +116,29 @@ pub fn run() {
                 });
             },
         )
+        .register_asynchronous_uri_scheme_protocol(
+            "linkedin-media",
+            |context, request, responder| {
+                let app = context.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let db_path = app
+                        .state::<commands::LinkVaultState>()
+                        .db_path()
+                        .to_path_buf();
+                    let response = tauri::async_runtime::spawn_blocking(move || {
+                        providers::linkedin::media_protocol::handle_request(&db_path, &request)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        tauri::http::Response::builder()
+                            .status(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(b"LinkedIn media could not be loaded.".to_vec())
+                            .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+                    });
+                    responder.respond(response);
+                });
+            },
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -147,6 +170,10 @@ pub fn run() {
             commands::set_all_downloads_paused,
             commands::set_download_job_pause,
             commands::start_download_jobs,
+            commands::linkedin_list_catalog,
+            commands::linkedin_open_course,
+            commands::linkedin_save_progress,
+            commands::linkedin_open_course_folder,
             coursera::commands::bootstrap_coursera_state,
             coursera::commands::parse_coursera_class_input,
             coursera::commands::coursera_login,

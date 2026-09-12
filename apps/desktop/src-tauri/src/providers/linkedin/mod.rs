@@ -15,6 +15,7 @@ pub(crate) mod expansion;
 pub(crate) mod folder_import;
 pub(crate) mod linkedin;
 pub mod live_clients;
+pub(crate) mod media_protocol;
 pub(crate) mod path_library;
 pub mod projection;
 pub mod quality;

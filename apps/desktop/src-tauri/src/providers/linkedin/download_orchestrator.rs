@@ -530,6 +530,7 @@ fn build_initial_artifact_downloads(
                             updated_at: timestamp,
                         },
                         source: ArtifactDownloadSource::Url(download_url.clone()),
+                        video_slug: Some(video.slug.clone()),
                     });
                     ensure_study_video(
                         &mut study_videos,
@@ -557,6 +558,7 @@ fn build_initial_artifact_downloads(
                             updated_at: timestamp,
                         },
                         source: ArtifactDownloadSource::Text(transcript_srt.clone()),
+                        video_slug: None,
                     });
                 }
             }
@@ -590,6 +592,7 @@ fn build_initial_artifact_downloads(
                             updated_at: timestamp,
                         },
                         source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                        video_slug: None,
                     });
                     ensure_study_video(
                         &mut study_videos,
@@ -626,6 +629,7 @@ fn build_initial_artifact_downloads(
                         updated_at: timestamp,
                     },
                     source: ArtifactDownloadSource::Text(quiz_markdown.clone()),
+                    video_slug: None,
                 });
                 study_assessments.push(StudyGuideQuiz {
                     title: assessment.title.clone(),
@@ -648,6 +652,7 @@ fn build_initial_artifact_downloads(
                 updated_at: timestamp,
             },
             source: ArtifactDownloadSource::Text(study_markdown),
+            video_slug: None,
         });
     }
 
@@ -666,6 +671,7 @@ fn build_initial_artifact_downloads(
                     updated_at: timestamp,
                 },
                 source: ArtifactDownloadSource::Urls(exercise_download_urls(exercise_file)),
+                video_slug: None,
             });
         }
     }

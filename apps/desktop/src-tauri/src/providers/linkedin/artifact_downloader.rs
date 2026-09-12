@@ -61,6 +61,7 @@ pub enum ArtifactDownloadSource {
 pub struct PlannedArtifactDownload {
     pub artifact: ArtifactRecord,
     pub source: ArtifactDownloadSource,
+    pub video_slug: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +228,7 @@ fn download_artifacts_for_active_job_with_pacing(
                     timestamp,
                 )?;
                 summary.completed += 1;
+                record_completed_video_file(connection, &job, download, timestamp)?;
                 continue;
             }
 
@@ -402,6 +404,7 @@ fn download_artifacts_for_active_job_with_pacing(
                     timestamp,
                 )?;
                 summary.completed += 1;
+                record_completed_video_file(connection, &job, download, timestamp)?;
             }
             Err(error) if is_exercise_artifact(&download.artifact) => {
                 let failure_reason = safe_artifact_error_reason(&error);
@@ -496,7 +499,12 @@ impl VideoPacingPolicy {
         Self::with_live_follow(min_seconds, max_seconds, seed, true)
     }
 
-    fn with_live_follow(min_seconds: u32, max_seconds: u32, seed: u64, follow_live_bounds: bool) -> Self {
+    fn with_live_follow(
+        min_seconds: u32,
+        max_seconds: u32,
+        seed: u64,
+        follow_live_bounds: bool,
+    ) -> Self {
         let (min_seconds, max_seconds) = normalize_video_wait_bounds(min_seconds, max_seconds);
         Self {
             min_seconds,
@@ -564,6 +572,30 @@ fn wait_for_video_pacing(seconds: u32, cancellation: &dyn CancellationFlag) -> b
 
 fn is_video_artifact(artifact: &ArtifactRecord) -> bool {
     artifact.artifact_type == "video"
+}
+
+fn record_completed_video_file(
+    connection: &Connection,
+    job: &crate::cache::JobRecord,
+    download: &PlannedArtifactDownload,
+    timestamp: i64,
+) -> Result<(), ArtifactDownloadError> {
+    let Some(video_slug) = download.video_slug.as_deref().map(str::trim) else {
+        return Ok(());
+    };
+    if video_slug.is_empty() {
+        return Ok(());
+    }
+    crate::providers::linkedin::path_library::record_video_file_on_connection(
+        connection,
+        &job.course_slug,
+        video_slug,
+        &download.artifact.id,
+        &job.id,
+        timestamp,
+    )
+    .map_err(CacheError::from)?;
+    Ok(())
 }
 
 fn reusable_artifact_size(
@@ -1230,7 +1262,10 @@ mod tests {
         set_live_video_wait_bounds(5, 8);
         let next = pacing.next_wait_seconds("live-video-after-refresh");
         assert!((5..=8).contains(&next));
-        set_live_video_wait_bounds(DEFAULT_VIDEO_WAIT_MIN_SECONDS, DEFAULT_VIDEO_WAIT_MAX_SECONDS);
+        set_live_video_wait_bounds(
+            DEFAULT_VIDEO_WAIT_MIN_SECONDS,
+            DEFAULT_VIDEO_WAIT_MAX_SECONDS,
+        );
     }
 
     #[test]
@@ -2362,6 +2397,7 @@ mod tests {
                 updated_at: 200,
             },
             source,
+            video_slug: None,
         }
     }
 
