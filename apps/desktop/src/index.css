@@ -1038,6 +1038,149 @@ textarea {
  padding: 12px 14px;
 }
 
+.linkedin-library-workspace {
+ display: grid;
+ min-height: 0;
+ grid-template-rows: auto minmax(0, 1fr);
+ gap: 12px;
+}
+
+.linkedin-library-header {
+ display: flex;
+ align-items: center;
+ gap: 10px;
+ min-width: 0;
+}
+
+.linkedin-library-title {
+ margin: 0;
+ color: var(--text-main);
+ font-size: 15px;
+ font-weight: 650;
+}
+
+.linkedin-library-list,
+.linkedin-library-chapter ol {
+ display: grid;
+ min-width: 0;
+ gap: 8px;
+ list-style: none;
+ margin: 0;
+ padding: 0;
+}
+
+.linkedin-library-chapter h3 {
+ margin: 8px 0 4px;
+ color: var(--muted-strong);
+ font-size: 12px;
+ font-weight: 650;
+}
+
+.linkedin-library-row {
+ display: grid;
+ width: 100%;
+ min-width: 0;
+ height: 76px;
+ min-height: 72px;
+ max-height: 80px;
+ grid-template-columns: 40px minmax(0, 1fr);
+ align-items: center;
+ gap: 12px;
+ border-radius: 10px;
+ border: 1px solid transparent;
+ background: var(--section-bg);
+ padding: 10px 14px;
+ text-align: left;
+ color: inherit;
+ cursor: pointer;
+}
+
+.linkedin-library-row:hover,
+.linkedin-library-row:focus-visible {
+ border-color: var(--border-soft);
+}
+
+.linkedin-library-row:disabled {
+ cursor: default;
+ opacity: 0.7;
+}
+
+.linkedin-library-copy {
+ display: grid;
+ min-width: 0;
+ gap: 3px;
+}
+
+.linkedin-library-copy strong,
+.linkedin-library-copy span {
+ overflow: hidden;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+
+.linkedin-library-empty {
+ display: grid;
+ gap: 6px;
+ padding: 24px 8px;
+ color: var(--muted-strong);
+}
+
+.linkedin-progress-ring {
+ width: 32px;
+ height: 32px;
+ transform: rotate(-90deg);
+}
+
+.linkedin-progress-ring-track {
+ fill: none;
+ stroke: var(--border-soft);
+ stroke-width: 3;
+}
+
+.linkedin-progress-ring-value {
+ fill: none;
+ stroke: var(--primary);
+ stroke-width: 3;
+ stroke-linecap: round;
+}
+
+.linkedin-player-overlay {
+ position: fixed;
+ inset: 0;
+ z-index: 80;
+ display: grid;
+ grid-template-rows: auto minmax(0, 1fr);
+ background: #0b0b0f;
+}
+
+.linkedin-player-toolbar {
+ display: flex;
+ align-items: center;
+ gap: 12px;
+ padding: 12px 16px;
+ color: #fff;
+}
+
+.linkedin-player-toolbar h2 {
+ margin: 0;
+ font-size: 15px;
+ font-weight: 650;
+}
+
+.linkedin-player-back {
+ border: 0;
+ background: transparent;
+ color: inherit;
+ cursor: pointer;
+ font: inherit;
+}
+
+.linkedin-player-video {
+ width: 100%;
+ height: 100%;
+ background: #000;
+}
+
 .download-history-row:hover,
 .download-history-row:focus-within,
 .youtube-history-row:hover,

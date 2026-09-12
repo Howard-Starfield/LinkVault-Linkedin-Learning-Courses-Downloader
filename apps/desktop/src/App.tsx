@@ -58,6 +58,7 @@ import { YouTubeView } from "./components/youtube/YouTubeView";
 import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
 import { ensureDestination, parseDestination } from "./lib/destinations";
 import { commitLinkedInDestination } from "./lib/linkedin/ipc";
+import { LinkedinHistory } from "./components/linkedin/LinkedinHistory";
 import {
   classifiedPasteToast,
   classifyLinkedInLearningUrls,
@@ -243,15 +244,6 @@ type SavedDownloadPreferences = {
   downloadQuizzes?: boolean;
 };
 
-type DownloadHistoryEntry = {
-  job_id: string;
-  course_slug: string;
-  source_url: string;
-  course_title: string;
-  output_dir: string;
-  completed_at: number;
-};
-
 type BootstrapState = {
   default_resolution: string;
   browser_sources: string[];
@@ -260,7 +252,6 @@ type BootstrapState = {
   saved_download_preferences: SavedDownloadPreferences | null;
   persisted_jobs: QueuedDownloadJob[];
   recent_events: PersistedJobEvent[];
-  download_history: DownloadHistoryEntry[];
   download_history_file_path: string;
 };
 
@@ -420,8 +411,6 @@ export default function App() {
   const [recentEvents, setRecentEvents] = useState<PersistedJobEvent[]>([]);
   const [emulatorJobs, setEmulatorJobs] = useState<QueuedDownloadJob[]>([]);
   const [emulatorEvents, setEmulatorEvents] = useState<PersistedJobEvent[]>([]);
-  const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryEntry[]>([]);
-  const [downloadHistoryFilePath, setDownloadHistoryFilePath] = useState("");
   const [queueSection, setQueueSection] = useState<DownloadQueueSection>("queue");
   const [activeView, setActiveView] = useState<AppView>("downloads");
   const [clippingGallerySummary, setClippingGallerySummary] = useState<{
@@ -826,8 +815,6 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setRecentEvents((previous) => serializedStateEqual(previous, previewState.events) ? previous : previewState.events);
         setHasSavedToken(hasPreviewSavedToken());
-        setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
-        setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
           default_resolution: "P720",
           browser_sources: ["Chrome", "Edge", "Firefox"],
@@ -836,7 +823,6 @@ export default function App() {
           saved_download_preferences: previewPreferences,
           persisted_jobs: previewState.jobs,
           recent_events: previewState.events,
-          download_history: downloadHistoryFromJobs(previewState.jobs),
           download_history_file_path: previewDownloadHistoryFilePath()
         };
       }
@@ -860,9 +846,6 @@ export default function App() {
       setQueuedJobs((previous) => serializedStateEqual(previous, state.persisted_jobs) ? previous : state.persisted_jobs);
       setRecentEvents((previous) => serializedStateEqual(previous, state.recent_events) ? previous : state.recent_events);
       setHasSavedToken(state.has_saved_token);
-      const nextHistory = state.download_history ?? [];
-      setDownloadHistory((previous) => serializedStateEqual(previous, nextHistory) ? previous : nextHistory);
-      setDownloadHistoryFilePath(state.download_history_file_path ?? "");
       return state;
     } catch {
       // Browser-only Vite previews do not expose Tauri commands.
@@ -871,8 +854,6 @@ export default function App() {
         setQueuedJobs(previewState.jobs);
         setRecentEvents((previous) => serializedStateEqual(previous, previewState.events) ? previous : previewState.events);
         setHasSavedToken(hasPreviewSavedToken());
-        setDownloadHistory(downloadHistoryFromJobs(previewState.jobs));
-        setDownloadHistoryFilePath(previewDownloadHistoryFilePath());
         return {
           default_resolution: "P720",
           browser_sources: ["Chrome", "Edge", "Firefox"],
@@ -881,7 +862,6 @@ export default function App() {
           saved_download_preferences: readPreviewPreferences(),
           persisted_jobs: previewState.jobs,
           recent_events: previewState.events,
-          download_history: downloadHistoryFromJobs(previewState.jobs),
           download_history_file_path: previewDownloadHistoryFilePath()
         };
       }
@@ -946,11 +926,6 @@ export default function App() {
     setRecentEvents((previous) =>
       serializedStateEqual(previous, state.recent_events) ? previous : state.recent_events
     );
-    const nextHistory = state.download_history ?? [];
-    setDownloadHistory((previous) =>
-      serializedStateEqual(previous, nextHistory) ? previous : nextHistory
-    );
-    setDownloadHistoryFilePath(state.download_history_file_path ?? "");
   }
 
   async function chooseLinkedInFolder(current: string): Promise<string | null> {
@@ -1359,7 +1334,6 @@ export default function App() {
     try {
       const state = await downloadScheduledJobNow(job.id);
       setQueuedJobs(state.persisted_jobs);
-      setDownloadHistory(state.download_history ?? []);
       toast.info("Moved to immediate queue", { description: courseDisplayName(job) });
       ensureDownloadProcessing(state.has_saved_token);
     } catch (error) {
@@ -1488,7 +1462,9 @@ export default function App() {
           description: `LinkedVault will read the ${browserSource} LinkedIn session for this download.`
         });
       }
-      const completedSlugs = new Set(downloadHistory.map((entry) => entry.course_slug));
+      const completedSlugs = new Set(
+        queuedJobs.filter((job) => job.status === "completed").map((job) => job.course_slug)
+      );
       const alreadyDownloaded = courseSlugsForHistoryConfirm(parsed).filter((slug) =>
         completedSlugs.has(slug)
       );
@@ -2627,10 +2603,8 @@ export default function App() {
               registerFlush={registerClippingFlush}
             />
           ) : activeView === "linkedin-history" ? (
-            <HistoryPage
-              entries={downloadHistory}
-              historyFilePath={downloadHistoryFilePath}
-              onOpenFolderByJobId={openCompletedFolderByJobId}
+            <LinkedinHistory
+              historyRevision={queuedJobs.map((job) => `${job.id}:${job.status}:${job.updated_at}`).join("|")}
             />
           ) : (
           <>
@@ -3532,16 +3506,6 @@ function mergeQueuedJobs(currentJobs: QueuedDownloadJob[], addedJobs: QueuedDown
   );
 }
 
-function formatEventTime(timestamp: number) {
-  if (!timestamp) return "--:--";
-  return new Date(timestamp * 1000).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
-}
-
 function activeVideoPacingState(
   events: PersistedJobEvent[],
   jobId: string,
@@ -4088,66 +4052,6 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
   );
 }
 
-function HistoryPage({
-  entries,
-  historyFilePath,
-  onOpenFolderByJobId
-}: {
-  entries: DownloadHistoryEntry[];
-  historyFilePath: string;
-  onOpenFolderByJobId: (jobId: string, fallbackPath?: string) => void | Promise<void>;
-}) {
-  return (
-    <div className="lv-workspace download-history-workspace">
-      <div className="download-history-header">
-        <p className="download-history-count">
-          {entries.length} completed course{entries.length === 1 ? "" : "s"}
-        </p>
-        {historyFilePath ? (
-          <p className="download-history-meta" title={historyFilePath}>
-            {historyFilePath}
-          </p>
-        ) : null}
-      </div>
-      {entries.length === 0 ? (
-        <div className="download-history-empty" role="status">
-          <span>No downloaded courses</span>
-          <span>Completed course downloads will appear here and in download-history.md.</span>
-        </div>
-      ) : (
-        <ol className="download-history-list" aria-label="LinkedIn download history">
-          {entries.map((entry) => {
-            const when = formatEventTime(entry.completed_at);
-            return (
-              <li key={entry.job_id} className="download-history-row">
-                <div className="download-history-copy">
-                  <strong title={entry.course_title}>{entry.course_title}</strong>
-                  <span title={entry.source_url}>
-                    {[when, entry.source_url].filter(Boolean).join(" · ")}
-                  </span>
-                </div>
-                <div className="download-history-overlay">
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="ghost"
-                    className="download-history-file-action"
-                    onClick={() => void onOpenFolderByJobId(entry.job_id, entry.output_dir)}
-                    aria-label={`Open folder for ${entry.course_title}`}
-                  >
-                    <FolderOpen aria-hidden="true" />
-                    Open Folder
-                  </Button>
-                </div>
-              </li>
-            );
-          })}
-        </ol>
-      )}
-    </div>
-  );
-}
-
 function MiniCourseArt({ title, thumbnailUrl }: { title: string; thumbnailUrl: string }) {
   return (
     <span className="mini-course-art" title={title}>
@@ -4492,7 +4396,6 @@ async function clearFailedDownloadJobs() {
     stores_plaintext_tokens_in_sqlite: false,
     browser_sources: ["Chrome", "Edge", "Firefox"],
     default_resolution: "P720",
-    download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
 }
@@ -4524,7 +4427,6 @@ function previewBootstrapState(jobs: QueuedDownloadJob[], events: PersistedJobEv
     saved_download_preferences: readPreviewPreferences(),
     persisted_jobs: jobs,
     recent_events: events,
-    download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   };
 }
@@ -4545,7 +4447,6 @@ async function removeDownloadQueueItem(jobId: string) {
     stores_plaintext_tokens_in_sqlite: false,
     browser_sources: ["Chrome", "Edge", "Firefox"],
     default_resolution: "P720",
-    download_history: downloadHistoryFromJobs(jobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   } satisfies BootstrapState;
 }
@@ -4717,7 +4618,6 @@ function retryFailedDownloadJobForPreview(jobId: string): BootstrapState {
     saved_download_preferences: readPreviewPreferences(),
     persisted_jobs: retriedJobs,
     recent_events: events,
-    download_history: downloadHistoryFromJobs(retriedJobs),
     download_history_file_path: previewDownloadHistoryFilePath()
   };
 }
@@ -5211,20 +5111,6 @@ function linkedinLearningSourceUrl(job: Pick<QueuedDownloadJob, "source_url" | "
   if (trimmed) return trimmed;
   if (job.course_slug.startsWith("local:")) return "";
   return `https://www.linkedin.com/learning/${job.course_slug}`;
-}
-
-function downloadHistoryFromJobs(jobs: QueuedDownloadJob[]): DownloadHistoryEntry[] {
-  return jobs
-    .filter((job) => job.status === "completed")
-    .map((job) => ({
-      job_id: job.id,
-      course_slug: job.course_slug,
-      source_url: linkedinLearningSourceUrl(job),
-      course_title: courseDisplayName(job),
-      output_dir: job.output_dir || "",
-      completed_at: job.updated_at ?? 0
-    }))
-    .sort((left, right) => right.completed_at - left.completed_at);
 }
 
 function previewDownloadHistoryFilePath() {
