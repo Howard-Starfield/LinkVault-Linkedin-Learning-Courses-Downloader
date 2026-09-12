@@ -2,7 +2,9 @@ use super::expansion::{
     classify_learning_urls, expand_learning_urls, ClassifiedPaste, ExpansionError,
     ExpansionSummary, PathCapture, SchedulePolicy,
 };
-use super::path_library::{CourseSlug, PathLibrary};
+use super::path_library::{
+    CatalogEntry, CoursePlayback, CourseSlug, PathLibrary, PlaybackTick, VideoProgress, VideoSlug,
+};
 use crate::app::database_writer::DatabaseWriter;
 use crate::artifact_downloader::{ArtifactHttpClient, CancellationFlag};
 use crate::auth::{
@@ -111,6 +113,10 @@ impl LinkVaultState {
         Arc::clone(&self.session_token)
     }
 
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     #[cfg(test)]
     fn is_download_cancellation_requested(&self) -> bool {
         self.download_cancellation.load(Ordering::SeqCst)
@@ -147,7 +153,6 @@ pub struct BootstrapState {
     saved_download_preferences: Option<SavedDownloadPreferences>,
     persisted_jobs: Vec<PersistedDownloadJob>,
     recent_events: Vec<PersistedJobEvent>,
-    download_history: Vec<DownloadHistoryEntry>,
     download_history_file_path: String,
 }
 
@@ -392,6 +397,66 @@ pub async fn expand_linkedin_learning_urls(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackTickDto {
+    course: String,
+    video: String,
+    position_ms: i64,
+    duration_ms: i64,
+}
+
+#[tauri::command]
+pub fn linkedin_list_catalog(
+    state: tauri::State<'_, LinkVaultState>,
+    writer: tauri::State<'_, DatabaseWriter>,
+) -> Result<Vec<CatalogEntry>, String> {
+    let connection = state.connection()?;
+    PathLibrary::new(writer.inner().clone())
+        .list_catalog(&connection)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn linkedin_open_course(
+    state: tauri::State<'_, LinkVaultState>,
+    writer: tauri::State<'_, DatabaseWriter>,
+    course_slug: String,
+) -> Result<CoursePlayback, String> {
+    let course = CourseSlug::parse(&course_slug).map_err(|error| error.to_string())?;
+    let connection = state.connection()?;
+    PathLibrary::new(writer.inner().clone())
+        .open_course(&connection, course)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn linkedin_save_progress(
+    writer: tauri::State<'_, DatabaseWriter>,
+    tick: PlaybackTickDto,
+) -> Result<VideoProgress, String> {
+    let playback = PlaybackTick {
+        course: CourseSlug::parse(&tick.course).map_err(|error| error.to_string())?,
+        video: VideoSlug::parse(&tick.video).map_err(|error| error.to_string())?,
+        position_ms: tick.position_ms,
+        duration_ms: tick.duration_ms,
+    };
+    PathLibrary::new(writer.inner().clone())
+        .save_progress(playback)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn linkedin_open_course_folder(
+    writer: tauri::State<'_, DatabaseWriter>,
+    course_slug: String,
+) -> Result<(), String> {
+    let course = CourseSlug::parse(&course_slug).map_err(|error| error.to_string())?;
+    PathLibrary::new(writer.inner().clone())
+        .open_course_folder(course)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2137,7 +2202,6 @@ fn load_bootstrap_state(
             video_artifacts,
         });
     }
-    let download_history = list_download_history(connection).map_err(|error| error.to_string())?;
 
     Ok(BootstrapState {
         default_resolution: VideoQuality::P1080,
@@ -2147,7 +2211,6 @@ fn load_bootstrap_state(
         saved_download_preferences,
         persisted_jobs,
         recent_events,
-        download_history,
         download_history_file_path: download_history_file_path.to_string_lossy().to_string(),
     })
 }
