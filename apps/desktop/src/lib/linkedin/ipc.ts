@@ -3,6 +3,7 @@ import type {
   CatalogEntry,
   CoursePlayback,
   CourseSlug,
+  PathSlug,
   PlaybackTick,
   VideoProgress
 } from "./types";
@@ -35,4 +36,11 @@ export async function linkedinSaveProgress(tick: PlaybackTick): Promise<VideoPro
 
 export async function linkedinOpenCourseFolder(courseSlug: CourseSlug): Promise<void> {
   return invoke<void>("linkedin_open_course_folder", { courseSlug });
+}
+
+export async function linkedinAddCourseToPath(
+  courseSlug: CourseSlug,
+  pathSlug: PathSlug
+): Promise<CatalogEntry[]> {
+  return invoke<CatalogEntry[]>("linkedin_add_course_to_path", { courseSlug, pathSlug });
 }

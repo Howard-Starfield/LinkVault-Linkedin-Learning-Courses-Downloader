@@ -17,6 +17,7 @@ pub(crate) mod linkedin;
 pub mod live_clients;
 pub(crate) mod media_protocol;
 pub(crate) mod path_library;
+pub(crate) mod placement;
 pub mod projection;
 pub mod quality;
 pub mod quiz_hints;

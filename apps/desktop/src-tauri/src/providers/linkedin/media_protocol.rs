@@ -124,28 +124,42 @@ fn parse_artifact_id(request: &Request<Vec<u8>>) -> Result<String, MediaError> {
     Ok(artifact_id.to_string())
 }
 
+const MAX_MEDIA_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+
 fn serve_media(request: &Request<Vec<u8>>, media: ResolvedMedia) -> Response<Vec<u8>> {
+    serve_media_chunked(request, media, MAX_MEDIA_CHUNK_BYTES)
+}
+
+fn clamp_media_range_end(start: u64, end: u64, max_chunk: u64) -> u64 {
+    start.saturating_add(max_chunk.saturating_sub(1)).min(end)
+}
+
+fn serve_media_chunked(
+    request: &Request<Vec<u8>>,
+    media: ResolvedMedia,
+    max_chunk: u64,
+) -> Response<Vec<u8>> {
     match parse_byte_range(request.headers().get(RANGE), media.len) {
-        ByteRange::Full => match read_file_range(&media.path, 0, media.len.saturating_sub(1)) {
-            Ok(bytes) => media_response(StatusCode::OK, bytes, media.mime_type, None, media.len),
-            Err(_) => text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                b"LinkedIn media could not be loaded.".to_vec(),
-            ),
-        },
-        ByteRange::Partial { start, end } => match read_file_range(&media.path, start, end) {
-            Ok(bytes) => media_response(
-                StatusCode::PARTIAL_CONTENT,
-                bytes,
-                media.mime_type,
-                Some((start, end)),
+        ByteRange::Full => {
+            if media.len == 0 {
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"LinkedIn media could not be loaded.".to_vec(),
+                );
+            }
+            let end = clamp_media_range_end(0, media.len.saturating_sub(1), max_chunk);
+            serve_file_span(
+                &media,
+                0,
+                end,
                 media.len,
-            ),
-            Err(_) => text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                b"LinkedIn media could not be loaded.".to_vec(),
-            ),
-        },
+                end >= media.len.saturating_sub(1),
+            )
+        }
+        ByteRange::Partial { start, end } => {
+            let end = clamp_media_range_end(start, end, max_chunk);
+            serve_file_span(&media, start, end, media.len, false)
+        }
         ByteRange::Unsatisfiable => {
             let builder = Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -158,6 +172,31 @@ fn serve_media(request: &Request<Vec<u8>>, media: ResolvedMedia) -> Response<Vec
                 .body(Vec::new())
                 .unwrap_or_else(|_| fallback_internal())
         }
+    }
+}
+
+fn serve_file_span(
+    media: &ResolvedMedia,
+    start: u64,
+    end: u64,
+    total: u64,
+    whole_file: bool,
+) -> Response<Vec<u8>> {
+    match read_file_range(&media.path, start, end) {
+        Ok(bytes) if whole_file => {
+            media_response(StatusCode::OK, bytes, media.mime_type, None, total)
+        }
+        Ok(bytes) => media_response(
+            StatusCode::PARTIAL_CONTENT,
+            bytes,
+            media.mime_type,
+            Some((start, end)),
+            total,
+        ),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"LinkedIn media could not be loaded.".to_vec(),
+        ),
     }
 }
 
@@ -298,6 +337,7 @@ mod tests {
     use super::*;
     use crate::cache::initialize_database;
     use rusqlite::params;
+    use tauri::http::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE};
 
     fn request_for_url(url: &str) -> Request<Vec<u8>> {
         Request::builder()
@@ -373,5 +413,65 @@ mod tests {
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body().as_slice(), b"fake-mp4-bytes-for-range");
+    }
+
+    #[test]
+    fn serves_windows_localhost_artifact_bytes() {
+        let (_directory, db_path, _video_path) = harness();
+        let response = handle_request(
+            &db_path,
+            &request_for_url("http://linkedin-media.localhost/v/artifact-welcome"),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_slice(), b"fake-mp4-bytes-for-range");
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(b"video/mp4".as_slice())
+        );
+    }
+
+    #[test]
+    fn serves_windows_localhost_byte_range() {
+        let (_directory, db_path, _video_path) = harness();
+        let request = Request::builder()
+            .uri("http://linkedin-media.localhost/v/artifact-welcome")
+            .header(RANGE, "bytes=0-3")
+            .body(Vec::new())
+            .expect("ranged media request");
+        let response = handle_request(&db_path, &request);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body().as_slice(), b"fake");
+    }
+
+    #[test]
+    fn clamp_media_range_end_caps_open_ended_reads() {
+        assert_eq!(clamp_media_range_end(0, 9_999_999, 2_000_000), 1_999_999);
+        assert_eq!(clamp_media_range_end(0, 100, 2_000_000), 100);
+        assert_eq!(clamp_media_range_end(4, 50, 8), 11);
+    }
+
+    #[test]
+    fn missing_range_on_large_file_returns_first_chunk() {
+        let (_directory, _db_path, video_path) = harness();
+        fs::write(&video_path, vec![7_u8; 32]).unwrap();
+        let media = ResolvedMedia {
+            path: video_path,
+            len: 32,
+            mime_type: "video/mp4",
+        };
+        let request = request_for_url("http://linkedin-media.localhost/v/artifact-welcome");
+        let response = serve_media_chunked(&request, media, 8);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body().len(), 8);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes 0-7/32")
+        );
     }
 }

@@ -28,9 +28,9 @@ pub fn parse_topic_listing(body: &str) -> TopicPage {
 
     let mut path_slugs = harvest_path_slugs(body);
     let mut courses = harvest_course_urls(body);
-    for script in json_script_bodies(body) {
-        if let Ok(value) = serde_json::from_str::<Value>(script) {
-            let page = topic_page_from_json(&value, script);
+    for script in json_embedded_bodies(body) {
+        if let Ok(value) = serde_json::from_str::<Value>(&script) {
+            let page = topic_page_from_json(&value, &script);
             merge_slugs(&mut path_slugs, page.path_slugs);
             merge_courses(&mut courses, page.courses);
             if page.next.is_some() || page.has_more {
@@ -41,6 +41,8 @@ pub fn parse_topic_listing(body: &str) -> TopicPage {
                     next: page.next,
                 };
             }
+        } else {
+            merge_courses(&mut courses, harvest_course_slugs_from_entities(&script));
         }
     }
 
@@ -249,19 +251,69 @@ fn listing_course_from_href(href: &str) -> Option<CourseUrl> {
     parse_course_url(&normalized, 1).ok()
 }
 
-fn json_script_bodies(html: &str) -> Vec<&str> {
-    let Some(regex) = json_script_regex() else {
-        return Vec::new();
-    };
-    regex
-        .captures_iter(html)
-        .filter_map(|capture| capture.get(1).map(|matched| matched.as_str().trim()))
-        .collect()
+fn json_embedded_bodies(html: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    if let Some(regex) = json_script_regex() {
+        for capture in regex.captures_iter(html) {
+            if let Some(body) = capture.get(1).map(|matched| matched.as_str().trim()) {
+                if !body.is_empty() {
+                    bodies.push(body.to_string());
+                }
+            }
+        }
+    }
+    if let Some(regex) = bpr_code_regex() {
+        for capture in regex.captures_iter(html) {
+            let Some(raw) = capture.get(1).map(|matched| matched.as_str().trim()) else {
+                continue;
+            };
+            let decoded = decode_html_entities(raw);
+            if !decoded.is_empty() {
+                bodies.push(decoded);
+            }
+        }
+    }
+    bodies
 }
 
 fn json_script_regex() -> Option<Regex> {
     Regex::new(r#"(?is)<script[^>]*type=["']application/(?:ld\+json|json)["'][^>]*>(.*?)</script>"#)
         .ok()
+}
+
+fn bpr_code_regex() -> Option<Regex> {
+    Regex::new(r#"(?is)<code[^>]*id=["']bpr-guid-[^"']+["'][^>]*>(.*?)</code>"#).ok()
+}
+
+fn decode_html_entities(body: &str) -> String {
+    body.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&amp;", "&")
+}
+
+fn harvest_course_slugs_from_entities(body: &str) -> Vec<CourseUrl> {
+    let mut courses = Vec::new();
+    let patterns = [
+        r#""entityType"\s*:\s*"COURSE"[\s\S]{0,1200}"slug"\s*:\s*"([^"]+)""#,
+        r#""slug"\s*:\s*"([^"]+)"[\s\S]{0,1200}"entityType"\s*:\s*"COURSE""#,
+    ];
+    for pattern in patterns {
+        let Some(regex) = Regex::new(pattern).ok() else {
+            continue;
+        };
+        for capture in regex.captures_iter(body) {
+            let Some(slug) = capture.get(1).map(|matched| matched.as_str().trim()) else {
+                continue;
+            };
+            if let Some(course) =
+                listing_course_from_href(&format!("https://www.linkedin.com/learning/{slug}"))
+            {
+                push_course(&mut courses, course);
+            }
+        }
+    }
+    courses
 }
 
 fn path_slug_from_href(href: &str) -> Option<String> {
@@ -383,5 +435,40 @@ mod tests {
             page.next.as_deref(),
             Some("https://www.linkedin.com/learning-api/search?entityType=LEARNING_PATH&start=12")
         );
+    }
+
+    #[test]
+    fn bpr_guid_html_entities_yield_course_slugs() {
+        let html = r#"
+            <code id="bpr-guid-240">{&quot;included&quot;:[{&quot;entityType&quot;:&quot;COURSE&quot;,&quot;slug&quot;:&quot;practical-negotiation-techniques&quot;},{&quot;entityType&quot;:&quot;COURSE&quot;,&quot;slug&quot;:&quot;strategic-negotiation&quot;},{&quot;entityType&quot;:&quot;VIDEO&quot;,&quot;slug&quot;:&quot;welcome&quot;}]}</code>
+        "#;
+        let page = parse_topic_listing(html);
+        let course_slugs: Vec<&str> = page
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert_eq!(
+            course_slugs,
+            vec!["practical-negotiation-techniques", "strategic-negotiation"]
+        );
+        assert!(!course_slugs.contains(&"welcome"));
+    }
+
+    #[test]
+    fn invalid_json_bpr_still_yields_course_slugs_next_to_entity_type() {
+        let html = r#"
+            <code id="bpr-guid-242">{&quot;data&quot;:{&quot;broken&quot; &quot;entityType&quot;:&quot;COURSE&quot;,&quot;slug&quot;:&quot;practical-negotiation-techniques&quot;,&quot;entityType&quot;:&quot;VIDEO&quot;,&quot;slug&quot;:&quot;welcome&quot;,&quot;slug&quot;:&quot;strategic-negotiation&quot;,&quot;entityType&quot;:&quot;COURSE&quot;}</code>
+        "#;
+        let page = parse_topic_listing(html);
+        let course_slugs: Vec<&str> = page
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert!(course_slugs.contains(&"practical-negotiation-techniques"));
+        assert!(course_slugs.contains(&"strategic-negotiation"));
+        assert_eq!(course_slugs.len(), 2);
+        assert!(!course_slugs.contains(&"welcome"));
     }
 }

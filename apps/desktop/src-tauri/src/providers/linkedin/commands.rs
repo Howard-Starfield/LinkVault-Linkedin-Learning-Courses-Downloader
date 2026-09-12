@@ -5,6 +5,7 @@ use super::expansion::{
 use super::path_library::{
     CatalogEntry, CoursePlayback, CourseSlug, PathLibrary, PlaybackTick, VideoProgress, VideoSlug,
 };
+use super::placement::OutputRoot;
 use crate::app::database_writer::DatabaseWriter;
 use crate::artifact_downloader::{ArtifactHttpClient, CancellationFlag};
 use crate::auth::{
@@ -460,6 +461,26 @@ pub fn linkedin_open_course_folder(
 }
 
 #[tauri::command]
+pub fn linkedin_add_course_to_path(
+    state: tauri::State<'_, LinkVaultState>,
+    writer: tauri::State<'_, DatabaseWriter>,
+    course_slug: String,
+    path_slug: String,
+) -> Result<Vec<CatalogEntry>, String> {
+    let course = CourseSlug::parse(&course_slug).map_err(|error| error.to_string())?;
+    let path =
+        super::path_library::PathSlug::parse(&path_slug).map_err(|error| error.to_string())?;
+    let library = PathLibrary::new(writer.inner().clone());
+    library
+        .add_course_to_path(course, path)
+        .map_err(|error| error.to_string())?;
+    let connection = state.connection()?;
+    library
+        .list_catalog(&connection)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn quality_fallback_order(selected: VideoQuality) -> Vec<VideoQuality> {
     fallback_order(selected)
 }
@@ -660,7 +681,11 @@ pub fn set_download_job_pause(
             }
         }
         Err(_) => {
-            if let Some(run) = runtime.get_run(job_id).map_err(|error| error.to_string())? {
+            let now = now_unix_timestamp();
+            if let Some(run) = runtime
+                .get_run(job_id.clone())
+                .map_err(|error| error.to_string())?
+            {
                 match run.state {
                     RunState::Running | RunState::Cancelling => {
                         // Cooperative pause for the in-flight LinkedIn executor. The
@@ -669,9 +694,9 @@ pub fn set_download_job_pause(
                         state.set_download_paused(paused);
                     }
                     RunState::Queued | RunState::Paused | RunState::RetryWait => {
-                        // Queued workflow runs are not in the legacy jobs table.
-                        // Keep the atomic flag clear for idle queue pauses so a
-                        // later active download is not accidentally frozen.
+                        runtime
+                            .set_linkedin_run_paused(job_id, paused, now)
+                            .map_err(|error| error.to_string())?;
                         if !paused {
                             state.set_download_paused(false);
                         }
@@ -698,7 +723,10 @@ pub fn set_all_downloads_paused(
     paused: bool,
 ) -> Result<BootstrapState, String> {
     let connection = state.connection()?;
-    set_all_download_jobs_paused(&connection, paused, now_unix_timestamp())
+    let now = now_unix_timestamp();
+    set_all_download_jobs_paused(&connection, paused, now).map_err(|error| error.to_string())?;
+    runtime
+        .set_all_queued_linkedin_runs_paused(paused, now)
         .map_err(|error| error.to_string())?;
     state.set_download_paused(paused);
     let history_file_path = download_history_file_path_for_db(&state.db_path);
@@ -1527,7 +1555,7 @@ fn queue_download_jobs_with_expander(
         classify_learning_urls(&request.course_urls).map_err(|error| error.to_string())?;
     let (courses, expansion, paths, standalone) = resolve_download_catalog(classified, expander)?;
     if let Some(path_library) = path_library {
-        capture_expanded_catalog(path_library, paths, standalone)?;
+        capture_expanded_catalog(path_library, &request.output_dir, paths, standalone)?;
     }
     if courses.is_empty() {
         return Err("Paste at least one LinkedIn Learning course URL.".to_string());
@@ -1641,20 +1669,14 @@ fn resolve_download_catalog(
 
 fn capture_expanded_catalog(
     path_library: &PathLibrary,
+    output_dir: &str,
     paths: Vec<PathCapture>,
     standalone: Vec<String>,
 ) -> Result<(), String> {
-    for path in paths {
-        path_library
-            .capture_path(path)
-            .map_err(|error| error.to_string())?;
-    }
-    for course in standalone {
-        path_library
-            .capture_standalone(CourseSlug::parse(&course).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    let output_root = OutputRoot::parse(output_dir).map_err(|error| error.to_string())?;
+    path_library
+        .ingest_expansion(output_root, paths, standalone)
+        .map_err(|error| error.to_string())
 }
 
 fn resolve_linkedin_session(
@@ -2476,6 +2498,85 @@ mod tests {
         assert!(response.jobs[0].scheduled_at.unwrap() >= created_at + 10 * 60);
         assert!(response.jobs[1].scheduled_at.unwrap() > response.jobs[0].scheduled_at.unwrap());
         assert_ne!(response.jobs[0].course_slug, response.jobs[1].course_slug);
+    }
+
+    #[test]
+    fn pausing_expanded_path_jobs_persists_and_can_resume() {
+        let (_dir, runtime, connection) = workflow_harness();
+        let path_html = r#"
+            <script type="application/ld+json">
+            {"@type":"ItemList","itemListElement":[
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/practical-github-actions"}},
+              {"@type":"ListItem","item":{"@type":"Course","url":"https://www.linkedin.com/learning/practical-github-copilot"}}
+            ]}
+            </script>
+        "#;
+        let mut client = ScriptedClient {
+            pages: HashMap::from([(
+                "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate"
+                    .to_string(),
+                Ok(path_html.to_string()),
+            )]),
+        };
+        let response = queue_download_jobs_with_expander(
+            &runtime,
+            &connection,
+            StartDownloadRequest {
+                course_urls: "https://www.linkedin.com/learning/paths/career-essentials-in-github-professional-certificate".to_string(),
+                output_dir: "C:/downloads".to_string(),
+                selected_quality: "720".to_string(),
+                delay_seconds: 0,
+                video_wait_min_seconds: 20,
+                video_wait_max_seconds: 40,
+                browser_source: "Chrome".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                schedule: None,
+                force_redownload: false,
+            },
+            1_700_000_000,
+            Some(&mut client),
+            None,
+        )
+        .unwrap();
+        assert_eq!(response.jobs.len(), 2);
+
+        runtime
+            .set_all_queued_linkedin_runs_paused(true, 1_700_000_100)
+            .unwrap();
+        let paused: Vec<_> = runtime
+            .list_linkedin_runs(20)
+            .unwrap()
+            .into_iter()
+            .map(|run| super::super::projection::job_from_run(&run))
+            .collect();
+        assert_eq!(paused.len(), 2);
+        assert!(paused
+            .iter()
+            .all(|job| job.paused && job.status == "queued"));
+
+        runtime
+            .set_linkedin_run_paused(paused[0].id.clone(), false, 1_700_000_200)
+            .unwrap();
+        let first = runtime.get_run(paused[0].id.clone()).unwrap().unwrap();
+        let second = runtime.get_run(paused[1].id.clone()).unwrap().unwrap();
+        assert_eq!(first.state, RunState::Queued);
+        assert_eq!(second.state, RunState::Paused);
+
+        runtime
+            .set_all_queued_linkedin_runs_paused(false, 1_700_000_300)
+            .unwrap();
+        let resumed: Vec<_> = runtime
+            .list_linkedin_runs(20)
+            .unwrap()
+            .into_iter()
+            .map(|run| super::super::projection::job_from_run(&run))
+            .collect();
+        assert!(resumed
+            .iter()
+            .all(|job| !job.paused && job.status == "queued"));
     }
 
     #[test]

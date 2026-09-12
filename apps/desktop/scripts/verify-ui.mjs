@@ -8,6 +8,9 @@ const reader = await readFile(new URL("../src/components/newspaper/NewspaperRead
 const readerPreferences = await readFile(new URL("../src/components/newspaper/newspaper-reader-preferences.ts", import.meta.url), "utf8");
 const newspaperApi = await readFile(new URL("../src/components/newspaper/newspaper-api.ts", import.meta.url), "utf8");
 const css = await readFile(new URL("../src/index.css", import.meta.url), "utf8");
+const history = await readFile(new URL("../src/components/linkedin/LinkedinHistory.tsx", import.meta.url), "utf8");
+const historyVirtual = await readFile(new URL("../src/components/linkedin/LinkedinVirtualList.tsx", import.meta.url), "utf8");
+const clippings = await readFile(new URL("../src/components/newspaper/NewspaperClippingList.tsx", import.meta.url), "utf8");
 
 for (const required of [
   "Download editions",
@@ -21,7 +24,7 @@ for (const required of [
   "Default zoom level",
   "Left-click zoom level",
   "Default newspaper page tone",
-  "Register archive",
+  "Recover newspaper library",
   "Repair existing",
   "windowResizing",
   'window.addEventListener("resize", handleWindowResize, { passive: true })',
@@ -130,7 +133,7 @@ for (const required of [
   "All statuses",
   "useVirtualizer",
   "PAGE_SIZE = 50",
-  "overscan: 4",
+  "overscan: 1",
   "ensureThumbnail",
   "writeNewspaperReaderPreferences",
   'className="newspaper-library-open"',
@@ -231,7 +234,7 @@ assert.ok(css.includes('data-pan-enabled="true"') && css.includes("cursor: grab"
 assert.ok(css.includes('data-panning="true"') && css.includes("cursor: grabbing"), "Active Reader dragging must expose the closed hand cursor.");
 assert.ok(css.includes("cursor: default"), "The baseline Reader page must retain the arrow cursor.");
 assert.ok(css.includes(".newspaper-reader-control-section") && css.includes("border-left: 1px solid var(--border-soft)"), "Reader option groups need vertical dividers.");
-assert.ok(css.includes(".newspaper-library-virtual") && css.includes(".newspaper-reader-virtual"), "Library and reader need virtual scroll geometry.");
+assert.ok(css.includes(".linkedin-library-virtual") && css.includes(".newspaper-library-virtual"), "LinkedIn history and newspaper library need virtual scroll geometry.");
 assert.ok(css.includes("--queue-live:"), "LinkedIn queue live states must use a non-orange live color.");
 assert.ok(css.includes(".queue-detail-overlay"), "LinkedIn video progress must overlay later queue rows.");
 assert.ok(css.includes(".queue-job-stack.is-open"), "The expanded queue row must stack above later downloads.");
@@ -247,4 +250,8 @@ assert.ok(css.includes("contain: layout paint"), "Resize-heavy newspaper surface
 assert.ok(css.includes(':root[data-window-resizing="true"]'), "Rapid window resizing must temporarily disable expensive visual transitions.");
 assert.ok(!view.includes("<h1"), "Downloader should keep the LinkedVault shell as the application-level heading.");
 
-console.log("UI contract verification passed.");
+assert.ok(historyVirtual.includes("LINKEDIN_HISTORY_OVERSCAN"), "LinkedIn history must cap overscan.");
+assert.ok(history.includes("LinkedinVirtualList"), "LinkedIn catalog/course lists must be virtualized.");
+assert.ok(history.includes("if (session) return"), "History must not refetch catalog while a video is playing.");
+assert.ok(clippings.includes("MAX_MOUNTED_CARDS = 12"), "Clipping gallery must cap mounted cards near one viewport.");
+assert.ok(!history.includes("{catalog.map("), "LinkedIn catalog must not mount every history row.");

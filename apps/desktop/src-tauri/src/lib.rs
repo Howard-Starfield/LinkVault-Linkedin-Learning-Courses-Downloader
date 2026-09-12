@@ -174,6 +174,7 @@ pub fn run() {
             commands::linkedin_open_course,
             commands::linkedin_save_progress,
             commands::linkedin_open_course_folder,
+            commands::linkedin_add_course_to_path,
             coursera::commands::bootstrap_coursera_state,
             coursera::commands::parse_coursera_class_input,
             coursera::commands::coursera_login,

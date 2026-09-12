@@ -59,6 +59,7 @@ import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc"
 import { ensureDestination, parseDestination } from "./lib/destinations";
 import { commitLinkedInDestination } from "./lib/linkedin/ipc";
 import { LinkedinHistory } from "./components/linkedin/LinkedinHistory";
+import { MiniCourseArt } from "./components/linkedin/MiniCourseArt";
 import {
   classifiedPasteToast,
   classifyLinkedInLearningUrls,
@@ -428,9 +429,11 @@ export default function App() {
   const [theme, setTheme] = useState<AppTheme>(readInitialTheme);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [linkedinCinema, setLinkedinCinema] = useState(false);
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
   const cancellationRequestedRef = useRef(false);
   const queueSubmissionRef = useRef(false);
+  const queueSubmissionIdRef = useRef(0);
   const startupUpdateCheckedRef = useRef(false);
   const downloadPreferencesHydratedRef = useRef(false);
   const downloadProcessingPromiseRef = useRef<Promise<ProcessQueuedDownloadResponse> | null>(null);
@@ -1202,10 +1205,17 @@ export default function App() {
     });
   }
 
+  const hasLinkedInSession = hasSavedToken || token.trim().length > 0;
   const canStart = useMemo(
-    () => courseUrls.trim().length > 0 && !isQueueingDownload,
-    [courseUrls, isQueueingDownload]
+    () => courseUrls.trim().length > 0 && !isQueueingDownload && hasLinkedInSession,
+    [courseUrls, isQueueingDownload, hasLinkedInSession]
   );
+
+  function warnLinkedInSessionRequired(action: string) {
+    toast.warning("LinkedIn session required", {
+      description: `Paste your li_at cookie before ${action}.`
+    });
+  }
 
   const syncLinkedInUrlHeight = useCallback(() => {
     const el = courseUrlsInputRef.current;
@@ -1421,8 +1431,18 @@ export default function App() {
 
   async function queueDownloads(schedule?: DownloadScheduleRequest) {
     if (queueSubmissionRef.current) return;
+    if (!hasLinkedInSession) {
+      warnLinkedInSessionRequired(schedule ? "confirming an automatic schedule" : "starting a download");
+      return;
+    }
+    const submissionId = queueSubmissionIdRef.current + 1;
+    queueSubmissionIdRef.current = submissionId;
+    cancellationRequestedRef.current = false;
     queueSubmissionRef.current = true;
     setIsQueueingDownload(true);
+
+    const isCurrentSubmission = () =>
+      queueSubmissionIdRef.current === submissionId && !cancellationRequestedRef.current;
 
     try {
       const addingToActiveQueue = Boolean(downloadProcessingPromiseRef.current) || isProcessingDownload;
@@ -1442,25 +1462,21 @@ export default function App() {
         setIsValidatingToken(true);
         try {
           await saveLinkedInToken(enteredToken);
+          if (!isCurrentSubmission()) return;
           setHasSavedToken(true);
           shouldUseSavedToken = true;
           setToken("");
           setQueueNeedsSessionRefresh(false);
         } catch (error) {
+          if (!isCurrentSubmission() || String(error).toLowerCase().includes("cancelled")) {
+            return;
+          }
           toast.error("Token validation failed", { description: String(error) });
           return;
-        } finally {
-          setIsValidatingToken(false);
         }
-      } else if (schedule && !shouldUseSavedToken) {
-        toast.warning("Saved session required", {
-          description: "Paste and save your LinkedIn token before confirming an automatic schedule."
-        });
-        return;
       } else if (!shouldUseSavedToken) {
-        toast.info("Using browser session", {
-          description: `LinkedVault will read the ${browserSource} LinkedIn session for this download.`
-        });
+        warnLinkedInSessionRequired(schedule ? "confirming an automatic schedule" : "starting a download");
+        return;
       }
       const completedSlugs = new Set(
         queuedJobs.filter((job) => job.status === "completed").map((job) => job.course_slug)
@@ -1477,6 +1493,7 @@ export default function App() {
         forceRedownload = true;
       }
 
+      if (!isCurrentSubmission()) return;
       const response = await startDownloadJobs({
         courseUrls,
         outputDir,
@@ -1492,13 +1509,30 @@ export default function App() {
         schedule,
         forceRedownload
       });
+      if (!isCurrentSubmission()) {
+        await refreshBootstrapState();
+        return;
+      }
       await finishQueueDownloads(response, schedule, addingToActiveQueue, shouldUseSavedToken);
     } catch (error) {
       await refreshBootstrapState();
-      toast.error("Could not add download", { description: String(error) });
+      if (!isCurrentSubmission() || String(error).toLowerCase().includes("cancelled")) {
+        return;
+      }
+      if (isLinkedInSessionError(error)) {
+        setQueueNeedsSessionRefresh(true);
+        toast.warning("LinkedIn session required", {
+          description: "Queued work was not started. Paste your li_at cookie, then try again."
+        });
+      } else {
+        toast.error("Could not add download", { description: String(error) });
+      }
     } finally {
-      queueSubmissionRef.current = false;
-      setIsQueueingDownload(false);
+      if (queueSubmissionIdRef.current === submissionId) {
+        queueSubmissionRef.current = false;
+        setIsQueueingDownload(false);
+        setIsValidatingToken(false);
+      }
     }
   }
 
@@ -1613,6 +1647,10 @@ export default function App() {
 
   async function resumeQueuedDownloads() {
     if (downloadProcessingPromiseRef.current) return;
+    if (!hasLinkedInSession) {
+      warnLinkedInSessionRequired("resuming the queued courses");
+      return;
+    }
 
     const enteredToken = token.trim();
     let shouldUseSavedToken = Boolean(hasSavedToken);
@@ -1624,10 +1662,8 @@ export default function App() {
         setHasSavedToken(true);
         setToken("");
         shouldUseSavedToken = true;
-      } else if (!shouldUseSavedToken && !isTauriRuntime()) {
-        toast.info("LinkedIn session required", {
-          description: "Paste a fresh li_at cookie before resuming the queued courses."
-        });
+      } else if (!shouldUseSavedToken) {
+        warnLinkedInSessionRequired("resuming the queued courses");
         return;
       }
 
@@ -1685,7 +1721,10 @@ export default function App() {
   }
 
   async function processQueuedDownloadBatchWithLiveRefresh(courseDelaySeconds: number, useSavedToken: boolean) {
-    if (isTauriRuntime() && useSavedToken) {
+    if (!useSavedToken) {
+      throw new Error("a LinkedIn Learning session is required");
+    }
+    if (isTauriRuntime()) {
       return waitForLinkedInQueueIdle();
     }
 
@@ -1693,7 +1732,7 @@ export default function App() {
 
     while (!cancellationRequestedRef.current) {
       const response = await processQueuedDownloadWithLiveRefresh(() =>
-        useSavedToken ? processNextQueuedDownloadWithSavedToken() : processNextQueuedDownloadWithBrowserSource(browserSource)
+        processNextQueuedDownloadWithSavedToken()
       );
       summary = mergeProcessQueuedDownloadResponses(summary, response);
 
@@ -1917,7 +1956,28 @@ export default function App() {
     });
   }, [isInstallingUpdate, pendingUpdate, updateBannerDismissed]);
 
+  async function cancelQueueSubmission() {
+    cancellationRequestedRef.current = true;
+    queueSubmissionIdRef.current += 1;
+    try {
+      await requestActiveDownloadCancellation();
+    } catch {
+      // The in-flight validate/queue command still observes the shared flag.
+    }
+    queueSubmissionRef.current = false;
+    setIsValidatingToken(false);
+    setIsQueueingDownload(false);
+    toast.info("Cancelled", {
+      description: "Nothing was added to the LinkedIn download queue."
+    });
+    await refreshBootstrapState();
+  }
+
   async function cancelDownload() {
+    if (isValidatingToken || isQueueingDownload) {
+      await cancelQueueSubmission();
+      return;
+    }
     if (!activeDownloadJob) return;
     cancellationRequestedRef.current = true;
     setIsCancellingDownload(true);
@@ -1948,9 +2008,13 @@ export default function App() {
           ? `${courseDisplayName(job)} will pause at the next safe boundary.`
           : `${courseDisplayName(job)} is available to continue.`
       });
-      if (!nextPaused && (job.status === "queued" || job.status === "active") && (isTauriRuntime() || hasSavedToken)) {
-        cancellationRequestedRef.current = false;
-        ensureDownloadProcessing(hasSavedToken);
+      if (!nextPaused && (job.status === "queued" || job.status === "active")) {
+        if (hasSavedToken) {
+          cancellationRequestedRef.current = false;
+          ensureDownloadProcessing(true);
+        } else {
+          warnLinkedInSessionRequired("resuming this download");
+        }
       }
     } catch (error) {
       toast.error(nextPaused ? "Pause failed" : "Resume failed", { description: String(error) });
@@ -1971,9 +2035,13 @@ export default function App() {
           ? "Active work will pause at the next safe boundary. Queued and scheduled courses will wait."
           : "Queued downloads are available to continue."
       });
-      if (!nextPaused && (isTauriRuntime() || hasSavedToken)) {
-        cancellationRequestedRef.current = false;
-        ensureDownloadProcessing(hasSavedToken);
+      if (!nextPaused) {
+        if (hasSavedToken) {
+          cancellationRequestedRef.current = false;
+          ensureDownloadProcessing(true);
+        } else {
+          warnLinkedInSessionRequired("resuming the queued courses");
+        }
       }
     } catch (error) {
       toast.error(nextPaused ? "Pause all failed" : "Resume all failed", { description: String(error) });
@@ -2133,6 +2201,10 @@ export default function App() {
 
   async function retryDownloadJob(job: QueuedDownloadJob) {
     if (job.status !== "failed" && job.status !== "cancelled") return;
+    if (!hasLinkedInSession) {
+      warnLinkedInSessionRequired("retrying this course");
+      return;
+    }
     const enteredToken = token.trim();
     let shouldUseSavedToken = Boolean(hasSavedToken);
 
@@ -2145,9 +2217,8 @@ export default function App() {
         setToken("");
         setQueueNeedsSessionRefresh(false);
       } else if (!shouldUseSavedToken) {
-        toast.info("Using browser session", {
-          description: `LinkedVault will read the ${browserSource} LinkedIn session for this retry.`
-        });
+        warnLinkedInSessionRequired("retrying this course");
+        return;
       }
       const state = await retryFailedDownloadJob(job.id);
       setQueuedJobs(state.persisted_jobs);
@@ -2217,6 +2288,7 @@ export default function App() {
       className="lv-shell"
       data-sidebar-dragging={isDraggingSidebar || undefined}
       data-sidebar-state={isSidebarCollapsed ? "collapsed" : "expanded"}
+      data-cinema={linkedinCinema ? "true" : undefined}
     >
       <aside className="lv-sidebar" aria-label="Primary navigation">
         <div className="lv-sidebar-trigger-wrap">
@@ -2487,7 +2559,7 @@ export default function App() {
           }}
         />
       </aside>
-      <main className="lv-main" data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>
+      <main className="lv-main" data-active-view={activeView} data-clipping-search={activeView === "newspaper-clippings" ? "true" : "false"}>
         <button
           type="button"
           className="lv-sidebar-reopen"
@@ -2605,6 +2677,7 @@ export default function App() {
           ) : activeView === "linkedin-history" ? (
             <LinkedinHistory
               historyRevision={queuedJobs.map((job) => `${job.id}:${job.status}:${job.updated_at}`).join("|")}
+              onPlayerOpenChange={setLinkedinCinema}
             />
           ) : (
           <>
@@ -2741,7 +2814,7 @@ export default function App() {
                   </label>
                 </div>
                 <div className="linkedin-primary-actions">
-                  <Button type="button" variant="primary" className="linkedin-action-button" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                  <Button type="button" variant="primary" className="linkedin-action-button" onClick={() => void startDownload()} disabled={!canStart || isValidatingToken || isQueueingDownload} title={courseUrls.trim().length > 0 && !hasLinkedInSession ? "Paste your li_at cookie before downloading" : undefined}>
                     {isProcessingDownload ? <Plus aria-hidden="true" className="h-3.5 w-3.5" /> : <Play aria-hidden="true" className="h-3.5 w-3.5" />}
                     {isValidatingToken
                       ? "Validating"
@@ -2749,10 +2822,16 @@ export default function App() {
                         ? isProcessingDownload ? "Adding" : "Queueing"
                         : isProcessingDownload ? "Add to queue" : "Download"}
                   </Button>
-                  <Button type="button" variant="outline" className="linkedin-action-button" onClick={() => void openScheduleDialog()} disabled={!canStart || isValidatingToken || isQueueingDownload}>
+                  <Button type="button" variant="outline" className="linkedin-action-button" onClick={() => void openScheduleDialog()} disabled={!canStart || isValidatingToken || isQueueingDownload} title={courseUrls.trim().length > 0 && !hasLinkedInSession ? "Paste your li_at cookie before scheduling" : undefined}>
                     <CalendarClock aria-hidden="true" className="h-3.5 w-3.5" />
                     Schedule
                   </Button>
+                  {isValidatingToken || isQueueingDownload ? (
+                    <Button type="button" variant="outline" className="linkedin-action-button" onClick={() => void cancelQueueSubmission()}>
+                      <X aria-hidden="true" className="h-3.5 w-3.5" />
+                      Cancel
+                    </Button>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -2840,7 +2919,7 @@ export default function App() {
                       size="xs"
                       variant="outline"
                       onClick={() => void resumeQueuedDownloads()}
-                      disabled={isProcessingDownload || isValidatingToken}
+                      disabled={isProcessingDownload || isValidatingToken || !hasLinkedInSession}
                     >
                       <RotateCcw aria-hidden="true" className="h-3 w-3" />
                       {isValidatingToken ? "Validating" : "Resume queue"}
@@ -4052,14 +4131,6 @@ function QueueStatusBadge({ job, title, onRetry }: { job: QueuedDownloadJob; tit
   );
 }
 
-function MiniCourseArt({ title, thumbnailUrl }: { title: string; thumbnailUrl: string }) {
-  return (
-    <span className="mini-course-art" title={title}>
-      <img src={thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
-    </span>
-  );
-}
-
 function courseInitials(title: string) {
   const parts = title.split(/\s+/).filter(Boolean);
   const initials = parts.slice(0, 3).map((part) => part.charAt(0).toUpperCase()).join("");
@@ -4216,6 +4287,7 @@ function isLinkedInSessionError(error: unknown) {
     "csrf check failed",
     "linkedin session expired",
     "rejected the saved session",
+    "session is required",
     "http 401",
     "http 403",
     "status 401",
@@ -4487,14 +4559,6 @@ async function processNextQueuedDownloadWithSavedToken() {
     throw new Error("Saved LinkedIn token is unavailable");
   }
   return processNextQueuedDownloadForPreview();
-}
-
-async function processNextQueuedDownloadWithBrowserSource(source: string) {
-  if (isTauriRuntime()) {
-    return invoke<ProcessQueuedDownloadResponse>("process_next_queued_download_from_browser_source", { source });
-  }
-
-  throw new Error("Browser session downloads are only available in the desktop app");
 }
 
 const previewJobsStorageKey = "linkvault.preview.jobs";

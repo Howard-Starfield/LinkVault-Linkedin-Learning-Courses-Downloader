@@ -16,6 +16,7 @@ pub fn expand_learning_urls(
     let mut standalone = Vec::new();
     let mut standalone_seen = HashSet::new();
     let mut failed_paths = Vec::new();
+    let mut failed_path_details = Vec::new();
     let mut attempted_paths = BTreeSet::new();
 
     for learning_ref in refs {
@@ -33,6 +34,7 @@ pub fn expand_learning_urls(
                     &mut courses,
                     &mut paths,
                     &mut failed_paths,
+                    &mut failed_path_details,
                     &mut attempted_paths,
                 );
             }
@@ -45,6 +47,7 @@ pub fn expand_learning_urls(
                     &mut standalone,
                     &mut standalone_seen,
                     &mut failed_paths,
+                    &mut failed_path_details,
                     &mut attempted_paths,
                 )?;
             }
@@ -52,7 +55,7 @@ pub fn expand_learning_urls(
     }
 
     if courses.is_empty() {
-        return Err(ExpansionError::EmptyCatalog);
+        return Err(empty_catalog_error(&failed_path_details));
     }
 
     let unique_course_count = courses.len();
@@ -75,12 +78,31 @@ fn push_standalone(standalone: &mut Vec<String>, seen: &mut HashSet<String>, slu
     }
 }
 
+fn empty_catalog_error(failed_path_details: &[(String, String)]) -> ExpansionError {
+    match failed_path_details {
+        [] => ExpansionError::EmptyCatalog,
+        [(path_slug, detail)] => ExpansionError::PathExpandFailed {
+            path_slug: path_slug.clone(),
+            detail: detail.clone(),
+        },
+        rest => ExpansionError::PathExpandFailed {
+            path_slug: rest[0].0.clone(),
+            detail: rest
+                .iter()
+                .map(|(slug, detail)| format!("{slug}: {detail}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        },
+    }
+}
+
 fn expand_path(
     client: &mut (impl CourseApiClient + ?Sized),
     path_slug: &str,
     courses: &mut BTreeMap<String, CourseUrl>,
     paths: &mut Vec<PathCapture>,
     failed_paths: &mut Vec<String>,
+    failed_path_details: &mut Vec<(String, String)>,
     attempted_paths: &mut BTreeSet<String>,
 ) {
     if !attempted_paths.insert(path_slug.to_string()) {
@@ -108,7 +130,10 @@ fn expand_path(
                 members,
             });
         }
-        Err(_) => failed_paths.push(path_slug.to_string()),
+        Err(detail) => {
+            failed_paths.push(path_slug.to_string());
+            failed_path_details.push((path_slug.to_string(), detail));
+        }
     }
 }
 
@@ -128,6 +153,7 @@ fn expand_topic(
     standalone: &mut Vec<String>,
     standalone_seen: &mut HashSet<String>,
     failed_paths: &mut Vec<String>,
+    failed_path_details: &mut Vec<(String, String)>,
     attempted_paths: &mut BTreeSet<String>,
 ) -> Result<(), ExpansionError> {
     let mut url = format!("https://www.linkedin.com/learning/topics/{topic_slug}");
@@ -190,6 +216,7 @@ fn expand_topic(
             courses,
             paths,
             failed_paths,
+            failed_path_details,
             attempted_paths,
         );
     }
@@ -405,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn all_failed_paths_yield_empty_catalog() {
+    fn all_failed_paths_yield_path_expand_failed() {
         let mut client = ScriptedClient {
             pages: HashMap::from([(
                 "https://www.linkedin.com/learning/paths/broken-path".to_string(),
@@ -413,7 +440,65 @@ mod tests {
             )]),
         };
         let error = expand_learning_urls(&mut client, &[path_ref("broken-path")]).unwrap_err();
-        assert_eq!(error, ExpansionError::EmptyCatalog);
+        assert_eq!(
+            error,
+            ExpansionError::PathExpandFailed {
+                path_slug: "broken-path".to_string(),
+                detail: "LinkedIn course API returned HTTP status 500".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn empty_path_html_yields_path_expand_failed() {
+        let mut client = ScriptedClient {
+            pages: HashMap::from([(
+                "https://www.linkedin.com/learning/paths/empty-path".to_string(),
+                Ok("<html></html>".to_string()),
+            )]),
+        };
+        let error = expand_learning_urls(&mut client, &[path_ref("empty-path")]).unwrap_err();
+        assert_eq!(
+            error,
+            ExpansionError::PathExpandFailed {
+                path_slug: "empty-path".to_string(),
+                detail: "learning path HTML did not contain course URLs".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn path_without_json_ld_expands_course_entities() {
+        let html = r#"
+            <script type="application/json">
+            {"included":[
+              {"entityType":"COURSE","slug":"practical-negotiation-techniques","url":"https://www.linkedin.com/learning/practical-negotiation-techniques"},
+              {"entityType":"LEARNING_PATH","url":"https://www.linkedin.com/learning/paths/negotiation-professional-certificate-by-american-negotiation-institute"}
+            ]}
+            </script>
+        "#;
+        let mut client = ScriptedClient {
+            pages: HashMap::from([(
+                "https://www.linkedin.com/learning/paths/negotiation-professional-certificate-by-american-negotiation-institute".to_string(),
+                Ok(html.to_string()),
+            )]),
+        };
+
+        let catalog = expand_learning_urls(
+            &mut client,
+            &[path_ref(
+                "negotiation-professional-certificate-by-american-negotiation-institute",
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(catalog.courses.len(), 1);
+        assert_eq!(catalog.courses[0].slug, "practical-negotiation-techniques");
+        assert_eq!(
+            catalog.paths[0].members,
+            vec!["practical-negotiation-techniques".to_string()]
+        );
+        assert!(catalog.summary.failed_paths.is_empty());
     }
 
     fn course_ref(slug: &str) -> LearningUrlRef {

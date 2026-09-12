@@ -7,7 +7,10 @@ pub fn is_allowed_run_transition(from: RunState, to: RunState) -> bool {
         return false;
     }
     match from {
-        RunState::Queued => matches!(to, RunState::Running | RunState::Cancelled),
+        RunState::Queued => matches!(
+            to,
+            RunState::Running | RunState::Paused | RunState::Cancelled
+        ),
         RunState::Running => matches!(
             to,
             RunState::Paused
@@ -18,7 +21,10 @@ pub fn is_allowed_run_transition(from: RunState, to: RunState) -> bool {
                 | RunState::Failed
                 | RunState::Cancelled
         ),
-        RunState::Paused => matches!(to, RunState::Running | RunState::Cancelled),
+        RunState::Paused => matches!(
+            to,
+            RunState::Queued | RunState::Running | RunState::Cancelled
+        ),
         RunState::RetryWait => matches!(to, RunState::Running | RunState::Cancelled),
         RunState::Cancelling => matches!(to, RunState::Cancelled),
         RunState::Succeeded
@@ -94,6 +100,22 @@ mod tests {
         assert!(!is_allowed_run_transition(
             RunState::Queued,
             RunState::Succeeded
+        ));
+    }
+
+    #[test]
+    fn queued_run_can_pause_and_return_to_queued() {
+        assert!(is_allowed_run_transition(
+            RunState::Queued,
+            RunState::Paused
+        ));
+        assert!(is_allowed_run_transition(
+            RunState::Paused,
+            RunState::Queued
+        ));
+        assert!(is_allowed_run_transition(
+            RunState::Paused,
+            RunState::Running
         ));
     }
 

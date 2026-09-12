@@ -1,12 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { ArrowLeft, FolderOpen } from "lucide-react";
 import { Button } from "../primitives";
+import { LinkedinVirtualList } from "./LinkedinVirtualList";
+import { LINKEDIN_HISTORY_ROW_PX } from "../../lib/linkedin/browse-window";
 import {
+  linkedinAddCourseToPath,
   linkedinListCatalog,
   linkedinOpenCourse,
   linkedinOpenCourseFolder
 } from "../../lib/linkedin/ipc";
 import { reduceLibraryNav } from "../../lib/linkedin/nav";
+import { nextPlayableVideo } from "../../lib/linkedin/playback";
 import type {
   CatalogEntry,
   CoursePlayback,
@@ -14,24 +19,46 @@ import type {
   LibraryNav,
   PathCatalogEntry,
   PathCourseSummary,
+  PathSlug,
   PlayerSession,
   VideoPlayback,
   VideoProgress
 } from "../../lib/linkedin/types";
-import { LinkedinPlayer } from "./LinkedinPlayer";
+import { LinkedinPlayerPane } from "./LinkedinPlayerPane";
+import { CatalogCourseMedia, HistoryProgressRing } from "./MiniCourseArt";
 
 type LinkedinHistoryProps = {
   historyRevision: string;
+  onPlayerOpenChange?: (open: boolean) => void;
 };
 
-export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
+type HistoryMenu =
+  | {
+      x: number;
+      y: number;
+      kind: "standalone";
+      course: CourseSlug;
+      title: string;
+      sourceUrl: string;
+    }
+  | {
+      x: number;
+      y: number;
+      kind: "copy";
+      sourceUrl: string;
+    };
+
+export function LinkedinHistory({ historyRevision, onPlayerOpenChange }: LinkedinHistoryProps) {
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [nav, setNav] = useState<LibraryNav>({ level: "catalog" });
   const [playback, setPlayback] = useState<CoursePlayback | null>(null);
   const [session, setSession] = useState<PlayerSession>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<HistoryMenu | null>(null);
+  const browseRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (session) return;
     let cancelled = false;
     void linkedinListCatalog()
       .then((entries) => {
@@ -48,7 +75,33 @@ export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
     return () => {
       cancelled = true;
     };
-  }, [historyRevision]);
+  }, [historyRevision, session]);
+
+  useEffect(() => {
+    onPlayerOpenChange?.(session !== null);
+  }, [onPlayerOpenChange, session]);
+
+  useEffect(() => {
+    return () => {
+      onPlayerOpenChange?.(false);
+    };
+  }, [onPlayerOpenChange]);
+
+  useEffect(() => {
+    if (!menu) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setMenu(null);
+    }
+    function onPointerDown() {
+      setMenu(null);
+    }
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [menu]);
 
   const activePath = useMemo(() => {
     if (nav.level === "path") {
@@ -109,6 +162,13 @@ export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
     setSession({ course: playback.course, video: video.video });
   }
 
+  function onVideoEnded() {
+    if (!playback || !session) return;
+    const next = nextPlayableVideo(playback, session.video);
+    if (!next) return;
+    setSession({ course: playback.course, video: next.video });
+  }
+
   function onProgress(video: VideoPlayback, progress: VideoProgress) {
     setPlayback((current) => {
       if (!current) return current;
@@ -128,6 +188,50 @@ export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
     await linkedinOpenCourseFolder(course);
   }
 
+  const pathEntries = useMemo(
+    () => catalog.filter((item): item is PathCatalogEntry => item.kind === "path"),
+    [catalog]
+  );
+
+  function openMenu(event: ReactMouseEvent, next: HistoryMenu) {
+    event.preventDefault();
+    event.stopPropagation();
+    const maxX = Math.max(8, window.innerWidth - 240);
+    const maxY = Math.max(8, window.innerHeight - 12);
+    setMenu({
+      ...next,
+      x: Math.min(Math.max(8, next.x), maxX),
+      y: Math.min(Math.max(8, next.y), maxY)
+    });
+  }
+
+  async function copyUrl(url: string) {
+    if (!url.trim()) {
+      setMenu(null);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      setLoadError("Could not copy the course URL");
+    }
+    setMenu(null);
+  }
+
+  async function moveStandaloneToPath(course: CourseSlug, path: PathSlug) {
+    try {
+      const next = await linkedinAddCourseToPath(course, path);
+      setCatalog(next);
+      setLoadError(null);
+      setNav({ level: "path", path });
+      setPlayback(null);
+      setSession(null);
+    } catch (error: unknown) {
+      setLoadError(error instanceof Error ? error.message : String(error));
+    }
+    setMenu(null);
+  }
+
   const heading =
     nav.level === "catalog"
       ? "Download history"
@@ -135,8 +239,14 @@ export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
         ? (activePath?.title ?? "Learning path")
         : (playback?.title ?? "Course");
 
+  const courseRows = useMemo(() => (playback ? flattenCourseRows(playback) : []), [playback]);
+
   return (
-    <div className="lv-workspace linkedin-library-workspace">
+    <div
+      className="lv-workspace linkedin-library-workspace"
+      data-player-open={session ? "true" : "false"}
+      onContextMenu={(event) => event.preventDefault()}
+    >
       <div className="linkedin-library-header">
         {nav.level !== "catalog" ? (
           <Button type="button" size="xs" variant="ghost" onClick={onBack} aria-label="Back">
@@ -158,103 +268,203 @@ export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
           </Button>
         ) : null}
       </div>
-      {loadError ? (
-        <div className="linkedin-library-empty" role="status">
-          <span>Could not load catalog</span>
-          <span>{loadError}</span>
-        </div>
-      ) : nav.level === "catalog" ? (
-        catalog.length === 0 ? (
-          <div className="linkedin-library-empty" role="status">
-            <span>No saved paths or courses</span>
-            <span>Queued LinkedIn paths and pasted courses appear here.</span>
-          </div>
-        ) : (
-          <ol className="linkedin-library-list" aria-label="LinkedIn catalog">
-            {catalog.map((entry) =>
-              entry.kind === "path" ? (
-                <li key={`path:${entry.path}`}>
-                  <button type="button" className="linkedin-library-row" onClick={() => onOpenEntry(entry)}>
-                    <ProgressRing completed={entry.completedVideos} total={entry.totalVideos} />
+      <div className="linkedin-library-stage">
+        <div className="linkedin-library-browse" ref={browseRef}>
+          {loadError ? (
+            <div className="linkedin-library-empty" role="status">
+              <span>Could not load catalog</span>
+              <span>{loadError}</span>
+            </div>
+          ) : nav.level === "catalog" ? (
+            catalog.length === 0 ? (
+              <div className="linkedin-library-empty" role="status">
+                <span>No saved paths or courses</span>
+                <span>Queued LinkedIn paths and pasted courses appear here.</span>
+              </div>
+            ) : (
+              <LinkedinVirtualList
+                items={catalog}
+                scrollRef={browseRef}
+                ariaLabel="LinkedIn catalog"
+                getKey={(entry) => (entry.kind === "path" ? `path:${entry.path}` : `standalone:${entry.course}`)}
+                renderItem={(entry) =>
+                  entry.kind === "path" ? (
+                    <button
+                      type="button"
+                      className="linkedin-library-row"
+                      onClick={() => onOpenEntry(entry)}
+                      onContextMenu={(event) =>
+                        openMenu(event, {
+                          x: event.clientX,
+                          y: event.clientY,
+                          kind: "copy",
+                          sourceUrl: entry.sourceUrl
+                        })
+                      }
+                    >
+                      <HistoryProgressRing completed={entry.completedVideos} total={entry.totalVideos} />
+                      <span className="linkedin-library-copy">
+                        <strong>{entry.title}</strong>
+                        <span>{entry.courses.length} course{entry.courses.length === 1 ? "" : "s"}</span>
+                      </span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="linkedin-library-row"
+                      onClick={() => onOpenEntry(entry)}
+                      onContextMenu={(event) =>
+                        openMenu(event, {
+                          x: event.clientX,
+                          y: event.clientY,
+                          kind: "standalone",
+                          course: entry.course,
+                          title: entry.title,
+                          sourceUrl: entry.sourceUrl
+                        })
+                      }
+                    >
+                      <CatalogCourseMedia
+                        title={entry.title}
+                        thumbnailUrl={entry.thumbnailUrl}
+                        completed={entry.completedVideos}
+                        total={entry.totalVideos}
+                      />
+                      <span className="linkedin-library-copy">
+                        <strong>{entry.title}</strong>
+                        <span>Standalone course</span>
+                      </span>
+                    </button>
+                  )
+                }
+              />
+            )
+          ) : nav.level === "path" && activePath ? (
+            <LinkedinVirtualList
+              items={activePath.courses}
+              scrollRef={browseRef}
+              ariaLabel={`${activePath.title} courses`}
+              getKey={(course) => course.course}
+              renderItem={(course) => (
+                <button type="button" className="linkedin-library-row" onClick={() => onOpenPathCourse(course, activePath)}>
+                  <CatalogCourseMedia
+                    title={course.title}
+                    thumbnailUrl={course.thumbnailUrl}
+                    completed={course.completedVideos}
+                    total={course.totalVideos}
+                  />
+                  <span className="linkedin-library-copy">
+                    <strong>{course.title}</strong>
+                    <span>{jobStatusLabel(course.jobStatus)}</span>
+                  </span>
+                </button>
+              )}
+            />
+          ) : playback ? (
+            <LinkedinVirtualList
+              items={courseRows}
+              scrollRef={browseRef}
+              ariaLabel={`${playback.title} videos`}
+              getKey={(row) => row.key}
+              estimateSize={(index) => (courseRows[index]?.kind === "chapter" ? 32 : LINKEDIN_HISTORY_ROW_PX)}
+              renderItem={(row) =>
+                row.kind === "chapter" ? (
+                  <h3 className="linkedin-library-chapter-title">{row.title}</h3>
+                ) : (
+                  <button
+                    type="button"
+                    className="linkedin-library-row"
+                    onClick={() => onOpenVideo(row.video)}
+                    disabled={!row.video.mediaUrl}
+                  >
+                    <HistoryProgressRing completed={row.video.progress.completedAt !== null ? 1 : 0} total={1} />
                     <span className="linkedin-library-copy">
-                      <strong>{entry.title}</strong>
-                      <span>{entry.courses.length} course{entry.courses.length === 1 ? "" : "s"}</span>
+                      <strong>{row.video.title}</strong>
+                      <span>{row.video.mediaUrl ? (row.video.progress.completedAt !== null ? "Complete" : "Ready") : "Downloading"}</span>
                     </span>
                   </button>
-                </li>
+                )
+              }
+            />
+          ) : (
+            <div className="linkedin-library-empty" role="status">
+              <span>Loading course</span>
+            </div>
+          )}
+        </div>
+        {playback ? (
+          <LinkedinPlayerPane
+            playback={playback}
+            session={session}
+            onClose={() => setSession(null)}
+            onProgress={onProgress}
+            onEnded={onVideoEnded}
+          />
+        ) : null}
+      </div>
+      {menu ? (
+        <div
+          className="linkedin-library-menu"
+          role="menu"
+          style={{ left: menu.x, top: menu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {menu.kind === "standalone" ? (
+            <>
+              {pathEntries.length === 0 ? (
+                <button type="button" className="linkedin-library-menu-item" role="menuitem" disabled>
+                  No learning paths yet
+                </button>
               ) : (
-                <li key={`standalone:${entry.course}`}>
-                  <button type="button" className="linkedin-library-row" onClick={() => onOpenEntry(entry)}>
-                    <ProgressRing completed={entry.completedVideos} total={entry.totalVideos} />
-                    <span className="linkedin-library-copy">
-                      <strong>{entry.title}</strong>
-                      <span>Standalone course</span>
-                    </span>
+                pathEntries.map((path) => (
+                  <button
+                    key={path.path}
+                    type="button"
+                    className="linkedin-library-menu-item"
+                    role="menuitem"
+                    onClick={() => void moveStandaloneToPath(menu.course, path.path)}
+                  >
+                    Move to {path.title}
                   </button>
-                </li>
-              )
-            )}
-          </ol>
-        )
-      ) : nav.level === "path" && activePath ? (
-        <ol className="linkedin-library-list" aria-label={`${activePath.title} courses`}>
-          {activePath.courses.map((course) => (
-            <li key={course.course}>
-              <button type="button" className="linkedin-library-row" onClick={() => onOpenPathCourse(course, activePath)}>
-                <ProgressRing completed={course.completedVideos} total={course.totalVideos} />
-                <span className="linkedin-library-copy">
-                  <strong>{course.title}</strong>
-                  <span>{jobStatusLabel(course.jobStatus)}</span>
-                </span>
+                ))
+              )}
+              <button
+                type="button"
+                className="linkedin-library-menu-item"
+                role="menuitem"
+                disabled={!menu.sourceUrl.trim()}
+                onClick={() => void copyUrl(menu.sourceUrl)}
+              >
+                Copy URL
               </button>
-            </li>
-          ))}
-        </ol>
-      ) : playback ? (
-        <ol className="linkedin-library-list" aria-label={`${playback.title} videos`}>
-          {playback.chapters.map((chapter) => (
-            <li key={chapter.title} className="linkedin-library-chapter">
-              <h3>{chapter.title}</h3>
-              <ol>
-                {chapter.videos.map((video) => {
-                  const complete = video.progress.completedAt !== null;
-                  return (
-                    <li key={video.video}>
-                      <button
-                        type="button"
-                        className="linkedin-library-row"
-                        onClick={() => onOpenVideo(video)}
-                        disabled={!video.mediaUrl}
-                      >
-                        <ProgressRing completed={complete ? 1 : 0} total={1} />
-                        <span className="linkedin-library-copy">
-                          <strong>{video.title}</strong>
-                          <span>{video.mediaUrl ? (complete ? "Complete" : "Ready") : "Downloading"}</span>
-                        </span>
-                      </button>
-                    </li>
-                  );
-                })}
-              </ol>
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <div className="linkedin-library-empty" role="status">
-          <span>Loading course</span>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="linkedin-library-menu-item"
+              role="menuitem"
+              disabled={!menu.sourceUrl.trim()}
+              onClick={() => void copyUrl(menu.sourceUrl)}
+            >
+              Copy URL
+            </button>
+          )}
         </div>
-      )}
-      {playback ? (
-        <LinkedinPlayer
-          playback={playback}
-          session={session}
-          onClose={() => setSession(null)}
-          onProgress={onProgress}
-        />
       ) : null}
     </div>
   );
 }
+
+function flattenCourseRows(playback: CoursePlayback): CourseBrowseRow[] {
+  return playback.chapters.flatMap((chapter) => [
+    { kind: "chapter", key: `chapter:${chapter.title}`, title: chapter.title },
+    ...chapter.videos.map((video) => ({ kind: "video" as const, key: `video:${video.video}`, video }))
+  ]);
+}
+
+type CourseBrowseRow =
+  | { kind: "chapter"; key: string; title: string }
+  | { kind: "video"; key: string; video: VideoPlayback };
 
 function jobStatusLabel(status: PathCourseSummary["jobStatus"]): string {
   switch (status) {
@@ -275,20 +485,3 @@ function jobStatusLabel(status: PathCourseSummary["jobStatus"]): string {
   }
 }
 
-function ProgressRing({ completed, total }: { completed: number; total: number }) {
-  const ratio = total > 0 ? Math.min(1, completed / total) : 0;
-  const circumference = 2 * Math.PI * 12;
-  const dash = circumference * ratio;
-  return (
-    <svg className="linkedin-progress-ring" viewBox="0 0 32 32" aria-hidden="true">
-      <circle cx="16" cy="16" r="12" className="linkedin-progress-ring-track" />
-      <circle
-        cx="16"
-        cy="16"
-        r="12"
-        className="linkedin-progress-ring-value"
-        strokeDasharray={`${dash} ${circumference}`}
-      />
-    </svg>
-  );
-}

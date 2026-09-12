@@ -23,6 +23,9 @@ pub fn parse_path_document(html: &str) -> Result<ParsedPath, PathParseError> {
         collect_anchor_courses(html, &mut courses);
     }
     if courses.is_empty() {
+        collect_listing_courses(html, &mut courses);
+    }
+    if courses.is_empty() {
         return Err(PathParseError::Empty);
     }
     Ok(ParsedPath {
@@ -77,11 +80,20 @@ fn walk_json_ld(value: &Value, courses: &mut Vec<CourseUrl>, title: &mut Option<
                 }
             }
             if type_contains(value, "listitem") {
+                let mut found = false;
                 if let Some(item) = map.get("item") {
                     if let Some(course) = course_from_json_value(item) {
                         courses.push(course);
+                        found = true;
                     } else {
+                        let before = courses.len();
                         walk_json_ld(item, courses, title);
+                        found = courses.len() > before;
+                    }
+                }
+                if !found {
+                    if let Some(course) = course_from_json_value(value) {
+                        courses.push(course);
                     }
                 }
             } else if let Some(course) = course_from_json_value(value) {
@@ -96,11 +108,14 @@ fn course_from_json_value(value: &Value) -> Option<CourseUrl> {
     match value {
         Value::String(url) => course_from_href(url),
         Value::Object(map) => {
-            if !type_contains(value, "course") {
-                return None;
+            for key in ["url", "canonicalUrl", "publicUrl", "trackingUrl"] {
+                if let Some(url) = map.get(key).and_then(Value::as_str) {
+                    if let Some(course) = course_from_href(url) {
+                        return Some(course);
+                    }
+                }
             }
-            let url = map.get("url").and_then(Value::as_str)?;
-            course_from_href(url)
+            None
         }
         _ => None,
     }
@@ -117,6 +132,11 @@ fn type_contains(value: &Value, needle: &str) -> bool {
         }),
         _ => false,
     }
+}
+
+fn collect_listing_courses(html: &str, courses: &mut Vec<CourseUrl>) {
+    let page = super::topic::parse_topic_listing(html);
+    courses.extend(page.courses);
 }
 
 fn collect_anchor_courses(html: &str, courses: &mut Vec<CourseUrl>) {
@@ -214,5 +234,99 @@ mod tests {
             parse_path_document("<html></html>").unwrap_err(),
             PathParseError::Empty
         );
+    }
+
+    #[test]
+    fn bpr_guid_encoded_courses_yield_path_members() {
+        let html = r#"
+            <html>
+              <code id="bpr-guid-240">{&quot;included&quot;:[{&quot;entityType&quot;:&quot;COURSE&quot;,&quot;slug&quot;:&quot;practical-negotiation-techniques&quot;},{&quot;entityType&quot;:&quot;COURSE&quot;,&quot;slug&quot;:&quot;strategic-negotiation&quot;},{&quot;entityType&quot;:&quot;VIDEO&quot;,&quot;slug&quot;:&quot;welcome&quot;}]}</code>
+            </html>
+        "#;
+        let parsed = parse_path_document(html).unwrap();
+        let slugs: Vec<&str> = parsed
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["practical-negotiation-techniques", "strategic-negotiation"]
+        );
+    }
+
+    #[test]
+    fn json_ld_list_item_without_course_type_still_yields_course_urls() {
+        let html = r#"
+            <script type="application/ld+json">
+            {"@type":"ItemList","name":"Negotiation Professional Certificate","itemListElement":[
+              {"@type":"ListItem","item":{"url":"https://www.linkedin.com/learning/practical-negotiation-techniques"}},
+              {"@type":"ListItem","url":"https://www.linkedin.com/learning/strategic-negotiation"},
+              {"@type":"ListItem","item":{"url":"https://www.linkedin.com/learning/paths/negotiation-professional-certificate-by-american-negotiation-institute"}},
+              {"@type":"ListItem","item":{"url":"https://www.linkedin.com/learning/topics/professional-certificates"}}
+            ]}
+            </script>
+        "#;
+        let parsed = parse_path_document(html).unwrap();
+        let slugs: Vec<&str> = parsed
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["practical-negotiation-techniques", "strategic-negotiation"]
+        );
+        assert_eq!(
+            parsed.title.as_deref(),
+            Some("Negotiation Professional Certificate")
+        );
+    }
+
+    #[test]
+    fn json_script_course_entities_yield_courses_without_ld_json() {
+        let html = r#"
+            <html>
+              <script type="application/json">
+              {"included":[
+                {"entityType":"COURSE","slug":"practical-negotiation-techniques","url":"https://www.linkedin.com/learning/practical-negotiation-techniques"},
+                {"entityType":"COURSE","slug":"strategic-negotiation","canonicalUrl":"https://www.linkedin.com/learning/strategic-negotiation"},
+                {"entityType":"LEARNING_PATH","slug":"negotiation-professional-certificate-by-american-negotiation-institute","url":"https://www.linkedin.com/learning/paths/negotiation-professional-certificate-by-american-negotiation-institute"},
+                {"entityType":"VIDEO","slug":"welcome","url":"https://www.linkedin.com/learning/practical-negotiation-techniques/welcome"}
+              ]}
+              </script>
+            </html>
+        "#;
+        let parsed = parse_path_document(html).unwrap();
+        let slugs: Vec<&str> = parsed
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["practical-negotiation-techniques", "strategic-negotiation"]
+        );
+        assert!(!slugs.contains(&"welcome"));
+        assert!(!slugs
+            .contains(&"negotiation-professional-certificate-by-american-negotiation-institute"));
+        assert!(!slugs.contains(&"paths"));
+        assert!(!slugs.contains(&"topics"));
+    }
+
+    #[test]
+    fn query_string_course_hrefs_are_harvested_without_json_ld() {
+        let html = r#"
+            <a href="https://www.linkedin.com/learning/practical-negotiation-techniques?u=123">Course</a>
+            <a href="/learning/paths/negotiation-professional-certificate-by-american-negotiation-institute">Path</a>
+            <a href="/learning/topics/professional-certificates">Topic</a>
+        "#;
+        let parsed = parse_path_document(html).unwrap();
+        let slugs: Vec<&str> = parsed
+            .courses
+            .iter()
+            .map(|course| course.slug.as_str())
+            .collect();
+        assert_eq!(slugs, vec!["practical-negotiation-techniques"]);
     }
 }

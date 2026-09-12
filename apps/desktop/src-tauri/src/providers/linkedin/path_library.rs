@@ -13,6 +13,10 @@ use crate::app::shell::open_folder_in_explorer;
 use crate::cache::get_course_cache_entry;
 
 use super::expansion::PathCapture;
+use super::placement::{
+    insert_placement_ignore, load_frozen_path_names, load_layout_names, load_placements,
+    plan_first_writer_homes, CourseHome, CourseLayout, LayoutName, OutputRoot, PlacementError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PathSlug(String);
@@ -203,12 +207,16 @@ pub enum PathLibraryError {
     InvalidSlug { value: String },
     #[error("LinkedIn course '{slug}' is not in the catalog")]
     UnknownCourse { slug: String },
+    #[error("LinkedIn learning path '{slug}' is not in the catalog")]
+    UnknownPath { slug: String },
     #[error("could not open the LinkedIn course folder")]
     FolderUnavailable,
     #[error(transparent)]
     Database(#[from] DatabaseWriteError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Placement(#[from] PlacementError),
 }
 
 #[derive(Clone)]
@@ -221,6 +229,7 @@ impl PathLibrary {
         Self { writer }
     }
 
+    #[cfg(test)]
     pub fn capture_path(&self, capture: PathCapture) -> Result<(), PathLibraryError> {
         let path = PathSlug::parse(&capture.path_slug)?;
         let mut members = Vec::with_capacity(capture.members.len());
@@ -238,6 +247,56 @@ impl PathLibrary {
         Ok(())
     }
 
+    /// Capture membership and assign FirstWriterHome in one writer transaction.
+    pub fn ingest_expansion(
+        &self,
+        output_root: OutputRoot,
+        paths: Vec<PathCapture>,
+        standalone: Vec<String>,
+    ) -> Result<(), PathLibraryError> {
+        let mut standalone_slugs = Vec::with_capacity(standalone.len());
+        for slug in &standalone {
+            standalone_slugs.push(CourseSlug::parse(slug)?);
+        }
+        let now = unix_timestamp();
+        self.writer
+            .execute(write_context("ingest_expansion"), move |connection| {
+                ingest_expansion_on_connection(
+                    connection,
+                    &output_root,
+                    &paths,
+                    &standalone_slugs,
+                    now,
+                )
+                .map_err(write_error_from_path_library)
+            })?;
+        Ok(())
+    }
+
+    pub fn add_course_to_path(
+        &self,
+        course: CourseSlug,
+        path: PathSlug,
+    ) -> Result<(), PathLibraryError> {
+        let now = unix_timestamp();
+        self.writer
+            .execute(write_context("add_course_to_path"), move |connection| {
+                add_course_to_path_on_connection(connection, &course, &path, now)
+                    .map_err(write_error_from_path_library)
+            })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn layout_for_course(
+        conn: &Connection,
+        output_root: &str,
+        course_slug: &str,
+    ) -> Result<CourseLayout, PathLibraryError> {
+        Ok(CourseLayout::load(conn, output_root, course_slug)?)
+    }
+
+    #[cfg(test)]
     pub fn capture_standalone(&self, course: CourseSlug) -> Result<(), PathLibraryError> {
         let now = unix_timestamp();
         self.writer
@@ -335,25 +394,16 @@ impl PathLibrary {
     }
 
     pub fn open_course_folder(&self, course: CourseSlug) -> Result<(), PathLibraryError> {
-        let output_dir: Option<String> =
+        let opened: Option<std::path::PathBuf> =
             self.writer
                 .execute(write_context("open_course_folder"), move |connection| {
-                    let output_dir: Option<String> = connection
-                        .query_row(
-                            "SELECT output_dir FROM jobs
-                         WHERE course_slug = ?1
-                         ORDER BY updated_at DESC LIMIT 1",
-                            params![course.as_str()],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    Ok(output_dir.filter(|value| !value.trim().is_empty()))
+                    resolve_course_folder_path(connection, &course)
+                        .map_err(write_error_from_path_library)
                 })?;
-        let Some(output_dir) = output_dir else {
+        let Some(opened) = opened else {
             return Err(PathLibraryError::FolderUnavailable);
         };
-        open_folder_in_explorer(std::path::Path::new(&output_dir))
-            .map_err(|_| PathLibraryError::FolderUnavailable)
+        open_folder_in_explorer(&opened).map_err(|_| PathLibraryError::FolderUnavailable)
     }
 }
 
@@ -372,6 +422,7 @@ fn unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn upsert_path(
     connection: &mut Connection,
     path: &PathSlug,
@@ -401,6 +452,218 @@ fn upsert_path(
     }
     transaction.commit()?;
     Ok(())
+}
+
+fn write_error_from_path_library(error: PathLibraryError) -> DatabaseWriteError {
+    match error {
+        PathLibraryError::Database(error) => error,
+        PathLibraryError::Sqlite(error) => DatabaseWriteError::from(error),
+        PathLibraryError::Placement(PlacementError::Sqlite(error)) => {
+            DatabaseWriteError::from(error)
+        }
+        PathLibraryError::Placement(PlacementError::Database(error)) => error,
+        other => DatabaseWriteError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(1),
+            Some(other.to_string()),
+        )),
+    }
+}
+
+fn ingest_expansion_on_connection(
+    connection: &Connection,
+    output_root: &OutputRoot,
+    paths: &[PathCapture],
+    standalone_slugs: &[CourseSlug],
+    now: i64,
+) -> Result<(), PathLibraryError> {
+    let existing = load_placements(connection, output_root)?;
+    let taken = load_layout_names(connection, output_root)?;
+    let frozen = load_frozen_path_names(connection)?;
+    let batch = plan_first_writer_homes(paths, standalone_slugs, &existing, &taken, &frozen)?;
+    let names: HashMap<PathSlug, LayoutName> = batch.path_layout_names.into_iter().collect();
+    for capture in paths {
+        let path = PathSlug::parse(&capture.path_slug)?;
+        let mut members = Vec::with_capacity(capture.members.len());
+        for (position, slug) in capture.members.iter().enumerate() {
+            members.push((position as i64, CourseSlug::parse(slug)?));
+        }
+        let layout_name = names
+            .get(&path)
+            .cloned()
+            .unwrap_or_else(|| LayoutName::from_title(&capture.title));
+        upsert_path_on_connection(
+            connection,
+            &path,
+            &capture.title,
+            &capture.source_url,
+            &layout_name,
+            &members,
+            now,
+        )?;
+    }
+    for (course, home) in batch.homes {
+        insert_placement_ignore(connection, output_root, &course, &home, now)?;
+    }
+    for course in standalone_slugs {
+        connection.execute(
+            "INSERT INTO linkedin_standalone_courses (course_slug, created_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(course_slug) DO NOTHING",
+            params![course.as_str(), now],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_path_on_connection(
+    connection: &Connection,
+    path: &PathSlug,
+    title: &str,
+    source_url: &str,
+    layout_name: &LayoutName,
+    members: &[(i64, CourseSlug)],
+    now: i64,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO linkedin_learning_paths (
+            path_slug, title, source_url, layout_name, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(path_slug) DO UPDATE SET
+            title = excluded.title,
+            source_url = excluded.source_url,
+            updated_at = excluded.updated_at",
+        params![path.as_str(), title, source_url, layout_name.as_str(), now],
+    )?;
+    for (position, course) in members {
+        connection.execute(
+            "INSERT INTO linkedin_path_membership (path_slug, course_slug, position, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path_slug, course_slug) DO UPDATE SET
+                position = excluded.position",
+            params![path.as_str(), course.as_str(), position, now],
+        )?;
+    }
+    Ok(())
+}
+
+fn add_course_to_path_on_connection(
+    connection: &Connection,
+    course: &CourseSlug,
+    path: &PathSlug,
+    now: i64,
+) -> Result<(), PathLibraryError> {
+    let path_exists: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM linkedin_learning_paths WHERE path_slug = ?1",
+        params![path.as_str()],
+        |row| row.get(0),
+    )?;
+    if path_exists == 0 {
+        return Err(PathLibraryError::UnknownPath {
+            slug: path.as_str().to_string(),
+        });
+    }
+    if !course_is_known(connection, course.as_str())? {
+        return Err(PathLibraryError::UnknownCourse {
+            slug: course.as_str().to_string(),
+        });
+    }
+    let next_position: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM linkedin_path_membership WHERE path_slug = ?1",
+        params![path.as_str()],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT INTO linkedin_path_membership (path_slug, course_slug, position, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path_slug, course_slug) DO NOTHING",
+        params![path.as_str(), course.as_str(), next_position, now],
+    )?;
+    connection.execute(
+        "DELETE FROM linkedin_standalone_courses WHERE course_slug = ?1",
+        params![course.as_str()],
+    )?;
+    connection.execute(
+        "UPDATE linkedin_learning_paths SET updated_at = ?1 WHERE path_slug = ?2",
+        params![now, path.as_str()],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn record_imported_layout_on_connection(
+    connection: &Connection,
+    output_root: &OutputRoot,
+    course: &CourseSlug,
+    nested_parent: Option<&LayoutName>,
+    now: i64,
+) -> Result<(), PathLibraryError> {
+    let home = match nested_parent {
+        Some(layout_name) => CourseHome::Certificate {
+            path: None,
+            layout_name: layout_name.clone(),
+        },
+        None => CourseHome::Standalone,
+    };
+    insert_placement_ignore(connection, output_root, course, &home, now)?;
+    Ok(())
+}
+
+fn resolve_course_folder_path(
+    connection: &Connection,
+    course: &CourseSlug,
+) -> Result<Option<std::path::PathBuf>, PathLibraryError> {
+    let output_dir: Option<String> = connection
+        .query_row(
+            "SELECT output_dir FROM jobs
+             WHERE course_slug = ?1
+             ORDER BY updated_at DESC LIMIT 1",
+            params![course.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .filter(|value: &String| !value.trim().is_empty());
+    let Some(output_dir) = output_dir else {
+        return Ok(None);
+    };
+
+    let artifact_path: Option<String> = connection
+        .query_row(
+            "SELECT a.path FROM artifacts a
+             INNER JOIN jobs j ON j.id = a.job_id
+             WHERE j.course_slug = ?1 AND a.status = 'completed'
+             ORDER BY a.updated_at DESC, a.id DESC LIMIT 1",
+            params![course.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(path) = artifact_path {
+        let file = std::path::PathBuf::from(&path);
+        if let Some(chapter_dir) = file.parent() {
+            if let Some(course_leaf) = chapter_dir.parent() {
+                if course_leaf.exists() {
+                    return Ok(Some(course_leaf.to_path_buf()));
+                }
+            }
+            if chapter_dir.exists() {
+                return Ok(Some(chapter_dir.to_path_buf()));
+            }
+        }
+    }
+
+    let title = get_course_cache_entry(connection, course.as_str())
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.title)
+        .unwrap_or_else(|| course.as_str().to_string());
+    let layout = CourseLayout::load(connection, &output_dir, course.as_str())?;
+    let course_dir = layout.course_dir(&title);
+    if course_dir.exists() {
+        return Ok(Some(course_dir));
+    }
+    let root = std::path::PathBuf::from(output_dir);
+    if root.exists() {
+        return Ok(Some(root));
+    }
+    Ok(None)
 }
 
 pub(crate) fn record_video_file_on_connection(
@@ -479,6 +742,9 @@ fn list_catalog_rows(conn: &Connection) -> Result<Vec<CatalogEntry>, PathLibrary
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for (course_slug, created_at) in standalones {
+        if listed_courses.contains(&course_slug) {
+            continue;
+        }
         listed_courses.insert(course_slug.clone());
         let summary = course_summary(conn, &course_slug, statuses.get(&course_slug).cloned())?;
         let source_url = course_source_url(conn, &course_slug)
@@ -662,7 +928,23 @@ fn course_is_known(conn: &Connection, course_slug: &str) -> Result<bool, rusqlit
         params![course_slug],
         |row| row.get(0),
     )?;
-    Ok(member > 0)
+    if member > 0 {
+        return Ok(true);
+    }
+    let cached: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM course_cache WHERE course_slug = ?1",
+        params![course_slug],
+        |row| row.get(0),
+    )?;
+    if cached > 0 {
+        return Ok(true);
+    }
+    let job: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE course_slug = ?1",
+        params![course_slug],
+        |row| row.get(0),
+    )?;
+    Ok(job > 0)
 }
 
 fn course_source_url(conn: &Connection, course_slug: &str) -> Option<String> {
@@ -823,7 +1105,18 @@ fn load_fallback_video_artifact_ids(
 }
 
 fn mint_media_url(artifact_id: String) -> LinkedinMediaUrl {
-    LinkedinMediaUrl(format!("linkedin-media://v/{artifact_id}"))
+    LinkedinMediaUrl(minted_media_url(&artifact_id))
+}
+
+fn minted_media_url(artifact_id: &str) -> String {
+    #[cfg(any(target_os = "windows", target_os = "android"))]
+    {
+        format!("http://linkedin-media.localhost/v/{artifact_id}")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    {
+        format!("linkedin-media://v/{artifact_id}")
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1180,8 +1473,8 @@ mod tests {
             playback.chapters[0].videos[0]
                 .media_url
                 .as_ref()
-                .map(LinkedinMediaUrl::as_str),
-            Some("linkedin-media://v/artifact-new")
+                .map(|url| url.as_str().to_string()),
+            Some(minted_media_url("artifact-new"))
         );
     }
 
@@ -1213,8 +1506,8 @@ mod tests {
             playback.chapters[0].videos[0]
                 .media_url
                 .as_ref()
-                .map(LinkedinMediaUrl::as_str),
-            Some("linkedin-media://v/artifact-welcome")
+                .map(|url| url.as_str().to_string()),
+            Some(minted_media_url("artifact-welcome"))
         );
     }
 
@@ -1300,10 +1593,144 @@ mod tests {
             playback.chapters[0].videos[0]
                 .media_url
                 .as_ref()
-                .map(LinkedinMediaUrl::as_str),
-            Some("linkedin-media://v/artifact-excel")
+                .map(|url| url.as_str().to_string()),
+            Some(minted_media_url("artifact-excel"))
         );
         let json = serde_json::to_string(&playback).unwrap();
         assert!(!json.contains("C:/secret-downloads"));
+    }
+
+    #[test]
+    fn ingest_second_path_membership_does_not_relocate_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = OutputRoot::parse(directory.path().to_string_lossy().as_ref()).unwrap();
+        let (_keep, library, db_path) = harness();
+        library
+            .ingest_expansion(
+                output.clone(),
+                vec![path_capture(
+                    "first-cert",
+                    "First Certificate",
+                    &["shared-course"],
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        library
+            .ingest_expansion(
+                output.clone(),
+                vec![path_capture(
+                    "second-cert",
+                    "Second Certificate",
+                    &["shared-course", "only-second"],
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        let connection = open_reader(&db_path);
+        let home: (String, Option<String>, String) = connection
+            .query_row(
+                "SELECT home_kind, path_slug, layout_name FROM linkedin_course_placement
+                 WHERE course_slug = 'shared-course' AND output_root = ?1",
+                params![output.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(home.0, "certificate");
+        assert_eq!(home.1.as_deref(), Some("first-cert"));
+        assert_eq!(home.2, "First Certificate");
+        let memberships: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM linkedin_path_membership WHERE course_slug = 'shared-course'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memberships, 2);
+    }
+
+    #[test]
+    fn add_course_to_path_moves_standalone_catalog_and_leaves_disk_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = OutputRoot::parse(directory.path().to_string_lossy().as_ref()).unwrap();
+        let (_keep, library, db_path) = harness();
+        library
+            .ingest_expansion(
+                output.clone(),
+                vec![path_capture(
+                    "github-cert",
+                    "GitHub Certificate",
+                    &["practical-github-actions"],
+                )],
+                vec!["solo-course".to_string()],
+            )
+            .unwrap();
+        library
+            .add_course_to_path(
+                CourseSlug::parse("solo-course").unwrap(),
+                PathSlug::parse("github-cert").unwrap(),
+            )
+            .unwrap();
+        library
+            .add_course_to_path(
+                CourseSlug::parse("solo-course").unwrap(),
+                PathSlug::parse("github-cert").unwrap(),
+            )
+            .unwrap();
+        let connection = open_reader(&db_path);
+        let standalone: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM linkedin_standalone_courses WHERE course_slug = 'solo-course'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let membership: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM linkedin_path_membership
+                 WHERE path_slug = 'github-cert' AND course_slug = 'solo-course'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(standalone, 0);
+        assert_eq!(membership, 1);
+        let home: String = connection
+            .query_row(
+                "SELECT home_kind FROM linkedin_course_placement
+                 WHERE course_slug = 'solo-course' AND output_root = ?1",
+                params![output.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(home, "standalone");
+        let catalog = library.list_catalog(&connection).unwrap();
+        assert!(catalog.iter().all(|entry| match entry {
+            CatalogEntry::Standalone(course) => course.course.as_str() != "solo-course",
+            CatalogEntry::Path(_) => true,
+        }));
+        match catalog
+            .iter()
+            .find(|entry| matches!(entry, CatalogEntry::Path(_)))
+        {
+            Some(CatalogEntry::Path(path)) => {
+                assert!(path
+                    .courses
+                    .iter()
+                    .any(|course| course.course.as_str() == "solo-course"));
+            }
+            _ => panic!("expected github-cert path in catalog"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mint_media_url_windows_uses_linkedin_media_localhost() {
+        let url = mint_media_url("artifact-welcome".to_string());
+        assert!(
+            url.as_str().contains("linkedin-media.localhost"),
+            "Windows media URL must use the localhost form, got {}",
+            url.as_str()
+        );
     }
 }

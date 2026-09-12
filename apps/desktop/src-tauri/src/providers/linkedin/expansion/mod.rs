@@ -110,7 +110,6 @@ pub struct ExpandedCourseCatalog {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExpansionError {
     #[error("could not expand learning path '{path_slug}': {detail}")]
-    #[allow(dead_code)]
     PathExpandFailed { path_slug: String, detail: String },
     #[error("could not expand topic '{topic_slug}': {detail}")]
     TopicExpandFailed { topic_slug: String, detail: String },

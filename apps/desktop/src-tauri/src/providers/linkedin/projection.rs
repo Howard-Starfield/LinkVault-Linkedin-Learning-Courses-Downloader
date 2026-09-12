@@ -102,6 +102,13 @@ mod tests {
     }
 
     #[test]
+    fn paused_run_projects_as_queued_with_paused_flag() {
+        let job = job_from_run(&sample_run("job-1", RunState::Paused, 10));
+        assert_eq!(job.status, "queued");
+        assert!(job.paused);
+    }
+
+    #[test]
     fn retry_wait_projects_as_queued() {
         let job = job_from_run(&sample_run("job-1", RunState::RetryWait, 10));
         assert_eq!(job.status, "queued");

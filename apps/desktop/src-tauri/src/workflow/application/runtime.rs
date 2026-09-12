@@ -380,6 +380,73 @@ impl WorkflowRuntime {
         self.inner.service.get_run(id)
     }
 
+    /// Persist pause for LinkedIn runs that have not started yet.
+    /// Queued → Paused so the supervisor will not claim them. Resume returns
+    /// Paused → Queued. In-flight Running work stays Running; the caller owns
+    /// the cooperative atomic flag.
+    pub fn set_linkedin_run_paused(
+        &self,
+        id: String,
+        paused: bool,
+        updated_at: i64,
+    ) -> Result<(), WorkflowError> {
+        let run = self
+            .inner
+            .service
+            .get_run(id.clone())?
+            .ok_or_else(|| WorkflowError::RunNotFound(id.clone()))?;
+        if run.workflow_type.as_str() != WorkflowType::linkedin_download().as_str() {
+            return Err(WorkflowError::RunNotFound(id));
+        }
+        match (paused, run.state) {
+            (true, RunState::Queued) => {
+                self.inner.service.transition_run(
+                    id,
+                    RunState::Paused,
+                    None,
+                    "run_paused",
+                    "{}".to_string(),
+                    updated_at,
+                )?;
+            }
+            (false, RunState::Paused) => {
+                self.inner.service.transition_run(
+                    id,
+                    RunState::Queued,
+                    None,
+                    "run_resumed",
+                    "{}".to_string(),
+                    updated_at,
+                )?;
+            }
+            (true, RunState::Paused)
+            | (false, RunState::Queued)
+            | (_, RunState::Running)
+            | (_, RunState::Cancelling) => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn set_all_queued_linkedin_runs_paused(
+        &self,
+        paused: bool,
+        updated_at: i64,
+    ) -> Result<usize, WorkflowError> {
+        let runs = self.list_linkedin_runs(250)?;
+        let mut changed = 0;
+        for run in runs {
+            let before = run.state;
+            self.set_linkedin_run_paused(run.id.clone(), paused, updated_at)?;
+            if let Some(after) = self.get_run(run.id)? {
+                if after.state != before {
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn list_events(
         &self,
         run_id: String,
@@ -475,7 +542,11 @@ impl WorkflowRuntime {
     /// Cancel a run and delete it once terminal. For in-flight Running work this
     /// advances Cancelling → Cancelled immediately so Active-tab removal can
     /// clear the row without waiting for the executor drain.
-    pub fn cancel_and_delete_run(&self, id: String, updated_at: i64) -> Result<bool, WorkflowError> {
+    pub fn cancel_and_delete_run(
+        &self,
+        id: String,
+        updated_at: i64,
+    ) -> Result<bool, WorkflowError> {
         let _ = self.cancel_run(id.clone(), updated_at);
         if let Some(run) = self.get_run(id.clone())? {
             if run.state == RunState::Cancelling {
@@ -644,10 +715,11 @@ fn claim_ready_step(
             .drain_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match runtime.inner.service.claim_next_ready_step(
-            WorkflowType::synthetic().as_str().to_string(),
-            now,
-        )? {
+        match runtime
+            .inner
+            .service
+            .claim_next_ready_step(WorkflowType::synthetic().as_str().to_string(), now)?
+        {
             Some(step) => {
                 let run = runtime
                     .inner
@@ -1393,9 +1465,8 @@ mod tests {
             .unwrap();
 
         let runtime_slow = runtime.clone();
-        let slow_handle = thread::spawn(move || {
-            runtime_slow.drain_type("linkedin_download").unwrap()
-        });
+        let slow_handle =
+            thread::spawn(move || runtime_slow.drain_type("linkedin_download").unwrap());
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !slow_entered.load(AtomicOrdering::SeqCst) {
