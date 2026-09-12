@@ -1,5 +1,6 @@
 //! LinkedIn path membership catalog. Jobs remain download attempts.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -426,6 +427,7 @@ pub(crate) fn record_video_file_on_connection(
 fn list_catalog_rows(conn: &Connection) -> Result<Vec<CatalogEntry>, PathLibraryError> {
     let statuses = course_job_statuses(conn)?;
     let mut entries = Vec::new();
+    let mut listed_courses = HashSet::new();
 
     let mut path_stmt = conn.prepare(
         "SELECT path_slug, title, source_url, updated_at
@@ -449,6 +451,7 @@ fn list_catalog_rows(conn: &Connection) -> Result<Vec<CatalogEntry>, PathLibrary
         let mut completed_videos = 0_u32;
         let mut total_videos = 0_u32;
         for (course_slug, _position) in members {
+            listed_courses.insert(course_slug.clone());
             let summary = course_summary(conn, &course_slug, statuses.get(&course_slug).cloned())?;
             completed_videos += summary.completed_videos;
             total_videos += summary.total_videos;
@@ -476,6 +479,7 @@ fn list_catalog_rows(conn: &Connection) -> Result<Vec<CatalogEntry>, PathLibrary
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for (course_slug, created_at) in standalones {
+        listed_courses.insert(course_slug.clone());
         let summary = course_summary(conn, &course_slug, statuses.get(&course_slug).cloned())?;
         let source_url = course_source_url(conn, &course_slug)
             .unwrap_or_else(|| format!("https://www.linkedin.com/learning/{course_slug}"));
@@ -489,7 +493,54 @@ fn list_catalog_rows(conn: &Connection) -> Result<Vec<CatalogEntry>, PathLibrary
             updated_at: created_at,
         }));
     }
+    append_historical_standalone_courses(conn, &statuses, &listed_courses, &mut entries)?;
     Ok(entries)
+}
+
+fn append_historical_standalone_courses(
+    conn: &Connection,
+    statuses: &HashMap<String, JobStatusChip>,
+    listed_courses: &HashSet<String>,
+    entries: &mut Vec<CatalogEntry>,
+) -> Result<(), PathLibraryError> {
+    let mut job_stmt = conn.prepare(
+        "SELECT course_slug, MAX(updated_at), MAX(source_url)
+         FROM jobs
+         WHERE status = 'completed'
+         GROUP BY course_slug
+         ORDER BY MAX(updated_at) DESC, course_slug",
+    )?;
+    let jobs = job_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (course_slug, updated_at, source_url) in jobs {
+        if listed_courses.contains(&course_slug) {
+            continue;
+        }
+        let summary = course_summary(conn, &course_slug, statuses.get(&course_slug).cloned())?;
+        let source_url = if source_url.trim().is_empty() {
+            course_source_url(conn, &course_slug)
+                .unwrap_or_else(|| format!("https://www.linkedin.com/learning/{course_slug}"))
+        } else {
+            source_url
+        };
+        entries.push(CatalogEntry::Standalone(StandaloneCatalogEntry {
+            course: CourseSlug::parse(&course_slug)?,
+            title: summary.title,
+            source_url,
+            thumbnail_url: summary.thumbnail_url,
+            completed_videos: summary.completed_videos,
+            total_videos: summary.total_videos,
+            updated_at,
+        }));
+    }
+    Ok(())
 }
 
 fn path_members(conn: &Connection, path_slug: &str) -> Result<Vec<(String, i64)>, rusqlite::Error> {
@@ -669,13 +720,17 @@ fn open_course_playback(
         .and_then(|entry| entry.title.clone())
         .or(parsed.title.clone())
         .unwrap_or_else(|| course.as_str().to_string());
+    let fallback_artifact_ids = load_fallback_video_artifact_ids(conn, course.as_str())?;
+    let mut video_index = 0_usize;
     let mut chapters = Vec::new();
     for chapter in parsed.chapters {
         let mut videos = Vec::new();
         for video in chapter.videos {
             let video_slug = VideoSlug::parse(&video.slug)?;
             let progress = load_progress(conn, course.as_str(), video_slug.as_str())?;
-            let artifact_id = load_video_artifact_id(conn, course.as_str(), video_slug.as_str())?;
+            let artifact_id = load_video_artifact_id(conn, course.as_str(), video_slug.as_str())?
+                .or_else(|| fallback_artifact_ids.get(video_index).cloned());
+            video_index += 1;
             let duration_ms = video
                 .duration_seconds
                 .map(|seconds| (seconds as i64).saturating_mul(1000))
@@ -740,6 +795,31 @@ fn load_video_artifact_id(
         |row| row.get(0),
     )
     .optional()
+}
+
+fn load_fallback_video_artifact_ids(
+    conn: &Connection,
+    course_slug: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let job_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM jobs
+             WHERE course_slug = ?1 AND status = 'completed'
+             ORDER BY updated_at DESC LIMIT 1",
+            params![course_slug],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(job_id) = job_id else {
+        return Ok(Vec::new());
+    };
+    conn.prepare(
+        "SELECT id FROM artifacts
+         WHERE job_id = ?1 AND artifact_type = 'video' AND status = 'completed'
+         ORDER BY created_at, id",
+    )?
+    .query_map(params![job_id], |row| row.get(0))?
+    .collect()
 }
 
 fn mint_media_url(artifact_id: String) -> LinkedinMediaUrl {
@@ -1136,5 +1216,94 @@ mod tests {
                 .map(LinkedinMediaUrl::as_str),
             Some("linkedin-media://v/artifact-welcome")
         );
+    }
+
+    fn seed_completed_job_with_video(
+        connection: &Connection,
+        job_id: &str,
+        course_slug: &str,
+        artifact_id: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO jobs (
+                    id, course_slug, source_url, status, selected_quality,
+                    download_videos, download_exercises, download_subtitles, download_quizzes,
+                    quiz_hints_json, output_dir, paused, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'completed', '720', 1, 1, 1, 1, '[]', 'C:/secret-downloads', 0, 10, 10)",
+                params![
+                    job_id,
+                    course_slug,
+                    format!("https://www.linkedin.com/learning/{course_slug}")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO artifacts (
+                    id, job_id, artifact_type, path, status, size_bytes, created_at, updated_at
+                 ) VALUES (?1, ?2, 'video', 'C:/secret-downloads/welcome.mp4', 'completed', 24, 10, 10)",
+                params![artifact_id, job_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn list_catalog_includes_completed_jobs_without_membership() {
+        let (_directory, library, db_path) = harness();
+        let connection = open_reader(&db_path);
+        seed_course_cache(
+            &connection,
+            "excel-essential-training",
+            "Excel Essential Training",
+            &[("welcome", "Welcome")],
+        );
+        seed_completed_job_with_video(
+            &connection,
+            "job-legacy",
+            "excel-essential-training",
+            "artifact-excel",
+        );
+        let catalog = library.list_catalog(&connection).unwrap();
+        match &catalog[..] {
+            [CatalogEntry::Standalone(course)] => {
+                assert_eq!(course.course.as_str(), "excel-essential-training");
+                assert_eq!(course.title, "Excel Essential Training");
+            }
+            other => panic!("expected one standalone card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_course_falls_back_to_completed_video_artifacts() {
+        let (_directory, library, db_path) = harness();
+        let connection = open_reader(&db_path);
+        seed_course_cache(
+            &connection,
+            "excel-essential-training",
+            "Excel Essential Training",
+            &[("welcome", "Welcome")],
+        );
+        seed_completed_job_with_video(
+            &connection,
+            "job-legacy",
+            "excel-essential-training",
+            "artifact-excel",
+        );
+        let playback = library
+            .open_course(
+                &connection,
+                CourseSlug::parse("excel-essential-training").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            playback.chapters[0].videos[0]
+                .media_url
+                .as_ref()
+                .map(LinkedinMediaUrl::as_str),
+            Some("linkedin-media://v/artifact-excel")
+        );
+        let json = serde_json::to_string(&playback).unwrap();
+        assert!(!json.contains("C:/secret-downloads"));
     }
 }

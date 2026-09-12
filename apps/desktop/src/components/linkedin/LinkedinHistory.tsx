@@ -70,13 +70,29 @@ export function LinkedinHistory({ historyRevision }: LinkedinHistoryProps) {
     }
     setNav(reduceLibraryNav(nav, { type: "openCourse", course: entry.course, via: { kind: "standalone" } }));
     setSession(null);
-    void linkedinOpenCourse(entry.course).then(setPlayback);
+    void linkedinOpenCourse(entry.course)
+      .then((next) => {
+        setPlayback(next);
+        setLoadError(null);
+      })
+      .catch((error: unknown) => {
+        setPlayback(null);
+        setLoadError(error instanceof Error ? error.message : String(error));
+      });
   }
 
   function onOpenPathCourse(course: PathCourseSummary, path: PathCatalogEntry) {
     setNav(reduceLibraryNav(nav, { type: "openCourse", course: course.course, via: { kind: "path", path: path.path } }));
     setSession(null);
-    void linkedinOpenCourse(course.course).then(setPlayback);
+    void linkedinOpenCourse(course.course)
+      .then((next) => {
+        setPlayback(next);
+        setLoadError(null);
+      })
+      .catch((error: unknown) => {
+        setPlayback(null);
+        setLoadError(error instanceof Error ? error.message : String(error));
+      });
   }
 
   function onBack() {

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { CoursePlayback, PlayerSession, PlaybackTick, VideoPlayback, VideoProgress } from "../../lib/linkedin/types";
 import { linkedinSaveProgress } from "../../lib/linkedin/ipc";
 
@@ -37,6 +37,8 @@ function PlayerOverlay({
   onClose: () => void;
   onProgress: LinkedinPlayerProps["onProgress"];
 }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
   useEffect(() => {
     let timer: number | null = null;
     let pending: PlaybackTick | null = null;
@@ -71,8 +73,7 @@ function PlayerOverlay({
       }, SAVE_DEBOUNCE_MS);
     }
 
-    const node = document.getElementById("linkedin-player-video");
-    const media = node instanceof HTMLVideoElement ? node : null;
+    const media = videoRef.current;
     if (!media) {
       return () => undefined;
     }
@@ -91,13 +92,24 @@ function PlayerOverlay({
       flush();
     }
 
+    function onLoadedMetadata(event: Event) {
+      const target = event.currentTarget;
+      if (!(target instanceof HTMLVideoElement)) return;
+      const resumeSeconds = video.progress.positionMs / 1000;
+      if (resumeSeconds > 0 && Number.isFinite(target.duration) && resumeSeconds < target.duration) {
+        target.currentTime = resumeSeconds;
+      }
+    }
+
     media.addEventListener("timeupdate", onTimeUpdate);
     media.addEventListener("pause", onPauseOrEnded);
     media.addEventListener("ended", onPauseOrEnded);
+    media.addEventListener("loadedmetadata", onLoadedMetadata);
     return () => {
       media.removeEventListener("timeupdate", onTimeUpdate);
       media.removeEventListener("pause", onPauseOrEnded);
       media.removeEventListener("ended", onPauseOrEnded);
+      media.removeEventListener("loadedmetadata", onLoadedMetadata);
       flush();
     };
   }, [onProgress, playback.course, video]);
@@ -111,7 +123,7 @@ function PlayerOverlay({
         <h2>{video.title}</h2>
       </div>
       <video
-        id="linkedin-player-video"
+        ref={videoRef}
         className="linkedin-player-video"
         src={video.mediaUrl ?? undefined}
         controls
