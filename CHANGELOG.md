@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.27 - 2026-09-12
+
+- **LinkedIn learning-path library.** Paths, topic pastes, and standalone courses share one History catalog. Pause/resume queued path jobs, move a standalone course into a path, and keep folder imports on the same placement rules.
+- **Cinema lesson player.** Full-bleed overlay chrome, autoplay next ready lesson, and completed/near-end lessons start at 0 instead of resuming at the tail.
+- **Bounded 150+ list mounts.** LinkedIn history and newspaper library/clippings virtualize to about 10 on-screen rows (overscan 1). Thumbnails stay lazy. Playing a lesson no longer refetches the whole catalog.
+- **Capped LinkedIn media reads.** Open-ended MP4 range requests stop at 2 MiB so WebView2 cannot pull an entire lesson into RAM on the first byte.
+
 ## 0.2.26 - 2026-09-10
 
 - **LinkedIn failed queue and retry.** Failed attempts leave Queue and land on Failed with Retry (including cancelled). Retry clears the terminal attempt and requeues the same job.
