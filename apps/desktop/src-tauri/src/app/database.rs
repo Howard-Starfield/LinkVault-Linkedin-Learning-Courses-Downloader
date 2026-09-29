@@ -3987,6 +3987,142 @@ mod tests {
     }
 
     #[test]
+    fn persistence_gate_v9_database_receives_query_indexes_with_verified_backup() {
+        // Table names owned by the v0.2.27 migrations. `linkedin_path_library_v8`
+        // creates the first five, `linkedin_course_placement_v9` the last. Their
+        // real names are private to those modules, so they are restated here;
+        // if the dispatch in `database_migrations::migrate` is ever reordered so
+        // v9 runs before v8, v9's `ALTER TABLE linkedin_learning_paths` and its
+        // `linkedin_path_membership` foreign key target no longer exist and
+        // these tables go missing.
+        const V0_2_27_TABLES: [&str; 6] = [
+            "linkedin_learning_paths",
+            "linkedin_path_membership",
+            "linkedin_standalone_courses",
+            "linkedin_video_files",
+            "linkedin_video_progress",
+            "linkedin_course_placement",
+        ];
+
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        // The real upgrade path for a v0.2.27 install: the v8 path library and
+        // the v9 course placement tables are already present and the schema is
+        // stamped 9, but the four query indexes are not installed yet.
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            legacy
+                .execute_batch(
+                    "DROP INDEX idx_jobs_status;
+                     DROP INDEX idx_job_events_job;
+                     DROP INDEX idx_artifacts_job;
+                     DROP INDEX idx_job_events_recent;
+                     PRAGMA user_version = 9;",
+                )
+                .unwrap();
+            // The fixture has to be a genuine v9 database, otherwise the test
+            // would pass without the migration running.
+            assert_eq!(schema_version(&legacy).unwrap(), 9);
+            for (index, _) in LINKEDIN_QUERY_INDEXES {
+                assert_eq!(
+                    index_owner(&legacy, index),
+                    "",
+                    "the v9 fixture must not already carry {index}"
+                );
+            }
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+
+        assert_eq!(initialization.from_version, 9);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let backup_path = initialization
+            .backup_path
+            .expect("populated v9 database must receive a verified backup");
+        assert!(backup_path.is_file());
+        assert_eq!(
+            backup_path.extension().and_then(|value| value.to_str()),
+            Some("bak")
+        );
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "the version bump is what carries the indexes to existing installs"
+        );
+        assert_linkedin_query_indexes(&connection);
+
+        let backup = Connection::open(&backup_path).unwrap();
+        let backup_integrity: String = backup
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_integrity, "ok");
+        assert_eq!(schema_version(&backup).unwrap(), 9);
+        assert_ne!(
+            schema_version(&connection).unwrap(),
+            schema_version(&backup).unwrap(),
+            "the upgrade must actually write the new user_version, not just report it"
+        );
+        for (index, _) in LINKEDIN_QUERY_INDEXES {
+            assert_eq!(
+                index_owner(&backup, index),
+                "",
+                "the pre-migration backup must not contain {index}"
+            );
+        }
+        let backup_events: i64 = backup
+            .query_row("SELECT COUNT(*) FROM job_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_events, 1);
+
+        // v0.2.27's own migrations must come through this upgrade untouched.
+        for table in V0_2_27_TABLES {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} must survive the v9->current migration");
+        }
+        // `linkedin_course_placement_v9` also adds this column; table presence
+        // alone would not catch a half-run v9.
+        let layout_name_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('linkedin_learning_paths')
+                 WHERE name = 'layout_name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            layout_name_columns, 1,
+            "linkedin_course_placement_v9 owns linkedin_learning_paths.layout_name"
+        );
+
+        for table in ["jobs", "job_events", "artifacts"] {
+            let survived: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(survived, 1, "pre-existing {table} rows must survive");
+        }
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        let foreign_key_check: usize = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+    }
+
+    #[test]
     fn persistence_gate_legacy_artifacts_rebuild_keeps_the_artifact_index() {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");

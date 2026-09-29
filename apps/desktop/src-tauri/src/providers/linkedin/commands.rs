@@ -4548,6 +4548,61 @@ mod tests {
         );
     }
 
+    /// The exact top-level key set `bootstrap_state` puts on the wire.
+    ///
+    /// `BootstrapState` derives `Serialize` with no `rename_all`, so these are
+    /// the Rust field names verbatim and the frontend adapter reads them as
+    /// such. Pinning the whole set -- not a subset -- is the point: a
+    /// hand-merge previously restored `download_history`, which v0.2.27 had
+    /// removed in fadd9d2, and nothing caught it because no test asserted the
+    /// serialized shape. Commit 1bda17d removed it again; this test stops the
+    /// third reappearance.
+    const BOOTSTRAP_STATE_KEYS: [&str; 8] = [
+        "browser_sources",
+        "default_resolution",
+        "download_history_file_path",
+        "has_saved_token",
+        "persisted_jobs",
+        "recent_events",
+        "saved_download_preferences",
+        "stores_plaintext_tokens_in_sqlite",
+    ];
+
+    #[test]
+    fn bootstrap_state_wire_shape_is_exactly_the_expected_key_set() {
+        let connection = initialized_connection();
+        let state = load_bootstrap_state(
+            &connection,
+            None,
+            false,
+            Path::new("C:/downloads/download-history.md"),
+            false,
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(&state).unwrap();
+        let object = json.as_object().expect("BootstrapState serializes to an object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys, BOOTSTRAP_STATE_KEYS,
+            "BootstrapState's serialized key set changed; update the TypeScript \
+             adapter in the same commit that changes it"
+        );
+
+        // `download_history` was deleted from BootstrapState in fadd9d2 (v0.2.27)
+        // so the history list could render path membership without shipping a
+        // filesystem path for every completed job on every poll. Its reappearance
+        // would mean an uncapped LEFT JOIN over every completed job is back on the
+        // poll path, which is the 2,338.9 ms UI-thread regression this branch
+        // exists to remove. The UI reads the markdown file at
+        // `download_history_file_path` instead.
+        assert!(
+            !object.contains_key("download_history"),
+            "download_history must stay deleted from the bootstrap payload (fadd9d2)"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Measurement-only performance probe. NOT a fix and NOT a threshold test.
     //
