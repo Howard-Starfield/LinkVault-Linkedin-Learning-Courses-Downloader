@@ -58,6 +58,7 @@ import { YouTubeView } from "./components/youtube/YouTubeView";
 import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
 import { ensureDestination, parseDestination } from "./lib/destinations";
 import { commitLinkedInDestination } from "./lib/linkedin/ipc";
+import { nextPollDelayMs, IDLE_POLL_CEILING_MS } from "./lib/linkedin/poll-schedule";
 import { LinkedinHistory } from "./components/linkedin/LinkedinHistory";
 import { MiniCourseArt } from "./components/linkedin/MiniCourseArt";
 import {
@@ -602,20 +603,38 @@ export default function App() {
   useEffect(() => {
     if (!hasSavedToken) return;
     let disposed = false;
+    let timerId: number | undefined;
 
-    async function checkDueSchedules() {
+    // Self-scheduling rather than setInterval: `nextPollDelayMs` returns null
+    // when no job is active or queued, so an idle install stops polling
+    // entirely. Every user action elsewhere calls refreshBootstrapState, which
+    // re-enters this effect and starts a fresh cycle.
+    async function tick() {
+      if (disposed) return;
       const state = await refreshBootstrapState();
-      if (disposed || !state) return;
+      if (disposed) return;
+
+      if (!state) {
+        // Transient failure (for example the database was briefly locked).
+        // Re-arm on the ceiling so polling self-heals instead of dying.
+        timerId = window.setTimeout(() => void tick(), IDLE_POLL_CEILING_MS);
+        return;
+      }
+
       if (!queueNeedsSessionRefresh && hasReadyQueuedJobs(state.persisted_jobs)) {
         ensureDownloadProcessing(true);
       }
+
+      const delay = nextPollDelayMs(state.persisted_jobs, Date.now());
+      if (delay !== null) {
+        timerId = window.setTimeout(() => void tick(), delay);
+      }
     }
 
-    void checkDueSchedules();
-    const intervalId = window.setInterval(() => void checkDueSchedules(), 15_000);
+    void tick();
     return () => {
       disposed = true;
-      window.clearInterval(intervalId);
+      if (timerId !== undefined) window.clearTimeout(timerId);
     };
   }, [hasSavedToken, delaySeconds, queueNeedsSessionRefresh]);
 

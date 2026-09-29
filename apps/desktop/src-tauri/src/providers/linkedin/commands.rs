@@ -19,8 +19,8 @@ use crate::browser_cookies::{
 use crate::cache::{
     append_job_event, clear_failed_jobs, clear_job_schedule, clear_linkedin_provider_data,
     get_course_cache_entry, get_job, get_setting, list_artifacts_for_job, list_download_history,
-    list_job_events, list_jobs_by_status, list_ready_queued_jobs, list_recent_jobs, open_runtime,
-    remove_completed_download_job, remove_download_job, set_all_download_jobs_paused,
+    list_jobs_by_status, list_ready_queued_jobs, list_recent_job_events, list_recent_jobs,
+    open_runtime, remove_completed_download_job, remove_download_job, set_all_download_jobs_paused,
     set_download_job_paused, upsert_setting_json, DownloadHistoryEntry, JobRecord, NewJobEvent,
     ProviderResetCounts,
 };
@@ -127,6 +127,91 @@ impl LinkVaultState {
     fn token_path(&self) -> &std::path::Path {
         &self.token_path
     }
+
+    /// Owned handle for async commands that must move their body into
+    /// `tauri::async_runtime::spawn_blocking`.
+    fn command_handles(&self) -> LinkedInCommandHandles {
+        LinkedInCommandHandles {
+            db_path: self.db_path.clone(),
+            token_path: self.token_path.clone(),
+            download_cancellation: Arc::clone(&self.download_cancellation),
+            download_paused: Arc::clone(&self.download_paused),
+        }
+    }
+}
+
+/// Owned view of the mutable slots `LinkVaultState` shares with the download
+/// executor.
+///
+/// `tauri::State<'_, LinkVaultState>` borrows the managed state for the life of
+/// the command and so cannot be moved into the `'static` closure
+/// `spawn_blocking` requires. The `Arc` slots here are the *same* allocations
+/// the state holds, not copies, so a pause or cancellation requested inside the
+/// closure is immediately visible to an in-flight download; the `PathBuf`s are
+/// plain owned values. This is deliberate duplication of cheap handles, not a
+/// second owner of any resource.
+#[derive(Clone)]
+struct LinkedInCommandHandles {
+    db_path: PathBuf,
+    token_path: PathBuf,
+    download_cancellation: Arc<AtomicBool>,
+    download_paused: Arc<AtomicBool>,
+}
+
+impl LinkedInCommandHandles {
+    fn connection(&self) -> Result<Connection, String> {
+        open_runtime(&self.db_path).map_err(|error| error.to_string())
+    }
+
+    fn has_saved_token(&self) -> bool {
+        token_store::has_saved_token(&self.token_path)
+    }
+
+    fn is_download_paused(&self) -> bool {
+        self.download_paused.load(Ordering::SeqCst)
+    }
+
+    fn set_download_paused(&self, paused: bool) {
+        self.download_paused.store(paused, Ordering::SeqCst);
+    }
+
+    fn request_download_cancellation(&self) {
+        self.download_cancellation.store(true, Ordering::SeqCst);
+    }
+
+    fn reset_download_cancellation(&self) {
+        self.download_cancellation.store(false, Ordering::SeqCst);
+        self.download_paused.store(false, Ordering::SeqCst);
+    }
+
+    fn history_file_path(&self) -> PathBuf {
+        download_history_file_path_for_db(&self.db_path)
+    }
+
+    /// The read every queue command returns: connection plus the whole
+    /// bootstrap projection. Runs inside the caller's blocking closure.
+    fn bootstrap_state(&self, runtime: &WorkflowRuntime) -> Result<BootstrapState, String> {
+        let connection = self.connection()?;
+        load_bootstrap_state(
+            &connection,
+            Some(runtime),
+            self.has_saved_token(),
+            &self.history_file_path(),
+            self.is_download_paused(),
+        )
+    }
+
+    /// Mirrors `LinkVaultState::is_download_cancellation_requested` so a test
+    /// can prove the handle and the state observe the same atomic.
+    #[cfg(test)]
+    fn cancellation_requested(&self) -> bool {
+        self.download_cancellation.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn token_path(&self) -> &Path {
+        &self.token_path
+    }
 }
 
 #[derive(Clone)]
@@ -154,6 +239,7 @@ pub struct BootstrapState {
     saved_download_preferences: Option<SavedDownloadPreferences>,
     persisted_jobs: Vec<PersistedDownloadJob>,
     recent_events: Vec<PersistedJobEvent>,
+    download_history: Vec<DownloadHistoryEntry>,
     download_history_file_path: String,
 }
 
@@ -330,19 +416,18 @@ pub struct LinkedInDestinationCommit {
 }
 
 #[tauri::command]
-pub fn bootstrap_state(
+pub async fn bootstrap_state(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<BootstrapState, String> {
-    let connection = state.connection()?;
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    // The whole read (SQLite open, job/artifact/event projection, DPAPI token
+    // check) is blocking and used to run on the UI thread, stalling the window
+    // for its whole duration on every 15-second frontend poll.
+    tauri::async_runtime::spawn_blocking(move || handles.bootstrap_state(&runtime))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Lean probe: any LinkedIn workflow/legacy job that is active or ready-queued.
@@ -667,278 +752,342 @@ pub fn cancel_active_download(
 }
 
 #[tauri::command]
-pub fn set_download_job_pause(
+pub async fn set_download_job_pause(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
     paused: bool,
 ) -> Result<BootstrapState, String> {
-    let connection = state.connection()?;
-    match set_download_job_paused(&connection, &job_id, paused, now_unix_timestamp()) {
-        Ok(job) => {
-            if job.status == "active" {
-                state.set_download_paused(paused);
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = handles.connection()?;
+        match set_download_job_paused(&connection, &job_id, paused, now_unix_timestamp()) {
+            Ok(job) => {
+                if job.status == "active" {
+                    handles.set_download_paused(paused);
+                }
             }
-        }
-        Err(_) => {
-            let now = now_unix_timestamp();
-            if let Some(run) = runtime
-                .get_run(job_id.clone())
-                .map_err(|error| error.to_string())?
-            {
-                match run.state {
-                    RunState::Running | RunState::Cancelling => {
-                        // Cooperative pause for the in-flight LinkedIn executor. The
-                        // run stays Running so the job remains on the Active tab;
-                        // bootstrap overlays this flag onto projected jobs.
-                        state.set_download_paused(paused);
-                    }
-                    RunState::Queued | RunState::Paused | RunState::RetryWait => {
-                        runtime
-                            .set_linkedin_run_paused(job_id, paused, now)
-                            .map_err(|error| error.to_string())?;
-                        if !paused {
-                            state.set_download_paused(false);
+            Err(_) => {
+                let now = now_unix_timestamp();
+                if let Some(run) = runtime
+                    .get_run(job_id.clone())
+                    .map_err(|error| error.to_string())?
+                {
+                    match run.state {
+                        RunState::Running | RunState::Cancelling => {
+                            // Cooperative pause for the in-flight LinkedIn executor. The
+                            // run stays Running so the job remains on the Active tab;
+                            // bootstrap overlays this flag onto projected jobs.
+                            handles.set_download_paused(paused);
                         }
+                        RunState::Queued | RunState::Paused | RunState::RetryWait => {
+                            runtime
+                                .set_linkedin_run_paused(job_id, paused, now)
+                                .map_err(|error| error.to_string())?;
+                            // Queued workflow runs are not in the legacy jobs
+                            // table. Keep the atomic flag clear for idle queue
+                            // pauses so a later active download is not
+                            // accidentally frozen.
+                            if !paused {
+                                handles.set_download_paused(false);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
-    }
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &handles.history_file_path(),
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn set_all_downloads_paused(
+pub async fn set_all_downloads_paused(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
     paused: bool,
 ) -> Result<BootstrapState, String> {
-    let connection = state.connection()?;
-    let now = now_unix_timestamp();
-    set_all_download_jobs_paused(&connection, paused, now).map_err(|error| error.to_string())?;
-    runtime
-        .set_all_queued_linkedin_runs_paused(paused, now)
-        .map_err(|error| error.to_string())?;
-    state.set_download_paused(paused);
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = now_unix_timestamp();
+        let connection = handles.connection()?;
+        set_all_download_jobs_paused(&connection, paused, now).map_err(|error| error.to_string())?;
+        runtime
+            .set_all_queued_linkedin_runs_paused(paused, now)
+            .map_err(|error| error.to_string())?;
+        handles.set_download_paused(paused);
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &handles.history_file_path(),
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn reset_linkedin_database(
+pub async fn reset_linkedin_database(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<ProviderResetCounts, String> {
-    // The UI is expected to call set_all_downloads_paused(true) first so the
-    // worker unwinds at a safe boundary. We still defensively re-arm the
-    // flags here so a stale in-flight request can't keep writing after the
-    // wipe commits.
-    state.set_download_paused(true);
-    runtime
-        .delete_linkedin_runs()
-        .map_err(|error| error.to_string())?;
-    let connection = state.connection()?;
-    let counts = clear_linkedin_provider_data(&connection).map_err(|error| error.to_string())?;
-    // Regenerate the history markdown so the next read sees a valid empty
-    // document instead of rows that no longer exist in the database.
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    let _ = sync_download_history_file(&connection, &history_file_path);
-    state.reset_download_cancellation();
-    Ok(counts)
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    // The whole reset is blocking: a SQLite open, a full-table delete write
+    // transaction and a markdown rewrite on disk. It used to run on the Tauri
+    // main thread, freezing the window for its whole duration on a large
+    // install.
+    tauri::async_runtime::spawn_blocking(move || {
+        // The UI is expected to call set_all_downloads_paused(true) first so the
+        // worker unwinds at a safe boundary. We still defensively re-arm the
+        // flags here so a stale in-flight request can't keep writing after the
+        // wipe commits. ORDER IS LOAD-BEARING: this must stay *before*
+        // `delete_linkedin_runs` and before the wipe, or a request that is
+        // already unwinding is re-armed and keeps writing into the tables the
+        // wipe is deleting.
+        handles.set_download_paused(true);
+        runtime
+            .delete_linkedin_runs()
+            .map_err(|error| error.to_string())?;
+        let connection = handles.connection()?;
+        let counts =
+            clear_linkedin_provider_data(&connection).map_err(|error| error.to_string())?;
+        // Regenerate the history markdown so the next read sees a valid empty
+        // document instead of rows that no longer exist in the database.
+        let history_file_path = handles.history_file_path();
+        let _ = sync_download_history_file(&connection, &history_file_path);
+        // ORDER IS LOAD-BEARING: the flags are cleared only once the wipe and
+        // the history rewrite have both committed, so the next download starts
+        // from a database that is actually empty.
+        handles.reset_download_cancellation();
+        Ok(counts)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn retry_failed_download_job(
+pub async fn retry_failed_download_job(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
-    // Cancel applies to the in-flight job only. Clear so a retry is not
-    // immediately re-cancelled by a sticky shared flag.
-    state.reset_download_cancellation();
-    let connection = state.connection()?;
-    retry_failed_download_job_inner(&runtime, &connection, job_id, now_unix_timestamp())?;
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    let _ = sync_download_history_file(&connection, &history_file_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Cancel applies to the in-flight job only. Clear so a retry is not
+        // immediately re-cancelled by a sticky shared flag.
+        handles.reset_download_cancellation();
+        let connection = handles.connection()?;
+        retry_failed_download_job_inner(&runtime, &connection, job_id, now_unix_timestamp())?;
+        let history_file_path = handles.history_file_path();
+        // The markdown regeneration is a filesystem write; keeping it inside
+        // this closure is what keeps it off the UI thread.
+        let _ = sync_download_history_file(&connection, &history_file_path);
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &history_file_path,
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn clear_failed_download_jobs(
+pub async fn clear_failed_download_jobs(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<BootstrapState, String> {
-    runtime
-        .delete_terminal_linkedin_runs()
-        .map_err(|error| error.to_string())?;
-    let connection = state.connection()?;
-    clear_failed_jobs(&connection).map_err(|error| error.to_string())?;
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    let _ = sync_download_history_file(&connection, &history_file_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime
+            .delete_terminal_linkedin_runs()
+            .map_err(|error| error.to_string())?;
+        let connection = handles.connection()?;
+        clear_failed_jobs(&connection).map_err(|error| error.to_string())?;
+        let history_file_path = handles.history_file_path();
+        let _ = sync_download_history_file(&connection, &history_file_path);
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &history_file_path,
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn remove_download_queue_item(
+pub async fn remove_download_queue_item(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
     job_id: String,
 ) -> Result<BootstrapState, String> {
-    let now = now_unix_timestamp();
-    let mut removed_workflow = false;
-    let mut requested_cancellation = false;
-    if let Some(run) = runtime
-        .get_run(job_id.clone())
-        .map_err(|error| error.to_string())?
-    {
-        if matches!(
-            run.state,
-            RunState::Running
-                | RunState::Cancelling
-                | RunState::Queued
-                | RunState::Paused
-                | RunState::RetryWait
-        ) {
-            if matches!(run.state, RunState::Running | RunState::Cancelling) {
-                state.request_download_cancellation();
-                state.set_download_paused(false);
-                requested_cancellation = true;
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = now_unix_timestamp();
+        let mut removed_workflow = false;
+        let mut requested_cancellation = false;
+        if let Some(run) = runtime
+            .get_run(job_id.clone())
+            .map_err(|error| error.to_string())?
+        {
+            if matches!(
+                run.state,
+                RunState::Running
+                    | RunState::Cancelling
+                    | RunState::Queued
+                    | RunState::Paused
+                    | RunState::RetryWait
+            ) {
+                if matches!(run.state, RunState::Running | RunState::Cancelling) {
+                    handles.request_download_cancellation();
+                    handles.set_download_paused(false);
+                    requested_cancellation = true;
+                }
+                removed_workflow = runtime
+                    .cancel_and_delete_run(job_id.clone(), now)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                removed_workflow = runtime
+                    .delete_run_if_terminal(job_id.clone())
+                    .map_err(|error| error.to_string())?;
             }
-            removed_workflow = runtime
-                .cancel_and_delete_run(job_id.clone(), now)
+        }
+        let connection = handles.connection()?;
+        match remove_download_job(&connection, &job_id) {
+            Ok(job) => {
+                if job.status == "active" {
+                    handles.request_download_cancellation();
+                    handles.set_download_paused(false);
+                    requested_cancellation = true;
+                }
+            }
+            Err(_error) if removed_workflow => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        // cancel_and_delete can remove the run without an executor unwind. Clear
+        // the shared flag so the next queued course is not sticky-cancelled.
+        if requested_cancellation {
+            handles.reset_download_cancellation();
+        }
+        let history_file_path = handles.history_file_path();
+        let _ = sync_download_history_file(&connection, &history_file_path);
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &history_file_path,
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_completed_download(
+    state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
+    job_id: String,
+) -> Result<BootstrapState, String> {
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = handles.connection()?;
+        let job = get_job(&connection, &job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Download job was not found.".to_string())?;
+        if job.status != "completed" {
+            return Err("Only completed downloads can delete their course files."
+                .to_string());
+        }
+
+        let artifacts =
+            list_artifacts_for_job(&connection, &job.id).map_err(|error| error.to_string())?;
+        // Recursive filesystem delete of the whole course folder.
+        delete_completed_download_files(&job, &artifacts)?;
+        remove_completed_download_job(&connection, &job.id).map_err(|error| error.to_string())?;
+        let _ = runtime.delete_run_if_terminal(job_id);
+
+        let history_file_path = handles.history_file_path();
+        let _ = sync_download_history_file(&connection, &history_file_path);
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &history_file_path,
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn download_scheduled_job_now(
+    state: tauri::State<'_, LinkVaultState>,
+    runtime: tauri::State<'_, WorkflowRuntime>,
+    job_id: String,
+) -> Result<BootstrapState, String> {
+    let handles = state.command_handles();
+    let runtime = (*runtime).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = handles.connection()?;
+        let now = now_unix_timestamp();
+        if let Some(run) = runtime
+            .get_run(job_id.clone())
+            .map_err(|error| error.to_string())?
+        {
+            let mut request: super::projection::LinkedInWorkflowRequest =
+                serde_json::from_str(&run.request_json).map_err(|error| error.to_string())?;
+            request.scheduled_at = None;
+            runtime
+                .cancel_run(job_id.clone(), now)
+                .map_err(|error| error.to_string())?;
+            let _ = runtime.delete_run_if_terminal(job_id.clone());
+            runtime
+                .submit_linkedin_download(
+                    job_id,
+                    request.course_slug.clone(),
+                    serde_json::to_string(&request).map_err(|error| error.to_string())?,
+                    run.output_root,
+                    now,
+                    None,
+                )
                 .map_err(|error| error.to_string())?;
         } else {
-            removed_workflow = runtime
-                .delete_run_if_terminal(job_id.clone())
-                .map_err(|error| error.to_string())?;
+            clear_job_schedule(&connection, &job_id, now).map_err(|error| error.to_string())?;
         }
-    }
-    let connection = state.connection()?;
-    match remove_download_job(&connection, &job_id) {
-        Ok(job) => {
-            if job.status == "active" {
-                state.request_download_cancellation();
-                state.set_download_paused(false);
-                requested_cancellation = true;
-            }
-        }
-        Err(_error) if removed_workflow => {}
-        Err(error) => return Err(error.to_string()),
-    }
-    // cancel_and_delete can remove the run without an executor unwind. Clear the
-    // shared flag so the next queued course is not sticky-cancelled.
-    if requested_cancellation {
-        state.reset_download_cancellation();
-    }
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    let _ = sync_download_history_file(&connection, &history_file_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
-}
-
-#[tauri::command]
-pub fn delete_completed_download(
-    state: tauri::State<'_, LinkVaultState>,
-    runtime: tauri::State<'_, WorkflowRuntime>,
-    job_id: String,
-) -> Result<BootstrapState, String> {
-    let connection = state.connection()?;
-    let job = get_job(&connection, &job_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Download job was not found.".to_string())?;
-    if job.status != "completed" {
-        return Err("Only completed downloads can delete their course files.".to_string());
-    }
-
-    let artifacts =
-        list_artifacts_for_job(&connection, &job.id).map_err(|error| error.to_string())?;
-    delete_completed_download_files(&job, &artifacts)?;
-    remove_completed_download_job(&connection, &job.id).map_err(|error| error.to_string())?;
-    let _ = runtime.delete_run_if_terminal(job_id);
-
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    let _ = sync_download_history_file(&connection, &history_file_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
-}
-
-#[tauri::command]
-pub fn download_scheduled_job_now(
-    state: tauri::State<'_, LinkVaultState>,
-    runtime: tauri::State<'_, WorkflowRuntime>,
-    job_id: String,
-) -> Result<BootstrapState, String> {
-    let connection = state.connection()?;
-    let now = now_unix_timestamp();
-    if let Some(run) = runtime
-        .get_run(job_id.clone())
-        .map_err(|error| error.to_string())?
-    {
-        let mut request: super::projection::LinkedInWorkflowRequest =
-            serde_json::from_str(&run.request_json).map_err(|error| error.to_string())?;
-        request.scheduled_at = None;
-        runtime
-            .cancel_run(job_id.clone(), now)
-            .map_err(|error| error.to_string())?;
-        let _ = runtime.delete_run_if_terminal(job_id.clone());
-        runtime
-            .submit_linkedin_download(
-                job_id,
-                request.course_slug.clone(),
-                serde_json::to_string(&request).map_err(|error| error.to_string())?,
-                run.output_root,
-                now,
-                None,
-            )
-            .map_err(|error| error.to_string())?;
-    } else {
-        clear_job_schedule(&connection, &job_id, now).map_err(|error| error.to_string())?;
-    }
-    let history_file_path = download_history_file_path_for_db(&state.db_path);
-    load_bootstrap_state(
-        &connection,
-        Some(&runtime),
-        token_store::has_saved_token(&state.token_path),
-        &history_file_path,
-        state.is_download_paused(),
-    )
+        load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            handles.has_saved_token(),
+            &handles.history_file_path(),
+            handles.is_download_paused(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2154,29 +2303,29 @@ fn load_bootstrap_state(
             legacy
         }
     };
-    let mut recent_events = Vec::new();
-    for job in &recent_jobs {
-        recent_events.extend(
-            list_job_events(connection, &job.id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|event| PersistedJobEvent {
-                    id: event.id,
-                    job_id: event.job_id,
-                    event_type: event.event_type,
-                    message: event.message,
-                    payload_json: event.payload_json,
-                    created_at: event.created_at,
-                }),
-        );
-    }
-    recent_events.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    recent_events.truncate(20);
+    // One ordered read of the newest 20 events for the whole database.
+    //
+    // This used to loop over every job, load every one of that job's events,
+    // sort the merged vector by `created_at DESC, id DESC` and keep 20. At 500
+    // jobs that deserialised 60,000 rows to return 20 and cost 74.92 ms of a
+    // 155.62 ms call on a debug build.
+    //
+    // `list_recent_job_events` issues the same comparator in SQL against
+    // `idx_job_events_recent (created_at DESC, id DESC)`, so it reads only the
+    // 20 index rows it returns. The projection below is unchanged, so the
+    // observable `recent_events` output is identical.
+    let recent_events = list_recent_job_events(connection, 20)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|event| PersistedJobEvent {
+            id: event.id,
+            job_id: event.job_id,
+            event_type: event.event_type,
+            message: event.message,
+            payload_json: event.payload_json,
+            created_at: event.created_at,
+        })
+        .collect();
 
     let mut persisted_jobs = Vec::with_capacity(recent_jobs.len());
     for job in recent_jobs {
@@ -2225,6 +2374,8 @@ fn load_bootstrap_state(
         });
     }
 
+    let download_history = list_download_history(connection).map_err(|error| error.to_string())?;
+
     Ok(BootstrapState {
         default_resolution: VideoQuality::P1080,
         browser_sources: vec!["Chrome", "Edge", "Firefox"],
@@ -2233,6 +2384,7 @@ fn load_bootstrap_state(
         saved_download_preferences,
         persisted_jobs,
         recent_events,
+        download_history,
         download_history_file_path: download_history_file_path.to_string_lossy().to_string(),
     })
 }
@@ -3110,6 +3262,456 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // `recent_events` used to be built by loading every event of every job,
+    // sorting the merged vector and truncating to 20. It is now a single
+    // ordered, capped query. These tests pin the observable output so the
+    // cheaper path cannot silently change what the UI renders.
+    // ---------------------------------------------------------------------
+
+    const EVENT_FIXTURE_JOBS: usize = 6;
+    /// Deliberately few distinct timestamps so `created_at` ties are common
+    /// and the `id DESC` tie-break is actually exercised.
+    const EVENT_FIXTURE_TIMESTAMP_SLOTS: i64 = 4;
+    const EVENT_FIXTURE_EVENTS_PER_JOB: usize = 25;
+
+    /// Seeds events whose `created_at` values collide across jobs, so ordering
+    /// by `created_at` alone is ambiguous and only the `id` tie-break resolves
+    /// it.
+    fn seed_tied_event_log(connection: &Connection) {
+        for job_index in 0..EVENT_FIXTURE_JOBS {
+            let job_id = format!("event-fixture-job-{job_index:02}");
+            let created_at = 1_700_000_000 + job_index as i64;
+            crate::cache::insert_job(
+                connection,
+                &JobRecord {
+                    id: job_id.clone(),
+                    course_slug: format!("event-fixture-course-{job_index:02}"),
+                    source_url: format!(
+                        "https://www.linkedin.com/learning/event-fixture-course-{job_index:02}"
+                    ),
+                    status: "completed".to_string(),
+                    selected_quality: "1080".to_string(),
+                    download_videos: true,
+                    download_exercises: true,
+                    download_subtitles: true,
+                    download_quizzes: true,
+                    quiz_hints_json: "[]".to_string(),
+                    output_dir: "C:/downloads".to_string(),
+                    paused: false,
+                    scheduled_at: None,
+                    created_at,
+                    updated_at: created_at + 1,
+                },
+            )
+            .unwrap();
+
+            for event_index in 0..EVENT_FIXTURE_EVENTS_PER_JOB {
+                // `created_at` only takes EVENT_FIXTURE_TIMESTAMP_SLOTS distinct
+                // values, so the newest 20 events are full of ties.
+                let event_created_at = 1_700_000_000
+                    + (event_index % EVENT_FIXTURE_TIMESTAMP_SLOTS as usize) as i64;
+                append_job_event(
+                    connection,
+                    &NewJobEvent {
+                        job_id: job_id.clone(),
+                        event_type: "artifact.started".to_string(),
+                        message: format!("{job_id} step {event_index}"),
+                        payload_json: Some(format!("{{\"step\":{event_index}}}")),
+                        created_at: event_created_at,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Recomputes `recent_events` the way the pre-optimisation loop did: one
+    /// query per job, merged, sorted by `created_at DESC, id DESC`, truncated
+    /// to 20. Used as the oracle for the single-query replacement.
+    #[allow(dead_code)]
+    fn recent_events_via_per_job_n_plus_one(connection: &Connection) -> Vec<PersistedJobEvent> {
+        let jobs = bootstrap_jobs(connection).unwrap();
+        let mut events: Vec<PersistedJobEvent> = Vec::new();
+        for job in &jobs {
+            events.extend(
+                list_job_events(connection, &job.id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|event| PersistedJobEvent {
+                        id: event.id,
+                        job_id: event.job_id,
+                        event_type: event.event_type,
+                        message: event.message,
+                        payload_json: event.payload_json,
+                        created_at: event.created_at,
+                    }),
+            );
+        }
+        events.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        events.truncate(20);
+        events
+    }
+
+    #[test]
+    fn bootstrap_state_recent_events_are_exactly_twenty_newest_first_with_id_tie_break() {
+        let (_dir, runtime, connection) = workflow_harness();
+        seed_tied_event_log(&connection);
+
+        let bootstrap = load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            true,
+            Path::new("C:/downloads/download-history.md"),
+            false,
+        )
+        .unwrap();
+
+        // The dataset is 150 events, so a cap of 20 is genuinely binding.
+        let total_events = connection
+            .query_row("SELECT COUNT(*) FROM job_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(total_events, 150);
+        assert_eq!(bootstrap.recent_events.len(), 20);
+
+        // Newest first, and ties on `created_at` broken by the higher rowid.
+        for pair in bootstrap.recent_events.windows(2) {
+            let (left, right) = (&pair[0], &pair[1]);
+            assert!(
+                left.created_at > right.created_at
+                    || (left.created_at == right.created_at && left.id > right.id),
+                "recent_events must be ordered by created_at DESC then id DESC, \
+                 got {left:?} before {right:?}"
+            );
+        }
+
+        // The 20 returned rows are genuinely the newest ones: every event not
+        // returned is strictly older than the oldest returned event.
+        let oldest_returned = bootstrap
+            .recent_events
+            .last()
+            .expect("20 events were just asserted");
+        let every_event = list_recent_job_events(&connection, 1_000).unwrap();
+        assert_eq!(every_event.len(), 150);
+        for event in &every_event {
+            let is_returned = bootstrap
+                .recent_events
+                .iter()
+                .any(|candidate| candidate.id == event.id);
+            if is_returned {
+                continue;
+            }
+            assert!(
+                event.created_at < oldest_returned.created_at
+                    || (event.created_at == oldest_returned.created_at
+                        && event.id < oldest_returned.id),
+                "event {event:?} was dropped but still sorts ahead of the \
+                 oldest returned event {oldest_returned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_state_recent_events_match_the_retired_per_job_merge() {
+        let (_dir, runtime, connection) = workflow_harness();
+        seed_tied_event_log(&connection);
+
+        let bootstrap = load_bootstrap_state(
+            &connection,
+            Some(&runtime),
+            true,
+            Path::new("C:/downloads/download-history.md"),
+            false,
+        )
+        .unwrap();
+        let expected = recent_events_via_per_job_n_plus_one(&connection);
+
+        assert_eq!(
+            bootstrap.recent_events, expected,
+            "the single capped query must return exactly what the retired \
+             per-job merge + sort + truncate returned"
+        );
+    }
+
+    #[test]
+    fn load_bootstrap_state_reads_recent_events_in_one_query_not_one_per_job() {
+        // Deterministic guard for the event N+1. A wall-clock bound can be
+        // argued away by a slow machine; this cannot.
+        let production = production_source();
+        let load = production
+            .split("fn load_bootstrap_state(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .unwrap_or_default();
+
+        assert!(
+            load.contains("let recent_events = list_recent_job_events(connection, 20)"),
+            "the single capped ordered query must be the initializer of the \
+             `recent_events` binding that is actually returned; a bare call to \
+             list_recent_job_events that is discarded or dead would pass a \
+             substring check"
+        );
+        // ... and that binding must reach the struct that is returned, not a
+        // shadowed or unused local.
+        let bound_at = load
+            .find("let recent_events = list_recent_job_events(connection, 20)")
+            .unwrap_or(0);
+        assert!(
+            load[bound_at..].contains("\n        recent_events,"),
+            "the recent_events binding must be the one handed to the returned \
+             BootstrapState"
+        );
+        assert!(
+            !load.contains("list_job_events"),
+            "load_bootstrap_state must not read job events one job at a time; \
+             at 500 jobs that deserialised 60,000 rows to keep 20"
+        );
+        assert!(
+            !load.contains("recent_events.sort_by"),
+            "the in-memory sort is dead once the query returns ordered rows"
+        );
+        assert!(
+            !load.contains("recent_events.truncate"),
+            "the query is already capped; truncating again would be redundant"
+        );
+    }
+
+    /// The commands that must not run blocking work on the Tauri main thread.
+    /// Every one of them used to be a synchronous `#[tauri::command]`, so the
+    /// whole bootstrap projection plus a filesystem rewrite of the history
+    /// markdown ran on the main thread, stalling the window on every 15-second
+    /// frontend poll.
+    const OFF_UI_THREAD_COMMANDS: [&str; 8] = [
+        "bootstrap_state",
+        "set_download_job_pause",
+        "set_all_downloads_paused",
+        "retry_failed_download_job",
+        "clear_failed_download_jobs",
+        "remove_download_queue_item",
+        "delete_completed_download",
+        "reset_linkedin_database",
+    ];
+
+    /// The subset of `OFF_UI_THREAD_COMMANDS` that returns a `BootstrapState`
+    /// and must therefore build that projection from the connection it opened
+    /// inside the closure. `reset_linkedin_database` is deliberately absent: it
+    /// returns `ProviderResetCounts` and never calls `load_bootstrap_state`.
+    /// The subset check below keeps the two lists from drifting apart.
+    const BOOTSTRAP_PROJECTING_COMMANDS: [&str; 7] = [
+        "bootstrap_state",
+        "set_download_job_pause",
+        "set_all_downloads_paused",
+        "retry_failed_download_job",
+        "clear_failed_download_jobs",
+        "remove_download_queue_item",
+        "delete_completed_download",
+    ];
+
+    /// The part of this file that is compiled outside `cargo test`.
+    ///
+    /// Splitting on the bare `#[cfg(test)]` attribute is wrong here: this file
+    /// also uses that attribute on individual test-only methods above the test
+    /// module, so that split truncates the "production" text to the first
+    /// `impl LinkVaultState`. Anchor on the module declaration instead.
+    fn production_source() -> &'static str {
+        let source = include_str!("commands.rs");
+        source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(source)
+    }
+
+    /// Extracts a command's body: everything from its signature up to the next
+    /// top-level `#[tauri::command]`.
+    fn command_source<'a>(production: &'a str, declaration: &str) -> &'a str {
+        production
+            .split(declaration)
+            .nth(1)
+            .and_then(|rest| rest.split("#[tauri::command]").next())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn linkedin_bootstrap_commands_are_async_and_leave_the_async_executor() {
+        let production = production_source();
+        assert!(
+            production.contains("pub async fn bootstrap_state("),
+            "production_source() must not be empty; the split anchor is stale"
+        );
+        for name in BOOTSTRAP_PROJECTING_COMMANDS {
+            assert!(
+                OFF_UI_THREAD_COMMANDS.contains(&name),
+                "{name} returns a BootstrapState and must be in OFF_UI_THREAD_COMMANDS"
+            );
+        }
+
+        for name in OFF_UI_THREAD_COMMANDS {
+            let async_declaration = format!("pub async fn {name}(");
+            assert!(
+                production.contains(&async_declaration),
+                "{name} must be declared `pub async fn`; a synchronous Tauri \
+                 command runs its whole body on the main thread"
+            );
+            assert!(
+                !production.contains(&format!("pub fn {name}(")),
+                "{name} must not remain a synchronous `pub fn` command"
+            );
+
+            let body = command_source(production, &async_declaration);
+            let spawn_at = body.find("tauri::async_runtime::spawn_blocking").unwrap_or_else(
+                || panic!(
+                    "{name} performs blocking SQLite and filesystem work and must \
+                     move it into spawn_blocking"
+                ),
+            );
+
+            // The invariant that actually has teeth: the SQLite open is taken
+            // from the *owned* `LinkedInCommandHandles` clone, and it happens
+            // after the closure is entered. A bare `!body.contains("state.
+            // connection()")` is satisfied just as well by a command that
+            // stopped reading the database at all, and `handles.connection()`
+            // hoisted above `spawn_blocking` would pass that negative check
+            // while putting a blocking open back on the async executor.
+            // `bootstrap_state` delegates the open to the handle method that
+            // owns it, so it is accepted as the equivalent token.
+            let connection_at = body
+                .find("handles.connection()")
+                .into_iter()
+                .chain(body.find(".bootstrap_state(&runtime)"))
+                .min();
+            assert!(
+                matches!(connection_at, Some(connection_at) if connection_at > spawn_at),
+                "{name} must open SQLite from its owned LinkedInCommandHandles \
+                 clone inside spawn_blocking, never from the borrowed \
+                 tauri::State and never before the closure is entered"
+            );
+
+            if BOOTSTRAP_PROJECTING_COMMANDS.contains(&name) {
+                // The projection may be built directly or, for `bootstrap_state`,
+                // via the `LinkedInCommandHandles` helper that owns it. Either
+                // way it must happen after the closure is entered.
+                let load_at = body
+                    .find("load_bootstrap_state(")
+                    .into_iter()
+                    .chain(body.find(".bootstrap_state(&runtime)"))
+                    .min()
+                    .unwrap_or(0);
+                assert!(
+                    load_at > spawn_at,
+                    "{name} must call load_bootstrap_state from inside its blocking \
+                     closure, not on the async executor"
+                );
+            }
+        }
+
+        // `reset_linkedin_database` is the one command in the list whose
+        // correctness depends on statement *order* inside the closure, and the
+        // order is load-bearing. Pin it: pause re-armed before the workflow
+        // wipe, cancellation cleared only after the wipe and the history
+        // rewrite have both run.
+        let reset = command_source(production, "pub async fn reset_linkedin_database(");
+        let positions = [
+            ("set_download_paused(true)", reset.find("set_download_paused(true)")),
+            (
+                "delete_linkedin_runs()",
+                reset.find("delete_linkedin_runs()"),
+            ),
+            (
+                "clear_linkedin_provider_data(&connection)",
+                reset.find("clear_linkedin_provider_data(&connection)"),
+            ),
+            (
+                "sync_download_history_file(&connection, ..)",
+                reset.find("sync_download_history_file(&connection"),
+            ),
+            (
+                "reset_download_cancellation()",
+                reset.find("reset_download_cancellation()"),
+            ),
+        ];
+        for (statement, position) in positions {
+            assert!(
+                position.is_some(),
+                "reset_linkedin_database must still call {statement}"
+            );
+        }
+        let ordered: Vec<usize> = positions
+            .iter()
+            .map(|(_, position)| position.expect("asserted above"))
+            .collect();
+        assert!(
+            ordered.windows(2).all(|pair| pair[0] < pair[1]),
+            "reset_linkedin_database's flag ordering is load-bearing and must be: \
+             set_download_paused(true) BEFORE delete_linkedin_runs(), then the \
+             provider wipe, then the history-file rewrite, and only then \
+             reset_download_cancellation(). Observed offsets {ordered:?}."
+        );
+    }
+
+    #[test]
+    fn linkedin_bootstrap_commands_move_the_history_file_write_off_the_main_thread() {
+        let production = production_source();
+
+        // `sync_download_history_file` rewrites the markdown on disk. The five
+        // commands that call it must do so from inside their blocking closure,
+        // otherwise the file write is still on the UI thread.
+        let writers = [
+            "retry_failed_download_job",
+            "clear_failed_download_jobs",
+            "remove_download_queue_item",
+            "delete_completed_download",
+            "set_all_downloads_paused",
+        ];
+        for name in writers {
+            let body = command_source(production, &format!("pub async fn {name}("));
+            let spawn = body.find("spawn_blocking");
+            let sync = body.find("sync_download_history_file");
+            match (spawn, sync) {
+                (Some(spawn_at), Some(sync_at)) => assert!(
+                    sync_at > spawn_at,
+                    "{name} must sync the history file after entering its \
+                     blocking closure, not before"
+                ),
+                (_, None) => {}
+                _ => panic!(
+                    "{name} calls sync_download_history_file but never enters \
+                     spawn_blocking, so the file write would run on the UI thread"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn linkvault_state_command_handles_share_the_existing_flag_allocations() {
+        // `tauri::State<'_, T>` cannot be moved into the `'static` closure
+        // `spawn_blocking` needs, so the async commands take this owned handle
+        // instead. It must share the state's `Arc` slots rather than copy the
+        // flags, or a pause set inside the closure would be invisible to the
+        // running download.
+        let state = LinkVaultState::new("linkvault-test.sqlite3".into());
+        let handles = state.command_handles();
+
+        handles.set_download_paused(true);
+        assert!(state.is_download_paused());
+
+        state.request_download_cancellation();
+        assert!(handles.cancellation_requested());
+
+        handles.reset_download_cancellation();
+        assert!(!state.is_download_cancellation_requested());
+        assert!(!state.is_download_paused());
+
+        assert_eq!(handles.db_path, PathBuf::from("linkvault-test.sqlite3"));
+        assert_eq!(handles.token_path(), state.token_path());
+    }
+
     #[test]
     fn process_next_queued_download_with_clients_reports_no_work_without_network() {
         let connection = initialized_connection();
@@ -3784,6 +4386,612 @@ mod tests {
         assert!(!state.is_download_cancellation_requested());
         assert!(!cancellation.is_cancelled());
         assert!(!cancellation.is_paused());
+    }
+
+    // ---------------------------------------------------------------------
+    // Scaling guard for the retired event N+1. A ratio, not a wall clock.
+    //
+    // The defect this pins: `load_bootstrap_state` read every `job_events` row
+    // of every job, sorted the merged vector, and threw all but 20 away. Its
+    // cost therefore scaled with the *total* event count, which is the axis
+    // that grows without bound in production -- a long-running install accrues
+    // events forever while the UI only ever renders 20.
+    //
+    // Why a ratio and not a millisecond budget: an absolute budget measures the
+    // machine, not the code. `cargo test` runs this binary's ~800 tests in
+    // parallel on a debug build, and the same call on the same dataset has been
+    // observed at 17 ms on a quiet run and 78.90 ms under full-suite load. A
+    // fixed ceiling is therefore a coin flip on how many other threads the OS
+    // happened to be running; the previous 70 ms budget failed that way roughly
+    // 1 run in 9.
+    //
+    // The two measurements here are taken back to back over the *same* job
+    // count, so whatever multiplicative slowdown the machine applies it
+    // applies to both, and only the event-dependent term survives the division.
+    // Holding the job count constant is what makes the per-job artifact and
+    // course-cache reads identical in both runs, so they cancel. The retired
+    // loop added a term proportional to the event count and quadrupling the
+    // event count quadruples that term; the replacement issues one indexed
+    // query that returns 20 rows regardless of table size, so its event term is
+    // a constant and the ratio is ~1.
+    // ---------------------------------------------------------------------
+
+    const BOOTSTRAP_REGRESSION_JOBS: usize = 60;
+    const BOOTSTRAP_REGRESSION_ARTIFACTS_PER_JOB: usize = 40;
+    const BOOTSTRAP_REGRESSION_EVENTS_PER_JOB: usize = 100;
+    const BOOTSTRAP_REGRESSION_EVENTS_MULTIPLIER: usize = 4;
+    const BOOTSTRAP_REGRESSION_WIDE_EVENTS_PER_JOB: usize =
+        BOOTSTRAP_REGRESSION_EVENTS_PER_JOB * BOOTSTRAP_REGRESSION_EVENTS_MULTIPLIER;
+    /// The measured ceiling on (cost at 4x events) / (cost at 1x events).
+    ///
+    /// Measured on this machine, debug build, by restoring the retired per-job
+    /// merge and running this test: 1.01 with the single capped indexed query,
+    /// 3.21 with the per-job merge + sort + truncate(20) loop back. 2.0 sits
+    /// near the middle of that gap. A 1.0 ceiling would be a tautology (any
+    /// real per-event work fails it); anything above ~3.2 would admit the N+1
+    /// this test exists to reject.
+    const BOOTSTRAP_REGRESSION_MAX_RATIO: f64 = 2.0;
+    /// Timed passes per dataset, after one untimed warm-up pass. The fastest
+    /// pass is the least-contended estimate: a descheduled thread adds time to
+    /// whichever pass it lands on rather than scaling all of them, so taking a
+    /// minimum keeps an unlucky stall out of the ratio.
+    const BOOTSTRAP_REGRESSION_SAMPLES: usize = 3;
+    /// Below this the denominator is a clock artefact rather than a
+    /// measurement, and the ratio would be noise amplified.
+    const BOOTSTRAP_REGRESSION_MIN_MEASURED_MS: f64 = 0.5;
+
+    /// Seeds a fresh harness with `events_per_job` events on each of
+    /// `BOOTSTRAP_REGRESSION_JOBS` jobs and returns the fastest warmed
+    /// `load_bootstrap_state` pass, its projection, and the event row count.
+    fn bootstrap_regression_sample(events_per_job: usize) -> (f64, BootstrapState, i64) {
+        use std::time::Instant;
+
+        let (_dir, runtime, connection) = workflow_harness();
+        perf_probe_seed_dataset_with(
+            &connection,
+            BOOTSTRAP_REGRESSION_JOBS,
+            BOOTSTRAP_REGRESSION_ARTIFACTS_PER_JOB,
+            events_per_job,
+        );
+
+        let event_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM job_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            event_rows,
+            (BOOTSTRAP_REGRESSION_JOBS * events_per_job) as i64,
+            "the seeder must produce exactly the requested event count"
+        );
+
+        let mut fastest_ms = f64::INFINITY;
+        let mut fastest: Option<BootstrapState> = None;
+        for pass in 0..=BOOTSTRAP_REGRESSION_SAMPLES {
+            // The first pass warms the statement cache and the SQLite page
+            // cache, so the timed passes reflect the query rather than
+            // first-touch page faults.
+            let started = Instant::now();
+            let bootstrap = load_bootstrap_state(
+                &connection,
+                Some(&runtime),
+                true,
+                Path::new("C:/downloads/download-history.md"),
+                false,
+            )
+            .unwrap();
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if pass == 0 {
+                continue;
+            }
+            if elapsed_ms < fastest_ms {
+                fastest_ms = elapsed_ms;
+                fastest = Some(bootstrap);
+            }
+        }
+
+        (
+            fastest_ms,
+            fastest.expect("the sample loop runs at least one timed pass"),
+            event_rows,
+        )
+    }
+
+    #[test]
+    fn bootstrap_state_event_read_does_not_scale_with_the_event_log() {
+        let (narrow_ms, narrow, narrow_rows) =
+            bootstrap_regression_sample(BOOTSTRAP_REGRESSION_EVENTS_PER_JOB);
+        let (wide_ms, wide, wide_rows) =
+            bootstrap_regression_sample(BOOTSTRAP_REGRESSION_WIDE_EVENTS_PER_JOB);
+
+        // The only axis allowed to differ is the event log; the job count is
+        // what the division relies on staying constant.
+        assert_eq!(
+            wide_rows,
+            narrow_rows * BOOTSTRAP_REGRESSION_EVENTS_MULTIPLIER as i64,
+            "the wide dataset must hold exactly {BOOTSTRAP_REGRESSION_EVENTS_MULTIPLIER}x the \
+             event log and the same number of jobs"
+        );
+        // Far more events than the 20 the UI ever receives: that amplification
+        // is what the retired loop could not avoid, and it is what makes a
+        // 4x event log detectable at all.
+        assert!(
+            narrow_rows > 20 && wide_rows > 20,
+            "the 20-row cap must be binding in both datasets, got {narrow_rows} and {wide_rows}"
+        );
+
+        // Both projections must still be correct; a fast-but-wrong read would
+        // satisfy the ratio trivially.
+        assert_eq!(narrow.recent_events.len(), 20);
+        assert_eq!(wide.recent_events.len(), 20);
+        assert_eq!(narrow.persisted_jobs.len(), BOOTSTRAP_REGRESSION_JOBS);
+        assert_eq!(wide.persisted_jobs.len(), BOOTSTRAP_REGRESSION_JOBS);
+
+        assert!(
+            narrow_ms > BOOTSTRAP_REGRESSION_MIN_MEASURED_MS,
+            "the {narrow_rows}-row measurement was {narrow_ms:.3} ms, too small to divide; \
+             the fixture no longer exercises load_bootstrap_state"
+        );
+
+        let ratio = wide_ms / narrow_ms;
+        // Printed unconditionally so a CI log always carries both figures, not
+        // just the failure.
+        println!(
+            "load_bootstrap_state: {narrow_ms:.2} ms at {narrow_rows} job_events rows vs \
+             {wide_ms:.2} ms at {wide_rows} rows \
+             ({BOOTSTRAP_REGRESSION_EVENTS_MULTIPLIER}x the event log, \
+             {BOOTSTRAP_REGRESSION_JOBS} jobs held constant) -> ratio {ratio:.2} \
+             (ceiling {BOOTSTRAP_REGRESSION_MAX_RATIO:.1})"
+        );
+
+        assert!(
+            ratio <= BOOTSTRAP_REGRESSION_MAX_RATIO,
+            "load_bootstrap_state took {narrow_ms:.2} ms over {narrow_rows} job_events rows but \
+             {wide_ms:.2} ms over {wide_rows} rows: a \
+             {BOOTSTRAP_REGRESSION_EVENTS_MULTIPLIER}x larger event log cost {ratio:.2}x more \
+             (ceiling {BOOTSTRAP_REGRESSION_MAX_RATIO:.1}). The per-job event N+1 is probably \
+             back."
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Measurement-only performance probe. NOT a fix and NOT a threshold test.
+    //
+    // Hypothesis under test: `load_bootstrap_state` is pathologically slow
+    // because it runs an N+1 query pattern over the unindexed
+    // `job_events.job_id` and `artifacts.job_id` columns, collects every
+    // event, and then throws all but 20 away.
+    //
+    // This probe records numbers and query plans so the hypothesis can be
+    // CONFIRMED or REFUTED with evidence before any remediation is written.
+    // It asserts only the behaviour that is currently true.
+    //
+    // Run explicitly:
+    //   cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml \
+    //     perf_probe_bootstrap_state_scaling -- --ignored --nocapture
+    // ---------------------------------------------------------------------
+
+    const PERF_PROBE_ARTIFACTS_PER_JOB: usize = 40;
+    const PERF_PROBE_EVENTS_PER_JOB: usize = 120;
+    const PERF_PROBE_EPOCH: i64 = 1_700_000_000;
+
+    struct PerfProbeSample {
+        jobs: usize,
+        job_events_rows: i64,
+        artifact_rows: i64,
+        course_cache_rows: i64,
+        download_history_rows: usize,
+        cold_ms: f64,
+        warm_ms: f64,
+        seed_ms: f64,
+        persisted_jobs: usize,
+        recent_events: usize,
+    }
+
+    fn perf_probe_count(connection: &Connection, sql: &str) -> i64 {
+        connection.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// Prints `EXPLAIN QUERY PLAN` rows verbatim (column 3 = `detail`).
+    fn perf_probe_explain(
+        connection: &Connection,
+        label: &str,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let details = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap();
+        println!("EXPLAIN QUERY PLAN -- {label}");
+        println!("  SQL: {sql}");
+        if details.is_empty() {
+            println!("  <no plan rows>");
+        }
+        for detail in details {
+            println!("  {detail}");
+        }
+    }
+
+    fn perf_probe_print_index_inventory(connection: &Connection) {
+        let mut statement = connection
+            .prepare(
+                "SELECT tbl_name || ' | ' || name || ' | ' || COALESCE(sql, '(implicit index)') \
+                 FROM sqlite_master WHERE type = 'index' \
+                 AND tbl_name IN ('jobs', 'job_events', 'artifacts', 'course_cache') \
+                 ORDER BY tbl_name, name",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap();
+        println!("INDEX INVENTORY (jobs / job_events / artifacts / course_cache)");
+        if rows.is_empty() {
+            println!("  <none>");
+        }
+        for row in rows {
+            println!("  {row}");
+        }
+    }
+
+    /// Seeds `job_count` jobs, each with `PERF_PROBE_ARTIFACTS_PER_JOB`
+    /// artifacts and `PERF_PROBE_EVENTS_PER_JOB` events, using only the public
+    /// `crate::cache` helpers so the dataset matches what production writes.
+    fn perf_probe_seed_dataset(connection: &Connection, job_count: usize) {
+        perf_probe_seed_dataset_with(
+            connection,
+            job_count,
+            PERF_PROBE_ARTIFACTS_PER_JOB,
+            PERF_PROBE_EVENTS_PER_JOB,
+        );
+    }
+
+    /// The same seeder with the per-job artifact and event counts as
+    /// parameters, so the wall-clock regression test can weight the dataset
+    /// toward the event log without duplicating the fixture.
+    fn perf_probe_seed_dataset_with(
+        connection: &Connection,
+        job_count: usize,
+        artifacts_per_job: usize,
+        events_per_job: usize,
+    ) {
+        let job_statuses = ["completed", "failed", "cancelled", "queued", "active"];
+        let artifact_types = ["video", "subtitle", "quiz"];
+        let artifact_statuses = ["completed", "completed", "pending", "failed", "cancelled"];
+        let event_types = [
+            "artifact.started",
+            "artifact.completed",
+            "artifact.failed",
+            "job.progress",
+            "quiz.graded",
+        ];
+
+        for index in 0..job_count {
+            let job_id = format!("perf-job-{index:05}");
+            let course_slug = format!("perf-course-{index:05}");
+            let created_at = PERF_PROBE_EPOCH + index as i64;
+            let status = job_statuses[index % job_statuses.len()];
+            let source_url = format!("https://www.linkedin.com/learning/{course_slug}");
+
+            // One transaction per job: this connection runs `synchronous = FULL`,
+            // so per-statement commits would add ~1 fsync per seeded row.
+            connection.execute_batch("BEGIN").unwrap();
+            crate::cache::insert_job(
+                connection,
+                &JobRecord {
+                    id: job_id.clone(),
+                    course_slug: course_slug.clone(),
+                    source_url: source_url.clone(),
+                    status: status.to_string(),
+                    selected_quality: "1080".to_string(),
+                    download_videos: true,
+                    download_exercises: true,
+                    download_subtitles: true,
+                    download_quizzes: true,
+                    quiz_hints_json: "[]".to_string(),
+                    output_dir: format!("C:/downloads/{course_slug}"),
+                    paused: false,
+                    scheduled_at: None,
+                    created_at,
+                    updated_at: created_at + 1,
+                },
+            )
+            .unwrap();
+            crate::cache::upsert_course_cache_entry(
+                connection,
+                &crate::cache::CourseCacheEntry {
+                    course_slug: course_slug.clone(),
+                    source_url: source_url.clone(),
+                    title: Some(format!("Perf Course {index}")),
+                    payload_json: format!(
+                        "{{\"title\":\"Perf Course {index}\",\"thumbnail_url\":\"https://media.licdn.com/thumb-{index}.jpg\",\"modules\":[{{\"urn\":\"urn:li:lesson:{index}\"}}]}}"
+                    ),
+                    fetched_at: created_at,
+                },
+            )
+            .unwrap();
+            for artifact_index in 0..artifacts_per_job {
+                let artifact_type = artifact_types[artifact_index % artifact_types.len()];
+                let artifact_status =
+                    artifact_statuses[artifact_index % artifact_statuses.len()];
+                let extension = match artifact_type {
+                    "video" => "mp4",
+                    "subtitle" => "vtt",
+                    _ => "json",
+                };
+                upsert_artifact(
+                    connection,
+                    &ArtifactRecord {
+                        id: format!("{job_id}-artifact-{artifact_index:03}"),
+                        job_id: job_id.clone(),
+                        artifact_type: artifact_type.to_string(),
+                        path: format!(
+                            "C:/downloads/{course_slug}/{:02} - {artifact_type}.{extension}",
+                            artifact_index + 1
+                        ),
+                        status: artifact_status.to_string(),
+                        size_bytes: Some(1_000_000 + artifact_index as i64),
+                        created_at: created_at + artifact_index as i64,
+                        updated_at: created_at + artifact_index as i64 + 1,
+                    },
+                )
+                .unwrap();
+            }
+            for event_index in 0..events_per_job {
+                let event_type = event_types[event_index % event_types.len()];
+                append_job_event(
+                    connection,
+                    &NewJobEvent {
+                        job_id: job_id.clone(),
+                        event_type: event_type.to_string(),
+                        message: format!("{event_type} for {course_slug} step {event_index}"),
+                        payload_json: Some(format!(
+                            "{{\"step\":{event_index},\"course_slug\":\"{course_slug}\",\"bytes\":{}}}",
+                            1_000_000 + event_index as i64
+                        )),
+                        created_at: created_at + event_index as i64,
+                    },
+                )
+                .unwrap();
+            }
+            connection.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement-only performance probe; run with --ignored --nocapture"]
+    fn perf_probe_bootstrap_state_scaling() {
+        use std::time::Instant;
+
+        let history_path = Path::new("C:/downloads/download-history.md");
+        println!("{}", "=".repeat(78));
+        println!("PERF PROBE: load_bootstrap_state scaling (measurement only, no fix)");
+        println!("dataset: {PERF_PROBE_ARTIFACTS_PER_JOB} artifacts + {PERF_PROBE_EVENTS_PER_JOB} events per job");
+        println!("{}", "=".repeat(78));
+
+        let mut samples: Vec<PerfProbeSample> = Vec::new();
+        let mut plan_sample: Option<(i64, i64, i64, i64, i64)> = None;
+
+        for job_count in [10_usize, 100, 500] {
+            let (_dir, runtime, connection) = workflow_harness();
+            let seed_started = Instant::now();
+            perf_probe_seed_dataset(&connection, job_count);
+            let seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+
+            let job_events_rows = perf_probe_count(&connection, "SELECT COUNT(*) FROM job_events");
+            let artifact_rows = perf_probe_count(&connection, "SELECT COUNT(*) FROM artifacts");
+            let course_cache_rows = perf_probe_count(&connection, "SELECT COUNT(*) FROM course_cache");
+
+            let cold_started = Instant::now();
+            let bootstrap = load_bootstrap_state(
+                &connection,
+                Some(&runtime),
+                true,
+                history_path,
+                false,
+            )
+            .unwrap();
+            let cold_ms = cold_started.elapsed().as_secs_f64() * 1000.0;
+
+            // Second pass: same work, warm OS page cache / SQLite page cache.
+            let warm_started = Instant::now();
+            let bootstrap_warm =
+                load_bootstrap_state(&connection, Some(&runtime), true, history_path, false)
+                    .unwrap();
+            let warm_ms = warm_started.elapsed().as_secs_f64() * 1000.0;
+
+            // Documented waste: every job_event row for every job is read,
+            // sorted, and then all but 20 rows are discarded.
+            assert_eq!(
+                bootstrap.recent_events.len(),
+                20,
+                "load_bootstrap_state is expected to keep exactly 20 events"
+            );
+            assert_eq!(bootstrap_warm.recent_events.len(), 20);
+            assert_eq!(
+                bootstrap.persisted_jobs.len(),
+                job_count,
+                "every seeded job is expected to be returned to the UI"
+            );
+            let expected_video_artifacts_per_job = (0..PERF_PROBE_ARTIFACTS_PER_JOB)
+                .filter(|artifact_index| artifact_index % 3 == 0)
+                .count();
+            assert_eq!(
+                bootstrap
+                    .persisted_jobs
+                    .iter()
+                    .map(|job| job.video_artifacts.len())
+                    .sum::<usize>(),
+                job_count * expected_video_artifacts_per_job
+            );
+
+            samples.push(PerfProbeSample {
+                jobs: job_count,
+                job_events_rows,
+                artifact_rows,
+                course_cache_rows,
+                download_history_rows: bootstrap.download_history.len(),
+                cold_ms,
+                warm_ms,
+                seed_ms,
+                persisted_jobs: bootstrap.persisted_jobs.len(),
+                recent_events: bootstrap.recent_events.len(),
+            });
+
+            println!("--- N = {job_count} jobs ---");
+            println!("  seeded: {job_events_rows} job_events rows, {artifact_rows} artifacts rows, {course_cache_rows} course_cache rows, {seed_ms:.1} ms");
+            println!("  load_bootstrap_state cold = {cold_ms:.2} ms, warm = {warm_ms:.2} ms");
+            println!("  returned: persisted_jobs = {}, recent_events = {}, download_history = {}", bootstrap.persisted_jobs.len(), bootstrap.recent_events.len(), bootstrap.download_history.len());
+
+            if job_count == 500 {
+                println!();
+                perf_probe_print_index_inventory(&connection);
+                println!();
+                perf_probe_explain(
+                    &connection,
+                    "hot query 1: list_job_events (N+1, called once per job)",
+                    "SELECT id, job_id, event_type, message, payload_json, created_at FROM job_events WHERE job_id = ?1 ORDER BY id",
+                    &[&"perf-job-00000"],
+                );
+                println!();
+                perf_probe_explain(
+                    &connection,
+                    "hot query 2: list_artifacts_for_job (N+1, called once per job)",
+                    "SELECT id, job_id, artifact_type, path, status, size_bytes, created_at, updated_at FROM artifacts WHERE job_id = ?1 ORDER BY created_at, id",
+                    &[&"perf-job-00000"],
+                );
+                println!();
+                perf_probe_explain(
+                    &connection,
+                    "hot query 3: list_jobs_by_status (called 5x by bootstrap_jobs)",
+                    "SELECT id, course_slug, source_url, status, selected_quality, download_videos, download_exercises, download_subtitles, download_quizzes, quiz_hints_json, output_dir, paused, scheduled_at, created_at, updated_at FROM jobs WHERE status = ?1 ORDER BY created_at, id",
+                    &[&"completed"],
+                );
+                println!();
+                perf_probe_explain(
+                    &connection,
+                    "hot query 4: list_download_history (uncapped)",
+                    "SELECT jobs.id, jobs.course_slug, jobs.source_url, COALESCE(NULLIF(course_cache.title, ''), jobs.course_slug), jobs.output_dir, jobs.updated_at FROM jobs LEFT JOIN course_cache ON course_cache.course_slug = jobs.course_slug WHERE jobs.status = 'completed' ORDER BY jobs.updated_at DESC, jobs.created_at DESC, jobs.id",
+                    &[],
+                );
+
+                // Phase breakdown: same read-only calls the production path
+                // makes, timed individually, to attribute the total cost.
+                let jobs = bootstrap_jobs(&connection).unwrap();
+                println!();
+                println!("PHASE BREAKDOWN AT N = {} (replays load_bootstrap_state's reads)", job_count);
+                // The production event read: one ordered, capped query.
+                let recent_started = Instant::now();
+                let recent_rows = list_recent_job_events(&connection, 20)
+                    .unwrap()
+                    .len();
+                let recent_ms = recent_started.elapsed().as_secs_f64() * 1000.0;
+                // Retired pattern, kept so the cost that was removed stays
+                // visible next to the cost that replaced it.
+                let events_started = Instant::now();
+                let mut events_read = 0usize;
+                for job in &jobs {
+                    events_read += list_job_events(&connection, &job.id).unwrap().len();
+                }
+                let events_ms = events_started.elapsed().as_secs_f64() * 1000.0;
+                let artifacts_started = Instant::now();
+                let mut artifacts_read = 0usize;
+                for job in &jobs {
+                    artifacts_read += list_artifacts_for_job(&connection, &job.id).unwrap().len();
+                }
+                let artifacts_ms = artifacts_started.elapsed().as_secs_f64() * 1000.0;
+                let cache_started = Instant::now();
+                for job in &jobs {
+                    let _ = get_course_cache_entry(&connection, &job.course_slug).unwrap();
+                }
+                let cache_ms = cache_started.elapsed().as_secs_f64() * 1000.0;
+                let history_started = Instant::now();
+                let history_rows = list_download_history(&connection).unwrap().len();
+                let history_ms = history_started.elapsed().as_secs_f64() * 1000.0;
+                let jobs_started = Instant::now();
+                let bootstrap_jobs_rows = bootstrap_jobs(&connection).unwrap().len();
+                let jobs_ms = jobs_started.elapsed().as_secs_f64() * 1000.0;
+                let job_queries = jobs.len();
+                println!("  bootstrap_jobs                 : {jobs_ms:>9.2} ms ({bootstrap_jobs_rows} jobs)");
+                println!("  list_recent_job_events(20)     : {recent_ms:>9.2} ms ({recent_rows} rows read, 1 query)  <- production path");
+                println!("  N+1 list_job_events (retired)  : {events_ms:>9.2} ms ({events_read} rows read, {job_queries} queries)");
+                println!("  N+1 list_artifacts_for_job     : {artifacts_ms:>9.2} ms ({artifacts_read} rows read, {job_queries} queries)");
+                println!("  N+1 get_course_cache_entry     : {cache_ms:>9.2} ms ({job_queries} queries, PK search)");
+                println!("  list_download_history          : {history_ms:>9.2} ms ({history_rows} rows)");
+                plan_sample = Some((
+                    jobs_ms as i64,
+                    recent_ms as i64,
+                    artifacts_ms as i64,
+                    cache_ms as i64,
+                    history_ms as i64,
+                ));
+            }
+        }
+
+        println!();
+        println!("{}", "=".repeat(78));
+        println!("RESULTS");
+        println!("{}", "=".repeat(78));
+        println!(
+            "{:>6} | {:>12} | {:>11} | {:>10} | {:>9} | {:>8} | {:>12} | {:>10} | {:>12}",
+            "N",
+            "job_events",
+            "artifacts",
+            "seed ms",
+            "cold ms",
+            "warm ms",
+            "cold ms/job",
+            "marginal",
+            "marginal ms/job"
+        );
+        println!("{}", "-".repeat(78));
+        let mut previous: Option<(usize, f64)> = None;
+        for sample in &samples {
+            let per_job = sample.cold_ms / sample.jobs as f64;
+            let marginal = match previous {
+                Some((previous_n, previous_ms)) => {
+                    format!("{:.2}", (sample.cold_ms - previous_ms) / (sample.jobs - previous_n) as f64)
+                }
+                None => "-".to_string(),
+            };
+            println!(
+                "{:>6} | {:>12} | {:>11} | {:>10.1} | {:>9.2} | {:>8.2} | {:>12.3} | {:>10} | {:>12.3}",
+                sample.jobs,
+                sample.job_events_rows,
+                sample.artifact_rows,
+                sample.seed_ms,
+                sample.cold_ms,
+                sample.warm_ms,
+                per_job,
+                marginal,
+                sample.warm_ms / sample.jobs as f64
+            );
+            previous = Some((sample.jobs, sample.cold_ms));
+        }
+        println!("{}", "-".repeat(78));
+        println!("marginal = ms of additional cold time per additional job, between consecutive sizes");
+        println!("last column = warm ms per job");
+        for sample in &samples {
+            println!(
+                "  N={:>3}: recent_events={} (kept) of {} seeded event rows read, persisted_jobs={}, download_history={}, course_cache={}",
+                sample.jobs,
+                sample.recent_events,
+                sample.job_events_rows,
+                sample.persisted_jobs,
+                sample.download_history_rows,
+                sample.course_cache_rows
+            );
+        }
+        if let Some((jobs_ms, recent_ms, artifacts_ms, cache_ms, history_ms)) = plan_sample {
+            println!();
+            println!("PHASE BREAKDOWN (N = 500, integer ms): bootstrap_jobs={jobs_ms}, list_recent_job_events(20)={recent_ms}, list_artifacts_for_job N+1={artifacts_ms}, get_course_cache_entry N+1={cache_ms}, list_download_history={history_ms}");
+        }
     }
 
     struct NoopCourseClient;

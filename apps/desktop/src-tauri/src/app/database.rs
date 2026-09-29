@@ -20,7 +20,7 @@ use thiserror::Error;
 // Bump this whenever any provider-owned schema changes. Provider migrations run
 // only while advancing this global version, so leaving it unchanged would make
 // existing installations skip new columns that fresh databases already have.
-pub const CURRENT_SCHEMA_VERSION: i32 = 9;
+pub const CURRENT_SCHEMA_VERSION: i32 = 10;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS artifacts (
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_events_recent
+    ON job_events(created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS coursera_jobs (
     id TEXT PRIMARY KEY NOT NULL,
@@ -413,6 +419,9 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     migrate_jobs_paused(connection)?;
     migrate_jobs_scheduled_at(connection)?;
     migrate_artifacts_known_types(connection)?;
+    // Runs last: the legacy `artifacts` rebuild above drops that table and with
+    // it every index attached to it.
+    crate::app::database_migrations::install_query_indexes(connection)?;
     Ok(())
 }
 
@@ -1405,16 +1414,35 @@ pub fn list_job_events(connection: &Connection, job_id: &str) -> CacheResult<Vec
         "#,
     )?;
     let events = statement
-        .query_map(params![job_id], |row| {
-            Ok(JobEventRecord {
-                id: row.get(0)?,
-                job_id: row.get(1)?,
-                event_type: row.get(2)?,
-                message: row.get(3)?,
-                payload_json: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?
+        .query_map(params![job_id], job_event_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(events)
+}
+
+/// Returns the newest `limit` job events across every job in one query.
+///
+/// Ordering is `created_at` descending then `id` descending, which is the
+/// comparator `load_bootstrap_state` applies in
+/// `providers/linkedin/commands.rs` before truncating the merged N+1 result to
+/// 20 events. `id` is the `job_events` rowid, so the ordering is total and the
+/// first `limit` rows of this query are exactly the rows that comparator keeps.
+///
+/// `idx_job_events_recent` is declared in the same order, so this reads only
+/// `limit` index rows instead of sorting the whole event log on every call.
+pub fn list_recent_job_events(
+    connection: &Connection,
+    limit: usize,
+) -> CacheResult<Vec<JobEventRecord>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, job_id, event_type, message, payload_json, created_at
+        FROM job_events
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?1
+        "#,
+    )?;
+    let events = statement
+        .query_map(params![limit as i64], job_event_from_row)?
         .collect::<Result<Vec<_>>>()?;
     Ok(events)
 }
@@ -1514,6 +1542,17 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> Result<JobRecord> {
         scheduled_at: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+    })
+}
+
+fn job_event_from_row(row: &rusqlite::Row<'_>) -> Result<JobEventRecord> {
+    Ok(JobEventRecord {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        event_type: row.get(2)?,
+        message: row.get(3)?,
+        payload_json: row.get(4)?,
+        created_at: row.get(5)?,
     })
 }
 
@@ -3590,4 +3629,419 @@ mod tests {
             .unwrap();
         assert_eq!(quick_check, "ok");
     }
+
+    // ---------------------------------------------------------------------
+    // Schema-v8 query indexes and the bounded reads they serve.
+    // ---------------------------------------------------------------------
+
+    /// Mirrors the SQL text of `list_job_events`, `list_artifacts_for_job` and
+    /// `list_jobs_by_status`. Query plans are decided from the schema, so these
+    /// statements fail this gate on a database that never received the indexes.
+    const JOB_EVENT_LOOKUP_SQL: &str =
+        "SELECT id, job_id, event_type, message, payload_json, created_at
+         FROM job_events WHERE job_id = ?1 ORDER BY id";
+    const ARTIFACT_LOOKUP_SQL: &str =
+        "SELECT id, job_id, artifact_type, path, status, size_bytes, created_at, updated_at
+         FROM artifacts WHERE job_id = ?1 ORDER BY created_at, id";
+    const JOB_STATUS_LOOKUP_SQL: &str =
+        "SELECT id, course_slug, source_url, status, selected_quality, download_videos,
+                download_exercises, download_subtitles, download_quizzes, quiz_hints_json,
+                output_dir, paused, scheduled_at, created_at, updated_at
+         FROM jobs WHERE status = ?1 ORDER BY created_at, id";
+    const RECENT_EVENTS_SQL: &str =
+        "SELECT id, job_id, event_type, message, payload_json, created_at
+         FROM job_events ORDER BY created_at DESC, id DESC LIMIT ?1";
+
+    const LINKEDIN_QUERY_INDEXES: [(&str, &str); 4] = [
+        ("idx_jobs_status", "jobs"),
+        ("idx_job_events_job", "job_events"),
+        ("idx_artifacts_job", "artifacts"),
+        ("idx_job_events_recent", "job_events"),
+    ];
+
+    fn query_plan_details(
+        connection: &Connection,
+        sql: &str,
+        bound: &[&dyn rusqlite::ToSql],
+    ) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let details = statement
+            .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        for detail in &details {
+            println!("    {detail}");
+        }
+        details
+    }
+
+    fn index_owner(connection: &Connection, name: &str) -> String {
+        connection
+            .query_row(
+                "SELECT COALESCE((SELECT tbl_name FROM sqlite_master
+                                   WHERE type = 'index' AND name = ?1), '')",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn assert_linkedin_query_indexes(connection: &Connection) {
+        for (index, table) in LINKEDIN_QUERY_INDEXES {
+            assert_eq!(
+                index_owner(connection, index),
+                table,
+                "{index} must be installed on {table}"
+            );
+        }
+    }
+
+    fn insert_query_index_job(connection: &Connection, id: &str, status: &str, created_at: i64) {
+        insert_job(
+            connection,
+            &JobRecord {
+                id: id.to_string(),
+                course_slug: format!("slug-{id}"),
+                source_url: "https://example.test".to_string(),
+                status: status.to_string(),
+                selected_quality: "720".to_string(),
+                download_videos: true,
+                download_exercises: true,
+                download_subtitles: true,
+                download_quizzes: true,
+                quiz_hints_json: "[]".to_string(),
+                output_dir: "C:\\Courses".to_string(),
+                paused: false,
+                scheduled_at: None,
+                created_at,
+                updated_at: created_at,
+            },
+        )
+        .unwrap();
+    }
+
+    fn insert_query_index_event(
+        connection: &Connection,
+        job_id: &str,
+        message: &str,
+        created_at: i64,
+    ) -> i64 {
+        append_job_event(
+            connection,
+            &NewJobEvent {
+                job_id: job_id.to_string(),
+                event_type: "job.progress".to_string(),
+                message: message.to_string(),
+                payload_json: None,
+                created_at,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bootstrap_reads_search_linkedin_indexes_instead_of_scanning_tables() {
+        let connection = initialized_connection();
+
+        println!("EXPLAIN QUERY PLAN -- list_job_events");
+        let events = query_plan_details(&connection, JOB_EVENT_LOOKUP_SQL, &[&"li-job"]);
+        assert!(
+            events
+                .iter()
+                .any(|detail| detail.contains("SEARCH job_events USING INDEX")),
+            "job_events lookups must use an index, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|detail| detail.trim() == "SCAN job_events"),
+            "job_events must not be scanned row by row, got {events:?}"
+        );
+
+        println!("EXPLAIN QUERY PLAN -- list_artifacts_for_job");
+        let artifacts = query_plan_details(&connection, ARTIFACT_LOOKUP_SQL, &[&"li-job"]);
+        assert!(
+            artifacts
+                .iter()
+                .any(|detail| detail.contains("SEARCH artifacts USING INDEX")),
+            "artifacts lookups must use an index, got {artifacts:?}"
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|detail| detail.trim() == "SCAN artifacts"),
+            "artifacts must not be scanned row by row, got {artifacts:?}"
+        );
+
+        println!("EXPLAIN QUERY PLAN -- list_jobs_by_status");
+        let jobs = query_plan_details(&connection, JOB_STATUS_LOOKUP_SQL, &[&"completed"]);
+        assert!(
+            jobs.iter()
+                .any(|detail| detail.contains("SEARCH jobs USING INDEX")),
+            "jobs lookups by status must use an index, got {jobs:?}"
+        );
+        assert!(
+            !jobs.iter().any(|detail| detail.trim() == "SCAN jobs"),
+            "jobs must not be scanned row by row, got {jobs:?}"
+        );
+
+        println!("EXPLAIN QUERY PLAN -- list_recent_job_events");
+        let recent = query_plan_details(&connection, RECENT_EVENTS_SQL, &[&20i64]);
+        assert!(
+            !recent
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "the bounded recent-events read must not sort the whole log, got {recent:?}"
+        );
+    }
+
+    #[test]
+    fn recent_job_events_return_the_newest_events_newest_first_across_jobs() {
+        let connection = initialized_connection();
+        assert!(
+            list_recent_job_events(&connection, 20).unwrap().is_empty(),
+            "an empty event log must produce no rows"
+        );
+
+        insert_query_index_job(&connection, "job-a", "completed", 10);
+        insert_query_index_job(&connection, "job-b", "active", 20);
+        let a_first = insert_query_index_event(&connection, "job-a", "a-old", 100);
+        let b_newest = insert_query_index_event(&connection, "job-b", "b-newest", 300);
+        let a_tie = insert_query_index_event(&connection, "job-a", "a-tie", 300);
+        let b_mid = insert_query_index_event(&connection, "job-b", "b-mid", 200);
+        assert!(
+            a_tie > b_newest,
+            "the tie-break relies on later rows receiving larger ids"
+        );
+
+        let events = list_recent_job_events(&connection, 20).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![a_tie, b_newest, b_mid, a_first],
+            "newest created_at first, higher id first inside a created_at tie"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-tie", "b-newest", "b-mid", "a-old"]
+        );
+
+        let limited = list_recent_job_events(&connection, 2).unwrap();
+        assert_eq!(
+            limited.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![a_tie, b_newest],
+            "the limit must be applied by the query, not after it"
+        );
+        assert!(list_recent_job_events(&connection, 0).unwrap().is_empty());
+
+        // The N+1 reads this replaces must agree with the bounded read.
+        let mut merged: Vec<JobEventRecord> = list_job_events(&connection, "job-a")
+            .unwrap()
+            .into_iter()
+            .chain(list_job_events(&connection, "job-b").unwrap())
+            .collect();
+        merged.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        merged.truncate(2);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            limited.iter().map(|event| event.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn persistence_gate_fresh_database_installs_linkedin_query_indexes() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+
+        assert_eq!(initialization.from_version, 0);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        assert!(initialization.backup_path.is_none());
+        assert_eq!(schema_version(&connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_linkedin_query_indexes(&connection);
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn persistence_gate_query_index_install_is_idempotent() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        let (connection, _) = initialize_database(&db_path).unwrap();
+        insert_representative_provider_rows(&connection);
+        initialize(&connection).unwrap();
+        initialize(&connection).unwrap();
+        assert_linkedin_query_indexes(&connection);
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        drop(connection);
+
+        let (reopened, rerun) = initialize_database(&db_path).unwrap();
+        assert_eq!(rerun.from_version, CURRENT_SCHEMA_VERSION);
+        assert!(rerun.backup_path.is_none());
+        assert_linkedin_query_indexes(&reopened);
+        let foreign_key_check: usize = reopened
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_check, 0);
+        let preserved: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM job_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved, 1);
+    }
+
+    #[test]
+    fn persistence_gate_v7_database_receives_query_indexes_with_verified_backup() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        // A representative v7 installation: every current table with data, but
+        // without the query indexes v8 adds.
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            legacy
+                .execute_batch(
+                    "DROP INDEX idx_jobs_status;
+                     DROP INDEX idx_job_events_job;
+                     DROP INDEX idx_artifacts_job;
+                     DROP INDEX idx_job_events_recent;
+                     PRAGMA user_version = 7;",
+                )
+                .unwrap();
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+
+        assert_eq!(initialization.from_version, 7);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let backup_path = initialization
+            .backup_path
+            .expect("populated v7 database must receive a verified backup");
+        assert!(backup_path.is_file());
+        assert_eq!(
+            backup_path.extension().and_then(|value| value.to_str()),
+            Some("bak")
+        );
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "the version bump is what carries the indexes to existing installs"
+        );
+        assert_linkedin_query_indexes(&connection);
+
+        let backup = Connection::open(&backup_path).unwrap();
+        let backup_integrity: String = backup
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_integrity, "ok");
+        assert_eq!(schema_version(&backup).unwrap(), 7);
+        for (index, _) in LINKEDIN_QUERY_INDEXES {
+            assert_eq!(
+                index_owner(&backup, index),
+                "",
+                "the pre-migration backup must not contain {index}"
+            );
+        }
+        let backup_events: i64 = backup
+            .query_row("SELECT COUNT(*) FROM job_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_events, 1);
+
+        for table in ["jobs", "job_events", "artifacts"] {
+            let survived: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(survived, 1, "pre-existing {table} rows must survive");
+        }
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn persistence_gate_legacy_artifacts_rebuild_keeps_the_artifact_index() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+
+        // `initialize` rebuilds `artifacts` when the CHECK constraint predates
+        // the `quiz` and `study_guide` types, and that rebuild drops the table
+        // with its indexes. A v7 installation in exactly that state must still
+        // come out of the v8 upgrade with the index attached.
+        {
+            let (legacy, _) = initialize_database(&db_path).unwrap();
+            insert_representative_provider_rows(&legacy);
+            legacy.pragma_update(None, "foreign_keys", false).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE artifacts_legacy_fixture (
+                         id TEXT PRIMARY KEY NOT NULL,
+                         job_id TEXT NOT NULL,
+                         artifact_type TEXT NOT NULL CHECK (artifact_type IN
+                             ('video', 'subtitle', 'exercise_zip', 'exercise_file')),
+                         path TEXT NOT NULL,
+                         status TEXT NOT NULL CHECK (status IN
+                             ('pending', 'active', 'completed', 'failed', 'cancelled', 'skipped')),
+                         size_bytes INTEGER,
+                         created_at INTEGER NOT NULL,
+                         updated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO artifacts_legacy_fixture SELECT * FROM artifacts;
+                     DROP TABLE artifacts;
+                     ALTER TABLE artifacts_legacy_fixture RENAME TO artifacts;
+                     PRAGMA user_version = 7;",
+                )
+                .unwrap();
+            assert_eq!(index_owner(&legacy, "idx_artifacts_job"), "");
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 7);
+        assert!(initialization.backup_path.is_some());
+        assert_eq!(index_owner(&connection, "idx_artifacts_job"), "artifacts");
+        assert_linkedin_query_indexes(&connection);
+        let rebuilt_types: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            rebuilt_types.contains("'quiz'") && rebuilt_types.contains("'study_guide'"),
+            "the legacy artifacts table must still be rebuilt"
+        );
+        let preserved: i64 = connection
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved, 1);
+    }
 }
+

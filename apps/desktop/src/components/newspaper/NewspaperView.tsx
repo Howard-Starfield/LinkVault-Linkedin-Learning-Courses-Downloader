@@ -21,6 +21,7 @@ import { writeNewspaperDestination } from "../../lib/newspaper/preferences";
 import { Button, Checkbox, Input, Select, StatusBadge, Switch, Tooltip } from "../primitives";
 import { NewspaperLibrary } from "./NewspaperLibrary";
 import { readNewspaperOptimizationPreferences, type NewspaperOptimizationRunOptions } from "./newspaper-optimization-preferences";
+import { sameSnapshotList, sameSnapshotRecord } from "./newspaper-activity-equality";
 import type { NewspaperReaderSourceTarget } from "./newspaper-navigation";
 
 type EditionKind = "daily" | "weekly" | "special";
@@ -255,11 +256,11 @@ export function NewspaperView({
       try {
         const snapshot = await invoke<ActivitySnapshot>("get_newspaper_activity_snapshot");
         if (disposed) return;
-        setJobs(snapshot.jobs);
-        setBatches(snapshot.batches ?? []);
-        setJobProgress(snapshot.progress);
-        setSchedules(snapshot.schedules);
-        setOptimizationRuntime(snapshot.optimizationRuntime);
+        setJobs((previous) => (sameSnapshotList(previous, snapshot.jobs) ? previous : snapshot.jobs));
+        setBatches((previous) => (sameSnapshotList(previous, snapshot.batches ?? []) ? previous : snapshot.batches ?? []));
+        setJobProgress((previous) => (sameSnapshotList(previous, snapshot.progress) ? previous : snapshot.progress));
+        setSchedules((previous) => (sameSnapshotList(previous, snapshot.schedules) ? previous : snapshot.schedules));
+        setOptimizationRuntime((previous) => (sameSnapshotRecord(previous, snapshot.optimizationRuntime) ? previous : snapshot.optimizationRuntime));
         nextDelay = snapshot.hasLiveActivity ? 1_000 : 15_000;
       } catch {
         nextDelay = 15_000;
