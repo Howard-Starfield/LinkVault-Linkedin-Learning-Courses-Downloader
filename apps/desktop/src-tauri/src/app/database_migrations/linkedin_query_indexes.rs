@@ -1,4 +1,4 @@
-//! Schema-v8 query indexes for the download bootstrap read path.
+//! Query indexes for the download bootstrap read path, installed at schema v10.
 //!
 //! `jobs.status`, `artifacts.job_id` and `job_events.job_id` were never
 //! indexed, so the per-job lookups that `load_bootstrap_state` issues once per
@@ -24,20 +24,23 @@ const EXPECTED_INDEXES: [(&str, &str); 4] = [
     ("idx_job_events_recent", "job_events"),
 ];
 
+/// Single source of truth for the savepoint name. `SAVEPOINT`, `ROLLBACK TO`
+/// and `RELEASE` must all agree, so they are built from this one literal.
+const SAVEPOINT: &str = "linkedin_query_indexes_v10";
+
 pub fn install_and_verify(connection: &Connection) -> Result<()> {
-    connection.execute_batch("SAVEPOINT linkedin_query_indexes_v8")?;
+    connection.execute_batch(&format!("SAVEPOINT {SAVEPOINT}"))?;
     let result = (|| {
         connection.execute_batch(INSTALL)?;
         verify(connection)
     })();
     if result.is_ok() {
-        connection.execute_batch("RELEASE linkedin_query_indexes_v8")?;
+        connection.execute_batch(&format!("RELEASE {SAVEPOINT}"))?;
         return Ok(());
     }
-    let _ = connection.execute_batch(
-        "ROLLBACK TO linkedin_query_indexes_v8;
-         RELEASE linkedin_query_indexes_v8;",
-    );
+    let _ = connection.execute_batch(&format!(
+        "ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT};"
+    ));
     result
 }
 

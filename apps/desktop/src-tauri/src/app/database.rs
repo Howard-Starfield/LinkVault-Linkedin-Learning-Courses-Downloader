@@ -3920,7 +3920,7 @@ mod tests {
         let db_path = directory.path().join("linkvault.sqlite3");
 
         // A representative v7 installation: every current table with data, but
-        // without the query indexes v8 adds.
+        // without the query indexes the v10 upgrade adds.
         {
             let (legacy, _) = initialize_database(&db_path).unwrap();
             insert_representative_provider_rows(&legacy);
@@ -3994,7 +3994,7 @@ mod tests {
         // `initialize` rebuilds `artifacts` when the CHECK constraint predates
         // the `quiz` and `study_guide` types, and that rebuild drops the table
         // with its indexes. A v7 installation in exactly that state must still
-        // come out of the v8 upgrade with the index attached.
+        // come out of the v10 upgrade with the index attached.
         {
             let (legacy, _) = initialize_database(&db_path).unwrap();
             insert_representative_provider_rows(&legacy);

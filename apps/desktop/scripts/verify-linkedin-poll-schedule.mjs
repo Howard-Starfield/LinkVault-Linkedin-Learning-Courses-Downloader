@@ -174,6 +174,25 @@ assert.ok(
   "The poll effect must bail out when disposed so a stale timer cannot re-arm"
 );
 
+// Regression guard: when the queue is idle the poll returns null and arms no
+// timer, so the ONLY thing that can restart it is this effect re-running. The
+// deps must therefore include a signal derived from the job list. Relying on
+// refreshBootstrapState is not enough: it only re-enters the effect through
+// hasSavedToken, which does not change once it is already true, which would
+// leave a schedule created from an idle queue with no timer at all.
+assert.ok(
+  appSource.includes(
+    "queueNeedsSessionRefresh, hasPendingQueueWork]);"
+  ),
+  "The poll effect must depend on hasPendingQueueWork so an idle queue can re-arm when a job is queued"
+);
+assert.ok(
+  appSource.includes(
+    'job.status === "active" || job.status === "queued"'
+  ),
+  "hasPendingQueueWork must be derived from the job statuses the poll gate keys on"
+);
+
 // The newspaper poll is a separate loop and must keep its own cadence.
 assert.ok(
   appSource.includes("window.setInterval(() => void processNewspaperSchedules(), 15_000)"),

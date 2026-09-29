@@ -239,7 +239,6 @@ pub struct BootstrapState {
     saved_download_preferences: Option<SavedDownloadPreferences>,
     persisted_jobs: Vec<PersistedDownloadJob>,
     recent_events: Vec<PersistedJobEvent>,
-    download_history: Vec<DownloadHistoryEntry>,
     download_history_file_path: String,
 }
 
@@ -2374,8 +2373,6 @@ fn load_bootstrap_state(
         });
     }
 
-    let download_history = list_download_history(connection).map_err(|error| error.to_string())?;
-
     Ok(BootstrapState {
         default_resolution: VideoQuality::P1080,
         browser_sources: vec!["Chrome", "Edge", "Firefox"],
@@ -2384,7 +2381,6 @@ fn load_bootstrap_state(
         saved_download_preferences,
         persisted_jobs,
         recent_events,
-        download_history,
         download_history_file_path: download_history_file_path.to_string_lossy().to_string(),
     })
 }
@@ -4836,7 +4832,7 @@ mod tests {
                 job_events_rows,
                 artifact_rows,
                 course_cache_rows,
-                download_history_rows: bootstrap.download_history.len(),
+                download_history_rows: 0,
                 cold_ms,
                 warm_ms,
                 seed_ms,
@@ -4847,7 +4843,7 @@ mod tests {
             println!("--- N = {job_count} jobs ---");
             println!("  seeded: {job_events_rows} job_events rows, {artifact_rows} artifacts rows, {course_cache_rows} course_cache rows, {seed_ms:.1} ms");
             println!("  load_bootstrap_state cold = {cold_ms:.2} ms, warm = {warm_ms:.2} ms");
-            println!("  returned: persisted_jobs = {}, recent_events = {}, download_history = {}", bootstrap.persisted_jobs.len(), bootstrap.recent_events.len(), bootstrap.download_history.len());
+            println!("  returned: persisted_jobs = {}, recent_events = {}", bootstrap.persisted_jobs.len(), bootstrap.recent_events.len());
 
             if job_count == 500 {
                 println!();

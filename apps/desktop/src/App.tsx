@@ -600,6 +600,15 @@ export default function App() {
     };
   }, []);
 
+  // The poll gate. True whenever any job could still progress on its own, which
+  // is exactly when the queue poll must be alive. Flipping it re-arms the poll
+  // effect, so queueing a download from an idle app starts the poll and the last
+  // job finishing stops it again.
+  const hasPendingQueueWork = useMemo(
+    () => queuedJobs.some((job) => job.status === "active" || job.status === "queued"),
+    [queuedJobs]
+  );
+
   useEffect(() => {
     if (!hasSavedToken) return;
     let disposed = false;
@@ -607,8 +616,13 @@ export default function App() {
 
     // Self-scheduling rather than setInterval: `nextPollDelayMs` returns null
     // when no job is active or queued, so an idle install stops polling
-    // entirely. Every user action elsewhere calls refreshBootstrapState, which
-    // re-enters this effect and starts a fresh cycle.
+    // entirely.
+    //
+    // Re-arming is driven by `hasPendingQueueWork` in the dependency array, NOT
+    // by `refreshBootstrapState` being called. That function only re-enters this
+    // effect through `hasSavedToken`, which does not change once it is already
+    // true, so relying on it would leave a schedule created from a fully idle
+    // queue with no timer armed and the download would never start.
     async function tick() {
       if (disposed) return;
       const state = await refreshBootstrapState();
@@ -636,7 +650,7 @@ export default function App() {
       disposed = true;
       if (timerId !== undefined) window.clearTimeout(timerId);
     };
-  }, [hasSavedToken, delaySeconds, queueNeedsSessionRefresh]);
+  }, [hasSavedToken, delaySeconds, queueNeedsSessionRefresh, hasPendingQueueWork]);
 
   useEffect(() => {
     const storedRaw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
