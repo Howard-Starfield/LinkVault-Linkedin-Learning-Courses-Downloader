@@ -1,3 +1,4 @@
+use super::path_library::{PathLibrary, PathLibraryError};
 use super::placement::{CourseLayout, PlacementError};
 use crate::artifact_downloader::{
     download_artifacts_for_active_job, ArtifactDownloadError, ArtifactDownloadSource,
@@ -45,6 +46,8 @@ pub enum DownloadOrchestrationError {
     InvalidQuality(String),
     #[error(transparent)]
     Placement(#[from] PlacementError),
+    #[error(transparent)]
+    PathLibrary(#[from] PathLibraryError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,7 @@ struct QueueStopReason {
 }
 
 pub fn process_next_queued_job(
+    library: &PathLibrary,
     connection: &Connection,
     client: &mut impl CourseApiClient,
     timestamp: i64,
@@ -74,7 +78,7 @@ pub fn process_next_queued_job(
         Some("Started course metadata fetch."),
     )?;
 
-    match plan_active_job(connection, client, &queued_job, timestamp) {
+    match plan_active_job(library, connection, client, &queued_job, timestamp) {
         Ok(processed) => Ok(Some(processed)),
         Err(error) => {
             let stop_reason = queue_stop_reason_for_orchestration_error(&error);
@@ -98,6 +102,7 @@ pub fn process_next_queued_job(
 }
 
 pub fn process_next_queued_job_and_download_artifacts(
+    library: &PathLibrary,
     connection: &Connection,
     course_client: &mut impl CourseApiClient,
     artifact_client: &mut impl ArtifactHttpClient,
@@ -105,6 +110,7 @@ pub fn process_next_queued_job_and_download_artifacts(
     timestamp: i64,
 ) -> Result<Option<ArtifactDownloadSummary>, DownloadOrchestrationError> {
     process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+        library,
         connection,
         course_client,
         artifact_client,
@@ -115,6 +121,7 @@ pub fn process_next_queued_job_and_download_artifacts(
 }
 
 pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+    library: &PathLibrary,
     connection: &Connection,
     course_client: &mut impl CourseApiClient,
     artifact_client: &mut impl ArtifactHttpClient,
@@ -129,6 +136,7 @@ pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
         return Ok(None);
     };
     process_prepared_job_and_download_artifacts_with_quiz_assessments(
+        library,
         connection,
         course_client,
         artifact_client,
@@ -139,7 +147,9 @@ pub fn process_next_queued_job_and_download_artifacts_with_quiz_assessments(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit shared writer alongside provider clients and job inputs.
 pub fn process_prepared_job_and_download_artifacts_with_quiz_assessments(
+    library: &PathLibrary,
     connection: &Connection,
     course_client: &mut impl CourseApiClient,
     artifact_client: &mut impl ArtifactHttpClient,
@@ -173,6 +183,7 @@ pub fn process_prepared_job_and_download_artifacts_with_quiz_assessments(
     }
 
     let planned_job = match plan_active_job_downloads(
+        library,
         connection,
         course_client,
         &queued_job,
@@ -201,6 +212,7 @@ pub fn process_prepared_job_and_download_artifacts_with_quiz_assessments(
     };
 
     let summary = match download_artifacts_for_active_job(
+        library,
         connection,
         artifact_client,
         cancellation,
@@ -324,12 +336,14 @@ fn queue_stop_reason(
 }
 
 fn plan_active_job(
+    library: &PathLibrary,
     connection: &Connection,
     client: &mut impl CourseApiClient,
     job: &JobRecord,
     timestamp: i64,
 ) -> Result<ProcessedQueuedJob, DownloadOrchestrationError> {
-    let planned_job = plan_active_job_downloads(connection, client, job, timestamp, Vec::new())?;
+    let planned_job =
+        plan_active_job_downloads(library, connection, client, job, timestamp, Vec::new())?;
     let active_job = planned_job.active_job;
 
     Ok(ProcessedQueuedJob {
@@ -340,6 +354,7 @@ fn plan_active_job(
 }
 
 fn plan_active_job_downloads(
+    library: &PathLibrary,
     connection: &Connection,
     client: &mut impl CourseApiClient,
     job: &JobRecord,
@@ -400,7 +415,7 @@ fn plan_active_job_downloads(
         },
     )?;
 
-    let layout = CourseLayout::load(connection, &job.output_dir, &job.course_slug)?;
+    let layout = library.course_layout(job.output_dir.clone(), job.course_slug.clone())?;
     let downloads = build_initial_artifact_downloads(job, &course, &layout, timestamp);
     for download in &downloads {
         upsert_artifact(connection, &download.artifact)?;
@@ -1128,12 +1143,11 @@ impl<'a> From<&'a Course> for CachedCoursePayload<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::path_library::PathLibrary;
     use super::super::placement::CourseHome;
     use super::*;
     use crate::artifact_downloader::{ArtifactHttpResponse, NeverCancelled};
     use crate::cache::{
-        get_course_cache_entry, initialize, insert_job, list_artifacts_for_job, list_job_events,
+        get_course_cache_entry, insert_job, list_artifacts_for_job, list_job_events,
         list_jobs_by_status,
     };
     use crate::course::{Chapter, CourseFetchError, CourseVideo, ExerciseFile};
@@ -1142,15 +1156,21 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    fn initialized_connection() -> Connection {
-        let connection = Connection::open_in_memory().unwrap();
-        initialize(&connection).unwrap();
-        connection
+    fn initialized_connection() -> (tempfile::TempDir, Connection, PathLibrary) {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let (connection, _) = crate::app::database::initialize_database(&db_path).unwrap();
+        let writer = crate::app::database_writer::DatabaseWriter::start(
+            db_path,
+            crate::app::database_diagnostics::DatabaseDiagnostics::default(),
+        )
+        .unwrap();
+        (directory, connection, PathLibrary::new(writer))
     }
 
     #[test]
     fn process_next_queued_job_fetches_course_caches_metadata_and_plans_artifacts() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
         let mut client = FakeCourseApiClient::new(vec![
             ("fields=chapters,title,exerciseFiles", metadata_fixture()),
@@ -1161,7 +1181,7 @@ mod tests {
             ("resolution=_1080", selected_video_fixture()),
         ]);
 
-        let processed = process_next_queued_job(&connection, &mut client, 200)
+        let processed = process_next_queued_job(&library, &connection, &mut client, 200)
             .unwrap()
             .unwrap();
         let active_jobs = list_jobs_by_status(&connection, "active").unwrap();
@@ -1207,14 +1227,14 @@ mod tests {
 
     #[test]
     fn process_next_queued_job_marks_job_failed_when_metadata_fetch_fails() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
         let mut client = FakeCourseApiClient::new(vec![(
             "fields=chapters,title,exerciseFiles",
             r#"{"message":"CSRF check failed"}"#,
         )]);
 
-        let error = process_next_queued_job(&connection, &mut client, 200).unwrap_err();
+        let error = process_next_queued_job(&library, &connection, &mut client, 200).unwrap_err();
         let failed_jobs = list_jobs_by_status(&connection, "failed").unwrap();
         let events = list_job_events(&connection, "job-1").unwrap();
 
@@ -1243,17 +1263,17 @@ mod tests {
 
     #[test]
     fn process_next_queued_job_returns_none_when_no_queued_job_exists() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let mut client = FakeCourseApiClient::new(vec![]);
 
-        let processed = process_next_queued_job(&connection, &mut client, 200).unwrap();
+        let processed = process_next_queued_job(&library, &connection, &mut client, 200).unwrap();
 
         assert!(processed.is_none());
     }
 
     #[test]
     fn process_next_queued_job_and_download_artifacts_completes_files_and_job() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         let mut job = sample_job("job-1", "queued", 100);
         job.output_dir = output.path().to_string_lossy().to_string();
@@ -1277,6 +1297,7 @@ mod tests {
         ]);
 
         let summary = process_next_queued_job_and_download_artifacts(
+            &library,
             &connection,
             &mut course_client,
             &mut artifact_client,
@@ -1339,7 +1360,7 @@ mod tests {
 
     #[test]
     fn artifact_guardrail_stops_queue_on_rate_limit_and_leaves_remaining_jobs_queued() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         let mut job = sample_job("job-1", "queued", 100);
         job.output_dir = output.path().to_string_lossy().to_string();
@@ -1357,6 +1378,7 @@ mod tests {
             FakeArtifactClient::new(vec![("https://cdn.example.test/welcome.mp4", 429, b"")]);
 
         let error = process_next_queued_job_and_download_artifacts(
+            &library,
             &connection,
             &mut course_client,
             &mut artifact_client,
@@ -1387,7 +1409,7 @@ mod tests {
 
     #[test]
     fn browser_quiz_assessments_are_merged_and_written_as_quiz_artifacts() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         let mut job = sample_job("job-1", "queued", 100);
         job.output_dir = output.path().to_string_lossy().to_string();
@@ -1411,6 +1433,7 @@ mod tests {
         ]);
 
         let summary = process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+            &library,
             &connection,
             &mut course_client,
             &mut artifact_client,
@@ -1656,13 +1679,14 @@ mod tests {
 
     #[test]
     fn process_next_queued_job_and_download_artifacts_cancels_before_metadata_fetch() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
         let mut course_client = FakeCourseApiClient::new(vec![]);
         let mut artifact_client = FakeArtifactClient::new(vec![]);
         let cancellation = AlwaysCancelled;
 
         let summary = process_next_queued_job_and_download_artifacts(
+            &library,
             &connection,
             &mut course_client,
             &mut artifact_client,
@@ -1697,7 +1721,7 @@ mod tests {
 
     #[test]
     fn legacy_job_without_placement_plans_flat_course_title() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         insert_job(&connection, &sample_job("job-1", "queued", 100)).unwrap();
         let mut client = FakeCourseApiClient::new(vec![
             ("fields=chapters,title,exerciseFiles", metadata_fixture()),
@@ -1708,7 +1732,7 @@ mod tests {
             ("resolution=_1080", selected_video_fixture()),
         ]);
 
-        process_next_queued_job(&connection, &mut client, 200)
+        process_next_queued_job(&library, &connection, &mut client, 200)
             .unwrap()
             .unwrap();
         let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();
@@ -1735,7 +1759,7 @@ mod tests {
 
     #[test]
     fn planned_artifacts_include_path_prefix_segment() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let job = sample_job("job-1", "queued", 100);
         insert_job(&connection, &job).unwrap();
         connection
@@ -1756,7 +1780,7 @@ mod tests {
             ("resolution=_1080", selected_video_fixture()),
         ]);
 
-        process_next_queued_job(&connection, &mut client, 200)
+        process_next_queued_job(&library, &connection, &mut client, 200)
             .unwrap()
             .unwrap();
         let artifacts = list_artifacts_for_job(&connection, "job-1").unwrap();

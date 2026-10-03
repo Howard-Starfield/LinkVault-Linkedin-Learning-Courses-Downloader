@@ -21,7 +21,7 @@ the user's option.
 
 The Newspaper Clippings editor adapter includes `@tiptap/core`,
 `@tiptap/react`, `@tiptap/starter-kit`, `@tiptap/markdown`,
-`@tiptap/suggestion`, and `@tiptap/extension-list`, each at version 3.29.2.
+`@tiptap/suggestion`, and `@tiptap/extension-list`, each at version 3.31.4.
 Their source is available from
 [ueberdosis/tiptap](https://github.com/ueberdosis/tiptap). These packages are
 licensed under the MIT License:

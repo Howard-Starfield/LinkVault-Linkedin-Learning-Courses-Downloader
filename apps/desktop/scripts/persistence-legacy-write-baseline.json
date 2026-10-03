@@ -1,14 +1,15 @@
 {
-  "version": 19,
+  "version": 22,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover. Coursera, YouTube, LinkedIn, and newspaper start/process now write through the workflow kernel.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 0,
     "src-tauri/src/providers/coursera/job.rs": 18,
     "src-tauri/src/providers/linkedin/folder_import.rs": 5,
-    "src-tauri/src/providers/linkedin/path_library.rs": 11,
+    "src-tauri/src/providers/linkedin/path_library.rs": 22,
+    "src-tauri/src/providers/linkedin/placement.rs": 2,
     "src-tauri/src/providers/linkedin/media_protocol.rs": 0,
     "src-tauri/src/providers/newspaper/archive_service.rs": 6,
-    "src-tauri/src/providers/newspaper/batch_service.rs": 11,
+    "src-tauri/src/providers/newspaper/batch_service.rs": 16,
     "src-tauri/src/providers/newspaper/catalog_service.rs": 2,
     "src-tauri/src/providers/newspaper/clipping_recovery.rs": 3,
     "src-tauri/src/providers/newspaper/clipping_draft_repository.rs": 5,
@@ -16,15 +17,15 @@
     "src-tauri/src/providers/newspaper/clipping_repository.rs": 25,
     "src-tauri/src/providers/newspaper/clipping_roots.rs": 2,
     "src-tauri/src/providers/newspaper/clipping_service.rs": 6,
-    "src-tauri/src/providers/newspaper/executor.rs": 1,
+    "src-tauri/src/providers/newspaper/executor.rs": 2,
     "src-tauri/src/providers/newspaper/job_service.rs": 10,
     "src-tauri/src/providers/newspaper/media_protocol.rs": 0,
     "src-tauri/src/providers/newspaper/optimization_service.rs": 3,
     "src-tauri/src/providers/newspaper/optimization_tasks.rs": 19,
     "src-tauri/src/providers/newspaper/page_metadata.rs": 2,
-    "src-tauri/src/providers/newspaper/queue_service.rs": 17,
-    "src-tauri/src/providers/newspaper/reader_service.rs": 3,
-    "src-tauri/src/providers/newspaper/schedule_service.rs": 4,
+    "src-tauri/src/providers/newspaper/queue_service.rs": 21,
+    "src-tauri/src/providers/newspaper/reader_service.rs": 4,
+    "src-tauri/src/providers/newspaper/schedule_service.rs": 15,
     "src-tauri/src/providers/newspaper/storage.rs": 52,
     "src-tauri/src/providers/newspaper/thumbnails.rs": 1
   },
@@ -67,7 +68,7 @@
       "clear_newspaper_provider_data": 1
     },
     "src-tauri/src/providers/newspaper/schedule_service.rs": {
-      "delete_newspaper_schedule_and_cancel_owned_work": 1
+      "delete_newspaper_schedule_and_cancel_owned_work": 0
     }
   },
   "versionNotes": {
@@ -89,6 +90,9 @@
     "16": "Newspaper batch create, schedule materialize, process, and reset now persist through workflow_runs. Production create() does not insert newspaper_jobs; the executor materializes a newspaper_jobs row at execute time for page/library parent keys. create_with_connection remains the test fixture path. Legacy newspaper_jobs remain a read/progress projection that wins on merge.",
     "17": "YouTube V1 now submits durable youtube_download runs and publishes verified media plus raw VTT and normalized transcript JSON. The legacy youtube_jobs write surface is gone; helper launches go through app::managed_process.",
     "18": "LinkedIn path-history capture writes membership and standalone rows through PathLibrary on DatabaseWriter. Direct SQL primitives stay inside writer closures. Also records PR 50 folder_import writer closures so the stacked branch has a complete LinkedIn baseline; no fourth scheduler was added.",
-    "19": "PathLibrary catalog/progress/file-index writes stay on DatabaseWriter. linkedin-media protocol is read-only and does not add SQL write primitives or a fourth scheduler."
+    "19": "PathLibrary catalog/progress/file-index writes stay on DatabaseWriter. linkedin-media protocol is read-only and does not add SQL write primitives or a fourth scheduler.",
+    "20": "Reviewed v0.2.27 placement and membership capture plus writer routing repair. path_library.rs: 22 lexical primitives = 19 existing scanned sites (including embedded cfg(test) helpers), two new atomic transaction boundaries, and one DatabaseWriter course_layout submission. placement.rs: two INSERT sites, reached through writer-owned expansion/import/fallback operations only; CourseLayout::load is read-only. Download and legacy command entrypoints require PathLibrary for fallback placement and completed-video index writes. Count matching is a structural guard, not proof of writer ownership; see docs/work-orders/linkedin-persistence-write-review-20261003.md for traced ownership and regressions.",
+    "21": "Newspaper reading-progress save now dispatches through the existing shared DatabaseWriter. reader_service.rs retains its existing transaction and two INSERT primitives; one new writer.execute submission raises the lexical count from three to four without adding SQL or a writer owner. The completed-page validation and atomic read-mark/progress transaction execute together on the writer thread.",
+    "22": "Reviewed atomic seven-day catch-up and native supervisor integration: batch creation, schedule mutations/reconciliation, executor materialization and guarded job activation now dispatch through DatabaseWriter. Lexical SQL primitives include writer submissions and transaction starts, not additional runtime writer connections. Batch planning commits workflow runs/steps/events with its batch and schedule checkpoint. Schedule deletion now cancels native and legacy owned work in its writer transaction instead of calling the legacy-only cancellation helper. Existing page persistence, archive and compatibility job mutations remain at their prior migration boundary. See docs/work-orders/newspaper-native-scheduling-20261003.md for ownership and regression evidence."
   }
 }

@@ -246,14 +246,88 @@ export function NewspaperView({
   }
 
   useEffect(() => {
-    if (mode === "library") return;
+    if (mode === "library" || !isTauriRuntime()) return;
     let disposed = false;
     let activityTimer: number | undefined;
-    let unlistenProgress: (() => void) | undefined;
+    let unlisteners: (() => void)[] = [];
+    let listenersReady = false;
+    let initialStateLoaded = false;
+    let activityInFlight = false;
+    let activityInvalidated = false;
+    let retryPending = false;
+    const isVisible = () => document.visibilityState !== "hidden";
+    const clearActivityTimer = () => {
+      if (activityTimer !== undefined) window.clearTimeout(activityTimer);
+      activityTimer = undefined;
+    };
+    const scheduleActivity = (delay: number | null) => {
+      if (disposed) return;
+      if (delay === null || !isVisible()) {
+        clearActivityTimer();
+        return;
+      }
+      if (activityInFlight) {
+        activityInvalidated = true;
+        return;
+      }
+      // Preserve an already-armed retry deadline during event bursts.
+      if (retryPending && activityTimer !== undefined) return;
+      clearActivityTimer();
+      activityTimer = window.setTimeout(() => void pollActivity(), retryPending ? 15_000 : delay);
+    };
+    const invalidateActivity = () => {
+      if (disposed) return;
+      activityInvalidated = true;
+      scheduleActivity(100);
+    };
+    const subscribeActivity = async () => {
+      const subscriptions = await Promise.allSettled([
+        "newspaper://activity-invalidated",
+        "newspaper://optimization-progress",
+        "newspaper://library-invalidated"
+      ].map((event) => listen(event, invalidateActivity).then((unlisten) => {
+        if (disposed) unlisten();
+        else unlisteners.push(unlisten);
+      })));
+      if (disposed) return;
+      if (subscriptions.some((subscription) => subscription.status === "rejected")) {
+        unlisteners.forEach((unlisten) => unlisten());
+        unlisteners = [];
+        throw new Error("Newspaper activity listeners unavailable");
+      }
+      listenersReady = true;
+    };
     const pollActivity = async () => {
-      if (disposed || !isTauriRuntime()) return;
-      let nextDelay = 15_000;
+      clearActivityTimer();
+      if (disposed || !isVisible()) return;
+      if (activityInFlight) {
+        activityInvalidated = true;
+        return;
+      }
+      activityInFlight = true;
+      activityInvalidated = false;
+      let nextDelay: number | null = null;
       try {
+        // Install every invalidation listener before the first state read.
+        if (!listenersReady) await subscribeActivity();
+        if (disposed) return;
+        if (!initialStateLoaded) {
+          const [catalog, bootstrap] = await Promise.allSettled([
+            invoke<NewspaperEdition[]>("refresh_newspaper_catalog"),
+            invoke<Bootstrap>("bootstrap_newspaper_state")
+          ]);
+          if (disposed) return;
+          if (bootstrap.status === "fulfilled") {
+            setCatalog(bootstrap.value.catalog.length ? bootstrap.value.catalog : FALLBACK_CATALOG);
+            setJobs(bootstrap.value.jobs);
+            setBatches(bootstrap.value.batches ?? []);
+            setSchedules(bootstrap.value.schedules);
+          } else {
+            toast.error("Could not load newspaper state", { description: String(bootstrap.reason) });
+          }
+          if (catalog.status === "fulfilled" && catalog.value.length) setCatalog(catalog.value);
+          initialStateLoaded = true;
+        }
         const snapshot = await invoke<ActivitySnapshot>("get_newspaper_activity_snapshot");
         if (disposed) return;
         setJobs((previous) => (sameSnapshotList(previous, snapshot.jobs) ? previous : snapshot.jobs));
@@ -261,34 +335,33 @@ export function NewspaperView({
         setJobProgress((previous) => (sameSnapshotList(previous, snapshot.progress) ? previous : snapshot.progress));
         setSchedules((previous) => (sameSnapshotList(previous, snapshot.schedules) ? previous : snapshot.schedules));
         setOptimizationRuntime((previous) => (sameSnapshotRecord(previous, snapshot.optimizationRuntime) ? previous : snapshot.optimizationRuntime));
-        nextDelay = snapshot.hasLiveActivity ? 1_000 : 15_000;
+        retryPending = false;
+        nextDelay = snapshot.hasLiveActivity ? 1_000 : null;
       } catch {
+        retryPending = true;
         nextDelay = 15_000;
+      } finally {
+        activityInFlight = false;
+        // Only visible live work polls. Idle state wakes from invalidations,
+        // view entry, focus, or visibility recovery; failed reads retry boundedly.
+        const delay = activityInvalidated && !retryPending ? 100 : nextDelay;
+        activityInvalidated = false;
+        scheduleActivity(delay);
       }
-      if (!disposed) activityTimer = window.setTimeout(() => void pollActivity(), nextDelay);
     };
-    if (isTauriRuntime()) {
-      void listen("newspaper://optimization-progress", () => {
-        if (disposed) return;
-        if (activityTimer !== undefined) window.clearTimeout(activityTimer);
-        activityTimer = window.setTimeout(() => void pollActivity(), 100);
-      }).then((unlisten) => {
-        if (disposed) unlisten();
-        else unlistenProgress = unlisten;
-      });
-      void invoke<NewspaperEdition[]>("refresh_newspaper_catalog")
-        .then((items) => items.length && setCatalog(items))
-        .catch(() => undefined)
-        .finally(() => void refresh().finally(() => {
-          if (!disposed) activityTimer = window.setTimeout(() => void pollActivity(), 1_000);
-        }));
-    } else {
-      void refresh();
-    }
+    const onVisibilityChange = () => {
+      if (isVisible()) invalidateActivity();
+      else clearActivityTimer();
+    };
+    window.addEventListener("focus", invalidateActivity);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    scheduleActivity(0);
     return () => {
       disposed = true;
-      unlistenProgress?.();
-      if (activityTimer !== undefined) window.clearTimeout(activityTimer);
+      unlisteners.forEach((unlisten) => unlisten());
+      window.removeEventListener("focus", invalidateActivity);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearActivityTimer();
     };
   }, [mode]);
 

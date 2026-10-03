@@ -1,3 +1,4 @@
+use super::path_library::{CourseSlug, PathLibrary, PathLibraryError, VideoSlug};
 use crate::cache::{
     append_job_event, get_job, list_artifacts_for_job, update_artifact_status, upsert_artifact,
     ArtifactRecord, CacheError, NewJobEvent,
@@ -134,6 +135,8 @@ pub enum ArtifactDownloadError {
     #[error(transparent)]
     Cache(#[from] CacheError),
     #[error(transparent)]
+    PathLibrary(#[from] PathLibraryError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("artifact download network request failed: {0}")]
     Network(String),
@@ -155,6 +158,7 @@ enum ArtifactWriteOutcome {
 }
 
 pub fn download_artifacts_for_active_job(
+    library: &PathLibrary,
     connection: &Connection,
     client: &mut impl ArtifactHttpClient,
     cancellation: &impl CancellationFlag,
@@ -164,6 +168,7 @@ pub fn download_artifacts_for_active_job(
 ) -> Result<ArtifactDownloadSummary, ArtifactDownloadError> {
     let mut pacing = VideoPacingPolicy::live(video_pacing_seed(job_id, timestamp));
     download_artifacts_for_active_job_with_pacing(
+        library,
         connection,
         client,
         cancellation,
@@ -177,6 +182,7 @@ pub fn download_artifacts_for_active_job(
 
 #[allow(clippy::too_many_arguments)]
 fn download_artifacts_for_active_job_with_pacing(
+    library: &PathLibrary,
     connection: &Connection,
     client: &mut impl ArtifactHttpClient,
     cancellation: &impl CancellationFlag,
@@ -228,7 +234,7 @@ fn download_artifacts_for_active_job_with_pacing(
                     timestamp,
                 )?;
                 summary.completed += 1;
-                record_completed_video_file(connection, &job, download, timestamp)?;
+                record_completed_video_file(library, &job, download, timestamp)?;
                 continue;
             }
 
@@ -404,7 +410,7 @@ fn download_artifacts_for_active_job_with_pacing(
                     timestamp,
                 )?;
                 summary.completed += 1;
-                record_completed_video_file(connection, &job, download, timestamp)?;
+                record_completed_video_file(library, &job, download, timestamp)?;
             }
             Err(error) if is_exercise_artifact(&download.artifact) => {
                 let failure_reason = safe_artifact_error_reason(&error);
@@ -575,10 +581,10 @@ fn is_video_artifact(artifact: &ArtifactRecord) -> bool {
 }
 
 fn record_completed_video_file(
-    connection: &Connection,
+    library: &PathLibrary,
     job: &crate::cache::JobRecord,
     download: &PlannedArtifactDownload,
-    timestamp: i64,
+    _timestamp: i64,
 ) -> Result<(), ArtifactDownloadError> {
     let Some(video_slug) = download.video_slug.as_deref().map(str::trim) else {
         return Ok(());
@@ -586,15 +592,12 @@ fn record_completed_video_file(
     if video_slug.is_empty() {
         return Ok(());
     }
-    crate::providers::linkedin::path_library::record_video_file_on_connection(
-        connection,
-        &job.course_slug,
-        video_slug,
-        &download.artifact.id,
-        &job.id,
-        timestamp,
-    )
-    .map_err(CacheError::from)?;
+    library.record_video_file(
+        CourseSlug::parse(&job.course_slug)?,
+        VideoSlug::parse(video_slug)?,
+        download.artifact.id.clone(),
+        job.id.clone(),
+    )?;
     Ok(())
 }
 
@@ -893,6 +896,7 @@ fn artifact_error_summary(error: &ArtifactDownloadError) -> serde_json::Value {
             serde_json::json!({ "kind": "io", "errorKind": error.kind().to_string() })
         }
         ArtifactDownloadError::Cache(_) => serde_json::json!({ "kind": "cache" }),
+        ArtifactDownloadError::PathLibrary(_) => serde_json::json!({ "kind": "path_library" }),
         ArtifactDownloadError::JobNotActive { .. } => {
             serde_json::json!({ "kind": "job_not_active" })
         }
@@ -976,6 +980,7 @@ fn safe_artifact_error_reason(error: &ArtifactDownloadError) -> String {
         ArtifactDownloadError::Network(_) => "network request failed".to_string(),
         ArtifactDownloadError::Io(error) => format!("file write failed: {}", error.kind()),
         ArtifactDownloadError::Cache(_) => "cache update failed".to_string(),
+        ArtifactDownloadError::PathLibrary(_) => "video file index update failed".to_string(),
         ArtifactDownloadError::JobNotActive { .. } => "job was not active".to_string(),
     }
 }
@@ -1013,9 +1018,7 @@ fn format_extraction_failure_message(result: &ExerciseArchiveExtractionResult) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{
-        get_job, initialize, insert_job, list_artifacts_for_job, list_job_events, JobRecord,
-    };
+    use crate::cache::{get_job, insert_job, list_artifacts_for_job, list_job_events, JobRecord};
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::VecDeque;
@@ -1024,13 +1027,48 @@ mod tests {
     use tempfile::tempdir;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
-    fn initialized_connection() -> Connection {
-        let connection = Connection::open_in_memory().unwrap();
-        initialize(&connection).unwrap();
-        connection
+    fn initialized_connection() -> (tempfile::TempDir, Connection, PathLibrary) {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let (connection, _) = crate::app::database::initialize_database(&db_path).unwrap();
+        let writer = crate::app::database_writer::DatabaseWriter::start(
+            db_path,
+            crate::app::database_diagnostics::DatabaseDiagnostics::default(),
+        )
+        .unwrap();
+        (directory, connection, PathLibrary::new(writer))
     }
 
     struct StreamingOnlyClient;
+
+    #[test]
+    fn persistence_gate_linkedin_completed_video_index_uses_shared_writer() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        let (connection, _) = crate::app::database::initialize_database(&db_path).unwrap();
+        let writer = crate::app::database_writer::DatabaseWriter::start(
+            db_path,
+            crate::app::database_diagnostics::DatabaseDiagnostics::default(),
+        )
+        .unwrap();
+        let library = PathLibrary::new(writer.clone());
+        connection.pragma_update(None, "query_only", true).unwrap();
+        let job = sample_job("job-1", "active", directory.path());
+        let mut download = planned_url(
+            "artifact-video",
+            "job-1",
+            "video",
+            &directory.path().join("welcome.mp4"),
+            "https://cdn/video.mp4",
+        );
+        download.video_slug = Some("welcome".to_string());
+        record_completed_video_file(&library, &job, &download, 200).unwrap();
+        let artifact: String = connection.query_row(
+            "SELECT artifact_id FROM linkedin_video_files WHERE course_slug = 'sample-course' AND video_slug = 'welcome'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(artifact, "artifact-video");
+        assert_eq!(writer.stats().completed, 1);
+    }
 
     impl ArtifactHttpClient for StreamingOnlyClient {
         fn get_bytes(&mut self, url: &str) -> Result<ArtifactHttpResponse, ArtifactDownloadError> {
@@ -1084,7 +1122,7 @@ mod tests {
 
     #[test]
     fn downloads_url_and_text_artifacts_marks_job_completed() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let video_path = output.path().join("Sample Course").join("welcome.mp4");
@@ -1108,6 +1146,7 @@ mod tests {
         let mut client = FakeArtifactClient::new(vec![("https://cdn/video.mp4", 200, b"video")]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1157,7 +1196,7 @@ mod tests {
 
     #[test]
     fn video_requests_wait_once_between_actual_video_downloads() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let first_video = output.path().join("Sample Course").join("first.mp4");
@@ -1198,6 +1237,7 @@ mod tests {
         };
 
         let summary = download_artifacts_for_active_job_with_pacing(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1270,7 +1310,7 @@ mod tests {
 
     #[test]
     fn cancellation_during_video_pacing_stops_before_next_request() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let downloads = vec![
@@ -1294,6 +1334,7 @@ mod tests {
         let mut waiter = |_seconds: u32, _cancellation: &dyn CancellationFlag| false;
 
         let summary = download_artifacts_for_active_job_with_pacing(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1316,7 +1357,7 @@ mod tests {
 
     #[test]
     fn existing_downloaded_files_are_reused_on_retry_without_network_request() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let existing_video_path = output.path().join("Sample Course").join("welcome.mp4");
@@ -1342,6 +1383,7 @@ mod tests {
         let mut client = FakeArtifactClient::new(vec![("https://cdn/missing.mp4", 200, b"new")]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1377,7 +1419,7 @@ mod tests {
 
     #[test]
     fn exercise_404_marks_artifact_failed_and_continues_remaining_downloads() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1404,6 +1446,7 @@ mod tests {
         ]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1453,7 +1496,7 @@ mod tests {
 
     #[test]
     fn exercise_non_404_download_failure_marks_artifact_failed_and_continues() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1480,6 +1523,7 @@ mod tests {
         ]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1540,7 +1584,7 @@ mod tests {
 
     #[test]
     fn exercise_url_list_tries_alternate_after_http_failure() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1570,6 +1614,7 @@ mod tests {
         ]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1606,7 +1651,7 @@ mod tests {
 
     #[test]
     fn exercise_url_list_tries_alternate_after_network_failure() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1631,6 +1676,7 @@ mod tests {
         };
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1656,7 +1702,7 @@ mod tests {
 
     #[test]
     fn artifact_download_accepts_successful_partial_content_response() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let video_path = output.path().join("Sample Course").join("welcome.mp4");
@@ -1674,6 +1720,7 @@ mod tests {
         )]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1696,7 +1743,7 @@ mod tests {
 
     #[test]
     fn exercise_url_list_failure_records_sanitized_attempt_statuses() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1726,6 +1773,7 @@ mod tests {
         ]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1762,7 +1810,7 @@ mod tests {
 
     #[test]
     fn exercise_zip_download_extracts_deletes_archive_and_records_events() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1779,6 +1827,7 @@ mod tests {
             FakeArtifactClient::new_owned(vec![("https://cdn/exercise.zip", 200, zip_bytes)]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1822,7 +1871,7 @@ mod tests {
 
     #[test]
     fn unsafe_exercise_zip_fails_artifact_keeps_zip_and_continues_remaining_downloads() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let root_name = output.path().file_name().unwrap().to_string_lossy();
@@ -1853,6 +1902,7 @@ mod tests {
         ]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &NeverCancelled,
@@ -1902,7 +1952,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_artifact_response_cancels_before_writing_file() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let first_path = output.path().join("Sample Course").join("first.mp4");
@@ -1930,6 +1980,7 @@ mod tests {
         );
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &cancellation,
@@ -1960,7 +2011,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_zip_download_keeps_zip_and_skips_extraction() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -1982,6 +2033,7 @@ mod tests {
             FakeArtifactClient::new_owned(vec![("https://cdn/exercise.zip", 200, zip_bytes)]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &cancellation,
@@ -2011,7 +2063,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_zip_extraction_keeps_artifact_completed_and_job_cancelled() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let exercise_path = output.path().join("Sample Course").join("exercise.zip");
@@ -2033,6 +2085,7 @@ mod tests {
             FakeArtifactClient::new_owned(vec![("https://cdn/exercise.zip", 200, zip_bytes)]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &cancellation,
@@ -2076,7 +2129,7 @@ mod tests {
 
     #[test]
     fn cancellation_marks_job_and_remaining_artifacts_cancelled() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let first_path = output.path().join("Sample Course").join("first.mp4");
@@ -2101,6 +2154,7 @@ mod tests {
         let cancellation = CancelAfterPolls::new(2);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &cancellation,
@@ -2136,7 +2190,7 @@ mod tests {
 
     #[test]
     fn active_download_waits_for_resume_and_finishes_with_atomic_file() {
-        let connection = initialized_connection();
+        let (_directory, connection, library) = initialized_connection();
         let output = tempdir().unwrap();
         insert_job(&connection, &sample_job("job-1", "active", output.path())).unwrap();
         let video_path = output.path().join("Sample Course").join("welcome.mp4");
@@ -2151,6 +2205,7 @@ mod tests {
         let mut client = FakeArtifactClient::new(vec![("https://cdn/video.mp4", 200, b"video")]);
 
         let summary = download_artifacts_for_active_job(
+            &library,
             &connection,
             &mut client,
             &pause,

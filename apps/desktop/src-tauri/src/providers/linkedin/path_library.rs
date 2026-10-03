@@ -261,14 +261,17 @@ impl PathLibrary {
         let now = unix_timestamp();
         self.writer
             .execute(write_context("ingest_expansion"), move |connection| {
+                let transaction = connection.transaction()?;
                 ingest_expansion_on_connection(
-                    connection,
+                    &transaction,
                     &output_root,
                     &paths,
                     &standalone_slugs,
                     now,
                 )
-                .map_err(write_error_from_path_library)
+                .map_err(write_error_from_path_library)?;
+                transaction.commit()?;
+                Ok(())
             })?;
         Ok(())
     }
@@ -281,8 +284,11 @@ impl PathLibrary {
         let now = unix_timestamp();
         self.writer
             .execute(write_context("add_course_to_path"), move |connection| {
-                add_course_to_path_on_connection(connection, &course, &path, now)
-                    .map_err(write_error_from_path_library)
+                let transaction = connection.transaction()?;
+                add_course_to_path_on_connection(&transaction, &course, &path, now)
+                    .map_err(write_error_from_path_library)?;
+                transaction.commit()?;
+                Ok(())
             })?;
         Ok(())
     }
@@ -334,6 +340,20 @@ impl PathLibrary {
                 Ok(())
             })?;
         Ok(())
+    }
+
+    /// Freeze a missing legacy placement through the shared writer before planning files.
+    pub fn course_layout(
+        &self,
+        output_root: String,
+        course_slug: String,
+    ) -> Result<CourseLayout, PathLibraryError> {
+        Ok(self
+            .writer
+            .execute(write_context("course_layout"), move |connection| {
+                CourseLayout::ensure_on_writer(connection, &output_root, &course_slug)
+                    .map_err(|error| write_error_from_path_library(error.into()))
+            })?)
     }
 
     pub fn list_catalog(&self, conn: &Connection) -> Result<Vec<CatalogEntry>, PathLibraryError> {
@@ -666,7 +686,7 @@ fn resolve_course_folder_path(
     Ok(None)
 }
 
-pub(crate) fn record_video_file_on_connection(
+fn record_video_file_on_connection(
     connection: &Connection,
     course_slug: &str,
     video_slug: &str,
@@ -1185,6 +1205,98 @@ mod tests {
 
     fn open_reader(db_path: &std::path::Path) -> Connection {
         crate::cache::open_runtime(db_path).unwrap()
+    }
+
+    #[test]
+    fn persistence_gate_linkedin_expansion_rolls_back_partial_capture() {
+        let (_directory, library, db_path) = harness();
+        let connection = open_reader(&db_path);
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_standalone_insert BEFORE INSERT ON linkedin_standalone_courses
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let error = library.ingest_expansion(
+            OutputRoot::parse("C:/downloads").unwrap(),
+            vec![path_capture("good-path", "Good Path", &["good-course"])],
+            vec!["standalone-course".to_string()],
+        );
+        assert!(error.is_err());
+        for table in [
+            "linkedin_learning_paths",
+            "linkedin_path_membership",
+            "linkedin_course_placement",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "failed capture leaked rows in {table}");
+        }
+    }
+
+    #[test]
+    fn persistence_gate_linkedin_membership_failure_preserves_standalone() {
+        let (_directory, library, db_path) = harness();
+        library
+            .ingest_expansion(
+                OutputRoot::parse("C:/downloads").unwrap(),
+                vec![path_capture("target-path", "Target Path", &[])],
+                vec!["standalone-course".to_string()],
+            )
+            .unwrap();
+        let connection = open_reader(&db_path);
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_path_update BEFORE UPDATE ON linkedin_learning_paths
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        assert!(library
+            .add_course_to_path(
+                CourseSlug::parse("standalone-course").unwrap(),
+                PathSlug::parse("target-path").unwrap(),
+            )
+            .is_err());
+        let membership_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM linkedin_path_membership WHERE course_slug = 'standalone-course'", [], |row| row.get(0),
+        ).unwrap();
+        let standalone_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM linkedin_standalone_courses WHERE course_slug = 'standalone-course'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(membership_count, 0);
+        assert_eq!(standalone_count, 1);
+    }
+
+    #[test]
+    fn persistence_gate_linkedin_runtime_layout_read_does_not_write() {
+        let (_directory, library, db_path) = harness();
+        let connection = open_reader(&db_path);
+        connection.pragma_update(None, "query_only", true).unwrap();
+        let layout = CourseLayout::load(&connection, "C:/downloads", "legacy-course").unwrap();
+        assert!(matches!(layout.home(), CourseHome::Standalone));
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM linkedin_course_placement",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        library
+            .course_layout("C:/downloads".to_string(), "legacy-course".to_string())
+            .unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM linkedin_course_placement",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(library.writer.stats().completed, 1);
     }
 
     #[test]

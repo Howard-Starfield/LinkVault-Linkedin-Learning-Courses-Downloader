@@ -17,6 +17,52 @@ pub struct WorkflowRepositoryService {
 }
 
 impl WorkflowRepositoryService {
+    pub fn release_unstarted_claim(
+        &self,
+        run_id: String,
+        step_id: String,
+        claimed_attempt: i64,
+        now: i64,
+    ) -> Result<(), WorkflowError> {
+        let repository = self.repository;
+        self.writer
+            .execute(
+                DatabaseWriteContext {
+                    operation: "workflow_release_unstarted_claim",
+                    provider: DatabaseProvider::Workflow,
+                    workflow_id: Some(run_id.clone()),
+                },
+                move |connection| {
+                    repository
+                        .release_unstarted_claim(
+                            connection,
+                            &run_id,
+                            &step_id,
+                            claimed_attempt,
+                            now,
+                        )
+                        .map_err(map_domain)
+                },
+            )
+            .map_err(map_writer)
+    }
+    pub fn set_run_paused(&self, id: String, paused: bool, now: i64) -> Result<(), WorkflowError> {
+        let repository = self.repository;
+        self.writer
+            .execute(
+                DatabaseWriteContext {
+                    operation: "workflow_set_run_paused",
+                    provider: DatabaseProvider::Workflow,
+                    workflow_id: Some(id.clone()),
+                },
+                move |connection| {
+                    repository
+                        .set_run_paused(connection, &id, paused, now)
+                        .map_err(map_domain)
+                },
+            )
+            .map_err(map_writer)
+    }
     pub fn new(writer: DatabaseWriter) -> Self {
         Self {
             writer,
@@ -270,6 +316,21 @@ impl WorkflowRepositoryService {
         updated_at: i64,
         lease_expires_before: i64,
     ) -> Result<usize, WorkflowError> {
+        self.fail_expired_running_runs_excluding(
+            warning,
+            updated_at,
+            lease_expires_before,
+            Vec::new(),
+        )
+    }
+
+    pub fn fail_expired_running_runs_excluding(
+        &self,
+        warning: String,
+        updated_at: i64,
+        lease_expires_before: i64,
+        active_run_ids: Vec<String>,
+    ) -> Result<usize, WorkflowError> {
         let repository = self.repository;
         self.writer
             .execute(
@@ -280,12 +341,35 @@ impl WorkflowRepositoryService {
                 },
                 move |connection| {
                     repository
-                        .fail_expired_running_runs(
+                        .fail_expired_running_runs_excluding(
                             connection,
                             &warning,
                             updated_at,
                             lease_expires_before,
+                            &active_run_ids,
                         )
+                        .map_err(map_domain)
+                },
+            )
+            .map_err(map_writer)
+    }
+
+    pub fn next_ready_deadline(
+        &self,
+        admitted_types: Vec<String>,
+        now: i64,
+    ) -> Result<Option<i64>, WorkflowError> {
+        let repository = self.repository;
+        self.writer
+            .execute(
+                DatabaseWriteContext {
+                    operation: "workflow_next_ready_deadline",
+                    provider: DatabaseProvider::Workflow,
+                    workflow_id: None,
+                },
+                move |connection| {
+                    repository
+                        .next_ready_deadline(connection, &admitted_types, now)
                         .map_err(map_domain)
                 },
             )

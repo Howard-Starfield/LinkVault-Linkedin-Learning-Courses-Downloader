@@ -118,6 +118,21 @@ for (const [baselinePath, source] of observedProviderSources) {
   }
 }
 
+const linkedinDownloader = observedProviderSources.get(
+  "src-tauri/src/providers/linkedin/artifact_downloader.rs",
+);
+const linkedinOrchestrator = observedProviderSources.get(
+  "src-tauri/src/providers/linkedin/download_orchestrator.rs",
+);
+if (
+  !linkedinDownloader?.includes("library.record_video_file(") ||
+  linkedinDownloader.includes("record_video_file_on_connection(") ||
+  !linkedinOrchestrator?.includes("library.course_layout(") ||
+  linkedinOrchestrator.includes("CourseLayout::load(")
+) {
+  fail("LinkedIn download placement and video indexing must dispatch through PathLibrary, not runtime reader connections");
+}
+
 const databaseFile = path.join(rustSourceDirectory, "app", "database.rs");
 const databaseSource = await readFile(databaseFile, "utf8");
 for (const contract of [

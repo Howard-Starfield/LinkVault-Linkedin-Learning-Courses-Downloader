@@ -44,6 +44,7 @@ mod reader_service;
 mod resource_governor;
 mod schedule_service;
 mod state;
+pub mod supervisor;
 pub mod storage;
 pub mod thumbnails;
 

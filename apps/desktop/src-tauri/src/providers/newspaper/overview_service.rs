@@ -1,19 +1,20 @@
 //! Cross-domain bootstrap and activity snapshot read models.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use rusqlite::{Connection, OptionalExtension};
 
 use super::{
     batch_service, catalog_service, job_repository,
     models::{
-        NewspaperActivitySnapshot, NewspaperBootstrap, NewspaperJob, NewspaperJobProgress,
+        NewspaperActivitySnapshot, NewspaperBatch, NewspaperBootstrap, NewspaperJob, NewspaperJobProgress,
         OptimizationRuntimeStatus,
     },
     projection, reader_service, schedule_service,
 };
 use crate::workflow::application::runtime::WorkflowRuntime;
 
+#[derive(Default)]
 struct RawOptimizationProgress {
     total: u32,
     completed: u32,
@@ -51,13 +52,22 @@ pub(super) fn activity(
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
     let jobs = merge_jobs(&connection, runtime)?;
     let progress = job_progress(&connection, &jobs)?;
-    let has_live_activity = jobs.iter().any(|job| {
-        matches!(job.status.as_str(), "queued" | "active" | "optimizing") || job.retry_at.is_some()
-    }) || optimization_runtime.active;
+    let batches = batch_service::list(&connection)?;
+    let batches_by_id: HashMap<_, _> = batches
+        .iter()
+        .map(|batch| (batch.id.as_str(), batch))
+        .collect();
+    let now = chrono::Utc::now().timestamp();
+    let has_live_activity = jobs
+        .iter()
+        .any(|job| {
+            job_has_live_activity(job, batches_by_id.get(job.batch_id.as_str()).copied(), now)
+        })
+        || optimization_runtime.active;
     Ok(NewspaperActivitySnapshot {
         jobs,
         progress,
-        batches: batch_service::list(&connection)?,
+        batches,
         schedules: schedule_service::list(&connection)?,
         has_live_activity,
         optimization_runtime,
@@ -65,13 +75,35 @@ pub(super) fn activity(
     })
 }
 
+fn job_has_live_activity(job: &NewspaperJob, batch: Option<&NewspaperBatch>, now: i64) -> bool {
+    if job.paused || job.dismissed {
+        return false;
+    }
+    match job.status.as_str() {
+        "active" | "optimizing" => true,
+        "queued" => {
+            job.retry_at.map_or(true, |retry_at| retry_at <= now)
+                && batch.map_or(true, |batch| {
+                    matches!(batch.status.as_str(), "queued" | "scheduled" | "active")
+                        && batch
+                            .scheduled_at
+                            .map_or(true, |scheduled_at| scheduled_at <= now)
+                })
+        }
+        _ => false,
+    }
+}
+
 fn job_progress(
     connection: &Connection,
     jobs: &[NewspaperJob],
 ) -> Result<Vec<NewspaperJobProgress>, String> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut statement = connection
         .prepare(
-            "SELECT
+            "SELECT t.job_id,
                 COUNT(t.page_id),
                 COALESCE(SUM(CASE WHEN t.status IN ('succeeded', 'kept_original') THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END), 0),
@@ -83,27 +115,33 @@ fn job_progress(
                 MIN(t.started_at),
                 MAX(t.completed_at)
              FROM newspaper_optimization_tasks t
-             WHERE t.job_id = ?1",
+             GROUP BY t.job_id",
         )
+        .map_err(|error| error.to_string())?;
+    let mut aggregates = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RawOptimizationProgress {
+                    total: row.get(1)?,
+                    completed: row.get(2)?,
+                    failed: row.get(3)?,
+                    pending: row.get(4)?,
+                    recovered: row.get(5)?,
+                    active_workers: row.get(6)?,
+                    original_bytes: row.get(7)?,
+                    optimized_bytes: row.get(8)?,
+                    first_started_at: row.get(9)?,
+                    last_completed_at: row.get(10)?,
+                },
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
         .map_err(|error| error.to_string())?;
     let mut progress = Vec::with_capacity(jobs.len());
     for job in jobs {
-        let raw = statement
-            .query_row([&job.id], |row| {
-                Ok(RawOptimizationProgress {
-                    total: row.get(0)?,
-                    completed: row.get(1)?,
-                    failed: row.get(2)?,
-                    pending: row.get(3)?,
-                    recovered: row.get(4)?,
-                    active_workers: row.get(5)?,
-                    original_bytes: row.get(6)?,
-                    optimized_bytes: row.get(7)?,
-                    first_started_at: row.get(8)?,
-                    last_completed_at: row.get(9)?,
-                })
-            })
-            .map_err(|error| error.to_string())?;
+        let raw = aggregates.remove(&job.id).unwrap_or_default();
         let terminal = raw.completed.saturating_add(raw.failed);
         let elapsed_seconds = raw
             .first_started_at
@@ -222,21 +260,21 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO newspaper_batches
-                 (id, status, destination, delay_minutes, delay_seconds,
-                  optimize_images, optimization_profile, optimization_quality,
-                  keep_original_jpg, created_at, updated_at)
-                 VALUES ('batch', 'active', '', 0, 0, 1, 'webp_balanced', 45, 1, 1, 1)",
+                     (id, status, destination, delay_minutes, delay_seconds,
+                      optimize_images, optimization_profile, optimization_quality,
+                      keep_original_jpg, created_at, updated_at)
+                     VALUES ('batch', 'active', '', 0, 0, 1, 'webp_balanced', 45, 1, 1, 1)",
                 [],
             )
             .unwrap();
         connection
             .execute(
                 "INSERT INTO newspaper_jobs
-                 (id, batch_id, edition_code, edition_publication_date,
-                  publication_date, status, output_dir, page_count,
-                  completed_count, queue_position, created_at, updated_at)
-                 VALUES ('job', 'batch', 'NY', '', '2026-07-26', 'optimizing',
-                         '', 4, 4, 1, 1, 1)",
+                     (id, batch_id, edition_code, edition_publication_date,
+                      publication_date, status, output_dir, page_count,
+                      completed_count, queue_position, created_at, updated_at)
+                     VALUES ('job', 'batch', 'NY', '', '2026-07-26', 'optimizing',
+                             '', 4, 4, 1, 1, 1)",
                 [],
             )
             .unwrap();
@@ -245,9 +283,9 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO newspaper_pages
-                     (id, job_id, page_number, source_url, original_path, status,
-                      original_bytes, final_bytes, created_at, updated_at)
-                     VALUES (?1, 'job', ?2, '', ?3, 'completed', 100, 100, 1, 1)",
+                         (id, job_id, page_number, source_url, original_path, status,
+                          original_bytes, final_bytes, created_at, updated_at)
+                         VALUES (?1, 'job', ?2, '', ?3, 'completed', 100, 100, 1, 1)",
                     rusqlite::params![page_id, index.to_string(), format!("page-{index}.jpg")],
                 )
                 .unwrap();
@@ -256,19 +294,19 @@ mod tests {
         connection
             .execute(
                 "UPDATE newspaper_optimization_tasks SET
-                    status = CASE page_id
-                        WHEN 'page-0' THEN 'succeeded'
-                        WHEN 'page-1' THEN 'kept_original'
-                        WHEN 'page-2' THEN 'failed'
-                        ELSE 'pending'
-                    END,
-                    recovered = CASE WHEN page_id = 'page-1' THEN 1 ELSE 0 END,
-                    source_bytes = 100,
-                    output_bytes = CASE WHEN page_id = 'page-0' THEN 60
-                                        WHEN page_id = 'page-1' THEN 100
-                                        ELSE NULL END,
-                    started_at = CASE WHEN page_id != 'page-3' THEN 10 END,
-                    completed_at = CASE WHEN page_id != 'page-3' THEN 20 END",
+                        status = CASE page_id
+                            WHEN 'page-0' THEN 'succeeded'
+                            WHEN 'page-1' THEN 'kept_original'
+                            WHEN 'page-2' THEN 'failed'
+                            ELSE 'pending'
+                        END,
+                        recovered = CASE WHEN page_id = 'page-1' THEN 1 ELSE 0 END,
+                        source_bytes = 100,
+                        output_bytes = CASE WHEN page_id = 'page-0' THEN 60
+                                            WHEN page_id = 'page-1' THEN 100
+                                            ELSE NULL END,
+                        started_at = CASE WHEN page_id != 'page-3' THEN 10 END,
+                        completed_at = CASE WHEN page_id != 'page-3' THEN 20 END",
                 [],
             )
             .unwrap();
@@ -296,5 +334,101 @@ mod tests {
         assert!(progress.eta_seconds.is_some());
         assert!(snapshot.has_live_activity);
         assert_eq!(snapshot.revision, 7);
+
+        // Preserve the aggregates above while covering a second task-bearing
+        // job and a completed history item with no optimization tasks.
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO newspaper_jobs
+                 (id, batch_id, edition_code, publication_date, status, output_dir,
+                  page_count, completed_count, queue_position, created_at, updated_at)
+                 VALUES ('other', 'batch', 'NY', '2026-07-26', 'optimizing', 'other', 1, 1, 2, 1, 1),
+                        ('empty', 'batch', 'NY', '2026-07-26', 'completed', 'empty', 0, 0, 3, 1, 1);
+                 INSERT INTO newspaper_pages
+                 (id, job_id, page_number, source_url, original_path, status,
+                  original_bytes, final_bytes, created_at, updated_at)
+                 VALUES ('other-page', 'other', '1', '', 'other.jpg', 'completed', 7, 7, 1, 1);",
+            )
+            .unwrap();
+        optimization_tasks::ensure_for_job(&connection, "other", 1).unwrap();
+        connection.execute(
+                "UPDATE newspaper_optimization_tasks SET status = 'running', source_bytes = 7 WHERE job_id = 'other'", []
+            ).unwrap();
+        let jobs = job_repository::list(&connection, None).unwrap();
+        let progress = job_progress(&connection, &jobs).unwrap();
+        assert_eq!(
+            progress.iter().map(|item| &item.job_id).collect::<Vec<_>>(),
+            jobs.iter().map(|job| &job.id).collect::<Vec<_>>()
+        );
+        let original = progress.iter().find(|item| item.job_id == "job").unwrap();
+        assert_eq!(
+            (
+                original.optimization_total,
+                original.optimization_completed,
+                original.optimization_failed,
+                original.optimization_pending
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(
+            (
+                original.original_bytes,
+                original.optimized_bytes,
+                original.bytes_saved
+            ),
+            (400, 160, 240)
+        );
+        let other = progress.iter().find(|item| item.job_id == "other").unwrap();
+        assert_eq!(
+            (
+                other.optimization_total,
+                other.optimization_pending,
+                other.active_workers,
+                other.original_bytes
+            ),
+            (1, 1, 1, 7)
+        );
+        let empty = progress.iter().find(|item| item.job_id == "empty").unwrap();
+        assert_eq!(
+            (
+                empty.optimization_total,
+                empty.optimization_pending,
+                empty.original_bytes
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(empty.current_stage, "complete");
+        assert_eq!(empty.pages_per_minute, None);
+        assert_eq!(empty.eta_seconds, None);
+
+        let mut job = jobs[0].clone();
+        let mut batches = batch_service::list(&connection).unwrap();
+        job.status = "queued".to_string();
+        job.retry_at = None;
+        assert!(job_has_live_activity(&job, batches.first(), 100));
+        job.paused = true;
+        assert!(!job_has_live_activity(&job, batches.first(), 100));
+        job.paused = false;
+        job.retry_at = Some(101);
+        assert!(!job_has_live_activity(&job, batches.first(), 100));
+        assert!(job_has_live_activity(&job, batches.first(), 101));
+        job.retry_at = None;
+        batches[0].scheduled_at = Some(101);
+        assert!(!job_has_live_activity(&job, batches.first(), 100));
+        assert!(job_has_live_activity(&job, batches.first(), 101));
+        batches[0].status = "paused".to_string();
+        assert!(!job_has_live_activity(&job, batches.first(), 101));
+        job.status = "active".to_string();
+        assert!(job_has_live_activity(&job, batches.first(), 100));
+        job.dismissed = true;
+        assert!(!job_has_live_activity(&job, batches.first(), 100));
+        job.dismissed = false;
+        job.paused = true;
+        assert!(!job_has_live_activity(&job, batches.first(), 100));
+        job.paused = false;
+        job.status = "completed".to_string();
+        job.retry_at = Some(99);
+        assert!(!job_has_live_activity(&job, batches.first(), 100));
     }
 }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.28 - 2026-10-03
+
+- **Smoother scrolling and interactions.** LinkedIn history queries use indexed, bounded reads; idle queues stop recurring bootstrap work. Newspaper reading-progress and queue mutations run away from the UI thread.
+- **Native newspaper scheduling.** The shared native supervisor owns downloads, optimization and deadline wakes. Idle newspaper screens stop activity polling, and completed items do not trigger recurring processing passes.
+- **Seven-day schedule catch-up.** Enabled schedules fill missing eligible edition/date pairs on startup and recovery, including gaps before the newest download. Existing attempts and completed archives are preserved; today's publication waits for its configured time.
+- **Responsive newspaper reader toolbar.** Controls wrap at compact and narrow widths without overlap, clipping or horizontal overflow.
+- **Safer persistence and worker lifecycle.** Planning commits batches and workflow records atomically; pause, cancellation, retry deadlines and shutdown retain a single worker owner.
+- **Patched clipping editor dependencies.** Tiptap packages advance together to address Markdown parsing and HTML attribute advisories.
+
 ## 0.2.27 - 2026-09-12
 
 - **LinkedIn learning-path library.** Paths, topic pastes, and standalone courses share one History catalog. Pause/resume queued path jobs, move a standalone course into a path, and keep folder imports on the same placement rules.

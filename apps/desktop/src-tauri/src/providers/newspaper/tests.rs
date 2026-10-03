@@ -10,7 +10,7 @@ use super::{
     clipping_note_mirror::NOTE_MIRROR_FILE_NAME,
     clipping_roots::SNAPSHOT_DIRECTORY_NAME,
     clipping_service::ClippingService,
-    job_repository, job_service, library_recovery, library_service,
+    job_service, library_recovery, library_service,
     models::*,
     optimization_service,
     optimizer::{optimize_page, OptimizationOutcome},
@@ -787,25 +787,91 @@ fn reading_progress_resumes_last_page_without_regressing_furthest_page() {
             .unwrap();
     }
 
-    let forward =
-        reader_service::save_progress(&connection, &job.id, "reading-page-2", 10).unwrap();
+    let diagnostics = DatabaseDiagnostics::default();
+    let writer = DatabaseWriter::start(db_path.clone(), diagnostics.clone()).unwrap();
+    let forward = reader_service::save_progress(&writer, &job.id, "reading-page-2", 10).unwrap();
     assert_eq!(forward.last_page_index, 2);
     assert_eq!(forward.furthest_page_index, 2);
     assert_eq!(forward.read_page_count, 1);
 
-    let backward =
-        reader_service::save_progress(&connection, &job.id, "reading-page-0", 11).unwrap();
+    let backward = reader_service::save_progress(&writer, &job.id, "reading-page-0", 11).unwrap();
     assert_eq!(backward.last_page_id, "reading-page-0");
     assert_eq!(backward.last_page_index, 0);
     assert_eq!(backward.furthest_page_index, 2);
     assert_eq!(backward.read_page_count, 2);
-    let repeated =
-        reader_service::save_progress(&connection, &job.id, "reading-page-0", 12).unwrap();
+    let repeated = reader_service::save_progress(&writer, &job.id, "reading-page-0", 12).unwrap();
     assert_eq!(repeated.read_page_count, 2);
     let completed_coverage =
-        reader_service::save_progress(&connection, &job.id, "reading-page-1", 13).unwrap();
+        reader_service::save_progress(&writer, &job.id, "reading-page-1", 13).unwrap();
     assert_eq!(completed_coverage.furthest_page_index, 2);
     assert_eq!(completed_coverage.read_page_count, 3);
+    assert_eq!(
+        reader_service::list_progress(&connection).unwrap(),
+        vec![completed_coverage.clone()]
+    );
+    assert_eq!(
+        diagnostics
+            .snapshot()
+            .iter()
+            .filter(|event| event.operation == "save_newspaper_reading_progress"
+                && event.provider == crate::app::database_diagnostics::DatabaseProvider::Newspaper)
+            .count(),
+        4
+    );
+    assert!(reader_service::save_progress(&writer, &job.id, "missing-page", 14).is_err());
+    assert_eq!(
+        reader_service::list_progress(&connection).unwrap(),
+        vec![completed_coverage.clone()]
+    );
+    connection
+        .execute(
+            "INSERT INTO newspaper_pages
+         (id, job_id, page_number, source_url, status, created_at, updated_at)
+         VALUES ('reading-page-3', ?1, 'A04', 'test://page', 'completed', 1, 1)",
+            params![job.id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_reading_progress BEFORE UPDATE ON newspaper_reading_progress
+         BEGIN SELECT RAISE(ABORT, 'injected reading progress failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        reader_service::save_progress(&writer, &job.id, "reading-page-3", 14)
+            .unwrap_err()
+            .contains("injected reading progress failure")
+    );
+    assert_eq!(writer.stats().failed, 1);
+    let failure = diagnostics.snapshot().pop().unwrap();
+    assert_eq!(
+        failure.outcome,
+        crate::app::database_diagnostics::DatabaseDiagnosticOutcome::Error
+    );
+    assert_eq!(
+        failure.error_class,
+        Some(crate::app::database_diagnostics::DatabaseErrorClass::Sqlite)
+    );
+    assert_eq!(
+        reader_service::list_progress(&connection).unwrap(),
+        vec![completed_coverage.clone()]
+    );
+    let leaked: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM newspaper_read_pages WHERE page_id = 'reading-page-3'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0);
+    connection
+        .execute_batch("DROP TRIGGER reject_reading_progress")
+        .unwrap();
+    writer.shutdown().unwrap();
+    assert_eq!(
+        reader_service::save_progress(&writer, &job.id, "reading-page-0", 15).unwrap_err(),
+        "WRITER_CLOSED"
+    );
     assert_eq!(
         reader_service::list_progress(&connection).unwrap(),
         vec![completed_coverage]
@@ -949,21 +1015,29 @@ fn due_daily_schedule_materializes_only_once_per_local_date() {
     connection
         .execute(
             "INSERT INTO newspaper_schedules
-             (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
-              optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
-             VALUES ('schedule-1', 1, '00:00', ?1, '[\"NY\"]', 15, 1,
-                     'webp_high', 0, 1, 1)",
+        (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+         optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
+        VALUES ('schedule-1', 1, '00:00', ?1, '[\"NY\"]', 15, 1, 'webp_high', 0, 1, 1)",
             params![directory.path().join("papers").to_string_lossy()],
         )
         .unwrap();
     drop(connection);
-
-    schedule_service::materialize_due(&db_path, None).unwrap();
-    schedule_service::materialize_due(&db_path, None).unwrap();
-
+    let writer = DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
+    assert_eq!(
+        schedule_service::materialize_due(&writer, &db_path).unwrap(),
+        7
+    );
+    assert_eq!(
+        schedule_service::materialize_due(&writer, &db_path).unwrap(),
+        0
+    );
     let connection = Connection::open(&db_path).unwrap();
-    let job_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM newspaper_jobs", [], |row| row.get(0))
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_runs WHERE workflow_type = 'newspaper_download'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     let last_run: String = connection
         .query_row(
@@ -972,8 +1046,9 @@ fn due_daily_schedule_materializes_only_once_per_local_date() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(job_count, 1);
+    assert_eq!(count, 7);
     assert_eq!(last_run, Local::now().date_naive().to_string());
+    writer.shutdown().unwrap();
 }
 
 #[test]
@@ -981,79 +1056,52 @@ fn due_last_seven_days_schedule_materializes_the_rolling_window() {
     let directory = tempdir().unwrap();
     let db_path = directory.path().join("test.db");
     let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
-    connection
-        .execute(
-            "INSERT INTO newspaper_schedules
-             (id, enabled, cron_time, destination, edition_codes_json, date_mode, delay_seconds,
-              optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
-             VALUES ('schedule-7-days', 1, '00:00', ?1, '[\"NY\"]', 'last7_days', 15, 1,
-                     'webp_high', 0, 1, 1)",
-            params![directory.path().join("papers").to_string_lossy()],
-        )
-        .unwrap();
+    connection.execute("INSERT INTO newspaper_schedules
+        (id, enabled, cron_time, destination, edition_codes_json, date_mode, delay_seconds,
+         optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
+        VALUES ('schedule-7-days', 1, '00:00', ?1, '[\"NY\"]', 'last7_days', 15, 1, 'webp_high', 0, 1, 1)",
+        params![directory.path().join("papers").to_string_lossy()]).unwrap();
     drop(connection);
-
-    schedule_service::materialize_due(&db_path, None).unwrap();
-
+    let writer = DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
+    assert_eq!(
+        schedule_service::materialize_due(&writer, &db_path).unwrap(),
+        7
+    );
     let connection = Connection::open(&db_path).unwrap();
-    let window: (i64, String, String, i64) = connection
-        .query_row(
-            "SELECT COUNT(*), MIN(j.publication_date), MAX(j.publication_date),
-                    COUNT(DISTINCT b.schedule_id)
-             FROM newspaper_jobs j
-             JOIN newspaper_batches b ON b.id = j.batch_id",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
+    let window: (i64, String, String) = connection.query_row(
+        "SELECT COUNT(*), MIN(json_extract(request_json, '$.publicationDate')), MAX(json_extract(request_json, '$.publicationDate')) FROM workflow_runs WHERE workflow_type = 'newspaper_download'", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
     let today = Local::now().date_naive();
-    assert_eq!(window.0, 7);
-    assert_eq!(window.1, (today - chrono::Duration::days(6)).to_string());
-    assert_eq!(window.2, today.to_string());
-    assert_eq!(window.3, 1);
-
-    let jobs = connection
-        .prepare("SELECT id, output_dir FROM newspaper_jobs")
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
+    assert_eq!(
+        window,
+        (
+            7,
+            (today - chrono::Duration::days(6)).to_string(),
+            today.to_string()
+        )
+    );
+    connection
+        .execute("UPDATE workflow_runs SET state = 'succeeded'", [])
         .unwrap();
-    for (job_id, output_dir) in jobs {
-        std::fs::create_dir_all(&output_dir).unwrap();
-        std::fs::write(Path::new(&output_dir).join(".complete"), b"").unwrap();
-        connection
-            .execute(
-                "UPDATE newspaper_jobs SET status = 'completed', completed_at = 2 WHERE id = ?1",
-                params![job_id],
-            )
-            .unwrap();
-    }
     connection
         .execute(
             "UPDATE newspaper_schedules SET last_run_date = NULL WHERE id = 'schedule-7-days'",
             [],
         )
         .unwrap();
-    drop(connection);
-
-    schedule_service::materialize_due(&db_path, None).unwrap();
-
-    let connection = Connection::open(&db_path).unwrap();
-    let second_poll: (i64, i64, i64, String) = connection
+    assert_eq!(
+        schedule_service::materialize_due(&writer, &db_path).unwrap(),
+        0
+    );
+    let counts: (i64, i64) = connection
         .query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM newspaper_jobs),
-                (SELECT COUNT(*) FROM newspaper_jobs WHERE status = 'queued'),
-                (SELECT COUNT(*) FROM newspaper_batches),
-                (SELECT status FROM newspaper_batches ORDER BY created_at DESC, rowid DESC LIMIT 1)",
+            "SELECT (SELECT COUNT(*) FROM workflow_runs), (SELECT COUNT(*) FROM newspaper_batches)",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(second_poll, (7, 0, 2, "completed".to_string()));
+    assert_eq!(counts, (7, 1));
+    writer.shutdown().unwrap();
 }
 
 #[test]
@@ -1061,40 +1109,50 @@ fn deleting_a_schedule_stops_retry_and_allows_immediate_manual_download() {
     let directory = tempdir().unwrap();
     let db_path = directory.path().join("test.db");
     let destination = directory.path().join("papers");
-    let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
+    let (mut connection, _) = crate::cache::initialize_database(&db_path).unwrap();
     connection
         .execute(
             "INSERT INTO newspaper_schedules
-             (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
-              optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
-             VALUES ('schedule-1', 1, '00:00', ?1, '[\"NY\"]', 15, 1,
-                     'webp_high', 0, 1, 1)",
+        (id, enabled, cron_time, destination, edition_codes_json, delay_seconds,
+         optimize_images, optimization_profile, keep_original_jpg, created_at, updated_at)
+        VALUES ('schedule-1', 1, '00:00', ?1, '[\"NY\"]', 15, 1, 'webp_high', 0, 1, 1)",
             params![destination.to_string_lossy()],
         )
         .unwrap();
+    // A materialized legacy attempt and still-unmaterialized kernel attempts
+    // must both retire atomically when their schedule is removed.
+    let mut job = batch_service::create_with_connection(
+        &mut connection,
+        request(&destination, &Local::now().date_naive().to_string()),
+    )
+    .unwrap()
+    .jobs
+    .remove(0);
+    connection
+        .execute(
+            "UPDATE newspaper_batches SET schedule_id = 'schedule-1' WHERE id = ?1",
+            params![job.batch_id],
+        )
+        .unwrap();
     drop(connection);
-
-    schedule_service::materialize_due(&db_path, None).unwrap();
-    let connection = Connection::open(&db_path).unwrap();
-    let mut job = job_repository::list(&connection, None).unwrap().remove(0);
-    let job_id = job.id.clone();
-    drop(connection);
+    let writer = DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
+    assert_eq!(
+        schedule_service::materialize_due(&writer, &db_path).unwrap(),
+        6
+    );
     queue_service::schedule_release_retry(&db_path, &mut job, "Not released.").unwrap();
-
-    schedule_service::delete(&db_path, "schedule-1").unwrap();
-
-    let connection = Connection::open(&db_path).unwrap();
+    schedule_service::delete(&writer, "schedule-1").unwrap();
+    let mut connection = Connection::open(&db_path).unwrap();
     let persisted: (String, Option<i64>) = connection
         .query_row(
             "SELECT status, retry_at FROM newspaper_jobs WHERE id = ?1",
-            params![job_id],
+            params![job.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(persisted, ("cancelled".to_string(), None));
-    drop(connection);
-
-    let mut connection = Connection::open(&db_path).unwrap();
+    let unfinished: i64 = connection.query_row("SELECT COUNT(*) FROM workflow_runs WHERE state NOT IN ('cancelled', 'succeeded', 'failed', 'succeeded_with_warnings')", [], |row| row.get(0)).unwrap();
+    assert_eq!(unfinished, 0);
     let response = batch_service::create_with_connection(
         &mut connection,
         request(&destination, &Local::now().date_naive().to_string()),
@@ -1105,11 +1163,12 @@ fn deleting_a_schedule_stops_retry_and_allows_immediate_manual_download() {
     let resumed: (String, Option<i64>) = connection
         .query_row(
             "SELECT status, retry_at FROM newspaper_jobs WHERE id = ?1",
-            params![job_id],
+            params![job.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(resumed, ("queued".to_string(), None));
+    writer.shutdown().unwrap();
 }
 
 #[test]

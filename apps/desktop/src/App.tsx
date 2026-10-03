@@ -58,7 +58,7 @@ import { YouTubeView } from "./components/youtube/YouTubeView";
 import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
 import { ensureDestination, parseDestination } from "./lib/destinations";
 import { commitLinkedInDestination } from "./lib/linkedin/ipc";
-import { nextPollDelayMs, IDLE_POLL_CEILING_MS } from "./lib/linkedin/poll-schedule";
+import { nextPollDelayMs, nextPollRetryDelayMs, pollScheduleKey } from "./lib/linkedin/poll-schedule";
 import { LinkedinHistory } from "./components/linkedin/LinkedinHistory";
 import { MiniCourseArt } from "./components/linkedin/MiniCourseArt";
 import {
@@ -276,7 +276,7 @@ const DEFAULT_VIDEO_WAIT_MIN_SECONDS = 20;
 const DEFAULT_VIDEO_WAIT_MAX_SECONDS = 40;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
-const APP_VERSION = "0.2.27";
+const APP_VERSION = "0.2.28";
 const UPDATE_TOAST_ID = "linkvault-update";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings" | "youtube" | "youtube-history";
@@ -571,43 +571,23 @@ export default function App() {
         await invoke("process_newspaper_queue");
         await invoke("process_newspaper_optimization_queue", { options });
       });
-    newspaperQueuePromiseRef.current = next.finally(() => {
-      if (newspaperQueuePromiseRef.current === next) {
+    const tracked = next.finally(() => {
+      if (newspaperQueuePromiseRef.current === tracked) {
         newspaperQueuePromiseRef.current = null;
       }
     });
-    return newspaperQueuePromiseRef.current;
+    newspaperQueuePromiseRef.current = tracked;
+    return tracked;
   }
 
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-
-    let disposed = false;
-    async function processNewspaperSchedules() {
-      if (disposed) return;
-      try {
-        await ensureNewspaperQueueProcessing(null, false);
-      } catch {
-        // The newspaper screen surfaces persisted job and schedule errors.
-      }
-    }
-
-    void processNewspaperSchedules();
-    const intervalId = window.setInterval(() => void processNewspaperSchedules(), 15_000);
-    return () => {
-      disposed = true;
-      window.clearInterval(intervalId);
-    };
-  }, []);
-
-  // The poll gate. True whenever any job could still progress on its own, which
-  // is exactly when the queue poll must be alive. Flipping it re-arms the poll
-  // effect, so queueing a download from an idle app starts the poll and the last
-  // job finishing stops it again.
-  const hasPendingQueueWork = useMemo(
-    () => queuedJobs.some((job) => job.status === "active" || job.status === "queued"),
+  // Re-arm when deadlines or pause/status change, including while other work is
+  // already pending. Progress-only updates retain the existing timer.
+  const queuePollScheduleKey = useMemo(
+    () => pollScheduleKey(queuedJobs),
     [queuedJobs]
   );
+  const queuePollJobsRef = useRef(queuedJobs);
+  queuePollJobsRef.current = queuedJobs;
 
   useEffect(() => {
     if (!hasSavedToken) return;
@@ -618,20 +598,21 @@ export default function App() {
     // when no job is active or queued, so an idle install stops polling
     // entirely.
     //
-    // Re-arming is driven by `hasPendingQueueWork` in the dependency array, NOT
-    // by `refreshBootstrapState` being called. That function only re-enters this
-    // effect through `hasSavedToken`, which does not change once it is already
-    // true, so relying on it would leave a schedule created from a fully idle
-    // queue with no timer armed and the download would never start.
+    // The stable schedule key also replaces a long timer when a user adds an
+    // earlier schedule or resumes a paused job. Full job-list dependencies
+    // would restart this effect on every progress refresh.
     async function tick() {
       if (disposed) return;
       const state = await refreshBootstrapState();
       if (disposed) return;
 
       if (!state) {
-        // Transient failure (for example the database was briefly locked).
-        // Re-arm on the ceiling so polling self-heals instead of dying.
-        timerId = window.setTimeout(() => void tick(), IDLE_POLL_CEILING_MS);
+        // Use the last known jobs on transient failure; pending work must not
+        // lose an hour of progress or scheduled-start updates.
+        const retryDelay = nextPollRetryDelayMs(queuePollJobsRef.current, Date.now());
+        if (retryDelay !== null) {
+          timerId = window.setTimeout(() => void tick(), retryDelay);
+        }
         return;
       }
 
@@ -650,7 +631,7 @@ export default function App() {
       disposed = true;
       if (timerId !== undefined) window.clearTimeout(timerId);
     };
-  }, [hasSavedToken, delaySeconds, queueNeedsSessionRefresh, hasPendingQueueWork]);
+  }, [hasSavedToken, delaySeconds, queueNeedsSessionRefresh, queuePollScheduleKey]);
 
   useEffect(() => {
     const storedRaw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);

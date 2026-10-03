@@ -341,6 +341,7 @@ pub(super) fn claim_next(
              FROM newspaper_optimization_tasks t
              JOIN newspaper_pages p ON p.id = t.page_id
              JOIN newspaper_jobs j ON j.id = t.job_id
+             JOIN newspaper_batches b ON b.id = j.batch_id
              WHERE t.job_id = ?1
                AND t.status = 'pending'
                AND t.attempts < ?2
@@ -349,6 +350,9 @@ pub(super) fn claim_next(
                AND p.optimized_path IS NULL
                AND j.paused = 0
                AND j.dismissed = 0
+               AND j.status != 'cancelled'
+               AND b.optimize_images = 1
+               AND b.status NOT IN ('paused', 'cancelled')
              ORDER BY p.page_number
              LIMIT 1",
             params![job_id, MAX_ATTEMPTS, now],

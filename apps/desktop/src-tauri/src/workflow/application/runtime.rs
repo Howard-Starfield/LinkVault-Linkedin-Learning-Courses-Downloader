@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -16,6 +16,18 @@ use crate::workflow::domain::types::{
     NewWorkflowRun, NewWorkflowStep, RunRecord, StepRecord, StepType, WorkflowType,
 };
 use crate::workflow::ports::executor::{ExecutorOutcome, StepExecutor};
+
+/// Provider reconciliation registered at composition. Return the next UTC
+/// deadline; callbacks must offload long work through the owned task API.
+pub trait SupervisorHook: Send + Sync {
+    fn reconcile(&self, runtime: &WorkflowRuntime, now: i64) -> Result<Option<i64>, WorkflowError>;
+
+    /// Called after supervisor dispatch stops, before owned workers are joined.
+    fn shutdown(&self) {}
+}
+
+const SUPERVISOR_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
+const SUPERVISOR_ERROR_RETRY_SECS: i64 = 5;
 
 #[derive(Clone)]
 pub struct WorkflowRuntime {
@@ -32,6 +44,13 @@ struct WorkflowRuntimeInner {
     /// One in-flight execute per workflow type so providers can overlap without
     /// double-running the same provider (shared cancel flags, rate limits).
     executing_types: Mutex<HashSet<String>>,
+    executing_run_ids: Mutex<HashSet<String>>,
+    hooks: Mutex<Vec<Arc<dyn SupervisorHook>>>,
+    wake_generation: Mutex<u64>,
+    wake_condition: Condvar,
+    /// Lifecycle lock registers every admitted worker before shutdown joins it.
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    task_keys: Mutex<HashSet<&'static str>>,
 }
 
 struct ClaimedStep {
@@ -43,6 +62,7 @@ struct ClaimedStep {
 struct ExecuteGuard {
     inner: Arc<WorkflowRuntimeInner>,
     workflow_type: String,
+    run_id: Option<String>,
 }
 
 impl Drop for ExecuteGuard {
@@ -52,7 +72,40 @@ impl Drop for ExecuteGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.workflow_type);
+        if let Some(run_id) = &self.run_id {
+            self.inner
+                .executing_run_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(run_id);
+            notify_wake(&self.inner);
+        }
     }
+}
+
+struct SupervisorTaskGuard {
+    inner: Arc<WorkflowRuntimeInner>,
+    key: &'static str,
+}
+
+impl Drop for SupervisorTaskGuard {
+    fn drop(&mut self) {
+        self.inner
+            .task_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(self.key);
+        notify_wake(&self.inner);
+    }
+}
+
+fn notify_wake(inner: &WorkflowRuntimeInner) {
+    let mut generation = inner
+        .wake_generation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *generation = generation.wrapping_add(1);
+    inner.wake_condition.notify_all();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +137,12 @@ impl WorkflowRuntime {
                 executors: Mutex::new(Vec::new()),
                 drain_lock: Mutex::new(()),
                 executing_types: Mutex::new(HashSet::new()),
+                executing_run_ids: Mutex::new(HashSet::new()),
+                hooks: Mutex::new(Vec::new()),
+                wake_generation: Mutex::new(0),
+                wake_condition: Condvar::new(),
+                workers: Mutex::new(Vec::new()),
+                task_keys: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -94,6 +153,104 @@ impl WorkflowRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(executor);
+        self.wake();
+    }
+
+    pub fn register_supervisor_hook(&self, hook: Arc<dyn SupervisorHook>) {
+        self.inner
+            .hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(hook);
+        self.wake();
+    }
+
+    /// Durable mutation callers wake after commit. A generation counter keeps a
+    /// wake during reconciliation from being lost when the supervisor waits.
+    pub fn wake(&self) {
+        notify_wake(&self.inner);
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn is_workflow_type_executing(&self, workflow_type: &str) -> bool {
+        let tasks = self
+            .inner
+            .task_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let executing = self
+            .inner
+            .executing_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.contains(workflow_type) || executing.contains(workflow_type)
+    }
+
+    fn after_mutation<T>(&self, result: Result<T, WorkflowError>) -> Result<T, WorkflowError> {
+        if result.is_ok() {
+            self.wake();
+        }
+        result
+    }
+
+    pub fn set_run_paused(
+        &self,
+        id: String,
+        paused: bool,
+        updated_at: i64,
+    ) -> Result<(), WorkflowError> {
+        let _claim_guard = self
+            .inner
+            .drain_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.after_mutation(self.inner.service.set_run_paused(id, paused, updated_at))
+    }
+
+    pub fn spawn_supervisor_task(
+        &self,
+        key: &'static str,
+        work: impl FnOnce() + Send + 'static,
+    ) -> Result<bool, WorkflowError> {
+        let mut workers = self
+            .inner
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let mut keys = self
+            .inner
+            .task_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !keys.insert(key) {
+            return Ok(false);
+        }
+        drop(keys);
+        let guard = SupervisorTaskGuard {
+            inner: Arc::clone(&self.inner),
+            key,
+        };
+        match thread::Builder::new()
+            .name(format!("linkvault-workflow-{key}"))
+            .spawn(move || {
+                let _guard = guard;
+                work();
+            }) {
+            Ok(worker) => {
+                workers.push(worker);
+                Ok(true)
+            }
+            Err(error) => {
+                // Spawn drops its closure and the guard releases admission.
+                Err(WorkflowError::Writer(error.to_string()))
+            }
+        }
     }
 
     pub fn start_supervisor(&self) -> Result<(), WorkflowError> {
@@ -111,10 +268,53 @@ impl WorkflowRuntime {
             .name("linkvault-workflow-supervisor".to_string())
             .spawn(move || {
                 while !shutdown.load(Ordering::SeqCst) {
+                    let generation = *runtime
+                        .inner
+                        .wake_generation
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let now = chrono::Utc::now().timestamp();
                     let _ = runtime.reclaim_expired_leases(30 * 60, now);
-                    let _ = runtime.drain_once();
-                    thread::sleep(Duration::from_millis(500));
+                    let mut next_deadline =
+                        now.saturating_add(SUPERVISOR_SAFETY_INTERVAL.as_secs() as i64);
+                    let hooks = runtime
+                        .inner
+                        .hooks
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    for hook in hooks {
+                        match hook.reconcile(&runtime, now) {
+                            Ok(Some(deadline)) => next_deadline = next_deadline.min(deadline),
+                            Ok(None) => {}
+                            Err(_) => {
+                                next_deadline = next_deadline
+                                    .min(now.saturating_add(SUPERVISOR_ERROR_RETRY_SECS))
+                            }
+                        }
+                    }
+                    if runtime.dispatch_ready_steps().is_err() {
+                        next_deadline =
+                            next_deadline.min(now.saturating_add(SUPERVISOR_ERROR_RETRY_SECS));
+                    }
+                    match runtime.next_ready_deadline(now) {
+                        Ok(Some(deadline)) => next_deadline = next_deadline.min(deadline),
+                        Ok(None) => {}
+                        Err(_) => {
+                            next_deadline =
+                                next_deadline.min(now.saturating_add(SUPERVISOR_ERROR_RETRY_SECS))
+                        }
+                    }
+                    runtime.reap_finished_workers();
+                    // Re-read wall time after callbacks; an overdue deadline
+                    // must not acquire a new full delay after a slow callback.
+                    let remaining = next_deadline
+                        .saturating_sub(chrono::Utc::now().timestamp())
+                        .max(1) as u64;
+                    runtime.wait_for_wake(
+                        generation,
+                        Duration::from_secs(remaining).min(SUPERVISOR_SAFETY_INTERVAL),
+                    );
                 }
             })
             .map_err(|error| WorkflowError::Writer(error.to_string()))?;
@@ -124,6 +324,7 @@ impl WorkflowRuntime {
 
     pub fn shutdown(&self) {
         self.inner.shutdown.store(true, Ordering::SeqCst);
+        self.wake();
         if let Some(handle) = self
             .inner
             .join
@@ -133,6 +334,166 @@ impl WorkflowRuntime {
         {
             let _ = handle.join();
         }
+        let hooks = self
+            .inner
+            .hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for hook in hooks {
+            hook.shutdown();
+        }
+        let workers = std::mem::take(
+            &mut *self
+                .inner
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    fn wait_for_wake(&self, generation: u64, timeout: Duration) {
+        let current = self
+            .inner
+            .wake_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _result = self
+            .inner
+            .wake_condition
+            .wait_timeout_while(current, timeout, |current| {
+                *current == generation && !self.inner.shutdown.load(Ordering::SeqCst)
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    fn reap_finished_workers(&self) {
+        let finished = {
+            let mut workers = self
+                .inner
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    finished.push(workers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            finished
+        };
+        for worker in finished {
+            let _ = worker.join();
+        }
+    }
+
+    fn next_ready_deadline(&self, now: i64) -> Result<Option<i64>, WorkflowError> {
+        let registered = self
+            .inner
+            .executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tasks = self
+            .inner
+            .task_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let busy = self
+            .inner
+            .executing_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let types = registered
+            .iter()
+            .map(|executor| executor.workflow_type())
+            .chain(std::iter::once("synthetic"))
+            .filter(|workflow_type| {
+                !busy.contains(*workflow_type) && !tasks.contains(*workflow_type)
+            })
+            .map(str::to_string)
+            .collect();
+        drop(busy);
+        drop(tasks);
+        drop(registered);
+        self.inner.service.next_ready_deadline(types, now)
+    }
+
+    fn dispatch_ready_steps(&self) -> Result<(), WorkflowError> {
+        while !self.inner.shutdown.load(Ordering::SeqCst) {
+            let Some((claimed, execute_guard)) = claim_ready_step(self, None)? else {
+                break;
+            };
+            if !self.dispatch_claimed_step(claimed, execute_guard)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_claimed_step(
+        &self,
+        claimed: ClaimedStep,
+        execute_guard: ExecuteGuard,
+    ) -> Result<bool, WorkflowError> {
+        let key = claimed
+            .executor
+            .as_ref()
+            .map_or("synthetic", |executor| executor.workflow_type());
+        let runtime = self.clone();
+        // Retain a record for a recoverable thread-launch failure.
+        let failed_claim = ClaimedStep {
+            run: claimed.run.clone(),
+            step: claimed.step.clone(),
+            executor: claimed.executor.clone(),
+        };
+        match self.spawn_supervisor_task(key, move || {
+            let _execute_guard = execute_guard;
+            let outcome = match &claimed.executor {
+                Some(executor) => executor.execute(&claimed.run, &claimed.step),
+                None => synthetic_outcome(&claimed.run),
+            };
+            let _apply_guard = runtime
+                .inner
+                .drain_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = finish_claimed_step(&runtime.inner.service, &claimed, outcome);
+        }) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let _apply_guard = self
+                    .inner
+                    .drain_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.after_mutation(self.inner.service.release_unstarted_claim(
+                    failed_claim.run.id,
+                    failed_claim.step.id,
+                    failed_claim.step.attempt,
+                    chrono::Utc::now().timestamp(),
+                ))?;
+                Ok(false)
+            }
+            Err(error) => {
+                let _apply_guard = self
+                    .inner
+                    .drain_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                finish_claimed_step(
+                    &self.inner.service,
+                    &failed_claim,
+                    ExecutorOutcome::failed("Workflow worker could not start".to_string()),
+                )?;
+                Err(error)
+            }
+        }
     }
 
     pub fn submit_synthetic(
@@ -140,7 +501,11 @@ impl WorkflowRuntime {
         request_json: &str,
         created_at: i64,
     ) -> Result<String, WorkflowError> {
-        submit_synthetic(&self.inner.service, request_json, created_at)
+        self.after_mutation(submit_synthetic(
+            &self.inner.service,
+            request_json,
+            created_at,
+        ))
     }
 
     pub fn submit_coursera_download(
@@ -173,6 +538,7 @@ impl WorkflowRuntime {
             "submitted",
             "{}".to_string(),
         )?;
+        self.wake();
         Ok(run_id)
     }
 
@@ -207,6 +573,7 @@ impl WorkflowRuntime {
             "submitted",
             "{}".to_string(),
         )?;
+        self.wake();
         Ok(run_id)
     }
 
@@ -224,23 +591,27 @@ impl WorkflowRuntime {
         &self,
         updated_at: i64,
     ) -> Result<usize, WorkflowError> {
-        self.inner.service.fail_running_runs(
+        self.after_mutation(self.inner.service.fail_running_runs(
             WorkflowType::linkedin_download().as_str().to_string(),
             "Interrupted by an application restart".to_string(),
             updated_at,
-        )
+        ))
     }
 
     pub fn delete_linkedin_runs(&self) -> Result<usize, WorkflowError> {
-        self.inner
-            .service
-            .delete_runs_by_workflow_type(WorkflowType::linkedin_download().as_str().to_string())
+        self.after_mutation(
+            self.inner.service.delete_runs_by_workflow_type(
+                WorkflowType::linkedin_download().as_str().to_string(),
+            ),
+        )
     }
 
     pub fn delete_terminal_linkedin_runs(&self) -> Result<usize, WorkflowError> {
-        self.inner
-            .service
-            .delete_terminal_runs(WorkflowType::linkedin_download().as_str().to_string())
+        self.after_mutation(
+            self.inner
+                .service
+                .delete_terminal_runs(WorkflowType::linkedin_download().as_str().to_string()),
+        )
     }
 
     pub fn submit_newspaper_download(
@@ -274,6 +645,7 @@ impl WorkflowRuntime {
             "submitted",
             "{}".to_string(),
         )?;
+        self.wake();
         Ok(run_id)
     }
 
@@ -291,23 +663,27 @@ impl WorkflowRuntime {
         &self,
         updated_at: i64,
     ) -> Result<usize, WorkflowError> {
-        self.inner.service.fail_running_runs(
+        self.after_mutation(self.inner.service.fail_running_runs(
             WorkflowType::newspaper_download().as_str().to_string(),
             "Interrupted by an application restart".to_string(),
             updated_at,
-        )
+        ))
     }
 
     pub fn delete_newspaper_runs(&self) -> Result<usize, WorkflowError> {
-        self.inner
-            .service
-            .delete_runs_by_workflow_type(WorkflowType::newspaper_download().as_str().to_string())
+        self.after_mutation(
+            self.inner.service.delete_runs_by_workflow_type(
+                WorkflowType::newspaper_download().as_str().to_string(),
+            ),
+        )
     }
 
     pub fn delete_terminal_newspaper_runs(&self) -> Result<usize, WorkflowError> {
-        self.inner
-            .service
-            .delete_terminal_runs(WorkflowType::newspaper_download().as_str().to_string())
+        self.after_mutation(
+            self.inner
+                .service
+                .delete_terminal_runs(WorkflowType::newspaper_download().as_str().to_string()),
+        )
     }
 
     pub fn submit_youtube_download(
@@ -340,6 +716,7 @@ impl WorkflowRuntime {
             "submitted",
             "{}".to_string(),
         )?;
+        self.wake();
         Ok(run_id)
     }
 
@@ -354,12 +731,14 @@ impl WorkflowRuntime {
     }
 
     pub fn reconcile_youtube_after_restart(&self, updated_at: i64) -> Result<usize, WorkflowError> {
-        // YouTube-only: fail queued/running/cancelling/(paused|retry_wait). Do not
-        // widen shared fail_running_runs used by other providers.
-        self.inner.service.fail_nonterminal_runs(
-            WorkflowType::youtube_download().as_str().to_string(),
-            "Interrupted by an application restart".to_string(),
-            updated_at,
+        self.after_mutation(
+            // YouTube-only: fail queued/running/cancelling/(paused|retry_wait). Do not
+            // widen shared fail_running_runs used by other providers.
+            self.inner.service.fail_nonterminal_runs(
+                WorkflowType::youtube_download().as_str().to_string(),
+                "Interrupted by an application restart".to_string(),
+                updated_at,
+            ),
         )
     }
 
@@ -398,34 +777,7 @@ impl WorkflowRuntime {
         if run.workflow_type.as_str() != WorkflowType::linkedin_download().as_str() {
             return Err(WorkflowError::RunNotFound(id));
         }
-        match (paused, run.state) {
-            (true, RunState::Queued) => {
-                self.inner.service.transition_run(
-                    id,
-                    RunState::Paused,
-                    None,
-                    "run_paused",
-                    "{}".to_string(),
-                    updated_at,
-                )?;
-            }
-            (false, RunState::Paused) => {
-                self.inner.service.transition_run(
-                    id,
-                    RunState::Queued,
-                    None,
-                    "run_resumed",
-                    "{}".to_string(),
-                    updated_at,
-                )?;
-            }
-            (true, RunState::Paused)
-            | (false, RunState::Queued)
-            | (_, RunState::Running)
-            | (_, RunState::Cancelling) => {}
-            _ => {}
-        }
-        Ok(())
+        self.set_run_paused(id, paused, updated_at)
     }
 
     pub fn set_all_queued_linkedin_runs_paused(
@@ -458,27 +810,31 @@ impl WorkflowRuntime {
         &self,
         updated_at: i64,
     ) -> Result<usize, WorkflowError> {
-        self.inner.service.fail_running_runs(
+        self.after_mutation(self.inner.service.fail_running_runs(
             WorkflowType::coursera_download().as_str().to_string(),
             "Interrupted by an application restart".to_string(),
             updated_at,
-        )
+        ))
     }
 
     pub fn delete_coursera_runs(&self) -> Result<usize, WorkflowError> {
-        self.inner
-            .service
-            .delete_runs_by_workflow_type(WorkflowType::coursera_download().as_str().to_string())
+        self.after_mutation(
+            self.inner.service.delete_runs_by_workflow_type(
+                WorkflowType::coursera_download().as_str().to_string(),
+            ),
+        )
     }
 
     pub fn delete_terminal_coursera_runs(&self) -> Result<usize, WorkflowError> {
-        self.inner
-            .service
-            .delete_terminal_runs(WorkflowType::coursera_download().as_str().to_string())
+        self.after_mutation(
+            self.inner
+                .service
+                .delete_terminal_runs(WorkflowType::coursera_download().as_str().to_string()),
+        )
     }
 
     pub fn delete_run_if_terminal(&self, id: String) -> Result<bool, WorkflowError> {
-        self.inner.service.delete_run_if_terminal(id)
+        self.after_mutation(self.inner.service.delete_run_if_terminal(id))
     }
 
     pub fn cancel_run(&self, id: String, updated_at: i64) -> Result<(), WorkflowError> {
@@ -502,6 +858,7 @@ impl WorkflowRuntime {
                     "{}".to_string(),
                     updated_at,
                 )?;
+                self.wake();
                 return Ok(());
             }
             RunState::Queued | RunState::Paused | RunState::RetryWait => {}
@@ -536,6 +893,7 @@ impl WorkflowRuntime {
             "{}".to_string(),
             updated_at,
         )?;
+        self.wake();
         Ok(())
     }
 
@@ -596,10 +954,31 @@ impl WorkflowRuntime {
         lease_ttl_secs: i64,
         now: i64,
     ) -> Result<usize, WorkflowError> {
-        self.inner.service.fail_expired_running_runs(
+        let _claim_guard = self
+            .inner
+            .drain_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active: Vec<String> = self
+            .inner
+            .executing_run_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        if active.is_empty() {
+            return self.inner.service.fail_expired_running_runs(
+                "Workflow lease expired".to_string(),
+                now,
+                now.saturating_sub(lease_ttl_secs),
+            );
+        }
+        self.inner.service.fail_expired_running_runs_excluding(
             "Workflow lease expired".to_string(),
             now,
             now.saturating_sub(lease_ttl_secs),
+            active,
         )
     }
 
@@ -612,6 +991,16 @@ impl WorkflowRuntime {
     }
 
     fn try_begin_execute(&self, workflow_type: &str) -> Option<ExecuteGuard> {
+        // A worker releases its execute guard before its task guard. Avoid
+        // claiming the next run during that small admission handoff window.
+        let tasks = self
+            .inner
+            .task_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks.contains(workflow_type) {
+            return None;
+        }
         let mut busy = self
             .inner
             .executing_types
@@ -623,7 +1012,17 @@ impl WorkflowRuntime {
         Some(ExecuteGuard {
             inner: Arc::clone(&self.inner),
             workflow_type: workflow_type.to_string(),
+            run_id: None,
         })
+    }
+
+    fn record_active_run(&self, guard: &mut ExecuteGuard, run_id: &str) {
+        self.inner
+            .executing_run_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.to_string());
+        guard.run_id = Some(run_id.to_string());
     }
 }
 
@@ -669,7 +1068,7 @@ fn claim_ready_step(
         if only_type.is_some_and(|wanted| executor.workflow_type() != wanted) {
             continue;
         }
-        let Some(execute_guard) = runtime.try_begin_execute(executor.workflow_type()) else {
+        let Some(mut execute_guard) = runtime.try_begin_execute(executor.workflow_type()) else {
             continue;
         };
         let claimed = {
@@ -689,6 +1088,7 @@ fn claim_ready_step(
                         .service
                         .get_run(step.run_id.clone())?
                         .ok_or_else(|| WorkflowError::RunNotFound(step.run_id.clone()))?;
+                    runtime.record_active_run(&mut execute_guard, &run.id);
                     Some(ClaimedStep {
                         run,
                         step,
@@ -706,7 +1106,8 @@ fn claim_ready_step(
     if only_type.is_some_and(|wanted| wanted != WorkflowType::synthetic().as_str()) {
         return Ok(None);
     }
-    let Some(execute_guard) = runtime.try_begin_execute(WorkflowType::synthetic().as_str()) else {
+    let Some(mut execute_guard) = runtime.try_begin_execute(WorkflowType::synthetic().as_str())
+    else {
         return Ok(None);
     };
     let claimed = {
@@ -726,6 +1127,7 @@ fn claim_ready_step(
                     .service
                     .get_run(step.run_id.clone())?
                     .ok_or_else(|| WorkflowError::RunNotFound(step.run_id.clone()))?;
+                runtime.record_active_run(&mut execute_guard, &run.id);
                 Some(ClaimedStep {
                     run,
                     step,
@@ -1042,6 +1444,391 @@ mod tests {
         drop(connection);
         let writer = DatabaseWriter::start(db_path, DatabaseDiagnostics::default()).unwrap();
         (directory, WorkflowRuntime::new(writer))
+    }
+
+    struct DeadlineHook {
+        calls: std::sync::mpsc::Sender<i64>,
+        deadline: std::sync::atomic::AtomicI64,
+    }
+
+    impl SupervisorHook for DeadlineHook {
+        fn reconcile(
+            &self,
+            _runtime: &WorkflowRuntime,
+            now: i64,
+        ) -> Result<Option<i64>, WorkflowError> {
+            let _ = self.calls.send(now);
+            let deadline = self.deadline.load(Ordering::SeqCst);
+            Ok((deadline > 0).then_some(deadline))
+        }
+    }
+
+    #[test]
+    fn supervisor_sleeps_when_idle_and_wakes_before_a_future_deadline() {
+        let (_dir, runtime) = runtime();
+        let (sent, received) = std::sync::mpsc::channel();
+        runtime.register_supervisor_hook(Arc::new(DeadlineHook {
+            calls: sent,
+            deadline: std::sync::atomic::AtomicI64::new(chrono::Utc::now().timestamp() + 3600),
+        }));
+        runtime.start_supervisor().unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The old 500ms loop would reconcile twice during this quiet interval.
+        assert!(received.recv_timeout(Duration::from_millis(1100)).is_err());
+        runtime.wake();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = std::time::Instant::now();
+        runtime.shutdown();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "Shutdown must interrupt the deadline wait"
+        );
+        assert!(!runtime
+            .spawn_supervisor_task("after_shutdown", || {})
+            .unwrap());
+    }
+
+    #[test]
+    fn supervisor_rechecks_a_deadline_that_is_already_missed() {
+        let (_dir, runtime) = runtime();
+        let (sent, received) = std::sync::mpsc::channel();
+        let missed = chrono::Utc::now().timestamp() - 60;
+        runtime.register_supervisor_hook(Arc::new(DeadlineHook {
+            calls: sent,
+            deadline: std::sync::atomic::AtomicI64::new(missed),
+        }));
+        runtime.start_supervisor().unwrap();
+        assert!(received.recv_timeout(Duration::from_secs(2)).unwrap() >= missed);
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn wake_during_reconciliation_is_not_lost() {
+        struct BlockingHook {
+            calls: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            first: AtomicBool,
+        }
+        impl SupervisorHook for BlockingHook {
+            fn reconcile(
+                &self,
+                _runtime: &WorkflowRuntime,
+                now: i64,
+            ) -> Result<Option<i64>, WorkflowError> {
+                let _ = self.calls.send(());
+                if self.first.swap(false, Ordering::SeqCst) {
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap();
+                }
+                Ok(Some(now + 3600))
+            }
+        }
+        let (_dir, runtime) = runtime();
+        let (calls, received) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        runtime.register_supervisor_hook(Arc::new(BlockingHook {
+            calls,
+            release: Mutex::new(blocked),
+            first: AtomicBool::new(true),
+        }));
+        runtime.start_supervisor().unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.wake();
+        release.send(()).unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn long_executor_does_not_block_hooks_or_expire_its_local_run() {
+        struct BlockingExecutor {
+            started: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl StepExecutor for BlockingExecutor {
+            fn workflow_type(&self) -> &'static str {
+                "newspaper_download"
+            }
+            fn execute(&self, _run: &RunRecord, _step: &StepRecord) -> ExecutorOutcome {
+                let _ = self.started.send(());
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                ExecutorOutcome::succeeded("{}".to_string())
+            }
+        }
+        let (_dir, runtime) = runtime();
+        let now = chrono::Utc::now().timestamp();
+        let orphan = runtime.submit_synthetic("{}", now - 100).unwrap();
+        runtime
+            .inner
+            .service
+            .claim_next_ready_step("synthetic".to_string(), now - 100)
+            .unwrap()
+            .unwrap();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        runtime.register_executor(Arc::new(BlockingExecutor {
+            started,
+            release: Mutex::new(release_rx),
+        }));
+        let (calls, calls_rx) = std::sync::mpsc::channel();
+        runtime.register_supervisor_hook(Arc::new(DeadlineHook {
+            calls,
+            deadline: std::sync::atomic::AtomicI64::new(now + 3600),
+        }));
+        let run_id = runtime
+            .submit_newspaper_download(
+                "long-run".to_string(),
+                "edition".to_string(),
+                "{}".to_string(),
+                String::new(),
+                now,
+                None,
+            )
+            .unwrap();
+        runtime.start_supervisor().unwrap();
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(runtime.is_workflow_type_executing("newspaper_download"));
+        runtime.wake();
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(runtime.reclaim_expired_leases(0, now + 2).unwrap(), 1);
+        assert_eq!(
+            runtime.get_run(orphan).unwrap().unwrap().state,
+            RunState::Failed
+        );
+        assert_eq!(
+            runtime.get_run(run_id.clone()).unwrap().unwrap().state,
+            RunState::Running
+        );
+        release.send(()).unwrap();
+        runtime.shutdown();
+        assert!(!runtime.is_workflow_type_executing("newspaper_download"));
+        assert_eq!(
+            runtime.get_run(run_id).unwrap().unwrap().state,
+            RunState::Succeeded
+        );
+    }
+
+    #[test]
+    fn owned_tasks_are_single_flight_and_shutdown_joins_them_after_hook_cancellation() {
+        struct ShutdownHook {
+            release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        }
+        impl SupervisorHook for ShutdownHook {
+            fn reconcile(
+                &self,
+                _runtime: &WorkflowRuntime,
+                _now: i64,
+            ) -> Result<Option<i64>, WorkflowError> {
+                Ok(None)
+            }
+            fn shutdown(&self) {
+                if let Some(release) = self.release.lock().unwrap().take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+        let (_dir, runtime) = runtime();
+        let (release, waiting) = std::sync::mpsc::channel();
+        runtime.register_supervisor_hook(Arc::new(ShutdownHook {
+            release: Mutex::new(Some(release)),
+        }));
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        assert!(runtime
+            .spawn_supervisor_task("owned_test", move || {
+                waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+                worker_completed.store(true, Ordering::SeqCst);
+            })
+            .unwrap());
+        assert!(!runtime
+            .spawn_supervisor_task("owned_test", || panic!("Duplicate must not run"))
+            .unwrap());
+        runtime.shutdown();
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pause_resume_retains_future_workflow_deadline_and_step_consistency() {
+        let (_dir, runtime) = runtime();
+        let now = chrono::Utc::now().timestamp();
+        let run_id = runtime
+            .submit_newspaper_download(
+                "future".to_string(),
+                "edition".to_string(),
+                "{}".to_string(),
+                String::new(),
+                now,
+                Some(now + 3600),
+            )
+            .unwrap();
+        let deadlines = |at| {
+            runtime
+                .inner
+                .service
+                .next_ready_deadline(vec!["newspaper_download".to_string()], at)
+                .unwrap()
+        };
+        assert_eq!(deadlines(now), Some(now + 3600));
+        runtime
+            .set_run_paused(run_id.clone(), true, now + 1)
+            .unwrap();
+        assert_eq!(
+            runtime.get_run(run_id.clone()).unwrap().unwrap().state,
+            RunState::Paused
+        );
+        assert_eq!(deadlines(now), None);
+        runtime
+            .set_run_paused(run_id.clone(), false, now + 2)
+            .unwrap();
+        let resumed = runtime.get_run(run_id.clone()).unwrap().unwrap();
+        assert_eq!(resumed.state, RunState::RetryWait);
+        assert_eq!(resumed.updated_at, now + 3600);
+        assert_eq!(deadlines(now + 2), Some(now + 3600));
+        assert_eq!(
+            deadlines(now + 3601),
+            Some(now + 3601),
+            "A missed workflow deadline is due immediately"
+        );
+        let steps = runtime.inner.service.list_steps_for_run(run_id).unwrap();
+        assert_eq!(steps[0].state, StepState::RetryWait);
+        assert_eq!(steps[0].updated_at, now + 3600);
+        assert!(runtime
+            .inner
+            .service
+            .claim_next_ready_step("newspaper_download".to_string(), now + 3)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn completed_worker_releases_admission_for_the_next_run() {
+        let (_dir, runtime) = runtime();
+        let now = chrono::Utc::now().timestamp();
+        let first = runtime.submit_synthetic("{}", now).unwrap();
+        let second = runtime.submit_synthetic("{}", now + 1).unwrap();
+        runtime.start_supervisor().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if runtime.get_run(second.clone()).unwrap().unwrap().state == RunState::Succeeded {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        runtime.shutdown();
+        assert_eq!(
+            runtime.get_run(first).unwrap().unwrap().state,
+            RunState::Succeeded
+        );
+        assert_eq!(
+            runtime.get_run(second).unwrap().unwrap().state,
+            RunState::Succeeded
+        );
+    }
+
+    #[test]
+    fn rejected_worker_admission_releases_the_unstarted_claim_without_an_attempt() {
+        let (_dir, runtime) = runtime();
+        let now = chrono::Utc::now().timestamp();
+        let run_id = runtime.submit_synthetic("{}", now).unwrap();
+        let (claimed, guard) = claim_ready_step(&runtime, None).unwrap().unwrap();
+        // Force the real shutdown race between durable claim and admission.
+        runtime.inner.shutdown.store(true, Ordering::SeqCst);
+        assert!(!runtime.dispatch_claimed_step(claimed, guard).unwrap());
+        let run = runtime.get_run(run_id.clone()).unwrap().unwrap();
+        let steps = runtime
+            .inner
+            .service
+            .list_steps_for_run(run_id.clone())
+            .unwrap();
+        assert_eq!(run.state, RunState::RetryWait);
+        assert_eq!(steps[0].state, StepState::RetryWait);
+        assert_eq!(steps[0].attempt, 0);
+        assert!(steps[0].updated_at <= chrono::Utc::now().timestamp());
+        runtime.inner.shutdown.store(false, Ordering::SeqCst);
+        assert!(runtime.drain_once().unwrap().processed);
+        assert_eq!(
+            runtime.get_run(run_id).unwrap().unwrap().state,
+            RunState::Succeeded
+        );
+    }
+
+    #[test]
+    fn rejected_worker_admission_does_not_overwrite_pause_or_cancel() {
+        for paused in [true, false] {
+            let (_dir, runtime) = runtime();
+            let now = chrono::Utc::now().timestamp();
+            let run_id = runtime.submit_synthetic("{}", now).unwrap();
+            let (claimed, guard) = claim_ready_step(&runtime, None).unwrap().unwrap();
+            if paused {
+                runtime
+                    .inner
+                    .service
+                    .transition_run(
+                        run_id.clone(),
+                        RunState::Paused,
+                        None,
+                        "run_paused",
+                        "{}".to_string(),
+                        now,
+                    )
+                    .unwrap();
+            } else {
+                runtime.cancel_run(run_id.clone(), now).unwrap();
+            }
+            runtime.inner.shutdown.store(true, Ordering::SeqCst);
+            assert!(!runtime.dispatch_claimed_step(claimed, guard).unwrap());
+            let run = runtime.get_run(run_id.clone()).unwrap().unwrap();
+            let steps = runtime.inner.service.list_steps_for_run(run_id).unwrap();
+            assert_eq!(
+                run.state,
+                if paused {
+                    RunState::Paused
+                } else {
+                    RunState::Cancelled
+                }
+            );
+            assert_eq!(
+                steps[0].state,
+                if paused {
+                    StepState::RetryWait
+                } else {
+                    StepState::Cancelled
+                }
+            );
+            assert_eq!(steps[0].attempt, 0);
+        }
+    }
+
+    #[test]
+    fn managed_task_admission_suppresses_an_overdue_workflow_deadline() {
+        let (_dir, runtime) = runtime();
+        let now = chrono::Utc::now().timestamp();
+        runtime.submit_synthetic("{}", now).unwrap();
+        assert_eq!(runtime.next_ready_deadline(now).unwrap(), Some(now));
+        let (release, waiting) = std::sync::mpsc::channel();
+        assert!(runtime
+            .spawn_supervisor_task("synthetic", move || {
+                waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+            })
+            .unwrap());
+        assert!(runtime.inner.executing_types.lock().unwrap().is_empty());
+        assert_eq!(
+            runtime.next_ready_deadline(now).unwrap(),
+            None,
+            "An admitted managed task must suppress claim and deadline identically"
+        );
+        release.send(()).unwrap();
+        runtime.shutdown();
+        assert_eq!(runtime.next_ready_deadline(now).unwrap(), Some(now));
     }
 
     #[test]

@@ -649,7 +649,7 @@ try {
 }
 
 const report = {
-  candidate: "@tiptap/core@3.29.2 + @tiptap/react@3.29.2 + @tiptap/starter-kit@3.29.2 + @tiptap/markdown@3.29.2 + @tiptap/suggestion@3.29.2 + @tiptap/extension-list@3.29.2",
+  candidate: "@tiptap/core@3.31.4 + @tiptap/react@3.31.4 + @tiptap/starter-kit@3.31.4 + @tiptap/markdown@3.31.4 + @tiptap/suggestion@3.31.4 + @tiptap/extension-list@3.31.4",
   baseUrl,
   checks,
   consoleErrors,

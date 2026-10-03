@@ -82,8 +82,7 @@ impl CourseLayout {
         }
     }
 
-    /// Read the frozen placement row. A missing row freezes Standalone so a
-    /// later membership capture cannot nest a previously-flat job.
+    /// Read the frozen placement row without mutating a runtime reader connection.
     pub fn load(
         conn: &Connection,
         output_root: &str,
@@ -93,10 +92,23 @@ impl CourseLayout {
         if let Some(home) = select_home(conn, output_root.as_str(), course_slug)? {
             return Ok(Self { output_root, home });
         }
-        insert_standalone_ignore(conn, output_root.as_str(), course_slug, unix_timestamp())?;
-        let home =
-            select_home(conn, output_root.as_str(), course_slug)?.unwrap_or(CourseHome::Standalone);
-        Ok(Self { output_root, home })
+        Ok(Self {
+            output_root,
+            home: CourseHome::Standalone,
+        })
+    }
+
+    /// Called only from a DatabaseWriter closure; freeze legacy flat jobs before use.
+    pub(crate) fn ensure_on_writer(
+        conn: &Connection,
+        output_root: &str,
+        course_slug: &str,
+    ) -> Result<Self, PlacementError> {
+        let root = OutputRoot::parse(output_root)?;
+        if select_home(conn, root.as_str(), course_slug)?.is_none() {
+            insert_standalone_ignore(conn, root.as_str(), course_slug, unix_timestamp())?;
+        }
+        Self::load(conn, root.as_str(), course_slug)
     }
 
     pub fn prefix_segments(&self) -> Vec<&str> {

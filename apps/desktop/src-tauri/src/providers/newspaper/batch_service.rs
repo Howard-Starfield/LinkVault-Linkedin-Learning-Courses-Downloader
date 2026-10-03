@@ -15,15 +15,95 @@ use super::{
     naming,
     projection::NewspaperWorkflowRequest,
 };
-use crate::workflow::application::runtime::WorkflowRuntime;
+use crate::app::database_diagnostics::DatabaseProvider;
+use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
+use crate::workflow::domain::types::{NewWorkflowRun, NewWorkflowStep, StepType, WorkflowType};
+use crate::workflow::infrastructure::sqlite_repository::SqliteWorkflowRepository;
+
+#[derive(Debug, thiserror::Error)]
+enum BatchCreationError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Validation(String),
+}
 
 pub(super) fn create(
-    db_path: &Path,
-    runtime: &WorkflowRuntime,
+    writer: &DatabaseWriter,
     request: CreateNewspaperBatchRequest,
 ) -> Result<CreateNewspaperBatchResponse, String> {
-    let mut connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    create_with_origin(&mut connection, request, None, Some(runtime))
+    let completed_markers = preflight_completed_markers(writer, &request)?;
+    writer
+        .execute(
+            DatabaseWriteContext {
+                operation: "create_newspaper_batch",
+                provider: DatabaseProvider::Newspaper,
+                workflow_id: None,
+            },
+            move |connection| match create_with_origin(
+                connection,
+                request,
+                None,
+                true,
+                Some(&completed_markers),
+            ) {
+                Ok(response) => Ok(Ok(response)),
+                Err(BatchCreationError::Sqlite(error)) => Err(error.into()),
+                Err(error) => Ok(Err(error.to_string())),
+            },
+        )
+        .map_err(|error| error.to_string())?
+}
+
+fn preflight_completed_markers(
+    writer: &DatabaseWriter,
+    request: &CreateNewspaperBatchRequest,
+) -> Result<HashSet<String>, String> {
+    validate_request(request)?;
+    let start = parse_date(&request.start_date)?;
+    let end = request.end_date.as_deref().map(parse_date).transpose()?;
+    let dates = expand_dates(request.date_mode, start, end).map_err(|error| error.to_string())?;
+    let catalog = writer
+        .execute(
+            DatabaseWriteContext {
+                operation: "plan_newspaper_batch",
+                provider: DatabaseProvider::Newspaper,
+                workflow_id: None,
+            },
+            |connection| Ok(catalog_service::list_with_connection(connection)),
+        )
+        .map_err(|error| error.to_string())??;
+    let mut markers = HashSet::new();
+    for edition in catalog.into_iter().filter(|edition| {
+        request
+            .edition_codes
+            .iter()
+            .any(|key| *key == naming::edition_key(edition))
+    }) {
+        let valid_dates: Vec<_> = if edition.kind == EditionKind::Special {
+            edition.publication_date.into_iter().collect()
+        } else {
+            dates
+                .iter()
+                .copied()
+                .filter(|date| edition.schedule.accepts(*date))
+                .collect()
+        };
+        for date in valid_dates {
+            let output_dir = Path::new(&request.destination)
+                .join(naming::sanitize_segment(&format!(
+                    "{} - {}",
+                    edition.name_zh, edition.code
+                )))
+                .join(date.to_string());
+            if output_dir.join(".complete").is_file() {
+                markers.insert(output_dir.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(markers)
 }
 
 #[cfg(test)]
@@ -31,29 +111,28 @@ pub(super) fn create_with_connection(
     connection: &mut Connection,
     request: CreateNewspaperBatchRequest,
 ) -> Result<CreateNewspaperBatchResponse, String> {
-    create_with_origin(connection, request, None, None)
-}
-
-pub(super) fn create_for_schedule_with_connection(
-    connection: &mut Connection,
-    request: CreateNewspaperBatchRequest,
-    schedule_id: &str,
-    runtime: Option<&WorkflowRuntime>,
-) -> Result<CreateNewspaperBatchResponse, String> {
-    create_with_origin(connection, request, Some(schedule_id), runtime)
+    create_with_origin(connection, request, None, false, None).map_err(|error| error.to_string())
 }
 
 fn create_with_origin(
     connection: &mut Connection,
     request: CreateNewspaperBatchRequest,
     schedule_id: Option<&str>,
-    runtime: Option<&WorkflowRuntime>,
-) -> Result<CreateNewspaperBatchResponse, String> {
-    validate_request(&request)?;
-    let start = parse_date(&request.start_date)?;
-    let end = request.end_date.as_deref().map(parse_date).transpose()?;
-    let dates = expand_dates(request.date_mode, start, end).map_err(|error| error.to_string())?;
-    let catalog = catalog_service::list_with_connection(connection)?;
+    workflow_enabled: bool,
+    completed_markers: Option<&HashSet<String>>,
+) -> Result<CreateNewspaperBatchResponse, BatchCreationError> {
+    validate_request(&request).map_err(BatchCreationError::Validation)?;
+    let start = parse_date(&request.start_date).map_err(BatchCreationError::Validation)?;
+    let end = request
+        .end_date
+        .as_deref()
+        .map(parse_date)
+        .transpose()
+        .map_err(BatchCreationError::Validation)?;
+    let dates = expand_dates(request.date_mode, start, end)
+        .map_err(|error| BatchCreationError::Validation(error.to_string()))?;
+    let catalog = catalog_service::list_with_connection(connection)
+        .map_err(BatchCreationError::Validation)?;
     let selected: Vec<NewspaperEdition> = catalog
         .into_iter()
         .filter(|edition| {
@@ -64,7 +143,9 @@ fn create_with_origin(
         })
         .collect();
     if selected.is_empty() {
-        return Err("Select at least one supported newspaper edition.".to_string());
+        return Err(BatchCreationError::Validation(
+            "Select at least one supported newspaper edition.".to_string(),
+        ));
     }
 
     let now = Utc::now().timestamp();
@@ -77,30 +158,31 @@ fn create_with_origin(
     };
     let mut workflow_keys = HashSet::new();
     let mut workflow_max_position = 0_i64;
-    if let Some(runtime) = runtime {
-        for run in runtime
-            .list_newspaper_runs(1_000)
-            .map_err(|error| error.to_string())?
-        {
-            let projected = super::projection::job_from_run(&run);
-            workflow_max_position = workflow_max_position.max(projected.queue_position);
-            workflow_keys.insert((
-                projected.edition_code,
-                projected.publication_date,
-                projected.output_dir,
-            ));
+    if workflow_enabled {
+        let mut statement = connection.prepare(
+            "SELECT request_json, output_root FROM workflow_runs WHERE workflow_type = 'newspaper_download'"
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (json, output_root) = row?;
+            if let Ok(projected) = serde_json::from_str::<NewspaperWorkflowRequest>(&json) {
+                workflow_max_position = workflow_max_position.max(projected.queue_position);
+                workflow_keys.insert((
+                    projected.edition_code,
+                    projected.publication_date,
+                    output_root,
+                ));
+            }
         }
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    let mut next_queue_position = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(queue_position), 0) + 1 FROM newspaper_jobs",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| error.to_string())?;
+    let transaction = connection.transaction()?;
+    let mut next_queue_position = transaction.query_row(
+        "SELECT COALESCE(MAX(queue_position), 0) + 1 FROM newspaper_jobs",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
     next_queue_position = next_queue_position.max(workflow_max_position.saturating_add(1));
     transaction
         .execute(
@@ -122,7 +204,7 @@ fn create_with_origin(
                 now,
             ],
         )
-        .map_err(|error| error.to_string())?;
+        ?;
 
     let mut created = Vec::new();
     let mut pending_submits = Vec::new();
@@ -158,13 +240,15 @@ fn create_with_origin(
                     params![edition.code, date_string, output_dir_string],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
-                .optional()
-                .map_err(|error| error.to_string())?;
+                .optional()?;
             if let Some((existing_job_id, existing_batch_id, existing_status, existing_dismissed)) =
                 existing
             {
                 skipped_count = skipped_count.saturating_add(1);
-                let marker_missing = !output_dir.join(".complete").is_file();
+                let marker_missing = match completed_markers {
+                    Some(markers) => !markers.contains(&output_dir_string),
+                    None => !output_dir.join(".complete").is_file(),
+                };
                 let should_requeue = marker_missing
                     && matches!(
                         existing_status.as_str(),
@@ -173,19 +257,16 @@ fn create_with_origin(
                 let should_restore = existing_dismissed
                     && matches!(existing_status.as_str(), "completed" | "partial");
                 if should_requeue {
-                    transaction
-                        .execute(
-                            "UPDATE newspaper_pages
+                    transaction.execute(
+                        "UPDATE newspaper_pages
                              SET status = 'pending', error = NULL, updated_at = ?2
                              WHERE job_id = ?1 AND status IN ('failed', 'cancelled')",
-                            params![existing_job_id, now],
-                        )
-                        .map_err(|error| error.to_string())?;
+                        params![existing_job_id, now],
+                    )?;
                 }
                 if should_requeue || should_restore {
-                    transaction
-                        .execute(
-                            "UPDATE newspaper_jobs
+                    transaction.execute(
+                        "UPDATE newspaper_jobs
                              SET status = CASE WHEN ?4 THEN 'queued' ELSE status END,
                                  retry_at = CASE WHEN ?4 THEN NULL ELSE retry_at END,
                                  failed_count = CASE WHEN ?4 THEN 0 ELSE failed_count END,
@@ -196,24 +277,21 @@ fn create_with_origin(
                                  completed_at = CASE WHEN ?4 THEN NULL ELSE completed_at END,
                                  updated_at = ?2
                              WHERE id = ?1",
-                            params![existing_job_id, now, next_queue_position, should_requeue],
-                        )
-                        .map_err(|error| error.to_string())?;
+                        params![existing_job_id, now, next_queue_position, should_requeue],
+                    )?;
                 }
                 if should_requeue {
                     next_queue_position += 1;
-                    transaction
-                        .execute(
-                            "UPDATE newspaper_batches
+                    transaction.execute(
+                        "UPDATE newspaper_batches
                              SET status = 'queued', scheduled_at = NULL, completed_at = NULL,
                                  updated_at = ?2 WHERE id = ?1",
-                            params![existing_batch_id, now],
-                        )
-                        .map_err(|error| error.to_string())?;
+                        params![existing_batch_id, now],
+                    )?;
                 }
                 continue;
             }
-            if runtime.is_some() {
+            if workflow_enabled {
                 if !workflow_keys.insert((
                     edition.code.clone(),
                     date_string.clone(),
@@ -273,25 +351,23 @@ fn create_with_origin(
                 next_queue_position += 1;
                 continue;
             }
-            transaction
-                .execute(
-                    "INSERT INTO newspaper_jobs
+            transaction.execute(
+                "INSERT INTO newspaper_jobs
                     (id, batch_id, edition_code, edition_publication_date, publication_date,
                      status, output_dir, queue_position, created_at, updated_at)
                     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?8)
                     ON CONFLICT(edition_code, publication_date, output_dir) DO NOTHING",
-                    params![
-                        job_id,
-                        batch_id,
-                        edition.code,
-                        edition_publication_date,
-                        date_string,
-                        output_dir_string,
-                        next_queue_position,
-                        now,
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
+                params![
+                    job_id,
+                    batch_id,
+                    edition.code,
+                    edition_publication_date,
+                    date_string,
+                    output_dir_string,
+                    next_queue_position,
+                    now,
+                ],
+            )?;
             if transaction.changes() == 0 {
                 skipped_count = skipped_count.saturating_add(1);
                 continue;
@@ -321,33 +397,43 @@ fn create_with_origin(
         }
     }
     if created.is_empty() && skipped_count == 0 {
-        return Err("The selected editions do not publish on the chosen dates.".to_string());
+        return Err(BatchCreationError::Validation(
+            "The selected editions do not publish on the chosen dates.".to_string(),
+        ));
     }
     if created.is_empty() {
-        transaction
-            .execute(
-                "UPDATE newspaper_batches
+        transaction.execute(
+            "UPDATE newspaper_batches
                  SET status = 'completed', completed_at = ?2, updated_at = ?2
                  WHERE id = ?1",
-                params![batch_id, now],
-            )
-            .map_err(|error| error.to_string())?;
+            params![batch_id, now],
+        )?;
     }
-    transaction.commit().map_err(|error| error.to_string())?;
-    if let Some(runtime) = runtime {
-        for (job, request, ready_at) in pending_submits {
-            runtime
-                .submit_newspaper_download(
-                    job.id,
-                    request.edition_code.clone(),
-                    serde_json::to_string(&request).map_err(|error| error.to_string())?,
-                    job.output_dir,
-                    job.created_at,
-                    ready_at,
-                )
-                .map_err(|error| error.to_string())?;
-        }
+    for (job, workflow_request, ready_at) in pending_submits {
+        SqliteWorkflowRepository.insert_run_with_steps_and_event_in_transaction(
+            &transaction,
+            &NewWorkflowRun {
+                id: job.id.clone(),
+                workflow_type: WorkflowType::newspaper_download(),
+                provider: "newspaper".to_string(),
+                legacy_origin: None,
+                legacy_id: None,
+                request_json: serde_json::to_string(&workflow_request)?,
+                output_root: job.output_dir,
+                created_at: job.created_at,
+                ready_at,
+            },
+            &[NewWorkflowStep {
+                id: format!("{}-execute", job.id),
+                step_key: workflow_request.edition_code,
+                step_type: StepType::newspaper_execute(),
+                created_at: job.created_at,
+            }],
+            "submitted",
+            "{}",
+        )?;
     }
+    transaction.commit()?;
     let batch = NewspaperBatch {
         id: batch_id,
         status: if created.is_empty() {
@@ -402,39 +488,41 @@ pub(super) fn list(connection: &Connection) -> Result<Vec<NewspaperBatch>, Strin
     result
 }
 
-pub(super) fn pause(db_path: &Path, batch_id: &str, paused: bool) -> Result<(), String> {
-    let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    connection
+pub(super) fn pause(writer: &DatabaseWriter, batch_id: &str, paused: bool) -> Result<(), String> {
+    let batch_id = batch_id.to_string();
+    writer
         .execute(
-            "UPDATE newspaper_batches SET status = ?2, updated_at = ?3
+            DatabaseWriteContext {
+                operation: "pause_newspaper_batch",
+                provider: DatabaseProvider::Newspaper,
+                workflow_id: Some(batch_id.clone()),
+            },
+            move |connection| {
+                connection.execute(
+                    "UPDATE newspaper_batches SET status = ?2, updated_at = ?3
              WHERE id = ?1 AND status IN ('queued', 'scheduled', 'active', 'paused')",
-            params![
-                batch_id,
-                if paused { "paused" } else { "queued" },
-                Utc::now().timestamp()
-            ],
+                    params![
+                        batch_id,
+                        if paused { "paused" } else { "queued" },
+                        Utc::now().timestamp()
+                    ],
+                )?;
+                Ok(())
+            },
         )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
-pub(super) fn cancel(db_path: &Path, batch_id: &str) -> Result<(), String> {
-    let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    let now = Utc::now().timestamp();
-    connection
-        .execute(
-            "UPDATE newspaper_batches SET status = 'cancelled', updated_at = ?2 WHERE id = ?1",
-            params![batch_id, now],
-        )
-        .map_err(|error| error.to_string())?;
-    connection
-        .execute(
-            "UPDATE newspaper_jobs SET status = 'cancelled', updated_at = ?2
-             WHERE batch_id = ?1 AND status IN ('queued', 'active', 'optimizing')",
-            params![batch_id, now],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+pub(super) fn cancel(writer: &DatabaseWriter, batch_id: &str) -> Result<(), String> {
+    let batch_id = batch_id.to_string();
+    writer.execute(DatabaseWriteContext { operation: "cancel_newspaper_batch", provider: DatabaseProvider::Newspaper, workflow_id: Some(batch_id.clone()) }, move |connection| {
+        let now = Utc::now().timestamp();
+        let tx = connection.transaction()?;
+        tx.execute("UPDATE newspaper_batches SET status = 'cancelled', updated_at = ?2 WHERE id = ?1", params![batch_id, now])?;
+        tx.execute("UPDATE newspaper_jobs SET status = 'cancelled', updated_at = ?2 WHERE batch_id = ?1 AND status IN ('queued', 'active', 'optimizing')", params![batch_id, now])?;
+        tx.commit()?;
+        Ok(())
+    }).map_err(|error| error.to_string())
 }
 
 pub(super) fn validate_request(request: &CreateNewspaperBatchRequest) -> Result<(), String> {
@@ -508,6 +596,7 @@ mod tests {
     use crate::app::database_diagnostics::DatabaseDiagnostics;
     use crate::app::database_writer::DatabaseWriter;
     use crate::newspaper::models::{CreateNewspaperBatchRequest, DateMode};
+    use crate::workflow::application::runtime::WorkflowRuntime;
     use tempfile::tempdir;
 
     fn request(destination: &Path, date: &str) -> CreateNewspaperBatchRequest {
@@ -526,21 +615,31 @@ mod tests {
         }
     }
 
-    fn workflow_harness() -> (tempfile::TempDir, WorkflowRuntime, std::path::PathBuf) {
+    fn workflow_harness() -> (
+        tempfile::TempDir,
+        DatabaseWriter,
+        WorkflowRuntime,
+        std::path::PathBuf,
+    ) {
         let directory = tempdir().unwrap();
         let db_path = directory.path().join("linkvault.sqlite3");
         let (connection, _) = crate::cache::initialize_database(&db_path).unwrap();
         drop(connection);
         let writer =
             DatabaseWriter::start(db_path.clone(), DatabaseDiagnostics::default()).unwrap();
-        (directory, WorkflowRuntime::new(writer), db_path)
+        (
+            directory,
+            writer.clone(),
+            WorkflowRuntime::new(writer),
+            db_path,
+        )
     }
 
     #[test]
     fn production_create_writes_workflow_runs_not_newspaper_jobs() {
-        let (directory, runtime, db_path) = workflow_harness();
+        let (directory, writer, runtime, db_path) = workflow_harness();
         let destination = directory.path().join("papers");
-        let response = create(&db_path, &runtime, request(&destination, "2026-07-24")).unwrap();
+        let response = create(&writer, request(&destination, "2026-07-24")).unwrap();
         assert_eq!(response.jobs.len(), 1);
         assert_eq!(response.jobs[0].edition_code, "NY");
         assert_eq!(response.jobs[0].status, "queued");
@@ -563,13 +662,14 @@ mod tests {
         let parsed: NewspaperWorkflowRequest = serde_json::from_str(&runs[0].request_json).unwrap();
         assert_eq!(parsed.batch_id, response.batch.id);
         assert_eq!(parsed.edition_code, "NY");
+        writer.shutdown().unwrap();
     }
 
     #[test]
     fn finish_if_terminal_waits_for_pending_workflow_runs() {
-        let (directory, runtime, db_path) = workflow_harness();
+        let (directory, writer, _runtime, db_path) = workflow_harness();
         let destination = directory.path().join("papers");
-        let response = create(&db_path, &runtime, request(&destination, "2026-07-24")).unwrap();
+        let response = create(&writer, request(&destination, "2026-07-24")).unwrap();
         let connection = crate::cache::open_runtime(&db_path).unwrap();
         finish_if_terminal(&connection, &response.batch.id).unwrap();
         let status: String = connection
@@ -580,5 +680,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "queued");
+        writer.shutdown().unwrap();
     }
 }

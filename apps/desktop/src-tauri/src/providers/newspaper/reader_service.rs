@@ -7,10 +7,21 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::app::database_diagnostics::DatabaseProvider;
+use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
+
 use super::{
     models::{NewspaperPage, NewspaperReadingProgress},
     thumbnails,
 };
+
+#[derive(Debug, thiserror::Error)]
+enum ReadingProgressError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("{0}")]
+    Validation(String),
+}
 
 pub(super) fn manifest(db_path: &Path, job_id: &str) -> Result<Vec<NewspaperPage>, String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
@@ -60,29 +71,52 @@ pub(super) fn manifest(db_path: &Path, job_id: &str) -> Result<Vec<NewspaperPage
 }
 
 pub(super) fn save_progress(
-    connection: &Connection,
+    writer: &DatabaseWriter,
     job_id: &str,
     page_id: &str,
     updated_at: i64,
 ) -> Result<NewspaperReadingProgress, String> {
-    let page_index = canonical_page_index(connection, job_id, page_id)?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    let viewed = transaction
+    let job_id = job_id.to_string();
+    let page_id = page_id.to_string();
+    // Preserve validation messages while allowing the writer to classify and
+    // count SQLite failures from the entire read-mark/progress transaction.
+    writer
         .execute(
-            "INSERT OR IGNORE INTO newspaper_read_pages (job_id, page_id, page_index, viewed_at)
+            DatabaseWriteContext {
+                operation: "save_newspaper_reading_progress",
+                provider: DatabaseProvider::Newspaper,
+                workflow_id: Some(job_id.clone()),
+            },
+            move |connection| match save_progress_with_connection(
+                connection, &job_id, &page_id, updated_at,
+            ) {
+                Ok(progress) => Ok(Ok(progress)),
+                Err(ReadingProgressError::Validation(message)) => Ok(Err(message)),
+                Err(ReadingProgressError::Sqlite(error)) => Err(error.into()),
+            },
+        )
+        .map_err(|error| error.to_string())?
+}
+
+fn save_progress_with_connection(
+    connection: &Connection,
+    job_id: &str,
+    page_id: &str,
+    updated_at: i64,
+) -> Result<NewspaperReadingProgress, ReadingProgressError> {
+    let page_index = canonical_page_index(connection, job_id, page_id)?;
+    let transaction = connection.unchecked_transaction()?;
+    let viewed = transaction.execute(
+        "INSERT OR IGNORE INTO newspaper_read_pages (job_id, page_id, page_index, viewed_at)
              SELECT ?1, ?2, ?3, ?4
              WHERE EXISTS (
                  SELECT 1 FROM newspaper_pages
                  WHERE id = ?2 AND job_id = ?1 AND status = 'completed'
              )",
-            params![job_id, page_id, page_index, updated_at],
-        )
-        .map_err(|error| error.to_string())?;
-    let changed = transaction
-        .execute(
-            "INSERT INTO newspaper_reading_progress (
+        params![job_id, page_id, page_index, updated_at],
+    )?;
+    let changed = transaction.execute(
+        "INSERT INTO newspaper_reading_progress (
                 job_id, last_page_id, last_page_index, furthest_page_index, updated_at
              )
              SELECT ?1, ?2, ?3, ?3, ?4
@@ -98,18 +132,18 @@ pub(super) fn save_progress(
                      excluded.furthest_page_index
                  ),
                  updated_at = excluded.updated_at",
-            params![job_id, page_id, page_index, updated_at],
-        )
-        .map_err(|error| error.to_string())?;
+        params![job_id, page_id, page_index, updated_at],
+    )?;
     if changed == 0 && viewed == 0 {
-        return Err(
+        return Err(ReadingProgressError::Validation(
             "Reading progress can only be saved for a completed page in this newspaper."
                 .to_string(),
-        );
+        ));
     }
-    let progress = progress_for_job(&transaction, job_id)?
-        .ok_or_else(|| "Reading progress was not saved.".to_string())?;
-    transaction.commit().map_err(|error| error.to_string())?;
+    let progress = progress_for_job(&transaction, job_id)?.ok_or_else(|| {
+        ReadingProgressError::Validation("Reading progress was not saved.".to_string())
+    })?;
+    transaction.commit()?;
     Ok(progress)
 }
 
@@ -137,26 +171,24 @@ fn canonical_page_index(
     connection: &Connection,
     job_id: &str,
     page_id: &str,
-) -> Result<u32, String> {
-    connection
-        .query_row(
-            "SELECT COUNT(*)
+) -> rusqlite::Result<u32> {
+    connection.query_row(
+        "SELECT COUNT(*)
              FROM newspaper_pages
              WHERE job_id = ?1
                AND page_number < (
                    SELECT page_number FROM newspaper_pages
                    WHERE id = ?2 AND job_id = ?1 AND status = 'completed'
                )",
-            params![job_id, page_id],
-            |row| row.get::<_, u32>(0),
-        )
-        .map_err(|error| error.to_string())
+        params![job_id, page_id],
+        |row| row.get::<_, u32>(0),
+    )
 }
 
 fn progress_for_job(
     connection: &Connection,
     job_id: &str,
-) -> Result<Option<NewspaperReadingProgress>, String> {
+) -> rusqlite::Result<Option<NewspaperReadingProgress>> {
     connection
         .query_row(
             "SELECT p.job_id, p.last_page_id, p.last_page_index, p.furthest_page_index,
@@ -167,7 +199,6 @@ fn progress_for_job(
             row_to_progress,
         )
         .optional()
-        .map_err(|error| error.to_string())
 }
 
 fn row_to_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<NewspaperReadingProgress> {

@@ -327,6 +327,7 @@ pub fn run() {
             let linkedin_session_token = Arc::new(Mutex::new(None));
             let linkedin_token_path = db_path.with_file_name("linkvault.li_at.dpapi");
             workflow_runtime.register_executor(Arc::new(executor::LinkedInDownloadExecutor {
+                path_library: providers::linkedin::path_library::PathLibrary::new(writer.clone()),
                 db_path: db_path.clone(),
                 token_path: linkedin_token_path,
                 cancellation: Arc::clone(&linkedin_cancellation),
@@ -334,17 +335,21 @@ pub fn run() {
                 session_token: Arc::clone(&linkedin_session_token),
             }));
             let newspaper_cancellation = Arc::new(AtomicBool::new(false));
+            let newspaper_app = app.handle().clone();
             workflow_runtime.register_executor(Arc::new(
                 newspaper::executor::NewspaperDownloadExecutor {
                     db_path: db_path.clone(),
+                    writer: writer.clone(),
                     cancellation: Arc::clone(&newspaper_cancellation),
+                    on_changed: Arc::new(move |job_id| {
+                        newspaper::supervisor::download_changed(&newspaper_app, job_id);
+                    }),
                 },
             ));
             workflow_runtime.reconcile_coursera_after_restart(commands::now_unix_timestamp())?;
             workflow_runtime.reconcile_youtube_after_restart(commands::now_unix_timestamp())?;
             workflow_runtime.reconcile_linkedin_after_restart(commands::now_unix_timestamp())?;
             workflow_runtime.reconcile_newspaper_after_restart(commands::now_unix_timestamp())?;
-            workflow_runtime.start_supervisor()?;
             let clipping_layout = newspaper::clipping_assets::ClippingAssetLayout::new(
                 storage::resolve_newspaper_clippings_root()?,
             );
@@ -384,6 +389,9 @@ pub fn run() {
                 db_path,
                 newspaper_cancellation,
             ));
+            let runtime = app.state::<workflow::WorkflowRuntime>();
+            runtime.register_supervisor_hook(Arc::new(newspaper::supervisor::NewspaperSupervisor::new(app.handle().clone())));
+            runtime.start_supervisor()?;
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
             app.manage(CooperativeExit::default());

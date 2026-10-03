@@ -1,8 +1,77 @@
 import assert from "node:assert/strict";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { chromium } from "playwright";
 
 const previewUrl = process.env.LINKVAULT_PREVIEW_URL;
 assert.ok(previewUrl, "Set LINKVAULT_PREVIEW_URL to a built LinkedVault preview.");
+
+async function verifyReaderToolbar(page) {
+  const originalViewport = page.viewportSize();
+  const screenshotDirectory = process.env.LINKVAULT_TOOLBAR_SCREENSHOT_DIR;
+  if (screenshotDirectory) await mkdir(screenshotDirectory, { recursive: true });
+  const measurements = [];
+  try {
+    for (const width of [320, 375, 500, 600, 768, 943, 1100, 1280, 1720]) {
+      await page.setViewportSize({ width, height: 960 });
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const geometry = await page.locator(".newspaper-reader-header").evaluate((header) => {
+        const bounds = header.getBoundingClientRect();
+        const controls = [...header.querySelectorAll("button, select, input")].map((control) => {
+          const rect = control.getBoundingClientRect();
+          const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+          return {
+            label: control.getAttribute("aria-label") ?? control.closest("label")?.textContent.trim() ?? control.textContent.trim(),
+            left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom,
+            width: rect.width, height: rect.height,
+            disabled: control.disabled,
+            reachable: Boolean(hit && (hit === control || control.contains(hit)))
+          };
+        });
+        const collisions = [];
+        for (let i = 0; i < controls.length; i++) {
+          for (let j = i + 1; j < controls.length; j++) {
+            const first = controls[i], second = controls[j];
+            if (Math.min(first.right, second.right) - Math.max(first.left, second.left) > 1
+              && Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top) > 1) {
+              collisions.push([first.label, second.label]);
+            }
+          }
+        }
+        return {
+          left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom,
+          height: bounds.height, scrollWidth: header.scrollWidth, clientWidth: header.clientWidth,
+          controls, collisions
+        };
+      });
+      assert.ok(geometry.right <= width + 1 && geometry.left >= -1, `${width}px: toolbar exceeds the reader viewport`);
+      assert.ok(geometry.scrollWidth <= geometry.clientWidth + 1, `${width}px: toolbar has horizontal overflow`);
+      assert.deepEqual(geometry.collisions, [], `${width}px: toolbar controls collide`);
+      for (const control of geometry.controls) {
+        assert.ok(control.width > 0 && control.height > 0, `${width}px: ${control.label} is hidden`);
+        assert.ok(control.left >= geometry.left - 1 && control.right <= geometry.right + 1
+          && control.top >= geometry.top - 1 && control.bottom <= geometry.bottom + 1,
+        `${width}px: ${control.label} is clipped by the toolbar`);
+        assert.ok(control.disabled || control.reachable, `${width}px: ${control.label} is covered by another element`);
+      }
+      await page.getByRole("button", { name: "Zoom in 20 percent", exact: true }).click();
+      assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "120%");
+      await page.getByRole("button", { name: "Fit page width", exact: true }).click();
+      assert.equal(await page.locator(".newspaper-reader-zoom output").textContent(), "100%");
+      await page.getByLabel("Newspaper page tone").selectOption("dim");
+      await page.getByLabel("Newspaper page tone").selectOption("soft");
+      await page.getByRole("button", { name: "Next page", exact: true }).click();
+      await page.getByRole("button", { name: "Previous page", exact: true }).click();
+      if (screenshotDirectory && [375, 943, 1720].includes(width)) {
+        await page.screenshot({ path: join(screenshotDirectory, `newspaper-toolbar-${width}.png`) });
+      }
+      measurements.push({ width, height: geometry.height, controls: geometry.controls.length });
+    }
+  } finally {
+    await page.setViewportSize(originalViewport);
+  }
+  console.table(measurements);
+}
 
 const browser = await chromium.launch({
   channel: process.env.PLAYWRIGHT_CHANNEL || "chrome",
@@ -29,7 +98,7 @@ try {
       const items = Array.from({ length: count }, (_, index) => ({
         jobId: `fixture-job-${index}`,
         editionCode: `E${String(index).padStart(3, "0")}`,
-        editionName: `Fixture Edition ${index + 1}`,
+        editionName: `Fixture Edition ${index + 1} with a long publication name`,
         publicationDate: `2026-07-${String((index % 25) + 1).padStart(2, "0")}`,
         status: "completed",
         outputDir: "C:\\fixture",
@@ -60,6 +129,7 @@ try {
         finalBytes: 1000,
         error: null
       }));
+      window.__NEWSPAPER_CLIPPING_HARNESS__ = true;
       window.__NEWSPAPER_PERF__ = {
         commandCounts: {},
         get lastSavedPageId() {
@@ -265,6 +335,12 @@ try {
       0,
       "A parent-only Reader preference rerender showed a loading flash"
     );
+    if (editionCount === editionCounts[0]) {
+      const manifestCallsBeforeResize = await page.evaluate(() => window.__NEWSPAPER_PERF__.commandCounts.get_newspaper_reader_manifest ?? 0);
+      await verifyReaderToolbar(page);
+      assert.equal(await page.evaluate(() => window.__NEWSPAPER_PERF__.commandCounts.get_newspaper_reader_manifest ?? 0),
+        manifestCallsBeforeResize, "Resizing or using toolbar controls must not reload the reader manifest");
+    }
     await page.waitForFunction(() => {
       const canvas = document.querySelector('[data-testid="newspaper-reader-scroll"]');
       const image = document.querySelector('[data-testid="newspaper-reader-page-image"]');

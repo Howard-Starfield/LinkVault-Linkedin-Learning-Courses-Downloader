@@ -16,16 +16,15 @@ use url::Url;
 use super::{
     batch_service,
     client::{FetchError, NewspaperClient},
-    commands::run_optimization_pass,
     downloader::{
         download_validated_page, validate_existing_page, DownloadedPage, PageDownloadError,
     },
     job_repository, manifest,
-    models::{NewspaperJob, OptimizationRunOptions},
-    naming,
-    state::NewspaperState,
-    storage,
+    models::NewspaperJob,
+    naming, storage,
 };
+use crate::app::database_diagnostics::DatabaseProvider;
+use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriter};
 
 /// Jobs whose terminal download status carries at least one optimizable
 /// page. The optimization queue's own SQL filter is the source of truth;
@@ -91,7 +90,14 @@ pub(super) async fn process_queue(
             })
             .await?;
         }
-        let outcome = process_job(db_path, &client, job.clone(), cancelled).await?;
+        let outcome = process_job(
+            db_path,
+            &app.state::<DatabaseWriter>(),
+            &client,
+            job.clone(),
+            cancelled,
+        )
+        .await?;
         let outcome_status = outcome.status.clone();
         processed.push(outcome);
         if OPTIMIZATION_ELIGIBLE_STATUSES.contains(&outcome_status.as_str()) {
@@ -129,29 +135,34 @@ pub(super) async fn process_queue(
 /// `run_optimization_pass` is the source of truth, so a manual "Optimize
 /// now" or a sibling per-edition trigger racing with this one resolves to a
 /// no-op rather than overlapping workers).
-pub(crate) fn spawn_per_edition_optimization(app: tauri::AppHandle, job_status: String) {
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<NewspaperState>();
-        let result =
-            run_optimization_pass(&app, state.inner(), OptimizationRunOptions::default()).await;
-        if let Err(error) = result {
-            eprintln!("per-edition optimization trigger failed after {job_status} job: {error}");
-        }
-    });
+pub(crate) fn spawn_per_edition_optimization(app: tauri::AppHandle, _job_status: String) {
+    super::supervisor::invalidate_activity(&app);
+    app.state::<crate::workflow::application::runtime::WorkflowRuntime>()
+        .wake();
 }
 
 pub(crate) async fn process_job(
     db_path: &Path,
+    writer: &DatabaseWriter,
     client: &NewspaperClient,
     mut job: NewspaperJob,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<NewspaperJob, String> {
     let now = Utc::now().timestamp();
-    {
-        let db_path = db_path.to_path_buf();
+    let activated = {
+        let writer = writer.clone();
         let job_id = job.id.clone();
         let batch_id = job.batch_id.clone();
-        run_blocking(move || activate_queued_job(&db_path, &job_id, &batch_id, now)).await?;
+        run_blocking(move || activate_queued_job(&writer, &job_id, &batch_id, now)).await?
+    };
+    if !activated {
+        let writer = writer.clone();
+        let interrupted = job.clone();
+        job.status = run_blocking(move || {
+            apply_interrupted_job_state_on_writer(&writer, &interrupted).map(str::to_string)
+        })
+        .await?;
+        return Ok(job);
     }
     job.status = "active".to_string();
     let manifest = match client
@@ -293,28 +304,38 @@ enum PersistPageOutcome {
     Stop(NewspaperJob),
 }
 
-fn activate_queued_job(
-    db_path: &Path,
+pub(super) fn activate_queued_job(
+    writer: &DatabaseWriter,
     job_id: &str,
     batch_id: &str,
     now: i64,
-) -> Result<(), String> {
-    let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    connection
-        .execute(
+) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    let batch_id = batch_id.to_string();
+    writer.execute(DatabaseWriteContext {operation: "newspaper_activate_job", provider: DatabaseProvider::Newspaper, workflow_id: Some(job_id.clone())}, move |connection| {
+        let transaction = connection.transaction()?;
+        let eligible: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM newspaper_jobs j JOIN newspaper_batches b ON b.id = j.batch_id
+            WHERE j.id = ?1 AND j.status = 'queued' AND j.paused = 0 AND j.dismissed = 0
+              AND b.status IN ('queued', 'scheduled', 'active')
+              AND (b.scheduled_at IS NULL OR b.scheduled_at <= ?2)
+              AND (j.retry_at IS NULL OR j.retry_at <= ?2))", params![job_id, now], |row| row.get(0))?;
+        if !eligible { transaction.commit()?; return Ok(false); }
+    transaction.execute(
             "UPDATE newspaper_jobs
              SET status = 'active', retry_at = NULL, warning = NULL, updated_at = ?2
              WHERE id = ?1",
             params![job_id, now],
         )
-        .map_err(|error| error.to_string())?;
-    connection
+        ?;
+    transaction
         .execute(
             "UPDATE newspaper_batches SET status = 'active', scheduled_at = NULL, updated_at = ?2 WHERE id = ?1",
             params![batch_id, now],
         )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        ?;
+    transaction.commit()?;
+    Ok(true)
+    }).map_err(|error| error.to_string())
 }
 
 fn upsert_job_pages(
@@ -480,6 +501,8 @@ pub(super) fn next_due_job(
                AND b.status IN ('queued', 'scheduled', 'active')
                AND (b.scheduled_at IS NULL OR b.scheduled_at <= ?1)
                AND (j.retry_at IS NULL OR j.retry_at <= ?1)
+               AND NOT EXISTS (SELECT 1 FROM workflow_runs r WHERE r.id = j.id
+                   AND r.state IN ('queued', 'running', 'retry_wait', 'paused', 'cancelling'))
              ORDER BY j.queue_position, j.created_at LIMIT 1",
             params![now],
             |row| Ok((job_repository::row_to_job(row)?, row.get(19)?, row.get(20)?)),
@@ -518,39 +541,61 @@ pub(super) fn apply_interrupted_job_state(
     job: &NewspaperJob,
 ) -> Result<&'static str, String> {
     let connection = crate::cache::open_runtime(db_path).map_err(|error| error.to_string())?;
-    let (paused, dismissed, current_status, batch_status): (bool, bool, String, String) =
-        connection
-            .query_row(
-                "SELECT j.paused, j.dismissed, j.status, b.status
+    interrupted_state_on_connection(&connection, job).map_err(|error| error.to_string())
+}
+
+pub(super) fn apply_interrupted_job_state_on_writer(
+    writer: &DatabaseWriter,
+    job: &NewspaperJob,
+) -> Result<&'static str, String> {
+    let job = job.clone();
+    writer
+        .execute(
+            DatabaseWriteContext {
+                operation: "newspaper_interrupt_job",
+                provider: DatabaseProvider::Newspaper,
+                workflow_id: Some(job.id.clone()),
+            },
+            move |connection| {
+                let transaction = connection.transaction()?;
+                let status = interrupted_state_on_connection(&transaction, &job)?;
+                transaction.commit()?;
+                Ok(status)
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn interrupted_state_on_connection(
+    connection: &Connection,
+    job: &NewspaperJob,
+) -> rusqlite::Result<&'static str> {
+    let (_paused, dismissed, current_status, batch_status): (bool, bool, String, String) =
+        connection.query_row(
+            "SELECT j.paused, j.dismissed, j.status, b.status
                  FROM newspaper_jobs j
                  JOIN newspaper_batches b ON b.id = j.batch_id
                  WHERE j.id = ?1",
-                params![job.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|error| error.to_string())?;
-    let (page_status, job_status) = if paused || batch_status == "paused" {
-        ("pending", "queued")
-    } else if dismissed || current_status == "cancelled" || batch_status == "cancelled" {
-        ("cancelled", "cancelled")
-    } else {
-        ("pending", "queued")
-    };
+            params![job.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let (page_status, job_status) =
+        if dismissed || current_status == "cancelled" || batch_status == "cancelled" {
+            ("cancelled", "cancelled")
+        } else {
+            ("pending", "queued")
+        };
     let now = Utc::now().timestamp();
-    connection
-        .execute(
-            "UPDATE newspaper_pages
+    connection.execute(
+        "UPDATE newspaper_pages
              SET status = ?2, error = NULL, updated_at = ?3
              WHERE job_id = ?1 AND status IN ('pending', 'downloading', 'optimizing')",
-            params![job.id, page_status, now],
-        )
-        .map_err(|error| error.to_string())?;
-    connection
-        .execute(
-            "UPDATE newspaper_jobs SET status = ?2, updated_at = ?3 WHERE id = ?1",
-            params![job.id, job_status, now],
-        )
-        .map_err(|error| error.to_string())?;
+        params![job.id, page_status, now],
+    )?;
+    connection.execute(
+        "UPDATE newspaper_jobs SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![job.id, job_status, now],
+    )?;
     Ok(job_status)
 }
 

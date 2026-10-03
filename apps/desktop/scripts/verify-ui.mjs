@@ -12,12 +12,13 @@ const history = await readFile(new URL("../src/components/linkedin/LinkedinHisto
 const historyVirtual = await readFile(new URL("../src/components/linkedin/LinkedinVirtualList.tsx", import.meta.url), "utf8");
 const clippings = await readFile(new URL("../src/components/newspaper/NewspaperClippingList.tsx", import.meta.url), "utf8");
 
+assert.ok(!app.includes("processNewspaperSchedules"), "The native supervisor owns newspaper schedule wakes");
+
 for (const required of [
   "Download editions",
   "Newspaper library",
   'activeView === "newspaper-download"',
   'activeView === "newspaper-library"',
-  "processNewspaperSchedules",
   "ensureNewspaperQueueProcessing",
   'invoke("process_newspaper_queue")',
   '"process_newspaper_optimization_queue"',

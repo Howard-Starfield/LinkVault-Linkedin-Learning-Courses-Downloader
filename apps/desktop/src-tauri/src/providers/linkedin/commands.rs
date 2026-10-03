@@ -494,14 +494,20 @@ pub struct PlaybackTickDto {
 }
 
 #[tauri::command]
-pub fn linkedin_list_catalog(
+pub async fn linkedin_list_catalog(
     state: tauri::State<'_, LinkVaultState>,
     writer: tauri::State<'_, DatabaseWriter>,
 ) -> Result<Vec<CatalogEntry>, String> {
-    let connection = state.connection()?;
-    PathLibrary::new(writer.inner().clone())
-        .list_catalog(&connection)
-        .map_err(|error| error.to_string())
+    let db_path = state.db_path.clone();
+    let library = PathLibrary::new(writer.inner().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_runtime(&db_path).map_err(|error| error.to_string())?;
+        library
+            .list_catalog(&connection)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -518,7 +524,7 @@ pub fn linkedin_open_course(
 }
 
 #[tauri::command]
-pub fn linkedin_save_progress(
+pub async fn linkedin_save_progress(
     writer: tauri::State<'_, DatabaseWriter>,
     tick: PlaybackTickDto,
 ) -> Result<VideoProgress, String> {
@@ -528,9 +534,14 @@ pub fn linkedin_save_progress(
         position_ms: tick.position_ms,
         duration_ms: tick.duration_ms,
     };
-    PathLibrary::new(writer.inner().clone())
-        .save_progress(playback)
-        .map_err(|error| error.to_string())
+    let library = PathLibrary::new(writer.inner().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .save_progress(playback)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -820,7 +831,8 @@ pub async fn set_all_downloads_paused(
     tauri::async_runtime::spawn_blocking(move || {
         let now = now_unix_timestamp();
         let connection = handles.connection()?;
-        set_all_download_jobs_paused(&connection, paused, now).map_err(|error| error.to_string())?;
+        set_all_download_jobs_paused(&connection, paused, now)
+            .map_err(|error| error.to_string())?;
         runtime
             .set_all_queued_linkedin_runs_paused(paused, now)
             .map_err(|error| error.to_string())?;
@@ -1017,8 +1029,7 @@ pub async fn delete_completed_download(
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Download job was not found.".to_string())?;
         if job.status != "completed" {
-            return Err("Only completed downloads can delete their course files."
-                .to_string());
+            return Err("Only completed downloads can delete their course files.".to_string());
         }
 
         let artifacts =
@@ -1141,7 +1152,9 @@ pub async fn process_next_queued_download_with_saved_token(
     app: tauri::AppHandle,
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
+    writer: tauri::State<'_, DatabaseWriter>,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
+    let library = PathLibrary::new(writer.inner().clone());
     let db_path = state.db_path.clone();
     let token_path = state.token_path.clone();
     let cancellation = state.reset_download_cancellation();
@@ -1176,6 +1189,7 @@ pub async fn process_next_queued_download_with_saved_token(
             .await;
     tauri::async_runtime::spawn_blocking(move || {
         process_next_queued_download_with_validated_token(
+            &library,
             db_path,
             token,
             session,
@@ -1192,8 +1206,10 @@ pub async fn process_next_queued_download_with_saved_token(
 pub async fn process_queued_download_batch_with_saved_token(
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
+    writer: tauri::State<'_, DatabaseWriter>,
     request: ProcessQueuedBatchRequest,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
+    let library = PathLibrary::new(writer.inner().clone());
     let db_path = state.db_path.clone();
     let token_path = state.token_path.clone();
     let cancellation = state.reset_download_cancellation();
@@ -1227,6 +1243,7 @@ pub async fn process_queued_download_batch_with_saved_token(
         let session = validate_li_at_with_client(&token, &mut home_client)
             .map_err(|error| error.to_string())?;
         let legacy = process_queued_download_batch_with_validated_token(
+            &library,
             db_path,
             token,
             session,
@@ -1246,8 +1263,10 @@ pub async fn process_next_queued_download_from_browser_source(
     app: tauri::AppHandle,
     state: tauri::State<'_, LinkVaultState>,
     runtime: tauri::State<'_, WorkflowRuntime>,
+    writer: tauri::State<'_, DatabaseWriter>,
     source: BrowserSource,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
+    let library = PathLibrary::new(writer.inner().clone());
     let db_path = state.db_path.clone();
     let cancellation = state.reset_download_cancellation();
     let session_token = state.session_token_slot();
@@ -1300,6 +1319,7 @@ pub async fn process_next_queued_download_from_browser_source(
             .await;
     tauri::async_runtime::spawn_blocking(move || {
         process_next_queued_download_with_validated_token(
+            &library,
             db_path,
             token,
             session,
@@ -1313,6 +1333,7 @@ pub async fn process_next_queued_download_from_browser_source(
 }
 
 fn process_queued_download_batch_with_validated_token(
+    library: &PathLibrary,
     db_path: PathBuf,
     token: String,
     session: ValidatedLinkedInSession,
@@ -1326,6 +1347,7 @@ fn process_queued_download_batch_with_validated_token(
     let mut artifact_client = course_client.clone();
 
     let response = process_queued_download_batch_with_clients(
+        library,
         &connection,
         &mut course_client,
         &mut artifact_client,
@@ -1338,6 +1360,7 @@ fn process_queued_download_batch_with_validated_token(
 }
 
 fn process_next_queued_download_with_validated_token(
+    library: &PathLibrary,
     db_path: PathBuf,
     token: String,
     session: ValidatedLinkedInSession,
@@ -1351,6 +1374,7 @@ fn process_next_queued_download_with_validated_token(
     let mut artifact_client = course_client.clone();
 
     let response = process_next_queued_download_with_clients(
+        library,
         &connection,
         &mut course_client,
         &mut artifact_client,
@@ -1363,6 +1387,7 @@ fn process_next_queued_download_with_validated_token(
 }
 
 fn process_queued_download_batch_with_clients(
+    library: &PathLibrary,
     connection: &Connection,
     course_client: &mut impl CourseApiClient,
     artifact_client: &mut impl ArtifactHttpClient,
@@ -1384,6 +1409,7 @@ fn process_queued_download_batch_with_clients(
 
         let quiz_assessments = record_quiz_metadata_discovery_for_next_job(connection, timestamp);
         let response = process_next_queued_download_with_clients(
+            library,
             connection,
             course_client,
             artifact_client,
@@ -1411,6 +1437,7 @@ fn process_queued_download_batch_with_clients(
 }
 
 fn process_next_queued_download_with_clients(
+    library: &PathLibrary,
     connection: &Connection,
     course_client: &mut impl CourseApiClient,
     artifact_client: &mut impl ArtifactHttpClient,
@@ -1419,6 +1446,7 @@ fn process_next_queued_download_with_clients(
     quiz_assessments: Vec<crate::course::CourseAssessment>,
 ) -> Result<ProcessQueuedDownloadResponse, String> {
     let summary = process_next_queued_job_and_download_artifacts_with_quiz_assessments(
+        library,
         connection,
         course_client,
         artifact_client,
@@ -3305,8 +3333,8 @@ mod tests {
             for event_index in 0..EVENT_FIXTURE_EVENTS_PER_JOB {
                 // `created_at` only takes EVENT_FIXTURE_TIMESTAMP_SLOTS distinct
                 // values, so the newest 20 events are full of ties.
-                let event_created_at = 1_700_000_000
-                    + (event_index % EVENT_FIXTURE_TIMESTAMP_SLOTS as usize) as i64;
+                let event_created_at =
+                    1_700_000_000 + (event_index % EVENT_FIXTURE_TIMESTAMP_SLOTS as usize) as i64;
                 append_job_event(
                     connection,
                     &NewJobEvent {
@@ -3535,6 +3563,32 @@ mod tests {
     }
 
     #[test]
+    fn linkedin_periodic_player_commands_run_database_work_on_blocking_workers() {
+        let production = production_source();
+        for (name, operation) in [
+            ("linkedin_list_catalog", ".list_catalog("),
+            ("linkedin_save_progress", ".save_progress("),
+        ] {
+            let declaration = format!("pub async fn {name}(");
+            assert!(
+                production.contains(&declaration),
+                "{name} must be asynchronous"
+            );
+            let body = command_source(production, &declaration);
+            let spawn = body
+                .find("tauri::async_runtime::spawn_blocking(move ||")
+                .unwrap();
+            let database_work = body.find(operation).unwrap();
+            assert!(
+                database_work > spawn,
+                "{name} must dispatch database work inside spawn_blocking"
+            );
+            assert!(!body[..spawn].contains("state.connection()"));
+            assert!(!body[..spawn].contains("open_runtime("));
+        }
+    }
+
+    #[test]
     fn linkedin_bootstrap_commands_are_async_and_leave_the_async_executor() {
         let production = production_source();
         assert!(
@@ -3561,12 +3615,14 @@ mod tests {
             );
 
             let body = command_source(production, &async_declaration);
-            let spawn_at = body.find("tauri::async_runtime::spawn_blocking").unwrap_or_else(
-                || panic!(
-                    "{name} performs blocking SQLite and filesystem work and must \
+            let spawn_at = body
+                .find("tauri::async_runtime::spawn_blocking")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} performs blocking SQLite and filesystem work and must \
                      move it into spawn_blocking"
-                ),
-            );
+                    )
+                });
 
             // The invariant that actually has teeth: the SQLite open is taken
             // from the *owned* `LinkedInCommandHandles` clone, and it happens
@@ -3614,7 +3670,10 @@ mod tests {
         // rewrite have both run.
         let reset = command_source(production, "pub async fn reset_linkedin_database(");
         let positions = [
-            ("set_download_paused(true)", reset.find("set_download_paused(true)")),
+            (
+                "set_download_paused(true)",
+                reset.find("set_download_paused(true)"),
+            ),
             (
                 "delete_linkedin_runs()",
                 reset.find("delete_linkedin_runs()"),
@@ -3710,11 +3769,13 @@ mod tests {
 
     #[test]
     fn process_next_queued_download_with_clients_reports_no_work_without_network() {
-        let connection = initialized_connection();
+        let (_directory, _runtime, connection, writer) = workflow_harness_with_writer();
+        let library = PathLibrary::new(writer);
         let mut course_client = NoopCourseClient;
         let mut artifact_client = NoopArtifactClient;
 
         let response = process_next_queued_download_with_clients(
+            &library,
             &connection,
             &mut course_client,
             &mut artifact_client,
@@ -3737,11 +3798,13 @@ mod tests {
 
     #[test]
     fn process_queued_download_batch_with_clients_reports_no_work_without_network() {
-        let connection = initialized_connection();
+        let (_directory, _runtime, connection, writer) = workflow_harness_with_writer();
+        let library = PathLibrary::new(writer);
         let mut course_client = NoopCourseClient;
         let mut artifact_client = NoopArtifactClient;
 
         let response = process_queued_download_batch_with_clients(
+            &library,
             &connection,
             &mut course_client,
             &mut artifact_client,
@@ -4581,7 +4644,9 @@ mod tests {
         .unwrap();
 
         let json = serde_json::to_value(&state).unwrap();
-        let object = json.as_object().expect("BootstrapState serializes to an object");
+        let object = json
+            .as_object()
+            .expect("BootstrapState serializes to an object");
         let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
         keys.sort_unstable();
         assert_eq!(
@@ -4769,8 +4834,7 @@ mod tests {
             .unwrap();
             for artifact_index in 0..artifacts_per_job {
                 let artifact_type = artifact_types[artifact_index % artifact_types.len()];
-                let artifact_status =
-                    artifact_statuses[artifact_index % artifact_statuses.len()];
+                let artifact_status = artifact_statuses[artifact_index % artifact_statuses.len()];
                 let extension = match artifact_type {
                     "video" => "mp4",
                     "subtitle" => "vtt",
@@ -4837,17 +4901,13 @@ mod tests {
 
             let job_events_rows = perf_probe_count(&connection, "SELECT COUNT(*) FROM job_events");
             let artifact_rows = perf_probe_count(&connection, "SELECT COUNT(*) FROM artifacts");
-            let course_cache_rows = perf_probe_count(&connection, "SELECT COUNT(*) FROM course_cache");
+            let course_cache_rows =
+                perf_probe_count(&connection, "SELECT COUNT(*) FROM course_cache");
 
             let cold_started = Instant::now();
-            let bootstrap = load_bootstrap_state(
-                &connection,
-                Some(&runtime),
-                true,
-                history_path,
-                false,
-            )
-            .unwrap();
+            let bootstrap =
+                load_bootstrap_state(&connection, Some(&runtime), true, history_path, false)
+                    .unwrap();
             let cold_ms = cold_started.elapsed().as_secs_f64() * 1000.0;
 
             // Second pass: same work, warm OS page cache / SQLite page cache.
@@ -4898,7 +4958,11 @@ mod tests {
             println!("--- N = {job_count} jobs ---");
             println!("  seeded: {job_events_rows} job_events rows, {artifact_rows} artifacts rows, {course_cache_rows} course_cache rows, {seed_ms:.1} ms");
             println!("  load_bootstrap_state cold = {cold_ms:.2} ms, warm = {warm_ms:.2} ms");
-            println!("  returned: persisted_jobs = {}, recent_events = {}", bootstrap.persisted_jobs.len(), bootstrap.recent_events.len());
+            println!(
+                "  returned: persisted_jobs = {}, recent_events = {}",
+                bootstrap.persisted_jobs.len(),
+                bootstrap.recent_events.len()
+            );
 
             if job_count == 500 {
                 println!();
@@ -4936,12 +5000,13 @@ mod tests {
                 // makes, timed individually, to attribute the total cost.
                 let jobs = bootstrap_jobs(&connection).unwrap();
                 println!();
-                println!("PHASE BREAKDOWN AT N = {} (replays load_bootstrap_state's reads)", job_count);
+                println!(
+                    "PHASE BREAKDOWN AT N = {} (replays load_bootstrap_state's reads)",
+                    job_count
+                );
                 // The production event read: one ordered, capped query.
                 let recent_started = Instant::now();
-                let recent_rows = list_recent_job_events(&connection, 20)
-                    .unwrap()
-                    .len();
+                let recent_rows = list_recent_job_events(&connection, 20).unwrap().len();
                 let recent_ms = recent_started.elapsed().as_secs_f64() * 1000.0;
                 // Retired pattern, kept so the cost that was removed stays
                 // visible next to the cost that replaced it.
@@ -4974,7 +5039,9 @@ mod tests {
                 println!("  N+1 list_job_events (retired)  : {events_ms:>9.2} ms ({events_read} rows read, {job_queries} queries)");
                 println!("  N+1 list_artifacts_for_job     : {artifacts_ms:>9.2} ms ({artifacts_read} rows read, {job_queries} queries)");
                 println!("  N+1 get_course_cache_entry     : {cache_ms:>9.2} ms ({job_queries} queries, PK search)");
-                println!("  list_download_history          : {history_ms:>9.2} ms ({history_rows} rows)");
+                println!(
+                    "  list_download_history          : {history_ms:>9.2} ms ({history_rows} rows)"
+                );
                 plan_sample = Some((
                     jobs_ms as i64,
                     recent_ms as i64,
@@ -5007,7 +5074,10 @@ mod tests {
             let per_job = sample.cold_ms / sample.jobs as f64;
             let marginal = match previous {
                 Some((previous_n, previous_ms)) => {
-                    format!("{:.2}", (sample.cold_ms - previous_ms) / (sample.jobs - previous_n) as f64)
+                    format!(
+                        "{:.2}",
+                        (sample.cold_ms - previous_ms) / (sample.jobs - previous_n) as f64
+                    )
                 }
                 None => "-".to_string(),
             };
@@ -5026,7 +5096,9 @@ mod tests {
             previous = Some((sample.jobs, sample.cold_ms));
         }
         println!("{}", "-".repeat(78));
-        println!("marginal = ms of additional cold time per additional job, between consecutive sizes");
+        println!(
+            "marginal = ms of additional cold time per additional job, between consecutive sizes"
+        );
         println!("last column = warm ms per job");
         for sample in &samples {
             println!(

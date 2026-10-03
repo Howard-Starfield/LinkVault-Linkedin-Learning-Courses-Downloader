@@ -1,5 +1,7 @@
 //! LinkedIn step executor. Course/artifact download stays provider-owned.
 
+use super::path_library::PathLibrary;
+
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -18,6 +20,7 @@ use crate::workflow::ports::executor::{ExecutorOutcome, StepExecutor};
 
 pub struct LinkedInDownloadExecutor {
     pub db_path: PathBuf,
+    pub path_library: PathLibrary,
     pub token_path: PathBuf,
     pub cancellation: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
@@ -54,6 +57,7 @@ impl StepExecutor for LinkedInDownloadExecutor {
                     Err(error) => ExecutorOutcome::failed(error),
                     Ok(token) => {
                         match download_linkedin_run(
+                            &self.path_library,
                             &self.db_path,
                             run,
                             &request,
@@ -96,6 +100,7 @@ fn session_token(
 }
 
 fn download_linkedin_run(
+    library: &PathLibrary,
     db_path: &std::path::Path,
     run: &RunRecord,
     request: &LinkedInWorkflowRequest,
@@ -123,6 +128,7 @@ fn download_linkedin_run(
         paused: Arc::clone(paused),
     };
     let summary = process_prepared_job_and_download_artifacts_with_quiz_assessments(
+        library,
         &connection,
         &mut client,
         &mut artifact_client,
@@ -154,12 +160,26 @@ mod tests {
     use crate::workflow::domain::state::{RunState, StepState};
     use crate::workflow::domain::types::{StepType, WorkflowType};
 
+    fn test_library(directory: &std::path::Path) -> PathLibrary {
+        let db_path = directory.join("linkvault.sqlite3");
+        let (connection, _) = crate::app::database::initialize_database(&db_path).unwrap();
+        drop(connection);
+        PathLibrary::new(
+            crate::app::database_writer::DatabaseWriter::start(
+                db_path,
+                crate::app::database_diagnostics::DatabaseDiagnostics::default(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn missing_token_fails_without_network() {
         let temp = tempfile::tempdir().unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         let executor = LinkedInDownloadExecutor {
             db_path: temp.path().join("linkvault.sqlite3"),
+            path_library: test_library(temp.path()),
             token_path: temp.path().join("token.bin"),
             cancellation: Arc::clone(&cancellation),
             paused: Arc::new(AtomicBool::new(false)),
@@ -201,6 +221,7 @@ mod tests {
         let cancellation = Arc::new(AtomicBool::new(true));
         let executor = LinkedInDownloadExecutor {
             db_path: temp.path().join("linkvault.sqlite3"),
+            path_library: test_library(temp.path()),
             token_path: temp.path().join("token.bin"),
             cancellation: Arc::clone(&cancellation),
             paused: Arc::new(AtomicBool::new(false)),

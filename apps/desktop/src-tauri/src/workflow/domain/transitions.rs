@@ -23,9 +23,12 @@ pub fn is_allowed_run_transition(from: RunState, to: RunState) -> bool {
         ),
         RunState::Paused => matches!(
             to,
-            RunState::Queued | RunState::Running | RunState::Cancelled
+            RunState::Queued | RunState::RetryWait | RunState::Running | RunState::Cancelled
         ),
-        RunState::RetryWait => matches!(to, RunState::Running | RunState::Cancelled),
+        RunState::RetryWait => matches!(
+            to,
+            RunState::Running | RunState::Paused | RunState::Cancelled
+        ),
         RunState::Cancelling => matches!(to, RunState::Cancelled),
         RunState::Succeeded
         | RunState::SucceededWithWarnings
@@ -116,6 +119,22 @@ mod tests {
         assert!(is_allowed_run_transition(
             RunState::Paused,
             RunState::Running
+        ));
+    }
+
+    #[test]
+    fn scheduled_run_can_pause_and_resume_its_retry_deadline() {
+        assert!(is_allowed_run_transition(
+            RunState::RetryWait,
+            RunState::Paused
+        ));
+        assert!(is_allowed_run_transition(
+            RunState::Paused,
+            RunState::RetryWait
+        ));
+        assert!(!is_allowed_run_transition(
+            RunState::RetryWait,
+            RunState::Succeeded
         ));
     }
 

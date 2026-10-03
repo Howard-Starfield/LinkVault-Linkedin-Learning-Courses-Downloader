@@ -14,16 +14,197 @@ use crate::workflow::ports::repository::WorkflowRepository;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SqliteWorkflowRepository;
 
-impl WorkflowRepository for SqliteWorkflowRepository {
-    fn insert_run_with_steps_and_event(
+impl SqliteWorkflowRepository {
+    /// A claimed step that never acquired a worker must be ready immediately,
+    /// without consuming an execution attempt or undoing concurrent cancellation.
+    pub fn release_unstarted_claim(
         &self,
         connection: &Connection,
+        run_id: &str,
+        step_id: &str,
+        claimed_attempt: i64,
+        now: i64,
+    ) -> Result<(), WorkflowError> {
+        let transaction = connection.unchecked_transaction()?;
+        let Some(run) = self.get_run(&transaction, run_id)? else {
+            return Ok(());
+        };
+        let step = self
+            .list_steps_for_run(&transaction, run_id)?
+            .into_iter()
+            .find(|step| step.id == step_id);
+        let Some(step) = step else {
+            return Ok(());
+        };
+        if step.state != StepState::Running || step.attempt != claimed_attempt {
+            return Ok(());
+        }
+        let (run_target, step_target) = match run.state {
+            RunState::Running => (RunState::RetryWait, StepState::RetryWait),
+            RunState::Paused => (RunState::Paused, StepState::RetryWait),
+            RunState::Cancelling | RunState::Cancelled => {
+                (RunState::Cancelled, StepState::Cancelled)
+            }
+            _ => return Ok(()),
+        };
+        if run.state != run_target {
+            validate_run_transition(run.state, run_target)?;
+        }
+        validate_step_transition(step.state, step_target)?;
+        transaction.execute(
+            "UPDATE workflow_steps SET state = ?2, attempt = MAX(attempt - 1, 0), updated_at = ?3 WHERE id = ?1",
+            params![step_id, step_target.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE workflow_runs SET state = ?2, updated_at = ?3,
+                completed_at = CASE WHEN ?2 = 'cancelled' THEN ?3 ELSE completed_at END WHERE id = ?1",
+            params![run_id, run_target.as_str(), now],
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            Some(step_id),
+            "claim_released_before_execution",
+            "{}",
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_run_paused(
+        &self,
+        connection: &Connection,
+        id: &str,
+        paused: bool,
+        now: i64,
+    ) -> Result<(), WorkflowError> {
+        let transaction = connection.unchecked_transaction()?;
+        let run = self
+            .get_run(&transaction, id)?
+            .ok_or_else(|| WorkflowError::RunNotFound(id.to_string()))?;
+        let (retry_deadline, running_steps): (Option<i64>, i64) = transaction.query_row(
+            "SELECT MIN(CASE WHEN state = 'retry_wait' THEN updated_at END),
+                    COALESCE(SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END), 0)
+             FROM workflow_steps WHERE run_id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let target = match (paused, run.state) {
+            (true, RunState::Queued | RunState::RetryWait) => Some(RunState::Paused),
+            (false, RunState::Paused) => Some(if running_steps > 0 {
+                RunState::Running
+            } else if retry_deadline.is_some() {
+                RunState::RetryWait
+            } else {
+                RunState::Queued
+            }),
+            _ => None, // Running work retains its cooperative provider flag.
+        };
+        if let Some(target) = target {
+            validate_run_transition(run.state, target)?;
+            // Steps retain their Ready/RetryWait state and their original
+            // deadline while paused, so resume cannot claim scheduled work early.
+            let updated_at = if target == RunState::RetryWait {
+                retry_deadline.unwrap_or(now)
+            } else {
+                now
+            };
+            transaction.execute(
+                "UPDATE workflow_runs SET state = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, target.as_str(), updated_at],
+            )?;
+            append_event(
+                &transaction,
+                id,
+                None,
+                if paused { "run_paused" } else { "run_resumed" },
+                "{}",
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn next_ready_deadline(
+        &self,
+        connection: &Connection,
+        admitted_types: &[String],
+        now: i64,
+    ) -> Result<Option<i64>, WorkflowError> {
+        let mut statement = connection.prepare(
+            "SELECT r.workflow_type,
+                    MIN(CASE WHEN r.state = 'queued' THEN ?1 ELSE s.updated_at END)
+             FROM workflow_steps s JOIN workflow_runs r ON r.id = s.run_id
+             WHERE (s.state = 'ready' AND r.state = 'queued')
+                OR (s.state = 'retry_wait' AND r.state = 'retry_wait')
+             GROUP BY r.workflow_type",
+        )?;
+        let deadlines = statement.query_map(params![now], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut earliest = None;
+        for deadline in deadlines {
+            let (workflow_type, deadline) = deadline?;
+            if admitted_types.contains(&workflow_type) {
+                let deadline = deadline.max(now);
+                earliest = Some(earliest.map_or(deadline, |previous: i64| previous.min(deadline)));
+            }
+        }
+        Ok(earliest)
+    }
+
+    pub fn fail_expired_running_runs_excluding(
+        &self,
+        connection: &Connection,
+        warning: &str,
+        updated_at: i64,
+        lease_expires_before: i64,
+        active_run_ids: &[String],
+    ) -> Result<usize, WorkflowError> {
+        let tx = connection.unchecked_transaction()?;
+        let run_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM workflow_runs
+                 WHERE state = 'running' AND updated_at <= ?1",
+            )?;
+            let ids = stmt
+                .query_map(params![lease_expires_before], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids.into_iter()
+                .filter(|id| !active_run_ids.contains(id))
+                .collect()
+        };
+        for run_id in &run_ids {
+            tx.execute(
+                "UPDATE workflow_steps
+                 SET state = 'failed', error_message = ?2, updated_at = ?3
+                 WHERE run_id = ?1 AND state = 'running'",
+                params![run_id, warning, updated_at],
+            )?;
+            tx.execute(
+                "UPDATE workflow_runs
+                 SET state = 'failed', error_message = ?2, updated_at = ?3, completed_at = ?3
+                 WHERE id = ?1",
+                params![run_id, warning, updated_at],
+            )?;
+            append_event(&tx, run_id, None, "lease_expired", "{}", updated_at)?;
+        }
+        tx.commit()?;
+        Ok(run_ids.len())
+    }
+
+    /// Joins a caller-owned writer transaction so provider planning and workflow
+    /// submission commit or roll back together. This method never commits.
+    pub fn insert_run_with_steps_and_event_in_transaction(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
         run: &NewWorkflowRun,
         steps: &[NewWorkflowStep],
         event_type: &str,
         payload_json: &str,
-    ) -> Result<(), WorkflowError> {
-        let tx = connection.unchecked_transaction()?;
+    ) -> rusqlite::Result<()> {
         let (run_state, step_state, updated_at) = match run.ready_at {
             Some(ready_at) if ready_at > run.created_at => ("retry_wait", "retry_wait", ready_at),
             _ => ("queued", "ready", run.created_at),
@@ -67,6 +248,27 @@ impl WorkflowRepository for SqliteWorkflowRepository {
                 (run_id, step_id, sequence, event_type, payload_json, created_at)
              VALUES (?1, NULL, 1, ?2, ?3, ?4)",
             params![run.id, event_type, payload_json, run.created_at],
+        )?;
+        Ok(())
+    }
+}
+
+impl WorkflowRepository for SqliteWorkflowRepository {
+    fn insert_run_with_steps_and_event(
+        &self,
+        connection: &Connection,
+        run: &NewWorkflowRun,
+        steps: &[NewWorkflowStep],
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<(), WorkflowError> {
+        let tx = connection.unchecked_transaction()?;
+        self.insert_run_with_steps_and_event_in_transaction(
+            &tx,
+            run,
+            steps,
+            event_type,
+            payload_json,
         )?;
         tx.commit()?;
         Ok(())
@@ -377,37 +579,14 @@ impl WorkflowRepository for SqliteWorkflowRepository {
         updated_at: i64,
         lease_expires_before: i64,
     ) -> Result<usize, WorkflowError> {
-        let tx = connection.unchecked_transaction()?;
-        let run_ids: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM workflow_runs
-                 WHERE state = 'running' AND updated_at <= ?1",
-            )?;
-            let ids = stmt
-                .query_map(params![lease_expires_before], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-            ids
-        };
-        for run_id in &run_ids {
-            tx.execute(
-                "UPDATE workflow_steps
-                 SET state = 'failed', error_message = ?2, updated_at = ?3
-                 WHERE run_id = ?1 AND state = 'running'",
-                params![run_id, warning, updated_at],
-            )?;
-            tx.execute(
-                "UPDATE workflow_runs
-                 SET state = 'failed', error_message = ?2, updated_at = ?3, completed_at = ?3
-                 WHERE id = ?1",
-                params![run_id, warning, updated_at],
-            )?;
-            append_event(&tx, run_id, None, "lease_expired", "{}", updated_at)?;
-        }
-        tx.commit()?;
-        Ok(run_ids.len())
+        self.fail_expired_running_runs_excluding(
+            connection,
+            warning,
+            updated_at,
+            lease_expires_before,
+            &[],
+        )
     }
-
     fn list_events(
         &self,
         connection: &Connection,
@@ -579,4 +758,93 @@ fn map_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRecord> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::database::initialize_database;
+
+    #[test]
+    fn caller_transaction_rolls_back_workflow_and_planning_watermark_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut connection, _) =
+            initialize_database(&directory.path().join("transaction.sqlite3")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE planner_watermark (id TEXT PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        let run = NewWorkflowRun {
+            id: "transaction-run".to_string(),
+            workflow_type: WorkflowType::synthetic(),
+            provider: "synthetic".to_string(),
+            legacy_origin: None,
+            legacy_id: None,
+            request_json: "{}".to_string(),
+            output_root: String::new(),
+            created_at: 10,
+            ready_at: Some(20),
+        };
+        let steps = [NewWorkflowStep {
+            id: "transaction-step".to_string(),
+            step_key: "execute".to_string(),
+            step_type: StepType::synthetic_execute(),
+            created_at: 10,
+        }];
+        {
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute("INSERT INTO planner_watermark VALUES ('schedule', 10)", [])
+                .unwrap();
+            SqliteWorkflowRepository
+                .insert_run_with_steps_and_event_in_transaction(
+                    &transaction,
+                    &run,
+                    &steps,
+                    "submitted",
+                    "{}",
+                )
+                .unwrap();
+            // A later planning failure must roll back every part of the unit.
+            assert!(transaction
+                .execute("INSERT INTO planner_watermark VALUES ('schedule', 20)", [])
+                .is_err());
+        }
+        for table in [
+            "planner_watermark",
+            "workflow_runs",
+            "workflow_steps",
+            "workflow_events",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must join the caller's rollback");
+        }
+        let transaction = connection.transaction().unwrap();
+        SqliteWorkflowRepository
+            .insert_run_with_steps_and_event_in_transaction(
+                &transaction,
+                &run,
+                &steps,
+                "submitted",
+                "{}",
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let committed = SqliteWorkflowRepository
+            .get_run(&connection, &run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.state, RunState::RetryWait);
+        assert_eq!(committed.updated_at, 20);
+        assert_eq!(
+            SqliteWorkflowRepository
+                .list_events(&connection, &run.id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

@@ -34,6 +34,20 @@ export const IDLE_POLL_CEILING_MS = 60 * 60_000;
 /** Never re-arm faster than this, so a job due in 200ms cannot spin the loop. */
 const MIN_POLL_DELAY_MS = 1_000;
 
+/** Only schedule changes re-arm the effect; progress refreshes must not. */
+export function pollScheduleKey(jobs: readonly PollableJob[]): string {
+  return JSON.stringify(jobs
+    .filter((job) => job.status === "active" || job.status === "queued")
+    .map((job) => JSON.stringify([job.status, Boolean(job.paused), job.scheduled_at ?? null]))
+    .sort());
+}
+
+/** Recover promptly from a failed refresh without reviving an idle queue. */
+export function nextPollRetryDelayMs(jobs: readonly PollableJob[], nowMs: number): number | null {
+  const delay = nextPollDelayMs(jobs, nowMs);
+  return delay === null ? null : Math.min(delay, ACTIVE_POLL_INTERVAL_MS);
+}
+
 function isDueLater(
   scheduledAt: number | null | undefined,
   nowMs: number

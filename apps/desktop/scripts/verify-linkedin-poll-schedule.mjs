@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   nextPollDelayMs,
+  nextPollRetryDelayMs,
+  pollScheduleKey,
   ACTIVE_POLL_INTERVAL_MS,
   IDLE_POLL_CEILING_MS
 } from "../src/lib/linkedin/poll-schedule.ts";
@@ -10,6 +12,19 @@ const NOW = 1_800_000_000_000; // ms
 const sec = (offsetSeconds) => (NOW + offsetSeconds * 1000) / 1000;
 
 const job = (overrides) => ({ status: "completed", paused: false, scheduled_at: null, ...overrides });
+
+const later = job({ status: "queued", scheduled_at: sec(1800) });
+const earlier = job({ status: "queued", scheduled_at: sec(60) });
+assert.notEqual(pollScheduleKey([later]), pollScheduleKey([later, earlier]), "An earlier added schedule must re-arm a pending queue");
+assert.notEqual(pollScheduleKey([{ ...earlier, paused: true }]), pollScheduleKey([earlier]), "Resuming a schedule must re-arm the poll");
+assert.notEqual(pollScheduleKey([earlier]), pollScheduleKey([{ ...earlier, status: "active" }]), "Queued-to-active transitions must re-arm the poll");
+assert.equal(pollScheduleKey([later, earlier]), pollScheduleKey([earlier, later]), "Reordering rows must retain the timer");
+assert.equal(pollScheduleKey([earlier]), pollScheduleKey([{ ...earlier, progress_percent: 50, title: "Updated" }, job({})]), "Progress and completed rows must not re-arm the effect");
+assert.equal(pollScheduleKey([]), pollScheduleKey([job({ status: "failed" })]), "Idle row changes must leave polling stopped");
+assert.equal(nextPollRetryDelayMs([], NOW), null, "Failed idle refreshes must not revive polling");
+assert.equal(nextPollRetryDelayMs([later], NOW), ACTIVE_POLL_INTERVAL_MS, "Failed pending refreshes must retry promptly");
+assert.equal(nextPollRetryDelayMs([job({ status: "active" })], NOW), ACTIVE_POLL_INTERVAL_MS, "Failed active refreshes must keep the progress cadence");
+assert.equal(nextPollRetryDelayMs([{ ...earlier, scheduled_at: sec(2) }], NOW), 2000, "Retry must not sleep past an imminent schedule");
 
 // --- The gate: stop polling when nothing can change on its own ---------------
 assert.equal(nextPollDelayMs([], NOW), null, "An empty queue must stop polling");
@@ -174,30 +189,24 @@ assert.ok(
   "The poll effect must bail out when disposed so a stale timer cannot re-arm"
 );
 
-// Regression guard: when the queue is idle the poll returns null and arms no
-// timer, so the ONLY thing that can restart it is this effect re-running. The
-// deps must therefore include a signal derived from the job list. Relying on
-// refreshBootstrapState is not enough: it only re-enters the effect through
-// hasSavedToken, which does not change once it is already true, which would
-// leave a schedule created from an idle queue with no timer at all.
+// The effect must observe schedule changes even if the queue stays pending.
 assert.ok(
   appSource.includes(
-    "queueNeedsSessionRefresh, hasPendingQueueWork]);"
+    "queueNeedsSessionRefresh, queuePollScheduleKey]);"
   ),
-  "The poll effect must depend on hasPendingQueueWork so an idle queue can re-arm when a job is queued"
+  "The poll effect must depend on the stable schedule key"
 );
 assert.ok(
-  appSource.includes(
-    'job.status === "active" || job.status === "queued"'
-  ),
-  "hasPendingQueueWork must be derived from the job statuses the poll gate keys on"
+  appSource.includes("() => pollScheduleKey(queuedJobs)"),
+  "The schedule key must derive from the actual queued jobs"
+);
+assert.ok(
+  appSource.includes("nextPollRetryDelayMs(queuePollJobsRef.current, Date.now())"),
+  "A failed refresh must use current known work to choose a bounded retry"
 );
 
-// The newspaper poll is a separate loop and must keep its own cadence.
-assert.ok(
-  appSource.includes("window.setInterval(() => void processNewspaperSchedules(), 15_000)"),
-  "The newspaper poll is independent and must keep its existing interval"
-);
+assert.ok(!appSource.includes("processNewspaperSchedules"),
+  "Newspaper deadlines must be owned by the native supervisor");
 
 console.log(
   `LinkedIn poll schedule passed: idle stops polling, active polls at ` +
