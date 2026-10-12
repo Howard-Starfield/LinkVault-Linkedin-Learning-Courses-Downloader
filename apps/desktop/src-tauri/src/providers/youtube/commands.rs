@@ -153,6 +153,20 @@ fn helper_status_response(
     }
 }
 
+/// Start-path counterpart of `helper_status_response`: the same missing-vs-broken
+/// split, so Start does not tell a never-installed user their helpers "failed
+/// integrity validation". Integrity failures carry the bare reason, exactly as
+/// scan, inspection and download report them via `from_helper_run`.
+fn helper_start_error(
+    error: ManagedProcessError,
+    install_present: impl FnOnce() -> bool,
+) -> YouTubeError {
+    if matches!(error, ManagedProcessError::Integrity(_)) && !install_present() {
+        return YouTubeError::new("HELPER_MISSING", HELPER_MISSING_MESSAGE);
+    }
+    YouTubeError::from(YouTubeInternalError::from_helper_run(error))
+}
+
 #[tauri::command]
 pub async fn get_youtube_helper_status() -> Result<GetYouTubeHelperStatusResponse, String> {
     // Hashes ~230 MB of helpers; never run on the Tauri main thread.
@@ -406,8 +420,9 @@ fn start_youtube_download_blocking(
     )
     .map_err(YouTubeError::from)?;
     let _output_root = validate_output_root(PathBuf::from(&request.output_dir).as_path())?;
-    let helper = helper_identity(helper_kind())
-        .map_err(|error| YouTubeError::new("HELPER_INTEGRITY_FAILED", error.to_string()))?;
+    let helper = helper_identity(helper_kind()).map_err(|error| {
+        helper_start_error(error, crate::app::media_toolchain::managed_install_present)
+    })?;
     let plan_fingerprint = fingerprint(&request, &plan, &helper.digest)?;
     let run_id = opaque_id("run");
     let selected_items = current_selected_items
@@ -1182,5 +1197,28 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(scan.code, "INVALID_OPERATION_ID");
+    }
+
+    #[test]
+    fn helper_start_error_reports_missing_when_no_managed_install_exists() {
+        let error = helper_start_error(ManagedProcessError::Integrity("absent".into()), || false);
+        assert_eq!(error.code, "HELPER_MISSING");
+        assert_eq!(error.message, HELPER_MISSING_MESSAGE);
+    }
+
+    #[test]
+    fn helper_start_error_reports_the_bare_integrity_reason_when_an_install_exists() {
+        let error = helper_start_error(ManagedProcessError::Integrity("bad hash".into()), || true);
+        assert_eq!(error.code, "HELPER_INTEGRITY_FAILED");
+        assert_eq!(error.message, "bad hash");
+        assert!(!error.message.contains("helper integrity validation failed"));
+    }
+
+    #[test]
+    fn helper_start_error_does_not_blame_the_install_for_non_integrity_failures() {
+        let error = helper_start_error(ManagedProcessError::UnsupportedPlatform, || {
+            unreachable!("install probe is only for integrity failures")
+        });
+        assert_eq!(error.code, "HELPER_FAILED");
     }
 }
