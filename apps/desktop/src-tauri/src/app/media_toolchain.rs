@@ -1216,6 +1216,13 @@ pub fn status() -> ToolchainResult<MediaToolchainStatus> {
     Ok(status_from_layout(&layout))
 }
 
+/// Whether a managed install directory exists, without verifying it.
+pub fn managed_install_present() -> bool {
+    MediaToolchainLayout::resolve()
+        .map(|layout| layout.root.exists())
+        .unwrap_or(false)
+}
+
 /// Re-verify the active install and return helper paths plus manifest digests.
 pub fn verified_component_paths() -> ToolchainResult<Option<VerifiedToolchainPaths>> {
     let layout = MediaToolchainLayout::resolve()?;

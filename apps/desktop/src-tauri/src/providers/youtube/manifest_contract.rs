@@ -494,6 +494,12 @@ fn is_windows_reserved_name(name: &str) -> bool {
                 .is_ok_and(|number| (1..=9).contains(&number)))
 }
 
+/// The digest check the start path applies to `helperLockDigest`, exposed so
+/// helper status can never report ready for a digest that start would reject.
+pub fn validate_helper_lock_digest(value: &str) -> Result<(), ManifestContractError> {
+    validate_digest("helperLockDigest", value)
+}
+
 fn validate_digest(field: &'static str, value: &str) -> Result<(), ManifestContractError> {
     if value.len() != 64
         || value != value.to_ascii_lowercase()

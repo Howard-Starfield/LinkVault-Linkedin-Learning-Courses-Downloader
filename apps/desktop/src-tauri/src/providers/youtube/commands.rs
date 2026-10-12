@@ -1,5 +1,6 @@
 use crate::app::managed_process::{
-    helper_identity, TransientRunSnapshot, TransientWorkItem, MAX_SELECTED_ITEMS,
+    helper_identity, HelperIdentity, ManagedProcessError, TransientRunSnapshot, TransientWorkItem,
+    MAX_SELECTED_ITEMS,
 };
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::cache::{get_setting, open_runtime, upsert_setting_json};
@@ -8,8 +9,8 @@ use crate::providers::youtube::executor::{YouTubeExecutorContext, YouTubeExecuto
 use crate::providers::youtube::helper::helper_kind;
 use crate::providers::youtube::live::{YouTubeLiveHandle, YoutubeDurableRequest};
 use crate::providers::youtube::manifest_contract::{
-    artifact_fingerprint, select_transcript, ArtifactFingerprintInput, ManifestContractError,
-    SelectedTranscript, FORMAT_POLICY_VERSION,
+    artifact_fingerprint, select_transcript, validate_helper_lock_digest, ArtifactFingerprintInput,
+    ManifestContractError, SelectedTranscript, FORMAT_POLICY_VERSION,
 };
 use crate::providers::youtube::models::{
     CancelYouTubeRunRequest, GetYouTubeDownloadStateRequest, GetYouTubeDownloadStateResponse,
@@ -119,27 +120,56 @@ impl PlanCache {
     }
 }
 
-#[tauri::command]
-pub fn get_youtube_helper_status() -> GetYouTubeHelperStatusResponse {
-    match helper_identity(helper_kind()) {
-        Ok(_) => GetYouTubeHelperStatusResponse {
-            status: YouTubeHelperBackendStatus::Ready,
-            code: None,
-            message: "YouTube helper integrity validation passed.".to_string(),
+const HELPER_MISSING_MESSAGE: &str =
+    "YouTube needs a one-time signed helper pack (~220 MB). It installs inside LinkVaultData and is not bundled in the app installer.";
+const HELPER_INTEGRITY_MESSAGE: &str =
+    "Installed YouTube helpers failed verification. Download YouTube helpers again to repair them.";
+
+/// Maps the start-path helper identity to UI status. `install_present` is only
+/// consulted on failure, to tell "never installed" from "installed but broken".
+fn helper_status_response(
+    identity: Result<HelperIdentity, ManagedProcessError>,
+    install_present: impl FnOnce() -> bool,
+) -> GetYouTubeHelperStatusResponse {
+    let blocked = |code: &str, message: &str| GetYouTubeHelperStatusResponse {
+        status: YouTubeHelperBackendStatus::Blocked,
+        code: Some(code.to_string()),
+        message: message.to_string(),
+    };
+    match identity {
+        Ok(identity) => match validate_helper_lock_digest(&identity.digest) {
+            Ok(()) => GetYouTubeHelperStatusResponse {
+                status: YouTubeHelperBackendStatus::Ready,
+                code: None,
+                message: "YouTube helper integrity validation passed.".to_string(),
+            },
+            Err(_) => blocked("HELPER_INTEGRITY_FAILED", HELPER_INTEGRITY_MESSAGE),
         },
-        Err(_) => GetYouTubeHelperStatusResponse {
-            status: YouTubeHelperBackendStatus::Blocked,
-            code: Some("HELPER_EXECUTION_BLOCKED".to_string()),
-            message: "YouTube helpers are missing or failed integrity validation. Install the signed media toolchain to continue."
-                .to_string(),
-        },
+        Err(_) if install_present() => blocked("HELPER_INTEGRITY_FAILED", HELPER_INTEGRITY_MESSAGE),
+        Err(_) => blocked("HELPER_MISSING", HELPER_MISSING_MESSAGE),
     }
 }
 
 #[tauri::command]
-pub fn get_media_toolchain_status(
+pub async fn get_youtube_helper_status() -> Result<GetYouTubeHelperStatusResponse, String> {
+    // Hashes ~230 MB of helpers; never run on the Tauri main thread.
+    tauri::async_runtime::spawn_blocking(|| {
+        helper_status_response(
+            helper_identity(helper_kind()),
+            crate::app::media_toolchain::managed_install_present,
+        )
+    })
+    .await
+    .map_err(|error| format!("YouTube helper status task failed: {error}"))
+}
+
+#[tauri::command]
+pub async fn get_media_toolchain_status(
 ) -> Result<crate::app::media_toolchain::MediaToolchainStatus, String> {
-    crate::app::media_toolchain::status().map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(crate::app::media_toolchain::status)
+        .await
+        .map_err(|error| format!("Media toolchain status task failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1015,5 +1045,50 @@ mod tests {
             }),
             i64::from(YOUTUBE_HISTORY_MAX_LIMIT)
         );
+    }
+
+    use crate::app::managed_process::{HelperIdentity, ManagedProcessError};
+    use crate::providers::youtube::models::YouTubeHelperBackendStatus;
+
+    #[test]
+    fn helper_status_is_ready_only_when_the_start_path_digest_contract_passes() {
+        let ready = helper_status_response(
+            Ok(HelperIdentity {
+                digest: "a".repeat(64),
+            }),
+            || true,
+        );
+        assert_eq!(ready.status, YouTubeHelperBackendStatus::Ready);
+        assert_eq!(ready.code, None);
+    }
+
+    #[test]
+    fn helper_status_blocks_a_digest_the_start_path_would_reject() {
+        // Regression: v0.2.28 reported ready for `media-toolchain:<version>`.
+        let blocked = helper_status_response(
+            Ok(HelperIdentity {
+                digest: "media-toolchain:2026.10.1".to_string(),
+            }),
+            || true,
+        );
+        assert_eq!(blocked.status, YouTubeHelperBackendStatus::Blocked);
+        assert_eq!(blocked.code.as_deref(), Some("HELPER_INTEGRITY_FAILED"));
+    }
+
+    #[test]
+    fn helper_status_reports_missing_when_no_managed_install_exists() {
+        let missing =
+            helper_status_response(Err(ManagedProcessError::Integrity("absent".into())), || {
+                false
+            });
+        assert_eq!(missing.code.as_deref(), Some("HELPER_MISSING"));
+        assert!(missing.message.contains("one-time"));
+    }
+
+    #[test]
+    fn helper_status_reports_integrity_failure_when_an_install_exists() {
+        let failed =
+            helper_status_response(Err(ManagedProcessError::Integrity("bad".into())), || true);
+        assert_eq!(failed.code.as_deref(), Some("HELPER_INTEGRITY_FAILED"));
     }
 }
