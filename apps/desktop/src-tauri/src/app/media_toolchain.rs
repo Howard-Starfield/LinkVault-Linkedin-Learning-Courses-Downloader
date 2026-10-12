@@ -742,27 +742,63 @@ fn default_state_schema_version() -> u32 {
     MEDIA_TOOLCHAIN_STATE_SCHEMA_VERSION
 }
 
+/// Why `state.json` could not be turned into an install state. Only `Malformed`
+/// justifies quarantining the file; the others must leave it untouched.
+#[derive(Debug)]
+enum InstallStateReadFailure {
+    /// Transient or environmental read failure (permissions, AV lock, races).
+    Io(MediaToolchainError),
+    /// Content is not valid install state: bad JSON, invalid field or version.
+    Malformed(MediaToolchainError),
+    /// Written by a newer build than this one understands.
+    NewerSchema(MediaToolchainError),
+}
+
+impl InstallStateReadFailure {
+    fn into_error(self) -> MediaToolchainError {
+        match self {
+            Self::Io(error) | Self::Malformed(error) | Self::NewerSchema(error) => error,
+        }
+    }
+}
+
 fn read_install_state(layout: &MediaToolchainLayout) -> ToolchainResult<MediaToolchainInstallState> {
+    read_install_state_classified(layout).map_err(InstallStateReadFailure::into_error)
+}
+
+fn read_install_state_classified(
+    layout: &MediaToolchainLayout,
+) -> Result<MediaToolchainInstallState, InstallStateReadFailure> {
     let path = layout.state_path();
     if !path.exists() {
         return Ok(MediaToolchainInstallState::default());
     }
     let bytes = fs::read(&path).map_err(|error| {
-        MediaToolchainError::new(
+        InstallStateReadFailure::Io(MediaToolchainError::new(
             MediaToolchainErrorCode::Io,
             format!("Read media-toolchain install state: {error}"),
-        )
+        ))
     })?;
     let state: MediaToolchainInstallState = serde_json::from_slice(&bytes).map_err(|_| {
-        MediaToolchainError::new(
+        InstallStateReadFailure::Malformed(MediaToolchainError::new(
             MediaToolchainErrorCode::ActivationFailed,
             "Media-toolchain install state is unreadable",
-        )
+        ))
     })?;
+    if state.schema_version > MEDIA_TOOLCHAIN_STATE_SCHEMA_VERSION {
+        return Err(InstallStateReadFailure::NewerSchema(
+            MediaToolchainError::new(
+                MediaToolchainErrorCode::ActivationFailed,
+                "The helper install state was written by a newer LinkedVault; update LinkedVault.",
+            ),
+        ));
+    }
     if state.schema_version != MEDIA_TOOLCHAIN_STATE_SCHEMA_VERSION {
-        return Err(MediaToolchainError::new(
-            MediaToolchainErrorCode::ActivationFailed,
-            "Media-toolchain install state uses an unsupported schema",
+        return Err(InstallStateReadFailure::Malformed(
+            MediaToolchainError::new(
+                MediaToolchainErrorCode::ActivationFailed,
+                "Media-toolchain install state uses an unsupported schema",
+            ),
         ));
     }
     for version in [
@@ -773,33 +809,77 @@ fn read_install_state(layout: &MediaToolchainLayout) -> ToolchainResult<MediaToo
     .flatten()
     {
         if validate_version(version).is_err() {
-            return Err(MediaToolchainError::new(
-                MediaToolchainErrorCode::ActivationFailed,
-                "Media-toolchain install state contains an invalid version",
+            return Err(InstallStateReadFailure::Malformed(
+                MediaToolchainError::new(
+                    MediaToolchainErrorCode::ActivationFailed,
+                    "Media-toolchain install state contains an invalid version",
+                ),
             ));
         }
     }
     Ok(state)
 }
 
-/// Reads the install state for a write path (install / activation). An existing
-/// `state.json` that cannot be read or parsed would otherwise make repair
-/// impossible, so it is moved aside to `state.json.corrupt-<unix-seconds>` (never
-/// deleted, never followed through a symlink) and the install proceeds as if no
-/// version were active. An absent state file already means "no active version".
-fn read_install_state_for_write(
+/// Install-time read that never touches the file: a malformed state is treated
+/// as "no active version" in memory (the flag reports it), while I/O failures
+/// and newer-schema files propagate unchanged.
+fn read_install_state_lenient(
     layout: &MediaToolchainLayout,
-) -> ToolchainResult<MediaToolchainInstallState> {
-    match read_install_state(layout) {
-        Ok(state) => Ok(state),
-        Err(error) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0);
-            quarantine_install_state(layout, now).map_err(|_| error)?;
-            Ok(MediaToolchainInstallState::default())
+) -> ToolchainResult<(MediaToolchainInstallState, bool)> {
+    match read_install_state_classified(layout) {
+        Ok(state) => Ok((state, false)),
+        Err(InstallStateReadFailure::Malformed(_)) => {
+            Ok((MediaToolchainInstallState::default(), true))
         }
+        Err(other) => Err(other.into_error()),
+    }
+}
+
+/// Writes the new install state for an activation. When the previous state was
+/// malformed it is first moved aside to `state.json.corrupt-<unix-seconds>`
+/// (never deleted), and moved back if the write fails so a failed repair leaves
+/// the user's files as they were. `write` is a seam for failure-injection tests.
+fn commit_install_state(
+    layout: &MediaToolchainLayout,
+    state: MediaToolchainInstallState,
+    previous_state_malformed: bool,
+    unix_seconds: u64,
+    write: impl FnOnce(&MediaToolchainLayout, MediaToolchainInstallState) -> ToolchainResult<()>,
+) -> ToolchainResult<()> {
+    let quarantined = if previous_state_malformed {
+        let path = quarantine_install_state(layout, unix_seconds).map_err(|error| {
+            MediaToolchainError::new(
+                MediaToolchainErrorCode::ActivationFailed,
+                format!("Set aside unreadable media-toolchain install state: {error}"),
+            )
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+    write(layout, state).inspect_err(|_| {
+        if let Some(path) = quarantined.as_deref() {
+            restore_quarantined_state(layout, path);
+        }
+    })
+}
+
+/// Best-effort move of a quarantined state file back to `state.json`. Never
+/// overwrites a file that is already there.
+fn restore_quarantined_state(layout: &MediaToolchainLayout, quarantined: &Path) {
+    let destination = layout.state_path();
+    let outcome = if fs::symlink_metadata(&destination).is_ok() {
+        Err("a state file already exists".to_string())
+    } else {
+        fs::rename(quarantined, &destination).map_err(|error| error.to_string())
+    };
+    match outcome {
+        Ok(()) => eprintln!(
+            "media-toolchain: activation failed; restored the unreadable install state file"
+        ),
+        Err(reason) => eprintln!(
+            "media-toolchain: activation failed and the unreadable install state could not be restored ({reason}); it remains in the quarantine file"
+        ),
     }
 }
 
@@ -1312,7 +1392,9 @@ pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
 
     let result = (|| -> ToolchainResult<()> {
         let (manifest_bytes, manifest) = fetch_verified_manifest()?;
-        let installed = read_install_state_for_write(&layout)?;
+        // Never renames: a malformed state is only set aside once an activation
+        // is ready to write a replacement, after the download has succeeded.
+        let (installed, _) = read_install_state_lenient(&layout)?;
         reject_downgrade(installed.active_version.as_deref(), &manifest.version)?;
 
         // Same version already verified: refresh state timestamps and return.
@@ -1793,7 +1875,7 @@ fn activate_candidate(
             "Media-toolchain candidate is incomplete",
         ));
     }
-    let mut state = read_install_state_for_write(layout)?;
+    let (mut state, previous_state_malformed) = read_install_state_lenient(layout)?;
     fs::create_dir_all(layout.versions_dir()).map_err(|error| {
         MediaToolchainError::new(
             MediaToolchainErrorCode::ActivationFailed,
@@ -1856,7 +1938,17 @@ fn activate_candidate(
     state.latest_available = Some(version.to_string());
     state.latest_manifest_size_bytes = manifest_size_bytes;
     state.last_checked_at = Some(Utc::now().to_rfc3339());
-    if let Err(error) = write_install_state_atomic(layout, state) {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Err(error) = commit_install_state(
+        layout,
+        state,
+        previous_state_malformed,
+        unix_seconds,
+        write_install_state_atomic,
+    ) {
         let mut recovery_failures = Vec::new();
         if let Err(restore_error) = fs::rename(&destination, candidate) {
             recovery_failures.push(format!("restore candidate: {restore_error}"));
@@ -2171,8 +2263,8 @@ mod tests {
         fs::create_dir_all(&layout.root).unwrap();
         // Absent state is "no active version", not corruption.
         assert_eq!(
-            read_install_state_for_write(&layout).unwrap(),
-            MediaToolchainInstallState::default()
+            read_install_state_lenient(&layout).unwrap(),
+            (MediaToolchainInstallState::default(), false)
         );
         assert_eq!(fs::read_dir(&layout.root).unwrap().count(), 0);
 
@@ -2189,6 +2281,103 @@ mod tests {
         assert_eq!(fs::read(first).unwrap(), b"first");
         assert_eq!(fs::read(second).unwrap(), b"second");
         assert!(!layout.state_path().exists());
+    }
+
+    /// Names of `state.json` and any quarantine siblings under the root.
+    fn state_dir_entries(layout: &MediaToolchainLayout) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&layout.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("state.json"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn io_class_state_read_failures_neither_quarantine_nor_proceed() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        // A directory named state.json exists but cannot be read as a file.
+        fs::create_dir_all(layout.state_path()).unwrap();
+
+        assert!(matches!(
+            read_install_state_classified(&layout),
+            Err(InstallStateReadFailure::Io(_))
+        ));
+        let lenient = read_install_state_lenient(&layout).unwrap_err();
+        assert_eq!(lenient.code, MediaToolchainErrorCode::Io);
+        let candidate = corrupt_state_candidate(&layout);
+        let activation = activate_candidate(&layout, "0.1.1", &candidate, None).unwrap_err();
+        assert_eq!(activation.code, MediaToolchainErrorCode::Io);
+
+        assert!(layout.state_path().is_dir());
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    #[test]
+    fn newer_schema_state_is_a_clear_error_and_left_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        let newer: &[u8] = br#"{"schema_version": 999, "active_version": "9.9.9"}"#;
+        fs::write(layout.state_path(), newer).unwrap();
+
+        assert!(matches!(
+            read_install_state_classified(&layout),
+            Err(InstallStateReadFailure::NewerSchema(_))
+        ));
+        let install_path = read_install_state_lenient(&layout).unwrap_err();
+        assert!(install_path.message.contains("newer LinkedVault"));
+        let candidate = corrupt_state_candidate(&layout);
+        let activation = activate_candidate(&layout, "0.1.1", &candidate, None).unwrap_err();
+        assert!(activation.message.contains("update LinkedVault"));
+
+        assert_eq!(fs::read(layout.state_path()).unwrap(), newer);
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    #[test]
+    fn install_time_read_leaves_a_malformed_state_file_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        fs::write(layout.state_path(), b"{ not json").unwrap();
+
+        let (state, malformed) = read_install_state_lenient(&layout).unwrap();
+
+        assert_eq!(state, MediaToolchainInstallState::default());
+        assert!(malformed);
+        assert_eq!(fs::read(layout.state_path()).unwrap(), b"{ not json");
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    #[test]
+    fn failed_state_write_restores_the_quarantined_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        fs::write(layout.state_path(), b"{ not json").unwrap();
+
+        let error = commit_install_state(
+            &layout,
+            MediaToolchainInstallState::default(),
+            true,
+            1_700_000_000,
+            |layout, _state| {
+                // The old file must already be set aside when the write is attempted.
+                assert!(!layout.state_path().exists());
+                Err(MediaToolchainError::new(
+                    MediaToolchainErrorCode::Io,
+                    "injected write failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.message, "injected write failure");
+        assert_eq!(fs::read(layout.state_path()).unwrap(), b"{ not json");
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
     }
 
     fn failed_install() -> ToolchainResult<()> {
