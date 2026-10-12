@@ -1665,16 +1665,20 @@ textarea {
  line-height: 14px;
 }
 
-.youtube-result-warning {
+.youtube-result-copy > .youtube-result-warning {
  color: var(--warning);
  font-size: 11px;
  line-height: 15px;
+ white-space: normal;
+ overflow-wrap: anywhere;
 }
 
-.youtube-result-error {
+.youtube-result-copy > .youtube-result-error {
  color: var(--danger);
  font-size: 11px;
  line-height: 15px;
+ white-space: normal;
+ overflow-wrap: anywhere;
 }
 
 .youtube-result-row[data-unavailable="true"] {
