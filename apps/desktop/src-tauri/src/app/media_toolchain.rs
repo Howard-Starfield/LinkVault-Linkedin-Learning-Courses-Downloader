@@ -1117,6 +1117,8 @@ fn read_verified_active(
 }
 
 fn status_from_layout(layout: &MediaToolchainLayout) -> MediaToolchainStatus {
+    // NOTE: `root.exists()` differs from `managed_install_present()` (recorded
+    // active version); reconcile in a follow-up.
     let managed_install_present = layout.root.exists();
     let state = match read_install_state(layout) {
         Ok(state) => state,
@@ -1216,11 +1218,21 @@ pub fn status() -> ToolchainResult<MediaToolchainStatus> {
     Ok(status_from_layout(&layout))
 }
 
-/// Whether a managed install directory exists, without verifying it.
+/// Whether an install has been recorded, without verifying it. A failed first
+/// download leaves `root/` and `root/staging/` behind, so directory existence is
+/// not enough: an install counts once `state.json` names an active version, or
+/// when `state.json` is unreadable (a broken install, not a missing one).
 pub fn managed_install_present() -> bool {
     MediaToolchainLayout::resolve()
-        .map(|layout| layout.root.exists())
+        .map(|layout| managed_install_present_in(&layout))
         .unwrap_or(false)
+}
+
+fn managed_install_present_in(layout: &MediaToolchainLayout) -> bool {
+    match read_install_state(layout) {
+        Ok(state) => state.active_version.is_some(),
+        Err(_) => true,
+    }
 }
 
 /// Re-verify the active install and return helper paths plus manifest digests.
@@ -2116,5 +2128,42 @@ mod tests {
         finish_install_stage(&stage, Ok(())).unwrap();
 
         assert!(!stage.exists());
+    }
+
+    #[test]
+    fn managed_install_present_ignores_leftover_staging_from_a_failed_first_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(layout.staging_dir("install-failed")).unwrap();
+        assert!(!managed_install_present_in(&layout));
+    }
+
+    #[test]
+    fn managed_install_present_requires_a_recorded_active_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+
+        write_install_state_atomic(&layout, MediaToolchainInstallState::default()).unwrap();
+        assert!(!managed_install_present_in(&layout));
+
+        write_install_state_atomic(
+            &layout,
+            MediaToolchainInstallState {
+                active_version: Some("2026.10.1".to_string()),
+                ..MediaToolchainInstallState::default()
+            },
+        )
+        .unwrap();
+        assert!(managed_install_present_in(&layout));
+    }
+
+    #[test]
+    fn managed_install_present_treats_an_unreadable_state_file_as_a_broken_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        fs::write(layout.state_path(), b"{ not json").unwrap();
+        assert!(managed_install_present_in(&layout));
     }
 }

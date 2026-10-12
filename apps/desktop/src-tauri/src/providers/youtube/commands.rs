@@ -127,6 +127,9 @@ const HELPER_INTEGRITY_MESSAGE: &str =
 
 /// Maps the start-path helper identity to UI status. `install_present` is only
 /// consulted on failure, to tell "never installed" from "installed but broken".
+/// Internal embedded-lock builds with a corrupted sidecar report HELPER_MISSING
+/// (no managed install); Download YouTube helpers still repairs it because a
+/// managed install is resolved first.
 fn helper_status_response(
     identity: Result<HelperIdentity, ManagedProcessError>,
     install_present: impl FnOnce() -> bool,
@@ -1047,16 +1050,13 @@ mod tests {
         );
     }
 
-    use crate::app::managed_process::{HelperIdentity, ManagedProcessError};
-    use crate::providers::youtube::models::YouTubeHelperBackendStatus;
-
     #[test]
     fn helper_status_is_ready_only_when_the_start_path_digest_contract_passes() {
         let ready = helper_status_response(
             Ok(HelperIdentity {
                 digest: "a".repeat(64),
             }),
-            || true,
+            || unreachable!("install probe must not run when identity resolved"),
         );
         assert_eq!(ready.status, YouTubeHelperBackendStatus::Ready);
         assert_eq!(ready.code, None);
@@ -1069,7 +1069,7 @@ mod tests {
             Ok(HelperIdentity {
                 digest: "media-toolchain:2026.10.1".to_string(),
             }),
-            || true,
+            || unreachable!("install probe must not run when identity resolved"),
         );
         assert_eq!(blocked.status, YouTubeHelperBackendStatus::Blocked);
         assert_eq!(blocked.code.as_deref(), Some("HELPER_INTEGRITY_FAILED"));
