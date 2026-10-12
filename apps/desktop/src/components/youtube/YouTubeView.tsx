@@ -364,7 +364,8 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   }, []);
 
   const recoverFromHelperFailure = useCallback((error: unknown) => {
-    // Skip while a check is already running; the install path calls refreshHelperStatus directly.
+    // Skip while a check is already running: a concurrent check reads the same helper files, so it
+    // will observe the same state. The install path calls refreshHelperStatus directly.
     if (helperRecoveryKind(error) === "reinstall" && helperRefreshInFlightRef.current === 0) {
       void refreshHelperStatus();
     }
@@ -540,7 +541,8 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     if (isYouTubeRunTerminal(runSnapshot.state)) downloadQueueRef.current = [];
     if (helperRecoveryRunRef.current === runSnapshot.runId) return;
     helperRecoveryRunRef.current = runSnapshot.runId; // once per run, not per revision
-    void refreshHelperStatus();
+    // A check already in flight reads the same helper files and will see the same state.
+    if (helperRefreshInFlightRef.current === 0) void refreshHelperStatus();
   }, [runSnapshot, refreshHelperStatus]);
 
   useEffect(() => {
@@ -1005,11 +1007,13 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       return false;
     }
     if (!helperReady) {
-      toast.error("YouTube helper is not ready", {
-        description: helperStatus === "pending"
-          ? "Checking YouTube helpers…"
-          : helperError?.message ?? "Download YouTube helpers to continue."
-      });
+      if (helperStatus === "pending") {
+        toast.error("Checking YouTube helpers…", { description: "Start the download again in a moment." });
+      } else {
+        toast.error("YouTube helper is not ready", {
+          description: helperError?.message ?? "Download YouTube helpers to continue."
+        });
+      }
       return false;
     }
     setSelectedOccurrenceIds(new Set(group.occurrenceIds));

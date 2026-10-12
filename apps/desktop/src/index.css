@@ -1665,7 +1665,8 @@ textarea {
  line-height: 14px;
 }
 
-.youtube-result-copy > .youtube-result-warning {
+.youtube-result-copy > .youtube-result-warning,
+.download-history-copy > .youtube-result-warning {
  color: var(--warning);
  font-size: 11px;
  line-height: 15px;
