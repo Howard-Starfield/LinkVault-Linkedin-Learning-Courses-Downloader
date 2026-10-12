@@ -1284,20 +1284,32 @@ pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
         Ok(())
     })();
 
+    finish_install_stage(&stage, result)?;
+    Ok(status_from_layout(&layout))
+}
+
+/// Clean up the install staging directory and report the install result.
+/// When a failed activation parked the previous install in
+/// `<stage>/replaced-version`, only that tree is kept (it may be the only
+/// copy); the archive and candidate are still removed so nothing else leaks.
+fn finish_install_stage(stage: &Path, result: ToolchainResult<()>) -> ToolchainResult<()> {
     let parked_previous = stage.join("replaced-version");
-    if stage_cleanup_allowed(result.is_err(), parked_previous.exists()) {
-        let _ = fs::remove_dir_all(&stage);
+    let parked = parked_previous.exists();
+    if stage_cleanup_allowed(result.is_err(), parked) {
+        let _ = fs::remove_dir_all(stage);
+    } else {
+        let _ = fs::remove_file(stage.join("toolchain.zip"));
+        let _ = fs::remove_dir_all(stage.join("candidate"));
     }
     result.map_err(|mut error| {
-        if parked_previous.exists() {
+        if parked {
             error.message.push_str(&format!(
                 "; the previous helper install was preserved at {}",
                 parked_previous.display()
             ));
         }
         error
-    })?;
-    Ok(status_from_layout(&layout))
+    })
 }
 
 /// True only when the active install already *is* the signed latest version
@@ -2041,5 +2053,61 @@ mod tests {
             Some(VERSION)
         );
         assert!(!stage.join("replaced-version").exists());
+    }
+
+    fn failed_install() -> ToolchainResult<()> {
+        Err(MediaToolchainError::new(
+            MediaToolchainErrorCode::ActivationFailed,
+            "activation failed",
+        ))
+    }
+
+    #[test]
+    fn failed_install_keeps_only_the_parked_previous_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("install-test");
+        let parked = stage.join("replaced-version");
+        fs::create_dir_all(parked.join("bin")).unwrap();
+        fs::write(parked.join("bin/ffmpeg.exe"), b"previous").unwrap();
+        fs::write(stage.join("toolchain.zip"), b"zip").unwrap();
+        fs::create_dir_all(stage.join("candidate/bin")).unwrap();
+        fs::write(stage.join("candidate/bin/ffmpeg.exe"), b"new").unwrap();
+
+        let error = finish_install_stage(&stage, failed_install()).unwrap_err();
+
+        assert_eq!(error.code, MediaToolchainErrorCode::ActivationFailed);
+        assert!(error.message.starts_with("activation failed"));
+        assert!(error.message.contains(&parked.display().to_string()));
+        assert_eq!(
+            fs::read(parked.join("bin/ffmpeg.exe")).unwrap(),
+            b"previous"
+        );
+        assert!(!stage.join("toolchain.zip").exists());
+        assert!(!stage.join("candidate").exists());
+    }
+
+    #[test]
+    fn failed_install_without_a_parked_tree_removes_the_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("install-test");
+        fs::create_dir_all(stage.join("candidate")).unwrap();
+        fs::write(stage.join("toolchain.zip"), b"zip").unwrap();
+
+        let error = finish_install_stage(&stage, failed_install()).unwrap_err();
+
+        assert_eq!(error.message, "activation failed");
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn successful_install_removes_the_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("install-test");
+        fs::create_dir_all(stage.join("candidate")).unwrap();
+        fs::write(stage.join("toolchain.zip"), b"zip").unwrap();
+
+        finish_install_stage(&stage, Ok(())).unwrap();
+
+        assert!(!stage.exists());
     }
 }
