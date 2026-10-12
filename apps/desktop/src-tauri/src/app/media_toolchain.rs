@@ -1244,14 +1244,22 @@ pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
         reject_downgrade(installed.active_version.as_deref(), &manifest.version)?;
 
         // Same version already verified: refresh state timestamps and return.
-        if installed.active_version.as_deref() == Some(manifest.version.as_str()) {
-            if read_verified_active(&layout)?.is_some() {
-                let mut state = installed;
-                state.last_checked_at = Some(Utc::now().to_rfc3339());
-                state.latest_available = Some(manifest.version.clone());
-                write_install_state_atomic(&layout, state)?;
-                return Ok(());
-            }
+        // A same-version install that fails verification falls through and is
+        // reinstalled from the freshly verified signed manifest and archive.
+        let active_is_latest =
+            installed.active_version.as_deref() == Some(manifest.version.as_str());
+        if active_is_latest
+            && same_version_install_is_current(
+                installed.active_version.as_deref(),
+                &manifest.version,
+                read_verified_active(&layout).map(|active| active.is_some()),
+            )
+        {
+            let mut state = installed;
+            state.last_checked_at = Some(Utc::now().to_rfc3339());
+            state.latest_available = Some(manifest.version.clone());
+            write_install_state_atomic(&layout, state)?;
+            return Ok(());
         }
 
         let platform = manifest.platform_for_host()?.clone();
@@ -1276,9 +1284,36 @@ pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
         Ok(())
     })();
 
-    let _ = fs::remove_dir_all(&stage);
-    result?;
+    let parked_previous = stage.join("replaced-version");
+    if stage_cleanup_allowed(result.is_err(), parked_previous.exists()) {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result.map_err(|mut error| {
+        if parked_previous.exists() {
+            error.message.push_str(&format!(
+                "; the previous helper install was preserved at {}",
+                parked_previous.display()
+            ));
+        }
+        error
+    })?;
     Ok(status_from_layout(&layout))
+}
+
+/// True only when the active install already *is* the signed latest version
+/// and still verifies. A failed verification means "repair", not "abort".
+fn same_version_install_is_current(
+    active_version: Option<&str>,
+    latest_version: &str,
+    active_verifies: ToolchainResult<bool>,
+) -> bool {
+    active_version == Some(latest_version) && matches!(active_verifies, Ok(true))
+}
+
+/// The staging tree may be removed unless a failed activation left the prior
+/// install parked inside it (`replaced-version`), which is then the only copy.
+fn stage_cleanup_allowed(install_failed: bool, replaced_version_parked: bool) -> bool {
+    !(install_failed && replaced_version_parked)
 }
 
 fn fetch_verified_manifest() -> ToolchainResult<(Vec<u8>, MediaToolchainManifest)> {
@@ -1909,5 +1944,102 @@ mod tests {
             layout.version_dir("1.0.0"),
             PathBuf::from("C:/tmp/media-toolchain/versions/1.0.0")
         );
+    }
+
+    #[test]
+    fn same_version_install_is_current_only_when_verification_passes() {
+        let verified: ToolchainResult<bool> = Ok(true);
+        assert!(same_version_install_is_current(
+            Some("0.1.1"),
+            "0.1.1",
+            verified
+        ));
+        // Regression: a failed verification used to abort the install instead of repairing it.
+        let corrupted: ToolchainResult<bool> = Err(MediaToolchainError::new(
+            MediaToolchainErrorCode::ComponentIntegrityFailed,
+            "hash mismatch",
+        ));
+        assert!(!same_version_install_is_current(
+            Some("0.1.1"),
+            "0.1.1",
+            corrupted
+        ));
+        assert!(!same_version_install_is_current(
+            Some("0.1.1"),
+            "0.1.1",
+            Ok(false)
+        ));
+        assert!(!same_version_install_is_current(
+            Some("0.1.0"),
+            "0.1.1",
+            Ok(true)
+        ));
+        assert!(!same_version_install_is_current(None, "0.1.1", Ok(true)));
+    }
+
+    #[test]
+    fn stage_cleanup_is_refused_only_when_a_failed_install_parked_the_previous_tree() {
+        assert!(stage_cleanup_allowed(false, false));
+        assert!(stage_cleanup_allowed(false, true));
+        assert!(stage_cleanup_allowed(true, false));
+        assert!(!stage_cleanup_allowed(true, true));
+    }
+
+    #[test]
+    fn activation_replaces_a_corrupted_same_version_tree() {
+        const VERSION: &str = "0.1.1";
+        let platform = MediaToolchainPlatformManifest {
+            target: MEDIA_TOOLCHAIN_V1_TARGET.to_string(),
+            archive: MediaToolchainArchive {
+                url: "https://github.com/Howard-Starfield/Infield-media-toolchain/releases/latest/download/toolchain.zip".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: None,
+            },
+            components: vec![
+                sample_component(MediaToolchainComponentKind::YtDlp, "bin/yt-dlp.exe", b"yt"),
+                sample_component(MediaToolchainComponentKind::Ffmpeg, "bin/ffmpeg.exe", b"ffmpeg"),
+                sample_component(MediaToolchainComponentKind::Deno, "bin/deno.exe", b"deno"),
+            ],
+        };
+        let write_tree = |root: &Path, ffmpeg: &[u8]| {
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::write(root.join("bin/yt-dlp.exe"), b"yt").unwrap();
+            fs::write(root.join("bin/ffmpeg.exe"), ffmpeg).unwrap();
+            fs::write(root.join("bin/deno.exe"), b"deno").unwrap();
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        let installed = layout.version_dir(VERSION);
+        write_tree(&installed, b"ffmpeg");
+        write_install_state_atomic(
+            &layout,
+            MediaToolchainInstallState {
+                active_version: Some(VERSION.to_string()),
+                ..MediaToolchainInstallState::default()
+            },
+        )
+        .unwrap();
+        verify_component_hashes(&installed, &platform).unwrap();
+
+        // Corrupt the installed tree by one byte.
+        fs::write(installed.join("bin/ffmpeg.exe"), b"ffmpeG").unwrap();
+        assert!(verify_component_hashes(&installed, &platform).is_err());
+
+        let stage = layout.staging_dir("install-test");
+        let candidate = stage.join("candidate");
+        write_tree(&candidate, b"ffmpeg");
+
+        activate_candidate(&layout, VERSION, &candidate, None).unwrap();
+
+        verify_component_hashes(&layout.version_dir(VERSION), &platform).unwrap();
+        assert_eq!(
+            read_install_state(&layout)
+                .unwrap()
+                .active_version
+                .as_deref(),
+            Some(VERSION)
+        );
+        assert!(!stage.join("replaced-version").exists());
     }
 }
