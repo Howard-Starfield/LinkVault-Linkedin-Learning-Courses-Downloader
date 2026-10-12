@@ -56,9 +56,11 @@ import {
   type YouTubeScanItem,
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
+import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
 
 type HelperStatus = "pending" | "ready" | "failed";
+type HelperRefreshResult = "ready" | "blocked" | "superseded";
 type YouTubeQueueSection = "queue" | "active" | "completed" | "failed";
 
 function queueSectionForItemState(state: YouTubeItemState): YouTubeQueueSection {
@@ -310,27 +312,55 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const [isInstallingHelpers, setIsInstallingHelpers] = useState(false);
   const helperReady = !nativeRuntime || helperStatus === "ready";
 
-  const refreshHelperStatus = useCallback(async () => {
+  const helperStatusGenerationRef = useRef(0);
+  const helperViewMountedRef = useRef(true);
+  const helperRecoveryRunRef = useRef<string | null>(null);
+
+  const refreshHelperStatus = useCallback(async (): Promise<HelperRefreshResult> => {
     if (!nativeRuntime) {
       setHelperStatus("ready");
       setHelperError(null);
-      return;
+      return "ready";
     }
+    // An install that finishes after unmount must not start a refresh that broadcasts.
+    if (!helperViewMountedRef.current) return "superseded";
+    const generation = helperStatusGenerationRef.current + 1;
+    helperStatusGenerationRef.current = generation;
+    let ready = false;
+    let failure: YouTubeError | null = null;
     try {
       const response = await getYouTubeHelperStatus();
-      const ready = response.status === "ready";
-      setHelperStatus(ready ? "ready" : "failed");
-      setHelperError(ready
+      ready = response.status === "ready";
+      failure = ready
         ? null
         : {
             code: response.code ?? "HELPER_INTEGRITY_FAILED",
             message: response.message || "YouTube helper integrity validation failed."
-          });
+          };
     } catch (error: unknown) {
-      setHelperStatus("failed");
-      setHelperError(helperStatusFailure(error));
+      failure = helperStatusFailure(error);
     }
+    // A newer refresh (or unmount) owns the UI; an older response must not
+    // set state, broadcast, or report a result a caller could act on.
+    if (generation !== helperStatusGenerationRef.current || !helperViewMountedRef.current) return "superseded";
+    setHelperStatus(ready ? "ready" : "failed");
+    setHelperError(failure);
+    window.dispatchEvent(new CustomEvent<boolean>(YOUTUBE_HELPER_STATUS_EVENT, { detail: ready }));
+    return ready ? "ready" : "blocked";
   }, [nativeRuntime]);
+
+  useEffect(() => {
+    helperViewMountedRef.current = true;
+    return () => {
+      // Invalidate in-flight and future refreshes so an unmounted view never broadcasts.
+      helperViewMountedRef.current = false;
+      helperStatusGenerationRef.current += 1;
+    };
+  }, []);
+
+  const recoverFromHelperFailure = useCallback((error: unknown) => {
+    if (helperRecoveryKind(error) === "reinstall") void refreshHelperStatus();
+  }, [refreshHelperStatus]);
 
   async function installYouTubeHelpers() {
     if (!nativeRuntime || isInstallingHelpers) return;
@@ -340,12 +370,18 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       if (!status.ready) {
         throw new Error(status.error ?? "Media toolchain install did not become ready.");
       }
-      await refreshHelperStatus();
-      toast.success("YouTube helpers ready", {
-        description: status.active_version
-          ? `Media toolchain ${status.active_version} is installed.`
-          : "Signed helpers are ready for downloads."
-      });
+      const result = await refreshHelperStatus();
+      if (result === "blocked") {
+        throw new Error("Helpers installed but did not pass the final YouTube check. Try Download YouTube helpers again.");
+      }
+      // "superseded": a newer refresh owns the banner, so show no success claim from a stale check.
+      if (result === "ready") {
+        toast.success("YouTube helpers ready", {
+          description: status.active_version
+            ? `Media toolchain ${status.active_version} is installed.`
+            : "Signed helpers are ready for downloads."
+        });
+      }
     } catch (error: unknown) {
       toast.error("Could not install YouTube helpers", {
         description: formatYouTubeInvokeError(error)
@@ -487,6 +523,15 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     latestRevisionRef.current = snapshot.revision;
     setRunSnapshot(snapshot);
   }, []);
+
+  useEffect(() => {
+    if (!runSnapshot || helperRecoveryRunRef.current === runSnapshot.runId) return;
+    const failures = [runSnapshot.error, ...runSnapshot.items.map((item) => item.error)];
+    if (failures.some((failure) => helperRecoveryKind(failure) === "reinstall")) {
+      helperRecoveryRunRef.current = runSnapshot.runId; // once per run, not per revision
+      void refreshHelperStatus();
+    }
+  }, [runSnapshot, refreshHelperStatus]);
 
   useEffect(() => {
     let disposed = false;
@@ -686,7 +731,8 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           for (const occurrence of response.occurrences) {
             tracks.push(...occurrence.tracks);
           }
-        } catch {
+        } catch (error) {
+          recoverFromHelperFailure(error);
           continue;
         }
       }
@@ -782,6 +828,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     } catch (error) {
       if (generation !== scanGenerationRef.current) return;
       toast.error("YouTube scan failed", { description: formatYouTubeInvokeError(error) });
+      recoverFromHelperFailure(error);
     } finally {
       if (generation === scanGenerationRef.current) setIsScanning(false);
     }
@@ -908,6 +955,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     } catch (error) {
       if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
       toast.error("Transcript inspection failed", { description: formatYouTubeInvokeError(error) });
+      recoverFromHelperFailure(error);
       return null;
     }
   }
@@ -940,7 +988,12 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       toast.error("Choose at least one public occurrence");
       return false;
     }
-    if (!helperReady) return false;
+    if (!helperReady) {
+      toast.error("YouTube helper is not ready", {
+        description: helperError?.message ?? "Download YouTube helpers to continue."
+      });
+      return false;
+    }
     setSelectedOccurrenceIds(new Set(group.occurrenceIds));
     startingGroupRef.current = true;
     setIsStarting(true);
@@ -979,6 +1032,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       return true;
     } catch (error) {
       toast.error("YouTube download could not start", { description: formatYouTubeInvokeError(error) });
+      recoverFromHelperFailure(error);
       return false;
     } finally {
       startingGroupRef.current = false;
@@ -1144,7 +1198,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
             <>
               <p>
                 {helperError?.message ??
-                  "YouTube needs a one-time signed helper pack (~220 MB). It installs beside LinkVaultData and is not bundled in the app installer."}
+                  "YouTube needs a one-time signed helper pack (~220 MB). It installs inside LinkVaultData and is not bundled in the app installer."}
               </p>
               <Button
                 type="button"
@@ -1310,6 +1364,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                 const warningText = outcome?.warnings?.length
                   ? formatYouTubeWarning(outcome.warnings[0] ?? "")
                   : null;
+                const errorText = state === "failed" && outcome?.error
+                  ? `${outcome.error.message}${helperRecoveryKind(outcome.error) === "reinstall" ? "" : " Retry the download, or check the link."}`
+                  : null;
                 const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
                 const duration = formatDuration(video.item.durationSeconds);
                 const plan = scanPlans.find((candidate) => candidate.scanPlanId === video.scanPlanId);
@@ -1331,6 +1388,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                         </div>
                       ) : status ? <span className="youtube-result-status">{status}</span> : null}
                       {warningText ? <span className="youtube-result-warning">{warningText}</span> : null}
+                      {errorText ? <span className="youtube-result-error">{errorText}</span> : null}
                       {!available ? <span className="youtube-result-status">{availabilityLabel}</span> : null}
                     </div>
                     <div className="youtube-result-overlay">

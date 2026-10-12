@@ -1671,6 +1671,12 @@ textarea {
  line-height: 15px;
 }
 
+.youtube-result-error {
+ color: var(--danger);
+ font-size: 11px;
+ line-height: 15px;
+}
+
 .youtube-result-row[data-unavailable="true"] {
  opacity: 0.58;
 }
