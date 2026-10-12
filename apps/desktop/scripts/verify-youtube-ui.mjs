@@ -306,7 +306,12 @@ matches(styles, /\.youtube-control-cluster[\s\S]*?select \{[\s\S]*?border-radius
 matches(styles, /\.youtube-search-input \{[\s\S]*?max-height: 132px;/, "Search box height cap is missing");
 assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are still present");
 
-assert.equal(packageJson.scripts["verify:youtube-ui"], "node ./scripts/verify-youtube-ui.mjs", "Desktop YouTube UI verifier is not wired");
+assert.equal(
+  packageJson.scripts["verify:youtube-ui"],
+  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock",
+  "Desktop YouTube UI verifier is not wired"
+);
+includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");
 assert.equal(rootPackageJson.scripts["verify:youtube-ui"], "npm --prefix apps/desktop run verify:youtube-ui", "Root YouTube UI verifier is not wired");
 
 // Item outcome warnings are Rust TransientWarning objects ({ code, message }), not bare string codes.

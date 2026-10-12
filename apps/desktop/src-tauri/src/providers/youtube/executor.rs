@@ -899,15 +899,15 @@ fn verify_media_with_ffprobe(
         return Err("media verification was cancelled".to_string().into());
     }
     if output.timed_out {
-        return Err("FFprobe verification timed out".to_string().into());
+        return Err("The FFmpeg media check timed out".to_string().into());
     }
     if output.stdout_truncated {
-        return Err("FFprobe verification output exceeded the safety limit"
+        return Err("The FFmpeg media check output exceeded the safety limit"
             .to_string()
             .into());
     }
     if !output.status.success() {
-        return Err("FFprobe could not read the media artifact"
+        return Err("The downloaded file failed the FFmpeg media check: it could not be read"
             .to_string()
             .into());
     }
@@ -960,17 +960,17 @@ fn verify_existing_media_with_ffprobe(
         return Err("media reuse verification was cancelled".to_string().into());
     }
     if output.timed_out {
-        return Err("FFprobe reuse verification timed out".to_string().into());
+        return Err("The FFmpeg media check of the existing file timed out".to_string().into());
     }
     if output.stdout_truncated {
         return Err(
-            "FFprobe reuse verification output exceeded the safety limit"
+            "The FFmpeg media check output for the existing file exceeded the safety limit"
                 .to_string()
                 .into(),
         );
     }
     if !output.status.success() {
-        return Err("FFprobe could not read the reused media artifact"
+        return Err("The existing file failed the FFmpeg media check: it could not be read"
             .to_string()
             .into());
     }

@@ -1387,7 +1387,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                   ? formatYouTubeWarning(outcome.warnings[0] ?? "")
                   : null;
                 const errorText = state === "failed" && outcome?.error
-                  ? `${outcome.error.message}${helperRecoveryKind(outcome.error) === "reinstall" ? "" : " Retry the download, or check the link."}`
+                  ? `${outcome.error.message}${helperRecoveryKind(outcome.error) === "reinstall" ? " Download YouTube helpers to repair." : " Retry the download, or check the link."}`
                   : null;
                 const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
                 const duration = formatDuration(video.item.durationSeconds);

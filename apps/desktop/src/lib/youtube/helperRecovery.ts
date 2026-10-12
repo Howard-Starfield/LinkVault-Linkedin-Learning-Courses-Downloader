@@ -10,6 +10,8 @@ const REINSTALL_CODES: ReadonlySet<string> = new Set([
 // Helper start failures (e.g. AV/WDAC blocking CreateProcessW -> HELPER_FAILED "failed to start
 // trusted helper: ...") are deliberately runtime: reinstalling a blocked exe would loop.
 const RUNTIME_CODES: ReadonlySet<string> = new Set(["HELPER_FAILED", "HELPER_TIMEOUT", "HELPER_TEMP_ROOT_INVALID"]);
+// Defensive only: Rust now codes integrity failures as HELPER_INTEGRITY_FAILED everywhere, so this
+// message-prefix fallback only catches a runtime-class code that still carries the legacy text.
 const INTEGRITY_MESSAGE_PREFIX = "helper integrity validation failed";
 const CODE_PREFIX = /^([A-Z][A-Z0-9_]+):\s*([\s\S]*)$/;
 
