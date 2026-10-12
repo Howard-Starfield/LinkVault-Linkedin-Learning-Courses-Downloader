@@ -17,7 +17,8 @@ use crate::providers::youtube::manifest_contract::{
     SelectedTranscript, FORMAT_POLICY_VERSION,
 };
 use crate::providers::youtube::media_verifier::{
-    verify_ffprobe_json, MediaMode, PLAYBACK_COMPATIBILITY_WARNING,
+    ffmpeg_copy_probe_args, verify_ffmpeg_copy_probe, FfmpegCopyProbeOutput, MediaMode,
+    PLAYBACK_COMPATIBILITY_WARNING,
 };
 use crate::providers::youtube::models::{
     StartYouTubeDownloadRequest, YouTubeDownloadMode, YouTubeTranscriptSource,
@@ -536,6 +537,9 @@ impl TransientExecutor for YouTubeExecutor {
                 ManagedProcessError::HelperTemp(reason) => {
                     transient_error("HELPER_TEMP_ROOT_INVALID", reason)
                 }
+                ManagedProcessError::Integrity(reason) => {
+                    transient_error("HELPER_INTEGRITY_FAILED", reason)
+                }
                 error => transient_error("HELPER_FAILED", error.to_string()),
             })?;
         cleanup
@@ -881,20 +885,12 @@ fn verify_media_with_ffprobe(
     }
     attempt.revalidate().map_err(|error| error.to_string())?;
     let media_path = attempt.path().join(&media[0].name);
+    let input_path = media_path.to_string_lossy().into_owned();
     let output = run(
-        media_probe_invocation(vec![
-            "-v".to_string(),
-            "error".to_string(),
-            "-print_format".to_string(),
-            "json".to_string(),
-            "-show_format".to_string(),
-            "-show_streams".to_string(),
-            "-i".to_string(),
-            media_path.to_string_lossy().into_owned(),
-            "-f".to_string(),
-            "null".to_string(),
-            "-".to_string(),
-        ]),
+        media_probe_invocation(ffmpeg_copy_probe_args(
+            &input_path,
+            MediaMode::VideoAndAudio,
+        )),
         ManagedProcessContext::Run(control),
     )
     .map_err(FfprobeVerificationError::ManagedProcess)?;
@@ -915,8 +911,13 @@ fn verify_media_with_ffprobe(
             .to_string()
             .into());
     }
-    let verified = verify_ffprobe_json(
-        &output.stdout,
+    let verified = verify_ffmpeg_copy_probe(
+        &FfmpegCopyProbeOutput {
+            progress: &output.stdout,
+            log: &output.stderr,
+            log_truncated: output.stderr_truncated,
+            input_path: &input_path,
+        },
         MediaMode::VideoAndAudio,
         context.source_duration_seconds.map(|value| value as f64),
     )
@@ -945,20 +946,12 @@ fn verify_existing_media_with_ffprobe(
     }
     lease.revalidate().map_err(|error| error.to_string())?;
     let media_path = lease.path().join(&media[0].name);
+    let input_path = media_path.to_string_lossy().into_owned();
     let output = run(
-        media_probe_invocation(vec![
-            "-v".to_string(),
-            "error".to_string(),
-            "-print_format".to_string(),
-            "json".to_string(),
-            "-show_format".to_string(),
-            "-show_streams".to_string(),
-            "-i".to_string(),
-            media_path.to_string_lossy().into_owned(),
-            "-f".to_string(),
-            "null".to_string(),
-            "-".to_string(),
-        ]),
+        media_probe_invocation(ffmpeg_copy_probe_args(
+            &input_path,
+            MediaMode::VideoAndAudio,
+        )),
         ManagedProcessContext::Run(control),
     )
     .map_err(FfprobeVerificationError::ManagedProcess)?;
@@ -981,8 +974,13 @@ fn verify_existing_media_with_ffprobe(
             .to_string()
             .into());
     }
-    verify_ffprobe_json(
-        &output.stdout,
+    verify_ffmpeg_copy_probe(
+        &FfmpegCopyProbeOutput {
+            progress: &output.stdout,
+            log: &output.stderr,
+            log_truncated: output.stderr_truncated,
+            input_path: &input_path,
+        },
         MediaMode::VideoAndAudio,
         context.source_duration_seconds.map(|value| value as f64),
     )
@@ -1910,6 +1908,9 @@ fn map_fresh_ffprobe_error(error: FfprobeVerificationError) -> TransientError {
         FfprobeVerificationError::ManagedProcess(ManagedProcessError::HelperTemp(reason)) => {
             transient_error("HELPER_TEMP_ROOT_INVALID", reason)
         }
+        FfprobeVerificationError::ManagedProcess(ManagedProcessError::Integrity(reason)) => {
+            transient_error("HELPER_INTEGRITY_FAILED", reason)
+        }
         FfprobeVerificationError::ManagedProcess(error) => {
             transient_error("MEDIA_VERIFY_FAILED", error.to_string())
         }
@@ -1926,6 +1927,9 @@ fn map_existing_output_verification_error(
         ExistingOutputVerificationError::Ffprobe(FfprobeVerificationError::ManagedProcess(
             ManagedProcessError::HelperTemp(reason),
         )) => transient_error("HELPER_TEMP_ROOT_INVALID", reason),
+        ExistingOutputVerificationError::Ffprobe(FfprobeVerificationError::ManagedProcess(
+            ManagedProcessError::Integrity(reason),
+        )) => transient_error("HELPER_INTEGRITY_FAILED", reason),
         ExistingOutputVerificationError::Ffprobe(FfprobeVerificationError::ManagedProcess(
             error,
         )) => existing_output_collision_error(error.to_string()),
@@ -1973,6 +1977,23 @@ mod tests {
 
         assert_eq!(error.code, "HELPER_TEMP_ROOT_INVALID");
         assert_eq!(error.message, HELPER_TEMP_ERROR_MESSAGE);
+    }
+
+    #[test]
+    fn helper_integrity_failures_keep_their_code_through_media_verification() {
+        let fresh = map_fresh_ffprobe_error(FfprobeVerificationError::ManagedProcess(
+            ManagedProcessError::Integrity("ffmpeg hash mismatch".to_string()),
+        ));
+        assert_eq!(fresh.code, "HELPER_INTEGRITY_FAILED");
+        let reuse = map_existing_output_verification_error(
+            ExistingOutputVerificationError::Ffprobe(FfprobeVerificationError::ManagedProcess(
+                ManagedProcessError::Integrity("x".to_string()),
+            )),
+        );
+        assert_eq!(reuse.code, "HELPER_INTEGRITY_FAILED");
+        let ordinary =
+            map_fresh_ffprobe_error(FfprobeVerificationError::Message("bad media".to_string()));
+        assert_eq!(ordinary.code, "MEDIA_VERIFY_FAILED");
     }
 
     #[test]
