@@ -2511,8 +2511,8 @@ export default function App() {
                 className="lv-nav-child"
                 active={activeView === "youtube"}
                 icon={<Download aria-hidden="true" />}
-                aria-label="Download YouTube video"
-                trailing={youtubeHelperSetupNeeded ? <span className="lv-nav-setup-badge"><span className="sr-only">Setup</span></span> : undefined}
+                aria-label={youtubeHelperSetupNeeded ? "Download YouTube video, helper setup needed" : "Download YouTube video"}
+                trailing={youtubeHelperSetupNeeded ? <span className="lv-nav-setup-badge" aria-hidden="true" /> : undefined}
                 title={youtubeHelperSetupNeeded ? "YouTube helper setup needed" : undefined}
                 onClick={() => void requestNavigation("youtube")}
               >
@@ -2561,7 +2561,7 @@ export default function App() {
             >
               <div className="text-xs font-semibold text-muted-strong">LinkedVault</div>
               <p className="mt-2 text-xs leading-5 text-muted">
-                LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts; YouTube needs a one-time signed helper pack (~220 MB); use Download YouTube helpers on the YouTube page.
+                LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts. It needs a one-time signed helper pack (~220 MB): click Download YouTube helpers on the YouTube page.
               </p>
             </Popover>
           </div>
