@@ -65,10 +65,8 @@ fn final_output_section(output: &Output) -> String {
 #[test]
 #[ignore]
 fn ffmpeg_copy_probe_live() {
-    let Ok(ffmpeg_path) = std::env::var("LINKVAULT_TEST_FFMPEG") else {
-        eprintln!("LINKVAULT_TEST_FFMPEG is not set; skipping");
-        return;
-    };
+    let ffmpeg_path = std::env::var("LINKVAULT_TEST_FFMPEG")
+        .expect("LINKVAULT_TEST_FFMPEG must point at an ffmpeg.exe to run this ignored live test");
     let dir = tempfile::tempdir().expect("tempdir");
     let normal = dir.path().join("normal.mp4");
     let normal_arg = path_str(&normal);

@@ -379,6 +379,11 @@ fn output_codecs(log: &str) -> Option<(Option<String>, Option<String>)> {
         let Some(body) = line.strip_prefix("  ") else {
             break;
         };
+        // FFmpeg prints sub-blocks (side data, display matrix, HDR mastering
+        // data) four spaces deep under the stream line they belong to.
+        if body.starts_with("  ") && (video.is_some() || audio.is_some()) {
+            continue;
+        }
         let rest = body.strip_prefix("Stream #0:")?;
         let (index, described) = rest.split_once(": ")?;
         if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
@@ -793,6 +798,41 @@ mod tests {
             Some(0.4),
         )
         .unwrap();
+        assert_eq!(media.container, "mov,mp4,m4a,3gp,3g2,mj2");
+        assert_eq!(media.video_codec.as_deref(), Some("h264"));
+        assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert_eq!((media.video_streams, media.audio_streams), (1, 1));
+        assert_eq!(media.duration_ms, Some(400));
+        assert!(media.warnings.is_empty());
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_skips_output_stream_sub_blocks() {
+        let marker = "q=2-31, 5 fps (default)\n";
+        let rotated = CLEAN_LOG.replacen(
+            marker,
+            "q=2-31, 5 fps (default)\n    Side data:\n      Display Matrix: rotation of -90.00 degrees\n",
+            1,
+        );
+        assert_ne!(rotated, CLEAN_LOG, "fixture edit must apply");
+        let media = verify_ffmpeg_copy_probe(
+            &probe(PROGRESS_END, &rotated),
+            MediaMode::VideoAndAudio,
+            Some(0.4),
+        )
+        .unwrap();
+        assert_eq!(media.video_codec.as_deref(), Some("h264"));
+        assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert!(media.warnings.is_empty());
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_accepts_crlf_output() {
+        let log = CLEAN_LOG.replace('\n', "\r\n");
+        let progress = PROGRESS_END.replace('\n', "\r\n");
+        let media =
+            verify_ffmpeg_copy_probe(&probe(&progress, &log), MediaMode::VideoAndAudio, Some(0.4))
+                .unwrap();
         assert_eq!(media.container, "mov,mp4,m4a,3gp,3g2,mj2");
         assert_eq!(media.video_codec.as_deref(), Some("h264"));
         assert_eq!(media.audio_codec.as_deref(), Some("aac"));
