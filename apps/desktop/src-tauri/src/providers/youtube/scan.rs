@@ -1,6 +1,4 @@
-use crate::app::managed_process::{
-    run, DiscoveryOperation, ManagedProcessContext, ManagedProcessError,
-};
+use crate::app::managed_process::{run, DiscoveryOperation, ManagedProcessContext};
 use crate::providers::youtube::error::YouTubeInternalError;
 use crate::providers::youtube::helper::{invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES};
 use crate::providers::youtube::models::{
@@ -76,10 +74,7 @@ fn discovery_stdout(
         invocation(args, MAX_DISCOVERY_STDOUT_BYTES),
         ManagedProcessContext::Discovery(operation),
     )
-    .map_err(|error| match error {
-        ManagedProcessError::HelperTemp(reason) => YouTubeInternalError::HelperTemp(reason),
-        error => YouTubeInternalError::Helper(error.to_string()),
-    })?;
+    .map_err(YouTubeInternalError::from_helper_run)?;
     if operation.cancellation_requested() || output.cancelled {
         return Err(YouTubeInternalError::InvalidRequest(
             "discovery was cancelled".to_string(),

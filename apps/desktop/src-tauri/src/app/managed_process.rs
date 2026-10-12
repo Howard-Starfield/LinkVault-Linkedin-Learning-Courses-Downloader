@@ -1127,6 +1127,15 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
+    #[test]
+    fn integrity_error_display_keeps_the_prefix_the_ui_relies_on() {
+        // apps/desktop/src/lib/youtube/helperRecovery.ts matches this prefix as a
+        // fallback to classify integrity failures that arrive as HELPER_FAILED.
+        assert!(super::ManagedProcessError::Integrity("x".into())
+            .to_string()
+            .starts_with("helper integrity validation failed"));
+    }
+
     fn toolchain_paths() -> VerifiedToolchainPaths {
         VerifiedToolchainPaths {
             root: PathBuf::from("toolchain"),

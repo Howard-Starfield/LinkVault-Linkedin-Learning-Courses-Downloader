@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { helperRecoveryKind } from "../src/lib/youtube/helperRecovery.ts";
 
-test("missing/integrity/blocked codes need reinstall", () => {
-  for (const code of ["HELPER_MISSING", "HELPER_INTEGRITY_FAILED", "HELPER_EXECUTION_BLOCKED"]) {
+test("missing and integrity codes need reinstall", () => {
+  for (const code of ["HELPER_MISSING", "HELPER_INTEGRITY_FAILED"]) {
     assert.equal(helperRecoveryKind({ code, message: "m" }), "reinstall", code);
   }
 });
@@ -39,4 +39,29 @@ test("unrelated and malformed errors are not helper failures", () => {
   assert.equal(helperRecoveryKind(new Error("network down")), null);
   assert.equal(helperRecoveryKind(null), null);
   assert.equal(helperRecoveryKind(42), null);
+});
+
+test("string-form codes are parsed", () => {
+  assert.equal(helperRecoveryKind("HELPER_INTEGRITY_FAILED: x"), "reinstall");
+});
+
+test("integrity prefix tolerates leading whitespace and realistic scan messages", () => {
+  assert.equal(
+    helperRecoveryKind({ code: "HELPER_FAILED", message: "  \n helper integrity validation failed: ffmpeg hash mismatch" }),
+    "reinstall"
+  );
+  assert.equal(
+    helperRecoveryKind({ code: "HELPER_FAILED", message: "helper integrity validation failed: the yt-dlp lock entry is unavailable" }),
+    "reinstall"
+  );
+});
+
+test("helper start failures are runtime, not reinstall", () => {
+  assert.equal(helperRecoveryKind({ code: "HELPER_FAILED", message: "failed to start trusted helper: access denied" }), "runtime");
+});
+
+test("malformed code shapes and status-unavailable are not helper failures", () => {
+  assert.equal(helperRecoveryKind({ code: 42 }), null);
+  assert.equal(helperRecoveryKind({ code: "HELPER_TIMEOUT" }), "runtime");
+  assert.equal(helperRecoveryKind({ code: "HELPER_STATUS_UNAVAILABLE", message: "m" }), null);
 });

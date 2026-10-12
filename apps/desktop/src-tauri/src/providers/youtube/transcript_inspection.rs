@@ -7,7 +7,7 @@
 //! contracts.
 
 use crate::app::managed_process::{
-    run, DiscoveryOperation, ManagedProcessContext, ManagedProcessError, ManagedProcessOutput,
+    run, DiscoveryOperation, ManagedProcessContext, ManagedProcessOutput,
 };
 use crate::providers::youtube::error::YouTubeInternalError;
 use crate::providers::youtube::helper::{invocation, output_error, MAX_RECORD_STDOUT_BYTES};
@@ -53,10 +53,7 @@ pub(crate) fn inspect_transcripts(
         invocation(inspection_args(item), MAX_RECORD_STDOUT_BYTES),
         ManagedProcessContext::Discovery(operation),
     )
-    .map_err(|error| match error {
-        ManagedProcessError::HelperTemp(reason) => YouTubeInternalError::HelperTemp(reason),
-        error => YouTubeInternalError::Helper(error.to_string()),
-    })?;
+    .map_err(YouTubeInternalError::from_helper_run)?;
     ensure_inspection_output(operation, &output)?;
     let tracks = parse_transcript_tracks(&item.public.occurrence_id, &output.stdout)?;
     Ok(TranscriptInspectionResult {

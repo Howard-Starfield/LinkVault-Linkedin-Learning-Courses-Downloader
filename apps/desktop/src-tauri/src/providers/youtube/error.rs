@@ -1,3 +1,4 @@
+use crate::app::managed_process::ManagedProcessError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -95,6 +96,20 @@ pub enum YouTubeInternalError {
     InvalidRequest(String),
 }
 
+impl YouTubeInternalError {
+    /// Map a failed discovery/inspection helper run. Integrity failures keep their
+    /// own public code so the UI can offer a helper reinstall.
+    pub(crate) fn from_helper_run(error: ManagedProcessError) -> Self {
+        match error {
+            ManagedProcessError::HelperTemp(reason) => Self::HelperTemp(reason),
+            ManagedProcessError::Integrity(reason) => {
+                Self::Public(YouTubeError::new("HELPER_INTEGRITY_FAILED", reason))
+            }
+            error => Self::Helper(error.to_string()),
+        }
+    }
+}
+
 impl From<YouTubeInternalError> for YouTubeError {
     fn from(error: YouTubeInternalError) -> Self {
         match error {
@@ -131,5 +146,33 @@ impl From<YouTubeInternalError> for YouTubeError {
             }
             YouTubeInternalError::InvalidRequest(message) => Self::new("INVALID_REQUEST", message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn public_code(error: ManagedProcessError) -> (String, String) {
+        let public = YouTubeError::from(YouTubeInternalError::from_helper_run(error));
+        (public.code, public.message)
+    }
+
+    #[test]
+    fn scan_and_inspection_integrity_failures_surface_as_helper_integrity_failed() {
+        let (code, message) = public_code(ManagedProcessError::Integrity(
+            "the yt-dlp lock entry is unavailable".to_string(),
+        ));
+        assert_eq!(code, "HELPER_INTEGRITY_FAILED");
+        assert_eq!(message, "the yt-dlp lock entry is unavailable");
+    }
+
+    #[test]
+    fn scan_and_inspection_temp_and_start_failures_keep_their_codes() {
+        let (code, _) = public_code(ManagedProcessError::HelperTemp("junction".to_string()));
+        assert_eq!(code, "HELPER_TEMP_ROOT_INVALID");
+        let (code, message) = public_code(ManagedProcessError::Start("blocked".to_string()));
+        assert_eq!(code, "HELPER_FAILED");
+        assert!(message.contains("failed to start trusted helper: blocked"));
     }
 }
