@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{Manager, State};
 
 const YOUTUBE_PREFERENCES_KEY: &str = "youtube.preferences";
 
@@ -201,10 +201,39 @@ pub fn save_youtube_preferences(
     persist_youtube_preferences(&connection, preferences, now_unix_timestamp())
 }
 
+/// Runs blocking YouTube command work (yt-dlp, helper hashing, SQLite) off the
+/// Tauri main thread. A panicked or cancelled task surfaces as a public error.
+async fn run_youtube_blocking<T, F>(task: F) -> Result<T, YouTubeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, YouTubeError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| {
+            YouTubeError::new(
+                "TASK_FAILED",
+                format!("YouTube background task failed: {error}"),
+            )
+        })?
+}
+
 #[tauri::command]
-pub fn scan_youtube_source(
-    live: State<'_, Arc<YouTubeLiveHandle>>,
-    state: State<'_, YouTubePlanStore>,
+pub async fn scan_youtube_source(
+    app: tauri::AppHandle,
+    request: ScanYouTubeSourceRequest,
+) -> Result<ScanYouTubeSourceResponse, YouTubeError> {
+    run_youtube_blocking(move || {
+        let live = app.state::<Arc<YouTubeLiveHandle>>();
+        let state = app.state::<YouTubePlanStore>();
+        scan_youtube_source_blocking(&live, &state, request)
+    })
+    .await
+}
+
+fn scan_youtube_source_blocking(
+    live: &YouTubeLiveHandle,
+    state: &YouTubePlanStore,
     request: ScanYouTubeSourceRequest,
 ) -> Result<ScanYouTubeSourceResponse, YouTubeError> {
     validate_operation_id(&request.client_operation_id)?;
@@ -222,16 +251,28 @@ pub fn scan_youtube_source(
 }
 
 #[tauri::command]
-pub fn inspect_youtube_transcripts(
-    live: State<'_, Arc<YouTubeLiveHandle>>,
-    state: State<'_, YouTubePlanStore>,
+pub async fn inspect_youtube_transcripts(
+    app: tauri::AppHandle,
+    request: InspectYouTubeTranscriptsRequest,
+) -> Result<InspectYouTubeTranscriptsResponse, YouTubeError> {
+    run_youtube_blocking(move || {
+        let live = app.state::<Arc<YouTubeLiveHandle>>();
+        let state = app.state::<YouTubePlanStore>();
+        inspect_youtube_transcripts_blocking(&live, &state, request)
+    })
+    .await
+}
+
+fn inspect_youtube_transcripts_blocking(
+    live: &YouTubeLiveHandle,
+    state: &YouTubePlanStore,
     request: InspectYouTubeTranscriptsRequest,
 ) -> Result<InspectYouTubeTranscriptsResponse, YouTubeError> {
     validate_operation_id(&request.client_operation_id)?;
     let guard = live
         .begin_discovery(request.client_operation_id)
         .map_err(YouTubeError::from)?;
-    let plan = get_plan(&state, &request.scan_plan_id)?;
+    let plan = get_plan(state, &request.scan_plan_id)?;
     let mut seen = std::collections::HashSet::new();
     let mut occurrences = Vec::new();
     let mut plan_inspections = Vec::new();
@@ -288,11 +329,26 @@ pub fn cancel_youtube_discovery(
 }
 
 #[tauri::command]
-pub fn start_youtube_download(
+pub async fn start_youtube_download(
     app: tauri::AppHandle,
-    live: State<'_, Arc<YouTubeLiveHandle>>,
-    state: State<'_, YouTubePlanStore>,
-    runtime: State<'_, WorkflowRuntime>,
+    request: StartYouTubeDownloadRequest,
+) -> Result<StartYouTubeDownloadResponse, YouTubeError> {
+    // Source revalidation (yt-dlp) and the ~230 MB helper identity hash must not
+    // run on the Tauri main thread. Only this preparation moves; the run is still
+    // admitted and drained exactly as before.
+    run_youtube_blocking(move || {
+        let live = app.state::<Arc<YouTubeLiveHandle>>();
+        let state = app.state::<YouTubePlanStore>();
+        let runtime = app.state::<WorkflowRuntime>();
+        start_youtube_download_blocking(&live, &state, &runtime, request)
+    })
+    .await
+}
+
+fn start_youtube_download_blocking(
+    live: &YouTubeLiveHandle,
+    state: &YouTubePlanStore,
+    runtime: &WorkflowRuntime,
     request: StartYouTubeDownloadRequest,
 ) -> Result<StartYouTubeDownloadResponse, YouTubeError> {
     validate_submission_id(&request.client_submission_id)?;
@@ -308,7 +364,7 @@ pub fn start_youtube_download(
     }
     live.ensure_submission_capacity(&request.client_submission_id)
         .map_err(YouTubeError::from)?;
-    let plan = get_plan(&state, &request.scan_plan_id)?;
+    let plan = get_plan(state, &request.scan_plan_id)?;
     if plan.expires_at <= Instant::now() {
         return Err(YouTubeError::from(YouTubeInternalError::PlanExpired));
     }
@@ -460,11 +516,10 @@ pub fn start_youtube_download(
         // before admit; surface residual ledger errors to the client.
         return Err(YouTubeError::from(error));
     }
-    let runtime = (*runtime).clone();
+    let runtime = runtime.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _ = runtime.drain_type("youtube_download");
     });
-    let _ = app;
     Ok(StartYouTubeDownloadResponse {
         receipt,
         replayed: false,
@@ -1090,5 +1145,42 @@ mod tests {
         let failed =
             helper_status_response(Err(ManagedProcessError::Integrity("bad".into())), || true);
         assert_eq!(failed.code.as_deref(), Some("HELPER_INTEGRITY_FAILED"));
+    }
+
+    #[test]
+    fn blocking_command_work_runs_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let worker = tauri::async_runtime::block_on(run_youtube_blocking(move || {
+            Ok(std::thread::current().id())
+        }))
+        .unwrap();
+        assert_ne!(caller, worker);
+    }
+
+    #[test]
+    fn blocking_command_task_failure_maps_to_a_public_error() {
+        let error = tauri::async_runtime::block_on(run_youtube_blocking::<(), _>(|| {
+            panic!("simulated worker panic")
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, "TASK_FAILED");
+        assert!(error.message.contains("YouTube background task failed"));
+    }
+
+    #[test]
+    fn blocking_command_bodies_keep_their_error_shapes() {
+        let live = YouTubeLiveHandle::default();
+        let store = YouTubePlanStore::default();
+        let scan = scan_youtube_source_blocking(
+            &live,
+            &store,
+            ScanYouTubeSourceRequest {
+                client_operation_id: "bad".to_string(),
+                url: "https://www.youtube.com/watch?v=aaaaaaaaaaa".to_string(),
+                playlist_mode: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(scan.code, "INVALID_OPERATION_ID");
     }
 }
