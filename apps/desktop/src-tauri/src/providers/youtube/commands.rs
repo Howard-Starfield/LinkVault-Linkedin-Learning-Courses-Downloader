@@ -157,6 +157,9 @@ fn helper_status_response(
 /// split, so Start does not tell a never-installed user their helpers "failed
 /// integrity validation". Integrity failures carry the bare reason, exactly as
 /// scan, inspection and download report them via `from_helper_run`.
+/// Only `Integrity` errors get the missing-vs-broken split. Anything else (for
+/// example `UnsupportedPlatform`) stays `HELPER_FAILED` so the UI does not offer a
+/// helper reinstall that cannot help.
 fn helper_start_error(
     error: ManagedProcessError,
     install_present: impl FnOnce() -> bool,
@@ -232,14 +235,22 @@ where
         })?
 }
 
+fn runtime_state_unavailable() -> YouTubeError {
+    YouTubeError::new("TASK_FAILED", "YouTube runtime state is not available")
+}
+
 #[tauri::command]
 pub async fn scan_youtube_source(
     app: tauri::AppHandle,
     request: ScanYouTubeSourceRequest,
 ) -> Result<ScanYouTubeSourceResponse, YouTubeError> {
     run_youtube_blocking(move || {
-        let live = app.state::<Arc<YouTubeLiveHandle>>();
-        let state = app.state::<YouTubePlanStore>();
+        let (Some(live), Some(state)) = (
+            app.try_state::<Arc<YouTubeLiveHandle>>(),
+            app.try_state::<YouTubePlanStore>(),
+        ) else {
+            return Err(runtime_state_unavailable());
+        };
         scan_youtube_source_blocking(&live, &state, request)
     })
     .await
@@ -270,8 +281,12 @@ pub async fn inspect_youtube_transcripts(
     request: InspectYouTubeTranscriptsRequest,
 ) -> Result<InspectYouTubeTranscriptsResponse, YouTubeError> {
     run_youtube_blocking(move || {
-        let live = app.state::<Arc<YouTubeLiveHandle>>();
-        let state = app.state::<YouTubePlanStore>();
+        let (Some(live), Some(state)) = (
+            app.try_state::<Arc<YouTubeLiveHandle>>(),
+            app.try_state::<YouTubePlanStore>(),
+        ) else {
+            return Err(runtime_state_unavailable());
+        };
         inspect_youtube_transcripts_blocking(&live, &state, request)
     })
     .await
@@ -351,9 +366,13 @@ pub async fn start_youtube_download(
     // run on the Tauri main thread. Only this preparation moves; the run is still
     // admitted and drained exactly as before.
     run_youtube_blocking(move || {
-        let live = app.state::<Arc<YouTubeLiveHandle>>();
-        let state = app.state::<YouTubePlanStore>();
-        let runtime = app.state::<WorkflowRuntime>();
+        let (Some(live), Some(state), Some(runtime)) = (
+            app.try_state::<Arc<YouTubeLiveHandle>>(),
+            app.try_state::<YouTubePlanStore>(),
+            app.try_state::<WorkflowRuntime>(),
+        ) else {
+            return Err(runtime_state_unavailable());
+        };
         start_youtube_download_blocking(&live, &state, &runtime, request)
     })
     .await

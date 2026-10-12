@@ -314,6 +314,17 @@ assert.equal(
 includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");
 assert.equal(rootPackageJson.scripts["verify:youtube-ui"], "npm --prefix apps/desktop run verify:youtube-ui", "Root YouTube UI verifier is not wired");
 
+// Tauri 2 runs sync commands on the main thread; these hash ~230 MB of helpers or run yt-dlp,
+// so they must stay `async` and do their work in spawn_blocking.
+const youtubeCommands = await read("src-tauri/src/providers/youtube/commands.rs");
+for (const name of ["scan_youtube_source", "inspect_youtube_transcripts", "start_youtube_download"]) {
+  matches(
+    youtubeCommands,
+    new RegExp(String.raw`#\[tauri::command\]\s*pub async fn ${name}\(`),
+    `${name} must be declared as an async #[tauri::command] so it stays off the main thread`
+  );
+}
+
 // Item outcome warnings are Rust TransientWarning objects ({ code, message }), not bare string codes.
 // formatYouTubeWarning must accept unknown and never call .trim() on a non-string.
 matches(
