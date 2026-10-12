@@ -651,6 +651,18 @@ textarea {
   place-items: center;
 }
 
+/* Dot, not a pill: the sidebar is ~200px wide and a "Setup" pill would
+   truncate the "Download video" label. The text stays for assistive tech. */
+.lv-nav-setup-badge {
+  display: block;
+  width: 8px;
+  height: 8px;
+  margin-left: -6px;
+  border-radius: 999px;
+  background: var(--warning);
+  flex-shrink: 0;
+}
+
 .lv-nav-group {
   display: grid;
   gap: 2px;
