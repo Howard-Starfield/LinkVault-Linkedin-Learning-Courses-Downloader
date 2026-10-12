@@ -905,6 +905,42 @@ mod tests {
     }
 
     #[test]
+    fn media_toolchain_helper_digest_is_accepted_by_the_start_path_fingerprint() {
+        let paths = crate::app::media_toolchain::VerifiedToolchainPaths {
+            root: std::path::PathBuf::from("toolchain"),
+            version: "2026.10.1".to_string(),
+            yt_dlp: std::path::PathBuf::from("toolchain/yt-dlp.exe"),
+            ffmpeg: std::path::PathBuf::from("toolchain/ffmpeg.exe"),
+            deno: std::path::PathBuf::from("toolchain/deno.exe"),
+            yt_dlp_sha256: digest_value('a'),
+            ffmpeg_sha256: digest_value('b'),
+            deno_sha256: digest_value('c'),
+            yt_dlp_size_bytes: Some(1),
+            ffmpeg_size_bytes: Some(2),
+            deno_size_bytes: Some(3),
+        };
+        let input = |helper_lock_digest: String| ArtifactFingerprintInput {
+            occurrence_id: "occurrence-1".to_string(),
+            video_id: "video-1".to_string(),
+            mode: YouTubeDownloadMode::VideoAndTranscript,
+            format_policy_version: FORMAT_POLICY_VERSION,
+            max_height: Some(1080),
+            selected_transcript: None,
+            helper_lock_digest,
+        };
+        // Regression: the legacy `media-toolchain:<version>` identity made every
+        // start fail with MANIFEST_CONTRACT_INVALID.
+        assert_eq!(
+            artifact_fingerprint(&input(format!("media-toolchain:{}", paths.version))),
+            Err(ManifestContractError::InvalidDigest {
+                field: "helperLockDigest"
+            })
+        );
+        let digest = crate::app::managed_process::media_toolchain_lock_digest(&paths);
+        assert!(artifact_fingerprint(&input(digest)).is_ok());
+    }
+
+    #[test]
     fn manifest_projection_rejects_invalid_digest_and_duplicate_path() {
         let mut input = manifest_input();
         input.helper_lock_digest = "not-a-digest".to_string();

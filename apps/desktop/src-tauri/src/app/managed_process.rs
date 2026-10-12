@@ -738,7 +738,7 @@ fn resolve_from_media_toolchain() -> Result<Option<VerifiedHelperSet>, ManagedPr
     let Some(paths) = paths else {
         return Ok(None);
     };
-    let lock_digest = format!("media-toolchain:{}", paths.version);
+    let lock_digest = media_toolchain_lock_digest(&paths);
     let size_or = |size: Option<u64>, path: &Path| -> Result<u64, ManagedProcessError> {
         if let Some(size) = size {
             return Ok(size);
@@ -767,6 +767,40 @@ fn resolve_from_media_toolchain() -> Result<Option<VerifiedHelperSet>, ManagedPr
             size_or(paths.ffmpeg_size_bytes, &paths.ffmpeg)?,
         )?,
     }))
+}
+
+/// Derives the helper identity digest for a verified media-toolchain install.
+///
+/// The result must satisfy the manifest contract (64 lowercase hex chars), so
+/// it is a SHA-256 over a length-prefixed, domain-separated encoding of the
+/// install version and each component's verified SHA-256 and size.
+pub(crate) fn media_toolchain_lock_digest(
+    paths: &crate::app::media_toolchain::VerifiedToolchainPaths,
+) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"linkvault-media-toolchain-v1");
+    field(&mut hasher, paths.version.as_bytes());
+    let components = [
+        ("yt-dlp", &paths.yt_dlp_sha256, paths.yt_dlp_size_bytes),
+        ("deno", &paths.deno_sha256, paths.deno_size_bytes),
+        ("ffmpeg", &paths.ffmpeg_sha256, paths.ffmpeg_size_bytes),
+    ];
+    for (name, sha256, size_bytes) in components {
+        field(&mut hasher, name.as_bytes());
+        field(&mut hasher, sha256.to_ascii_lowercase().as_bytes());
+        match size_bytes {
+            Some(size) => {
+                field(&mut hasher, b"size");
+                field(&mut hasher, &size.to_le_bytes());
+            }
+            None => field(&mut hasher, b"no-size"),
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 struct LockedHelperDigest {
@@ -1088,8 +1122,63 @@ fn read_bounded<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_json, parse_locked_helpers};
+    use super::{canonical_json, media_toolchain_lock_digest, parse_locked_helpers};
+    use crate::app::media_toolchain::VerifiedToolchainPaths;
     use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    fn toolchain_paths() -> VerifiedToolchainPaths {
+        VerifiedToolchainPaths {
+            root: PathBuf::from("toolchain"),
+            version: "2026.10.1".to_string(),
+            yt_dlp: PathBuf::from("toolchain/yt-dlp.exe"),
+            ffmpeg: PathBuf::from("toolchain/ffmpeg.exe"),
+            deno: PathBuf::from("toolchain/deno.exe"),
+            yt_dlp_sha256: "a".repeat(64),
+            ffmpeg_sha256: "b".repeat(64),
+            deno_sha256: "c".repeat(64),
+            yt_dlp_size_bytes: Some(10),
+            ffmpeg_size_bytes: Some(20),
+            deno_size_bytes: Some(30),
+        }
+    }
+
+    #[test]
+    fn media_toolchain_lock_digest_is_lowercase_sha256_hex() {
+        let digest = media_toolchain_lock_digest(&toolchain_paths());
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_eq!(digest, media_toolchain_lock_digest(&toolchain_paths()));
+    }
+
+    #[test]
+    fn media_toolchain_lock_digest_changes_with_every_identity_input() {
+        let base = media_toolchain_lock_digest(&toolchain_paths());
+        let mut variants = Vec::new();
+        let mut paths = toolchain_paths();
+        paths.version = "2026.10.2".to_string();
+        variants.push(paths);
+        let mut paths = toolchain_paths();
+        paths.yt_dlp_sha256 = "d".repeat(64);
+        variants.push(paths);
+        let mut paths = toolchain_paths();
+        paths.deno_sha256 = "d".repeat(64);
+        variants.push(paths);
+        let mut paths = toolchain_paths();
+        paths.ffmpeg_sha256 = "d".repeat(64);
+        variants.push(paths);
+        let mut paths = toolchain_paths();
+        paths.ffmpeg_size_bytes = None;
+        variants.push(paths);
+        let mut paths = toolchain_paths();
+        paths.yt_dlp_size_bytes = Some(11);
+        variants.push(paths);
+        for variant in variants {
+            assert_ne!(base, media_toolchain_lock_digest(&variant));
+        }
+    }
 
     fn seal_lock(value: &mut serde_json::Value) {
         let mut without_digest = value.clone();
