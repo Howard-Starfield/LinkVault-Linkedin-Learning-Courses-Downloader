@@ -1694,6 +1694,31 @@ textarea {
  overflow-wrap: anywhere;
 }
 
+.youtube-result-copy > .youtube-result-status.youtube-result-stage,
+.youtube-result-progress .youtube-result-stage {
+ display: inline-flex;
+ min-width: 0;
+ align-items: center;
+ gap: 6px;
+}
+
+.youtube-result-spinner {
+ width: 12px;
+ height: 12px;
+ flex: 0 0 auto;
+}
+
+.youtube-run-error {
+ margin: 0 0 8px;
+ border: 1px solid var(--danger);
+ border-radius: 10px;
+ color: var(--danger);
+ font-size: 12px;
+ line-height: 16px;
+ overflow-wrap: anywhere;
+ padding: 8px 12px;
+}
+
 .youtube-result-row[data-unavailable="true"] {
  opacity: 0.58;
 }

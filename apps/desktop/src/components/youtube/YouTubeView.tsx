@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import {
   Folder,
   FolderOpen,
+  LoaderCircle,
   Pause,
   Play,
   Square
@@ -57,6 +58,7 @@ import {
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
+import { youtubeItemStatusText, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
 
 type HelperStatus = "pending" | "ready" | "failed";
@@ -261,21 +263,16 @@ function itemProgressPercent(
 ): number | null {
   if (state === "completed" || state === "skipped_existing") return 100;
   if (state === "running" && runSnapshot?.item?.occurrenceId === occurrenceId) return runPercent;
-  if (state === "pending" && runSnapshot && !isYouTubeRunTerminal(runSnapshot.state)) return 0;
   return null;
 }
 
-function itemStatusText(state: YouTubeItemState, available: boolean): string | null {
-  if (!available) return state === "skipped" ? "Unavailable" : "Unconfirmed";
-  switch (state) {
-    case "completed": return "Saved";
-    case "completed_with_warnings": return "Saved with warnings";
-    case "running": return "Downloading";
-    case "failed": return "Failed";
-    case "cancelled": return "Cancelled";
-    case "skipped_existing": return "Already saved";
-    default: return null;
-  }
+/** Error text for a failed item or run, with the next step the user can take. */
+function formatYouTubeFailure(error: YouTubeError): string {
+  const nextStep = helperRecoveryKind(error) === "reinstall"
+    ? "Download YouTube helpers to repair."
+    : "Retry the download, or check the link.";
+  const message = error.message.trim();
+  return `${message}${/[.!?]$/.test(message) ? "" : "."} ${nextStep}`;
 }
 
 function readTrimmedString(value: unknown): string | null {
@@ -298,6 +295,7 @@ function formatYouTubeWarning(value: unknown): string {
 
   switch (code) {
     case "TRANSCRIPT_MISSING":
+      if (message && message !== code) return message;
       return "No captions were available on YouTube for this video, so only the media file was saved.";
     default:
       if (message && message !== code) return message;
@@ -647,6 +645,14 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     [videosWithSection, queueSection]
   );
   const activeRun = runSnapshot !== null && !isYouTubeRunTerminal(runSnapshot.state);
+  // A run that failed before any item could report an error (for example a bad
+  // request) still has to say why; otherwise the rows just look stalled.
+  const runFailureNotice = runSnapshot !== null
+    && runSnapshot.state === "failed"
+    && runSnapshot.error !== null
+    && runSnapshot.items.every((item) => item.error === null)
+    ? formatYouTubeFailure(runSnapshot.error)
+    : null;
   const canPauseRun = activeRun && runSnapshot?.state === "running";
   const canResumeRun = activeRun && (runSnapshot?.state === "paused" || runSnapshot?.state === "pause_requested");
   const currentProgress = runSnapshot?.progress.fraction === null || runSnapshot?.progress.fraction === undefined
@@ -669,6 +675,19 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
         ? `${videos.length} video${videos.length === 1 ? "" : "s"} detected.`
         : "Paste a YouTube link to detect videos.";
 
+  const failedTabRunRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!runSnapshot || !isYouTubeRunTerminal(runSnapshot.state)) return;
+    if (failedTabRunRef.current === runSnapshot.runId) return;
+    failedTabRunRef.current = runSnapshot.runId;
+    // A failed row leaves the Active tab; follow it so the failure is not hidden
+    // behind an empty "No active videos" panel.
+    const target: YouTubeQueueSection | null = queueCounts.failed > 0
+      ? "failed"
+      : runSnapshot.state === "failed" ? "queue" : null;
+    if (target) setQueueSection((current) => (current === "active" ? target : current));
+  }, [runSnapshot, queueCounts.failed]);
+
   useEffect(() => {
     if (!runSnapshot || runSnapshot.state !== "completed_with_warnings") return;
     if (warnedRunIdRef.current === runSnapshot.runId) return;
@@ -677,7 +696,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       ...runSnapshot.warnings,
       ...runSnapshot.items.flatMap((item) => item.warnings)
     ];
-    const first = warnings.find((warning) => warning.code === "TRANSCRIPT_MISSING") ?? warnings[0] ?? null;
+    const first = warnings.find((warning) => warning.code === "TRANSCRIPT_MISSING")
+      ?? warnings.find((warning) => warning.code === "TRANSCRIPT_INVALID")
+      ?? warnings[0]
+      ?? null;
     if (!first) return;
     toast.warning("Saved with warnings", { description: formatYouTubeWarning(first) });
   }, [runSnapshot]);
@@ -1339,6 +1361,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
               {renderRunControls()}
             </div>
           ) : null}
+          {runFailureNotice ? (
+            <p className="youtube-run-error" role="alert">{runFailureNotice}</p>
+          ) : null}
           <div className="queue-section-tabs youtube-queue-section-tabs" role="group" aria-label="YouTube download queue sections">
             <YouTubeQueueSectionTab
               section="queue"
@@ -1382,12 +1407,13 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                 const outcome = runItems.get(video.item.occurrenceId);
                 const available = video.item.availability === "available";
                 const availabilityLabel = video.item.availability === "unknown" ? "Unconfirmed" : "Unavailable";
-                const status = itemStatusText(state, available);
-                const warningText = outcome?.warnings?.length
-                  ? formatYouTubeWarning(outcome.warnings[0] ?? "")
-                  : null;
+                const rowRunContext: YouTubeRowRunContext = !outcome ? "idle" : activeRun ? "active" : "terminal";
+                const status = youtubeItemStatusText(state, outcome?.phase ?? null, available, rowRunContext);
+                const warningTexts = Array.from(new Set(
+                  (outcome?.warnings ?? []).map((warning) => formatYouTubeWarning(warning))
+                ));
                 const errorText = state === "failed" && outcome?.error
-                  ? `${outcome.error.message}${helperRecoveryKind(outcome.error) === "reinstall" ? " Download YouTube helpers to repair." : " Retry the download, or check the link."}`
+                  ? formatYouTubeFailure(outcome.error)
                   : null;
                 const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
                 const duration = formatDuration(video.item.durationSeconds);
@@ -1406,10 +1432,18 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                       {percent !== null ? (
                         <div className="youtube-result-progress">
                           <Progress value={percent} />
-                          <span>{status ?? "Downloading"}{percent > 0 ? ` · ${Math.round(percent)}%` : ""}</span>
+                          <span className="youtube-result-stage">
+                            {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
+                            {status}{percent > 0 ? ` · ${Math.round(percent)}%` : ""}
+                          </span>
                         </div>
-                      ) : status ? <span className="youtube-result-status">{status}</span> : null}
-                      {warningText ? <span className="youtube-result-warning">{warningText}</span> : null}
+                      ) : status ? (
+                        <span className="youtube-result-status youtube-result-stage">
+                          {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
+                          {status}
+                        </span>
+                      ) : null}
+                      {warningTexts.map((text) => <span key={text} className="youtube-result-warning">{text}</span>)}
                       {errorText ? <span className="youtube-result-error" title={errorText}>{errorText}</span> : null}
                       {!available ? <span className="youtube-result-status">{availabilityLabel}</span> : null}
                     </div>

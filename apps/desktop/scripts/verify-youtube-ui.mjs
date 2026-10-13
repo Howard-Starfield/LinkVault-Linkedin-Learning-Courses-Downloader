@@ -308,7 +308,7 @@ assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are sti
 
 assert.equal(
   packageJson.scripts["verify:youtube-ui"],
-  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock",
+  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status",
   "Desktop YouTube UI verifier is not wired"
 );
 includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");
@@ -354,8 +354,8 @@ matches(
 );
 matches(
   view,
-  /formatYouTubeWarning\(outcome\.warnings\[0\]/,
-  "Result-row warning text must format the full warning payload, not a bare code string"
+  /\(outcome\?\.warnings \?\? \[\]\)\.map\(\(warning\) => formatYouTubeWarning\(warning\)\)/,
+  "Result-row warning text must format each full warning payload, not a bare code string"
 );
 
 // Runtime contract: object payloads must never throw on .trim(), and useful messages are preferred.
@@ -375,6 +375,7 @@ function formatYouTubeWarningContract(value) {
   }
   switch (code) {
     case "TRANSCRIPT_MISSING":
+      if (message && message !== code) return message;
       return "No captions were available on YouTube for this video, so only the media file was saved.";
     default:
       if (message && message !== code) return message;
