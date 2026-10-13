@@ -419,8 +419,11 @@ impl YouTubeExecutor {
         }
         if !matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
             // `--print` implies `--quiet`, which would drop the progress
-            // records unless progress is requested explicitly.
+            // records unless progress is requested explicitly, and it implies
+            // `--simulate` on some yt-dlp versions, which would skip the
+            // download itself.
             args.push("--progress".to_string());
+            args.push("--no-simulate".to_string());
             args.push("--print".to_string());
             args.push(FORMATS_PRINT.to_string());
         }
@@ -3825,6 +3828,10 @@ mod tests {
             );
             assert_eq!(
                 args.iter().any(|argument| argument == "--progress"),
+                expects_print
+            );
+            assert_eq!(
+                args.iter().any(|argument| argument == "--no-simulate"),
                 expects_print
             );
         }

@@ -16,6 +16,18 @@
 //! LVPROGRESS 440 NA 440 NA            <- subtitle download: format id "NA"
 //! LVFORMATS 160, 139                  <- requested formats, once before download
 //! ```
+//!
+//! # How the fraction is derived
+//!
+//! Every requested format (video, audio, ...) owns an equal `1/N` share of the
+//! item, so a finished video with the audio still to come reads about 50%, not
+//! 90%, and the audio then moves the bar. Within its share a stream advances by
+//! `downloaded / total`, where `total` is the exact size when yt-dlp knows it.
+//! Otherwise it is the largest *trusted* estimate seen, never below
+//! `downloaded / 0.95`: an estimate is only trusted once 64 KiB have arrived
+//! and only when it exceeds the bytes so far, because early and degenerate
+//! estimates (`estimate == downloaded`) would claim an instant 100%. The
+//! reported ratio is a high-water mark, so it never decreases.
 
 use std::time::{Duration, Instant};
 
@@ -34,20 +46,19 @@ const MAX_FORMAT_ID_CHARS: usize = 64;
 const MAX_STREAMS: usize = 8;
 /// Non-terminal publishes per second the spec allows.
 const MIN_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
-/// While a requested stream has not started its size is unknown, so do not
-/// claim the item is nearly done.
-const UNSTARTED_STREAM_RATIO_CAP: f64 = 0.9;
-/// Estimated totals are rough (HLS estimates swing by several times), so never
-/// reach completion on an estimate alone.
+/// An estimate is not trusted before this many bytes of the stream arrived.
+const MIN_TRUSTED_ESTIMATE_BYTES: u64 = 64 * 1024;
+/// A stream sized only by an estimate never reads above this share of itself.
 const ESTIMATE_RATIO_CAP: f64 = 0.95;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamSample {
     pub format_id: String,
     pub downloaded: u64,
+    /// Exact size, when yt-dlp knows it.
     pub total: Option<u64>,
-    /// `total` came from yt-dlp's estimate, not an exact size.
-    pub total_is_estimate: bool,
+    /// yt-dlp's rough size estimate, when it has one.
+    pub estimate: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,16 +105,11 @@ pub fn parse_record(line: &str) -> Option<ProgressRecord> {
         if format_id == UNAVAILABLE || !valid_format_id(format_id) {
             return None;
         }
-        let (total, total_is_estimate) = match (total, estimate) {
-            (Some(total), _) => (Some(total), false),
-            (None, Some(estimate)) => (Some(estimate), true),
-            (None, None) => (None, false),
-        };
         return Some(ProgressRecord::Stream(StreamSample {
             format_id: format_id.to_string(),
             downloaded,
             total,
-            total_is_estimate,
+            estimate,
         }));
     }
     let rest = line.strip_prefix(FORMATS_PREFIX)?;
@@ -122,8 +128,36 @@ pub fn parse_record(line: &str) -> Option<ProgressRecord> {
 struct Stream {
     format_id: String,
     downloaded: u64,
-    total: Option<u64>,
-    exact: bool,
+    exact_total: Option<u64>,
+    /// Largest trusted estimate seen; it never shrinks, so a noisy low
+    /// estimate cannot make the stream look further along than it was.
+    estimate_max: Option<u64>,
+}
+
+impl Stream {
+    /// Best known size, never below the bytes already downloaded.
+    fn total(&self) -> Option<u64> {
+        self.exact_total
+            .or(self.estimate_max)
+            .map(|total| total.max(self.downloaded))
+    }
+
+    /// Share of this stream done, `0.0..=1.0`; `0.0` while its size is unknown.
+    fn ratio(&self) -> f64 {
+        let downloaded = self.downloaded as f64;
+        if let Some(total) = self.exact_total {
+            let total = total.max(self.downloaded);
+            return if total == 0 {
+                0.0
+            } else {
+                downloaded / total as f64
+            };
+        }
+        match self.estimate_max {
+            Some(estimate) => downloaded / (estimate as f64).max(downloaded / ESTIMATE_RATIO_CAP),
+            None => 0.0,
+        }
+    }
 }
 
 /// What the UI should show for the download so far.
@@ -199,8 +233,8 @@ impl DownloadProgress {
                 self.streams.push(Stream {
                     format_id: sample.format_id.clone(),
                     downloaded: 0,
-                    total: None,
-                    exact: false,
+                    exact_total: None,
+                    estimate_max: None,
                 });
                 self.streams.len() - 1
             }
@@ -209,9 +243,14 @@ impl DownloadProgress {
         let stream = &mut self.streams[index];
         // A stream restarting from zero (retry) must not move bytes backwards.
         stream.downloaded = stream.downloaded.max(sample.downloaded);
-        if !(stream.exact && sample.total_is_estimate) {
-            stream.total = sample.total.map(|total| total.max(stream.downloaded));
-            stream.exact = sample.total.is_some() && !sample.total_is_estimate;
+        if sample.total.is_some() {
+            stream.exact_total = sample.total;
+        }
+        if let Some(estimate) = sample.estimate {
+            if sample.downloaded >= MIN_TRUSTED_ESTIMATE_BYTES && estimate > sample.downloaded {
+                stream.estimate_max =
+                    Some(stream.estimate_max.map_or(estimate, |m| m.max(estimate)));
+            }
         }
     }
 
@@ -220,32 +259,19 @@ impl DownloadProgress {
             return None;
         }
         let bytes_completed = self.streams.iter().map(|stream| stream.downloaded).sum();
-        let all_totals_known = self.streams.iter().all(|stream| stream.total.is_some());
-        let all_started = self
-            .expected_streams
-            .map_or(true, |expected| self.streams.len() >= expected);
-        let known_total = all_totals_known
-            .then(|| {
-                self.streams
-                    .iter()
-                    .map(|stream| stream.total.unwrap_or(0))
-                    .sum::<u64>()
-            })
-            .filter(|total| *total > 0);
-        if let Some(total) = known_total {
-            let mut ratio = bytes_completed as f64 / total as f64;
-            if !all_started {
-                ratio = ratio.min(UNSTARTED_STREAM_RATIO_CAP);
-            }
-            if self.streams.iter().any(|stream| !stream.exact) {
-                ratio = ratio.min(ESTIMATE_RATIO_CAP);
-            }
-            self.ratio_floor = self.ratio_floor.max(ratio.clamp(0.0, 1.0));
-        }
-        // Without a known total (a stream has just begun) the ratio is held.
+        let requested = self.expected_streams.unwrap_or(0).max(self.streams.len());
+        let all_started = self.streams.len() >= requested;
+        let bytes_total = self
+            .streams
+            .iter()
+            .map(Stream::total)
+            .sum::<Option<u64>>()
+            .filter(|total| all_started && *total > 0);
+        let ratio = self.streams.iter().map(Stream::ratio).sum::<f64>() / requested as f64;
+        self.ratio_floor = self.ratio_floor.max(ratio.clamp(0.0, 1.0));
         Some(ProgressReading {
             bytes_completed,
-            bytes_total: known_total.filter(|_| all_started),
+            bytes_total,
             ratio: self.ratio_floor,
         })
     }
@@ -259,13 +285,13 @@ mod tests {
         format_id: &str,
         downloaded: u64,
         total: Option<u64>,
-        estimate: bool,
+        estimate: Option<u64>,
     ) -> ProgressRecord {
         ProgressRecord::Stream(StreamSample {
             format_id: format_id.to_string(),
             downloaded,
             total,
-            total_is_estimate: estimate,
+            estimate,
         })
     }
 
@@ -273,35 +299,35 @@ mod tests {
     fn parses_exact_total_lines() {
         assert_eq!(
             parse_record("LVPROGRESS 1024 195278 NA 160"),
-            Some(stream("160", 1024, Some(195278), false))
+            Some(stream("160", 1024, Some(195278), None))
         );
     }
 
     #[test]
-    fn falls_back_to_the_estimate_when_the_total_is_na() {
+    fn parses_the_estimate_when_the_total_is_na() {
         assert_eq!(
             parse_record("LVPROGRESS 7168 NA 9216.0 269"),
-            Some(stream("269", 7168, Some(9216), true))
+            Some(stream("269", 7168, None, Some(9216)))
         );
         assert_eq!(
             parse_record("LVPROGRESS 1024 NA 1024 269"),
-            Some(stream("269", 1024, Some(1024), true))
+            Some(stream("269", 1024, None, Some(1024)))
         );
     }
 
     #[test]
-    fn unknown_total_and_estimate_yield_no_total() {
+    fn unknown_total_and_estimate_yield_neither() {
         assert_eq!(
             parse_record("LVPROGRESS 500 NA NA 139-drc"),
-            Some(stream("139-drc", 500, None, false))
+            Some(stream("139-drc", 500, None, None))
         );
     }
 
     #[test]
-    fn exact_total_wins_over_a_present_estimate() {
+    fn keeps_both_the_total_and_a_present_estimate() {
         assert_eq!(
             parse_record("LVPROGRESS 10 100 5000.0 18"),
-            Some(stream("18", 10, Some(100), false))
+            Some(stream("18", 10, Some(100), Some(5000)))
         );
     }
 
@@ -375,17 +401,57 @@ mod tests {
         Clock(Instant::now())
     }
 
-    /// Feed lines 1 s apart so the throttle never interferes, and collect the
-    /// ratio of every published reading.
-    fn ratios(tracker: &mut DownloadProgress, lines: &[&str]) -> Vec<f64> {
+    /// Feed lines 1 s apart so the throttle never interferes, and collect every
+    /// published reading.
+    fn readings(tracker: &mut DownloadProgress, lines: &[&str]) -> Vec<ProgressReading> {
         let clock = clock();
         lines
             .iter()
             .enumerate()
             .filter_map(|(index, line)| tracker.observe_line(line, clock.at(index as u64 * 1000)))
+            .collect()
+    }
+
+    fn ratios(tracker: &mut DownloadProgress, lines: &[&str]) -> Vec<f64> {
+        readings(tracker, lines)
+            .into_iter()
             .map(|reading| reading.ratio)
             .collect()
     }
+
+    fn non_decreasing(values: &[f64]) -> bool {
+        values.windows(2).all(|pair| pair[0] <= pair[1])
+    }
+
+    /// The HLS sequence yt-dlp printed for a real video (see the module docs):
+    /// no exact total until the last line, wildly varying float estimates,
+    /// and estimates that merely echo the bytes so far.
+    const HLS_ESTIMATE_ONLY: &[&str] = &[
+        "LVPROGRESS 1024 NA 1024 269",
+        "LVPROGRESS 3072 NA 3072.0 269",
+        "LVPROGRESS 7168 NA 9216.0 269",
+        "LVPROGRESS 15360 NA 21504.0 269",
+        "LVPROGRESS 31744 NA 46080.0 269",
+        "LVPROGRESS 64512 NA 95232.0 269",
+        "LVPROGRESS 66552 NA 193536.0 269",
+        "LVPROGRESS 66552 NA 399312.0 269",
+        "LVPROGRESS 67576 NA 99828.0 269",
+        "LVPROGRESS 69624 NA 101364.0 269",
+        "LVPROGRESS 73720 NA 104436.0 269",
+        "LVPROGRESS 81912 NA 110580.0 269",
+        "LVPROGRESS 98296 NA 122868.0 269",
+        "LVPROGRESS 131064 NA 147444.0 269",
+        "LVPROGRESS 139120 NA 196596.0 269",
+        "LVPROGRESS 139120 NA 317532.0 269",
+        "LVPROGRESS 140144 NA 140144 269",
+        "LVPROGRESS 142192 NA 142192 269",
+        "LVPROGRESS 146288 NA 146288 269",
+        "LVPROGRESS 154480 NA 154480 269",
+        "LVPROGRESS 170864 NA 170864 269",
+        "LVPROGRESS 203632 NA 203632 269",
+        "LVPROGRESS 232744 NA 232744 269",
+        "LVPROGRESS 232744 NA 326368.0 269",
+    ];
 
     #[test]
     fn single_stream_progress_maps_to_bytes_and_ratio() {
@@ -405,7 +471,60 @@ mod tests {
     }
 
     #[test]
-    fn two_streams_sum_and_the_ratio_never_drops_when_the_second_starts() {
+    fn the_first_estimate_line_does_not_jump_the_bar() {
+        let mut tracker = DownloadProgress::new();
+        let first = tracker
+            .observe_line("LVPROGRESS 1024 NA 1024 269", clock().at(0))
+            .unwrap();
+        assert!(first.ratio < 0.05, "ratio jumped to {}", first.ratio);
+        assert_eq!(first.bytes_total, None, "an untrusted estimate is no total");
+        // Even a large-looking estimate is ignored below 64 KiB.
+        let mut tracker = DownloadProgress::new();
+        let early = tracker
+            .observe_line("LVPROGRESS 9000 NA 9001.0 269", clock().at(0))
+            .unwrap();
+        assert!(early.ratio < 0.05);
+    }
+
+    #[test]
+    fn an_hls_like_estimate_only_download_progresses_without_latching() {
+        let mut tracker = DownloadProgress::new();
+        let observed = readings(&mut tracker, HLS_ESTIMATE_ONLY);
+        let values = observed.iter().map(|r| r.ratio).collect::<Vec<_>>();
+
+        assert!(non_decreasing(&values), "ratio dropped: {values:?}");
+        assert!(values[0] < 0.05, "starts near zero: {values:?}");
+        // Never claims completion on estimates alone.
+        assert!(
+            values
+                .iter()
+                .all(|ratio| *ratio <= ESTIMATE_RATIO_CAP + 1e-9),
+            "{values:?}"
+        );
+        // It keeps moving as bytes arrive instead of freezing at a latched
+        // value: the second half of the download is clearly ahead of the
+        // first third, and keeps rising through the final lines.
+        let at = |downloaded: u64| {
+            observed
+                .iter()
+                .find(|reading| reading.bytes_completed >= downloaded)
+                .map(|reading| reading.ratio)
+                .unwrap()
+        };
+        assert!(at(131_064) < at(170_864));
+        assert!(at(170_864) < at(232_744));
+        assert!(at(232_744) > 0.5 && at(232_744) <= ESTIMATE_RATIO_CAP);
+
+        // The exact total on the stream's last line finishes it.
+        let finished = tracker
+            .observe_line("LVPROGRESS 232744 232744 NA 269", clock().at(60_000))
+            .unwrap();
+        assert!((finished.ratio - 1.0).abs() < 1e-9);
+        assert_eq!(finished.bytes_total, Some(232_744));
+    }
+
+    #[test]
+    fn a_stream_finished_before_the_next_starts_reads_about_half_then_moves() {
         let mut tracker = DownloadProgress::new();
         let observed = ratios(
             &mut tracker,
@@ -413,21 +532,24 @@ mod tests {
                 "LVFORMATS 160, 139",
                 "LVPROGRESS 50 100 NA 160",
                 "LVPROGRESS 100 100 NA 160",
-                // Audio begins at zero with an unknown size: hold the ratio.
+                // Audio begins at zero with an unknown size: nothing changes.
                 "LVPROGRESS 0 NA NA 139",
                 "LVPROGRESS 10 40 NA 139",
+                "LVPROGRESS 20 40 NA 139",
                 "LVPROGRESS 40 40 NA 139",
             ],
         );
+        assert!(non_decreasing(&observed), "ratio dropped: {observed:?}");
+        // [video 25%, video 50%, audio 62.5%, audio 75%, done]
+        assert_eq!(observed.len(), 5, "{observed:?}");
+        assert!((observed[0] - 0.25).abs() < 1e-9);
         assert!(
-            observed.windows(2).all(|pair| pair[0] <= pair[1]),
-            "ratio dropped: {observed:?}"
+            (observed[1] - 0.5).abs() < 1e-9,
+            "video alone is half the item, not 90%: {observed:?}"
         );
-        // Video done but audio not started: capped, not complete.
-        assert!(observed
-            .iter()
-            .any(|ratio| (ratio - UNSTARTED_STREAM_RATIO_CAP).abs() < 1e-9));
-        assert!((observed.last().unwrap() - 1.0).abs() < 1e-9);
+        assert!((observed[2] - 0.625).abs() < 1e-9);
+        assert!((observed[3] - 0.75).abs() < 1e-9);
+        assert!((observed[4] - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -482,23 +604,23 @@ mod tests {
     }
 
     #[test]
-    fn estimate_only_totals_never_report_completion() {
+    fn estimate_only_totals_are_trusted_late_and_never_report_completion() {
         let mut tracker = DownloadProgress::new();
         let observed = ratios(
             &mut tracker,
             &[
                 "LVPROGRESS 1024 NA 1024 269",
-                "LVPROGRESS 232744 NA 326368.0 269",
+                "LVPROGRESS 100000 NA 100001.0 269",
+                "LVPROGRESS 232744 NA 232745.0 269",
             ],
         );
+        // First line: untrusted. Later lines: bounded by the soft cap even
+        // when the estimate barely exceeds the bytes so far.
+        assert!(observed[0] < 0.05);
         assert!(observed
             .iter()
             .all(|ratio| *ratio <= ESTIMATE_RATIO_CAP + 1e-9));
-        let mut tracker = DownloadProgress::new();
-        let reading = tracker
-            .observe_line("LVPROGRESS 232744 232744 NA 269", clock().at(0))
-            .unwrap();
-        assert!((reading.ratio - 1.0).abs() < 1e-9);
+        assert!(*observed.last().unwrap() > 0.9);
     }
 
     #[test]
@@ -513,10 +635,7 @@ mod tests {
             ],
         );
         assert_eq!(observed.len(), 3);
-        assert!(
-            observed.windows(2).all(|pair| pair[0] <= pair[1]),
-            "{observed:?}"
-        );
+        assert!(non_decreasing(&observed), "{observed:?}");
     }
 
     #[test]
@@ -548,7 +667,7 @@ mod tests {
     fn total_is_never_below_the_bytes_already_downloaded() {
         let mut tracker = DownloadProgress::new();
         let reading = tracker
-            .observe_line("LVPROGRESS 500 NA 100.0 18", clock().at(0))
+            .observe_line("LVPROGRESS 500 100 NA 18", clock().at(0))
             .unwrap();
         assert_eq!(reading.bytes_total, Some(500));
     }
