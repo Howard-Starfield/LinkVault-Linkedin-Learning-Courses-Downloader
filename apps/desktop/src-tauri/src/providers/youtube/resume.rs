@@ -680,13 +680,26 @@ pub fn discard_paused_run_staging(run: &RunRecord) {
 /// Startup sweep of abandoned staging under every known output root.
 /// Blocking; call from `spawn_blocking` after the restart reconcile.
 pub fn sweep_orphans(runtime: &WorkflowRuntime, extra_roots: &[String]) -> usize {
-    let Ok(runs) = runtime.list_youtube_runs(1000) else {
+    sweep_orphans_at(runtime, extra_roots, SystemTime::now())
+}
+
+/// [`sweep_orphans`] with the clock injected.
+pub fn sweep_orphans_at(
+    runtime: &WorkflowRuntime,
+    extra_roots: &[String],
+    now: SystemTime,
+) -> usize {
+    // References come from every unfinished run, not from the bounded
+    // history list: an old paused run must keep its partial files.
+    let Ok(unfinished) = runtime.list_youtube_nonterminal_runs() else {
         return 0;
     };
-    let referenced = referenced_staging_names(&runs);
+    let history = runtime.list_youtube_runs(1000).unwrap_or_default();
+    let referenced = referenced_staging_names(&unfinished);
     let mut roots: BTreeMap<String, String> = BTreeMap::new();
-    for root in runs
+    for root in unfinished
         .iter()
+        .chain(history.iter())
         .map(|run| run.output_root.as_str())
         .chain(extra_roots.iter().map(String::as_str))
     {
@@ -696,7 +709,14 @@ pub fn sweep_orphans(runtime: &WorkflowRuntime, extra_roots: &[String]) -> usize
                 .or_insert_with(|| root.trim().to_string());
         }
     }
-    let now = SystemTime::now();
+    // A cancelled run's partial files are garbage whatever their age (the
+    // cancel may have been cut short by a restart).
+    for run in history
+        .iter()
+        .filter(|run| run.state == RunState::Cancelled)
+    {
+        discard_paused_run_staging(run);
+    }
     let mut removed = 0;
     for (key, root_path) in roots {
         let Ok(root) = validate_output_root(Path::new(&root_path)) else {

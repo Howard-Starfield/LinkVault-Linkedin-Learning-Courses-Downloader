@@ -754,6 +754,13 @@ impl WorkflowRuntime {
             .list_resumable(WorkflowType::youtube_download().as_str().to_string())
     }
 
+    /// Every unfinished YouTube run, with no history limit.
+    pub fn list_youtube_nonterminal_runs(&self) -> Result<Vec<RunRecord>, WorkflowError> {
+        self.inner
+            .service
+            .list_nonterminal_runs(WorkflowType::youtube_download().as_str().to_string())
+    }
+
     pub fn get_resume(&self, run_id: String) -> Result<Option<RunResumeRecord>, WorkflowError> {
         self.inner.service.get_resume(run_id)
     }

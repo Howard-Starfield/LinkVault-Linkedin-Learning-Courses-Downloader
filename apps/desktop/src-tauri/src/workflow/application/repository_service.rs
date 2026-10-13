@@ -534,6 +534,15 @@ impl WorkflowRepositoryService {
         })
     }
 
+    pub fn list_nonterminal_runs(
+        &self,
+        workflow_type: String,
+    ) -> Result<Vec<RunRecord>, WorkflowError> {
+        self.with_connection("workflow_list_nonterminal", None, move |repo, conn| {
+            repo.list_nonterminal_runs(conn, &workflow_type)
+        })
+    }
+
     pub fn list_resumable(
         &self,
         workflow_type: String,

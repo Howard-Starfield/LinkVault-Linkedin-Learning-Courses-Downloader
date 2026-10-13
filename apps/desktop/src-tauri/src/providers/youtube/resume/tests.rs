@@ -601,3 +601,138 @@ fn a_projection_carries_the_state_reason_and_preserved_bytes() {
     assert_eq!(projected.preserved_bytes, 321);
     assert!(projected.reason.unwrap().contains("restart"));
 }
+
+// ---- cancel vs. admission ------------------------------------------------------
+
+#[test]
+fn a_cancel_that_lands_first_makes_a_later_admission_refuse_the_run() {
+    use crate::providers::youtube::commands::cancel_youtube_download_blocking;
+    let (_dir, runtime) = runtime();
+    let live = YouTubeLiveHandle::default();
+    let run = interrupted_run(&runtime, "yt-cancel-first", ".");
+
+    cancel_youtube_download_blocking(&live, &runtime, "yt-cancel-first").unwrap();
+    let admission = attach_and_begin(&runtime, &live, &run, ResumeTrigger::Auto).unwrap();
+
+    assert_eq!(admission, Admission::NotResumable);
+    assert!(!live.has_active_run("yt-cancel-first"), "no control may be left attached");
+    assert_eq!(
+        runtime.get_run("yt-cancel-first".to_string()).unwrap().unwrap().state,
+        RunState::Cancelled
+    );
+}
+
+#[test]
+fn a_cancel_after_admission_signals_the_attached_control() {
+    use crate::providers::youtube::commands::cancel_youtube_download_blocking;
+    let (_dir, runtime) = runtime();
+    let live = YouTubeLiveHandle::default();
+    interrupted_run(&runtime, "yt-cancel-after", ".");
+    assert_eq!(
+        auto_resume_next(&runtime, &live, &go).unwrap(),
+        AutoResumeStep::Started
+    );
+    let control = live.control_for("yt-cancel-after").unwrap();
+
+    cancel_youtube_download_blocking(&live, &runtime, "yt-cancel-after").unwrap();
+
+    assert!(control.is_cancelled(), "the running download must be told to stop");
+}
+
+#[test]
+fn cancel_is_serialized_with_admission_by_the_drain_lock() {
+    use crate::providers::youtube::commands::cancel_youtube_download_blocking;
+    let (_dir, runtime) = runtime();
+    let live = Arc::new(YouTubeLiveHandle::default());
+    interrupted_run(&runtime, "yt-serial", ".");
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    runtime.with_drain_lock(|| {
+        let runtime = runtime.clone();
+        let live = Arc::clone(&live);
+        std::thread::spawn(move || {
+            let _ = cancel_youtube_download_blocking(&live, &runtime, "yt-serial");
+            let _ = finished_tx.send(());
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "cancel must wait for an admission in progress"
+        );
+    });
+    finished_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("cancel proceeds once the lock is free");
+}
+
+// ---- sweep references ------------------------------------------------------------
+
+#[test]
+fn the_sweep_keeps_an_old_paused_run_behind_more_than_a_thousand_newer_runs() {
+    let (_db, runtime) = runtime();
+    let out = tempdir().unwrap();
+    let root = validate_output_root(out.path()).unwrap();
+    let item = work_item(1);
+    let held = root
+        .resumable_staging_lease(&item.occurrence_id, &item.artifact_fingerprint)
+        .unwrap();
+    let path = held.lease.path().to_path_buf();
+    std::fs::write(path.join("media.f137.mp4.part"), b"partial").unwrap();
+    drop(held);
+    let root_text = out.path().to_string_lossy().into_owned();
+    runtime
+        .submit_youtube_download(
+            "yt-oldest".to_string(),
+            "vid-1".to_string(),
+            request_json(&[work_item(1)]),
+            root_text.clone(),
+            1,
+        )
+        .unwrap();
+    for index in 0..1100 {
+        runtime
+            .submit_youtube_download(
+                format!("yt-newer-{index}"),
+                "vid-2".to_string(),
+                request_json(&[work_item(2)]),
+                root_text.clone(),
+                10 + index,
+            )
+            .unwrap();
+    }
+    runtime.reconcile_youtube_after_restart(5000).unwrap();
+
+    let thirty_days = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+    let removed = sweep_orphans_at(&runtime, &[], SystemTime::now() + thirty_days);
+
+    assert_eq!(removed, 0);
+    assert!(path.exists(), "the oldest paused run still owns its partial files");
+}
+
+#[test]
+fn the_sweep_removes_a_cancelled_runs_staging_whatever_its_age() {
+    let (_db, runtime) = runtime();
+    let out = tempdir().unwrap();
+    let root = validate_output_root(out.path()).unwrap();
+    let item = work_item(1);
+    let held = root
+        .resumable_staging_lease(&item.occurrence_id, &item.artifact_fingerprint)
+        .unwrap();
+    let path = held.lease.path().to_path_buf();
+    std::fs::write(path.join("media.f137.mp4.part"), b"partial").unwrap();
+    drop(held);
+    runtime
+        .submit_youtube_download(
+            "yt-cancelled".to_string(),
+            "vid-1".to_string(),
+            request_json(&[work_item(1)]),
+            out.path().to_string_lossy().into_owned(),
+            1,
+        )
+        .unwrap();
+    runtime.cancel_run("yt-cancelled".to_string(), 2).unwrap();
+
+    sweep_orphans(&runtime, &[]);
+
+    assert!(!path.exists());
+}

@@ -119,6 +119,34 @@ impl SqliteWorkflowRepository {
         Ok(found)
     }
 
+    /// Every run of `workflow_type` that is not finished, with no limit:
+    /// queued, running, retry_wait, paused and cancelling.
+    pub fn list_nonterminal_runs(
+        &self,
+        connection: &Connection,
+        workflow_type: &str,
+    ) -> Result<Vec<RunRecord>, WorkflowError> {
+        let run_ids: Vec<String> = {
+            let mut statement = connection.prepare(
+                "SELECT id FROM workflow_runs
+                 WHERE workflow_type = ?1
+                   AND state IN ('queued', 'running', 'retry_wait', 'paused', 'cancelling')
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let ids = statement
+                .query_map(params![workflow_type], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            ids
+        };
+        let mut runs = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            if let Some(run) = self.get_run(connection, &run_id)? {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
     /// Restart reconcile: make every non-terminal run of `workflow_type`
     /// resumable instead of failing it.
     ///
