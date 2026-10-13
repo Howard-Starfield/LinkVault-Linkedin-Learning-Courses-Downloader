@@ -2,6 +2,7 @@
 
 use rusqlite::Connection;
 
+use super::resume_repository::PauseNote;
 use super::sqlite_repository::SqliteWorkflowRepository;
 use crate::app::database::initialize_database;
 use crate::workflow::domain::resume::{ResumeState, ResumeTrigger, RunResumeRecord};
@@ -172,9 +173,11 @@ fn a_failed_resumed_attempt_pauses_and_continue_runs_exactly_one_attempt() {
             &connection,
             "run-b",
             &step,
-            "network dropped",
-            Some("HELPER_FAILED"),
-            0,
+            PauseNote {
+                reason: "network dropped",
+                reason_code: Some("HELPER_FAILED"),
+                last_revision: 0,
+            },
             13,
         )
         .unwrap());

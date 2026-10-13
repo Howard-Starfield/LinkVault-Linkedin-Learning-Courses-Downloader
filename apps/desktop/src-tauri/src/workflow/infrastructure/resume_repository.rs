@@ -72,6 +72,14 @@ fn append_event(
     Ok(())
 }
 
+/// Why and how far a run got when a resumed attempt failed.
+#[derive(Clone, Copy, Debug)]
+pub struct PauseNote<'a> {
+    pub reason: &'a str,
+    pub reason_code: Option<&'a str>,
+    pub last_revision: u64,
+}
+
 impl SqliteWorkflowRepository {
     pub fn get_resume(
         &self,
@@ -354,11 +362,14 @@ impl SqliteWorkflowRepository {
         connection: &Connection,
         run_id: &str,
         step_id: &str,
-        reason: &str,
-        reason_code: Option<&str>,
-        last_revision: u64,
+        note: PauseNote<'_>,
         now: i64,
     ) -> Result<bool, WorkflowError> {
+        let PauseNote {
+            reason,
+            reason_code,
+            last_revision,
+        } = note;
         let tx = connection.unchecked_transaction()?;
         let Some(run) = self.get_run(&tx, run_id)? else {
             return Err(WorkflowError::RunNotFound(run_id.to_string()));

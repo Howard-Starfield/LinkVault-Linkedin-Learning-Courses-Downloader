@@ -8,6 +8,7 @@ use crate::workflow::domain::state::{RunState, StepState};
 use crate::workflow::domain::types::{
     NewWorkflowRun, NewWorkflowStep, RunRecord, StepRecord, WorkflowEventRecord,
 };
+use crate::workflow::infrastructure::resume_repository::PauseNote;
 use crate::workflow::infrastructure::sqlite_repository::SqliteWorkflowRepository;
 use crate::workflow::ports::repository::WorkflowRepository;
 
@@ -495,9 +496,11 @@ impl WorkflowRepositoryService {
                 conn,
                 &run_id,
                 &step_id,
-                &reason,
-                reason_code.as_deref(),
-                last_revision,
+                PauseNote {
+                    reason: &reason,
+                    reason_code: reason_code.as_deref(),
+                    last_revision,
+                },
                 now,
             )
         })
