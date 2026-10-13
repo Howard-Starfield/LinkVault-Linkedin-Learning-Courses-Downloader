@@ -83,15 +83,20 @@ fn helper_failures_are_classified_from_their_output() {
 
 #[test]
 fn only_transport_failures_keep_their_partial_files() {
-    for code in ["HELPER_FAILED", "HELPER_TIMEOUT", "DISK_FULL", "VIDEO_UNAVAILABLE"] {
+    for code in [
+        "HELPER_FAILED",
+        "HELPER_TIMEOUT",
+        "DISK_FULL",
+        "VIDEO_UNAVAILABLE",
+        "OUTPUT_VERIFY_FAILED",
+        "MEDIA_VERIFY_FAILED",
+    ] {
         assert!(keep_staging_after(code), "{code}");
     }
     for code in [
-        "OUTPUT_VERIFY_FAILED",
         "NO_ARTIFACT",
         "TRANSCRIPT_INVALID",
         "CANCELLED",
-        "MEDIA_VERIFY_FAILED",
     ] {
         assert!(!keep_staging_after(code), "{code}");
     }
@@ -298,7 +303,7 @@ fn continue_starts_a_single_attempt_even_when_clicked_twice() {
     let live = YouTubeLiveHandle::default();
     interrupted_run(&runtime, "yt-continue", ".");
     runtime
-        .park_for_user("yt-continue".to_string(), "network".to_string(), None, 120)
+        .park_for_user("yt-continue".to_string(), "network".to_string(), None, 120, None)
         .unwrap();
 
     let first = continue_run_with(&runtime, &live, "yt-continue", generation_of(&runtime, "yt-continue"), &go).unwrap();
@@ -374,6 +379,7 @@ fn resume_record(expected: Option<u64>, key: Option<&str>) -> RunResumeRecord {
         expected_item_key: key.map(str::to_string),
         updated_at: 1,
         generation: 0,
+        last_revision: 0,
     }
 }
 
@@ -564,7 +570,7 @@ fn cancelling_a_paused_run_removes_its_partial_files() {
     std::fs::write(staging_path.join("media.f137.mp4.part"), b"partial").unwrap();
     drop(held);
 
-    discard_paused_run_staging(&run);
+    discard_paused_run_staging(&run, &HashSet::new());
     assert!(!staging_path.exists());
 }
 
@@ -769,7 +775,7 @@ fn a_delayed_duplicate_continue_cannot_start_another_attempt_after_a_failure() {
     let live = YouTubeLiveHandle::default();
     interrupted_run(&runtime, "yt-dup", ".");
     runtime
-        .park_for_user("yt-dup".to_string(), "network".to_string(), None, 120)
+        .park_for_user("yt-dup".to_string(), "network".to_string(), None, 120, None)
         .unwrap();
     let shown = generation_of(&runtime, "yt-dup");
 
@@ -811,4 +817,149 @@ fn the_format_id_record_gives_the_exact_selection_for_merged_and_single_formats(
     assert_eq!(parse_pinned_formats("137+"), None);
     assert!(pinned_format_unavailable("ERROR: Requested format is not available. Use --list-formats"));
     assert!(!pinned_format_unavailable("HTTP Error 403"));
+}
+
+// ---- shared staging, stale park, durable revisions ---------------------------------
+
+struct PausesAtRevision(WorkflowRuntime);
+
+impl crate::workflow::ports::executor::StepExecutor for PausesAtRevision {
+    fn workflow_type(&self) -> &'static str {
+        "youtube_download"
+    }
+
+    fn execute(
+        &self,
+        run: &RunRecord,
+        _step: &crate::workflow::domain::types::StepRecord,
+    ) -> crate::workflow::ports::executor::ExecutorOutcome {
+        self.0
+            .pause_running_for_user(run.id.clone(), "x".to_string(), "HELPER_FAILED".to_string(), 4000)
+            .unwrap();
+        crate::workflow::ports::executor::ExecutorOutcome::paused_for_user("x".to_string(), None)
+    }
+}
+
+fn stage_partials(root: &Path) -> std::path::PathBuf {
+    let root = validate_output_root(root).unwrap();
+    let item = work_item(1);
+    let held = root
+        .resumable_staging_lease(&item.occurrence_id, &item.artifact_fingerprint)
+        .unwrap();
+    let path = held.lease.path().to_path_buf();
+    std::fs::write(path.join("media.f137.mp4.part"), b"partial").unwrap();
+    path
+}
+
+#[test]
+fn a_cancelled_run_never_wipes_the_partials_of_a_paused_run_sharing_its_staging() {
+    let (_db, runtime) = runtime();
+    let out = tempdir().unwrap();
+    let path = stage_partials(out.path());
+    let root_text = out.path().to_string_lossy().into_owned();
+    for (id, created) in [("yt-a", 1), ("yt-b", 2)] {
+        runtime
+            .submit_youtube_download(
+                id.to_string(),
+                "vid-1".to_string(),
+                request_json(&[work_item(1)]),
+                root_text.clone(),
+                created,
+            )
+            .unwrap();
+    }
+    runtime.reconcile_youtube_after_restart(10).unwrap();
+
+    // The startup sweep: A is cancelled, B (same video and options) is paused.
+    runtime.cancel_run("yt-a".to_string(), 11).unwrap();
+    sweep_orphans(&runtime, &[]);
+    assert!(path.exists(), "B's partial download must survive A's cleanup");
+
+    // The same through the live cancel path.
+    runtime
+        .submit_youtube_download(
+            "yt-c".to_string(),
+            "vid-1".to_string(),
+            request_json(&[work_item(1)]),
+            root_text,
+            3,
+        )
+        .unwrap();
+    runtime.reconcile_youtube_after_restart(12).unwrap();
+    let live = YouTubeLiveHandle::default();
+    crate::providers::youtube::commands::cancel_youtube_download_blocking(&live, &runtime, "yt-c")
+        .unwrap();
+    assert!(path.exists(), "cancelling C must not wipe B's partials either");
+
+    // Once B is gone too, nothing references it and the cancel cleans up.
+    crate::providers::youtube::commands::cancel_youtube_download_blocking(&live, &runtime, "yt-b")
+        .unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_stale_park_cannot_overwrite_a_newer_pause() {
+    let (_dir, runtime) = runtime();
+    interrupted_run(&runtime, "yt-stale", ".");
+    let shown = generation_of(&runtime, "yt-stale");
+    // Another pause lands (a newer generation with its own reason).
+    runtime
+        .park_for_user("yt-stale".to_string(), "disk is full".to_string(), None, 130, None)
+        .unwrap();
+    let newer = generation_of(&runtime, "yt-stale");
+    assert!(newer > shown);
+
+    // A preflight that was computed against the older pause arrives late.
+    let applied = runtime
+        .park_for_user(
+            "yt-stale".to_string(),
+            "helpers missing".to_string(),
+            None,
+            140,
+            Some(shown),
+        )
+        .unwrap();
+
+    assert!(!applied, "a stale park is dropped");
+    let record = runtime.get_resume("yt-stale".to_string()).unwrap().unwrap();
+    assert_eq!(record.reason.as_deref(), Some("disk is full"));
+    assert_eq!(record.generation, newer, "and it must not bump the generation");
+}
+
+#[test]
+fn revisions_continue_from_the_durable_base_even_with_a_forgetful_live_handle() {
+    let (_dir, runtime) = runtime();
+    interrupted_run(&runtime, "yt-rev", ".");
+    runtime
+        .park_for_user("yt-rev".to_string(), "x".to_string(), None, 120, None)
+        .unwrap();
+    // The run was paused when its live view had reached revision 4000.
+    assert_eq!(
+        auto_resume_next(&runtime, &YouTubeLiveHandle::default(), &go).unwrap(),
+        AutoResumeStep::Idle
+    );
+    runtime.register_executor(Arc::new(PausesAtRevision(runtime.clone())));
+    let live = YouTubeLiveHandle::default();
+    let run = runtime.get_run("yt-rev".to_string()).unwrap().unwrap();
+    assert_eq!(
+        attach_and_begin(&runtime, &live, &run, ResumeTrigger::Manual).unwrap(),
+        Admission::Started
+    );
+    runtime.drain_type("youtube_download").unwrap();
+    live.clear_run("yt-rev");
+
+    // A handle that has forgotten everything (cache eviction, new handle).
+    let fresh = YouTubeLiveHandle::default();
+    let run = runtime.get_run("yt-rev".to_string()).unwrap().unwrap();
+    attach_and_begin(&runtime, &fresh, &run, ResumeTrigger::Manual).unwrap();
+
+    assert!(fresh.revision_of("yt-rev") > 4000);
+}
+
+#[test]
+fn only_incomplete_downloads_count_as_partials() {
+    assert!(has_incomplete_partials(&names(&["media.f137.mp4.part"])));
+    assert!(has_incomplete_partials(&names(&["media.f137.mp4.part-Frag3"])));
+    assert!(has_incomplete_partials(&names(&["media.f137.mp4.ytdl"])));
+    assert!(!has_incomplete_partials(&names(&["media.mp4", "media.en.vtt"])));
 }

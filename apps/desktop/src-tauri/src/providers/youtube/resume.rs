@@ -107,6 +107,16 @@ pub fn stale_part_leaves(names: &[String], chosen_format_ids: &[String]) -> Vec<
 /// and removed before the item is verified and published.
 pub const FORMAT_MARKER: &str = "media.lvformat";
 
+/// True when any file is an unfinished download (`.part`, fragments, `.ytdl`).
+/// A directory with none holds only complete files, whose bytes cannot be
+/// mixed across formats.
+pub fn has_incomplete_partials(names: &[String]) -> bool {
+    names.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains(".part") || lower.ends_with(".ytdl")
+    })
+}
+
 /// Whether yt-dlp refused a pinned `--format` because it no longer exists.
 pub fn pinned_format_unavailable(stderr: &str) -> bool {
     stderr.to_lowercase().contains("requested format is not available")
@@ -159,6 +169,11 @@ pub fn keep_staging_after(code: &str) -> bool {
             | "DISK_FULL"
             | "VIDEO_UNAVAILABLE"
             | "STAGING_BUSY"
+            // The download is complete; a verification or manifest I/O
+            // failure must not throw it away. Continue re-verifies only.
+            | "OUTPUT_VERIFY_FAILED"
+            | "MEDIA_VERIFY_FAILED"
+            | "MEDIA_CORRUPT"
     )
 }
 
@@ -167,6 +182,10 @@ pub fn pause_reason(code: &str, message: &str) -> String {
     match code {
         "DISK_FULL" => {
             "The disk filled up. Free some space, then press Continue to pick up where it stopped."
+                .to_string()
+        }
+        "MEDIA_CORRUPT" => {
+            "The downloaded video failed its integrity check and was removed. Press Continue to download it again."
                 .to_string()
         }
         "VIDEO_UNAVAILABLE" => {
@@ -399,12 +418,18 @@ pub fn attach_and_begin(
         .begin_discovery(opaque_id("resume"))
         .map_err(YouTubeError::from)?;
     let now = chrono::Utc::now().timestamp();
+    let base_revision = runtime
+        .get_resume(run.id.clone())
+        .ok()
+        .flatten()
+        .map_or(0, |record| record.last_revision);
     let result = runtime.with_drain_lock(|| {
-        live.attach_run(
+        live.attach_run_at(
             run.id.clone(),
             request.client_submission_id.clone(),
             request.plan_fingerprint.clone(),
             &request.work_items,
+            base_revision,
         )
         .map_err(YouTubeError::from)?;
         match runtime.begin_resume(run.id.clone(), trigger, now) {
@@ -477,7 +502,14 @@ pub fn continue_run_with(
     }
     let now = chrono::Utc::now().timestamp();
     if let Preflight::Park { code, reason } = preflight(&run, &resume) {
-        let _ = runtime.park_for_user(run_id.to_string(), reason.clone(), Some(code.clone()), now);
+        // Only if the pause the user answered is still the current one.
+        let _ = runtime.park_for_user(
+            run_id.to_string(),
+            reason.clone(),
+            Some(code.clone()),
+            now,
+            Some(generation),
+        );
         return Err(YouTubeError::new(code, reason));
     }
     match attach_and_begin(runtime, live, &run, ResumeTrigger::ManualAt(generation)) {
@@ -550,7 +582,13 @@ pub fn auto_resume_next(
     match preflight(&run, &resume) {
         Preflight::Wait => Ok(AutoResumeStep::Waiting),
         Preflight::Park { code, reason } => {
-            runtime.park_for_user(run.id.clone(), reason, Some(code), now)?;
+            runtime.park_for_user(
+                run.id.clone(),
+                reason,
+                Some(code),
+                now,
+                Some(resume.generation),
+            )?;
             Ok(AutoResumeStep::Parked)
         }
         Preflight::Go => match attach_and_begin(runtime, live, &run, ResumeTrigger::Auto) {
@@ -560,7 +598,13 @@ pub fn auto_resume_next(
                 Ok(AutoResumeStep::Waiting)
             }
             Err(error) => {
-                runtime.park_for_user(run.id.clone(), error.message, Some(error.code), now)?;
+                runtime.park_for_user(
+                    run.id.clone(),
+                    error.message,
+                    Some(error.code),
+                    now,
+                    Some(resume.generation),
+                )?;
                 Ok(AutoResumeStep::Parked)
             }
         },
@@ -677,23 +721,53 @@ pub fn project_resumable(run: &RunRecord, resume: &RunResumeRecord) -> YouTubeRe
 // ---------------------------------------------------------------------------
 
 /// Remove the resumable staging of every item of a run (cancel, terminal
-/// failure). Best effort: an item whose directory is in use is skipped.
-pub fn discard_run_staging(root: &ValidatedOutputRoot, items: &[TransientWorkItem]) {
+/// failure). Names in `shared` belong to another unfinished run (staging names
+/// are deterministic, so two runs of the same video and options share one
+/// directory) and are left alone. Best effort: an item whose directory is in
+/// use is skipped.
+pub fn discard_run_staging(
+    root: &ValidatedOutputRoot,
+    items: &[TransientWorkItem],
+    shared: &HashSet<String>,
+) {
     for item in items {
+        let name = resumable_staging_name(&item.occurrence_id, &item.artifact_fingerprint);
+        if shared.contains(&name) {
+            continue;
+        }
         let _ = root.discard_resumable_staging(&item.occurrence_id, &item.artifact_fingerprint);
     }
 }
 
 /// Discard staging for a run that no attempt owns (a paused run the user
-/// cancelled). Blocking; call from `spawn_blocking`.
-pub fn discard_paused_run_staging(run: &RunRecord) {
+/// cancelled), sparing directories another unfinished run still references.
+/// Blocking; call from `spawn_blocking`.
+pub fn discard_paused_run_staging(run: &RunRecord, shared: &HashSet<String>) {
     let Ok(request) = serde_json::from_str::<YoutubeDurableRequest>(&run.request_json) else {
         return;
     };
     let Ok(root) = validate_output_root(Path::new(&run.output_root)) else {
         return;
     };
-    discard_run_staging(&root, &request.work_items);
+    discard_run_staging(&root, &request.work_items, shared);
+}
+
+/// Staging directory names, under `root`, that unfinished runs other than
+/// `run_id` still reference.
+pub fn staging_shared_with_others(
+    runtime: &WorkflowRuntime,
+    run_id: &str,
+    root: &str,
+) -> HashSet<String> {
+    let others = runtime
+        .list_youtube_nonterminal_runs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|other| other.id != run_id)
+        .collect::<Vec<_>>();
+    referenced_staging_names(&others)
+        .remove(&normalize_root(root))
+        .unwrap_or_default()
 }
 
 /// Startup sweep of abandoned staging under every known output root.
@@ -730,11 +804,17 @@ pub fn sweep_orphans_at(
     }
     // A cancelled run's partial files are garbage whatever their age (the
     // cancel may have been cut short by a restart).
+    // Never one that an unfinished run references: names are deterministic,
+    // so an old cancelled run and a newer paused run can share a directory.
     for run in history
         .iter()
         .filter(|run| run.state == RunState::Cancelled)
     {
-        discard_paused_run_staging(run);
+        let keep = referenced
+            .get(&normalize_root(&run.output_root))
+            .cloned()
+            .unwrap_or_default();
+        discard_paused_run_staging(run, &keep);
     }
     let mut removed = 0;
     for (key, root_path) in roots {

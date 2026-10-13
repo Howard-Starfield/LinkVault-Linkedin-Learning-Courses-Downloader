@@ -182,7 +182,11 @@ pub fn resumable_staging_name(occurrence_id: &str, artifact_fingerprint: &str) -
 /// Whether a direct child of a resumable staging directory is something
 /// yt-dlp could have written for the `media.%(ext)s` output template.
 pub fn is_expected_staging_leaf(name: &str) -> bool {
-    name.len() > "media.".len() && name.starts_with("media.") && validate_component(name).is_ok()
+    // `manifest.json` is derived output a failed finalization may have left;
+    // the executor deletes it before regenerating.
+    (name == "manifest.json"
+        || (name.len() > "media.".len() && name.starts_with("media.")))
+        && validate_component(name).is_ok()
 }
 
 /// Whether `newest_change` is old enough to sweep.

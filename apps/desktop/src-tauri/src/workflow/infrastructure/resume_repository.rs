@@ -21,7 +21,7 @@ use crate::workflow::domain::types::RunRecord;
 use crate::workflow::ports::repository::WorkflowRepository;
 
 const RESUME_COLUMNS: &str = "run_id, state, auto_resume_used, last_interruption_reason,
-     reason_code, expected_bytes, expected_item_key, updated_at, generation";
+     reason_code, expected_bytes, expected_item_key, updated_at, generation, last_revision";
 
 fn map_resume(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunResumeRecord> {
     let state_text: String = row.get(1)?;
@@ -46,6 +46,7 @@ fn map_resume(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunResumeRecord> {
         expected_item_key: row.get(6)?,
         updated_at: row.get(7)?,
         generation: row.get(8)?,
+        last_revision: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
     })
 }
 
@@ -355,6 +356,7 @@ impl SqliteWorkflowRepository {
         step_id: &str,
         reason: &str,
         reason_code: Option<&str>,
+        last_revision: u64,
         now: i64,
     ) -> Result<bool, WorkflowError> {
         let tx = connection.unchecked_transaction()?;
@@ -386,15 +388,22 @@ impl SqliteWorkflowRepository {
         )?;
         tx.execute(
             "INSERT INTO workflow_run_resume
-                (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at, generation)
-             VALUES (?1, 'needs_user', 1, ?2, ?3, ?4, 1)
+                (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at, generation, last_revision)
+             VALUES (?1, 'needs_user', 1, ?2, ?3, ?4, 1, ?5)
              ON CONFLICT(run_id) DO UPDATE SET
                 state = 'needs_user',
                 last_interruption_reason = excluded.last_interruption_reason,
                 reason_code = excluded.reason_code,
                 updated_at = excluded.updated_at,
-                generation = workflow_run_resume.generation + 1",
-            params![run_id, reason, reason_code, now],
+                generation = workflow_run_resume.generation + 1,
+                last_revision = MAX(workflow_run_resume.last_revision, excluded.last_revision)",
+            params![
+                run_id,
+                reason,
+                reason_code,
+                now,
+                i64::try_from(last_revision).unwrap_or(i64::MAX)
+            ],
         )?;
         append_event(&tx, run_id, Some(step_id), "run_paused_for_user", "{}", now)?;
         tx.commit()?;
@@ -412,6 +421,7 @@ impl SqliteWorkflowRepository {
         reason: &str,
         reason_code: Option<&str>,
         now: i64,
+        expected_generation: Option<i64>,
     ) -> Result<bool, WorkflowError> {
         let tx = connection.unchecked_transaction()?;
         let Some(run) = self.get_run(&tx, run_id)? else {
@@ -419,6 +429,13 @@ impl SqliteWorkflowRepository {
         };
         if run.state != RunState::Paused {
             return Ok(false);
+        }
+        // A park decided against an older pause must not overwrite a newer one.
+        if let (Some(expected), Some(current)) = (expected_generation, self.get_resume(&tx, run_id)?)
+        {
+            if current.generation != expected {
+                return Ok(false);
+            }
         }
         tx.execute(
             "INSERT INTO workflow_run_resume

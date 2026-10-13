@@ -174,6 +174,7 @@ fn a_failed_resumed_attempt_pauses_and_continue_runs_exactly_one_attempt() {
             &step,
             "network dropped",
             Some("HELPER_FAILED"),
+            0,
             13,
         )
         .unwrap());
@@ -214,7 +215,8 @@ fn parking_for_the_user_keeps_the_budget_unspent() {
             "run-c",
             "helpers missing",
             Some("HELPER_MISSING"),
-            11
+            11,
+            None,
         )
         .unwrap());
     let row = resume(&connection, "run-c");

@@ -72,9 +72,6 @@ pub struct YouTubeLiveHandle {
     shutting_down: AtomicBool,
     submissions: Mutex<HashMap<String, SubmissionLedgerEntry>>,
     submission_order: Mutex<VecDeque<String>>,
-    /// Highest revision published per run, so a re-attached run (Continue)
-    /// keeps counting up and the UI never discards its events as stale.
-    last_revisions: Mutex<HashMap<String, u64>>,
     /// Runs once, just before the next `update_snapshot` takes the active
     /// lock, so a test can land a pause in what used to be the race window.
     #[cfg(test)]
@@ -92,7 +89,6 @@ impl Default for YouTubeLiveHandle {
             shutting_down: AtomicBool::new(false),
             submissions: Mutex::new(HashMap::new()),
             submission_order: Mutex::new(VecDeque::new()),
-            last_revisions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             before_update: Mutex::new(None),
         }
@@ -269,6 +265,18 @@ impl YouTubeLiveHandle {
         plan_fingerprint: String,
         work_items: &[TransientWorkItem],
     ) -> Result<Arc<TransientRunControl>, TransientRuntimeError> {
+        self.attach_run_at(run_id, client_submission_id, plan_fingerprint, work_items, 0)
+    }
+
+    /// [`Self::attach_run`] whose first revision exceeds `base_revision`.
+    pub fn attach_run_at(
+        &self,
+        run_id: String,
+        client_submission_id: String,
+        plan_fingerprint: String,
+        work_items: &[TransientWorkItem],
+        base_revision: u64,
+    ) -> Result<Arc<TransientRunControl>, TransientRuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(TransientRuntimeError::ShuttingDown);
         }
@@ -286,14 +294,10 @@ impl YouTubeLiveHandle {
             plan_fingerprint,
             work_items,
         );
-        if let Some(last) = self
-            .last_revisions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&run_id)
-        {
-            snapshot.revision = snapshot.revision.max(last + 1);
-        }
+        // A re-attached run (Continue) keeps counting up from the revision
+        // durably recorded when it paused, so the UI never discards its events
+        // as stale, whatever any in-memory cache has forgotten.
+        snapshot.revision = snapshot.revision.max(base_revision.saturating_add(1));
         *active = Some(ActiveDownload {
             run_id,
             control_revision: snapshot.revision,
@@ -591,24 +595,38 @@ impl YouTubeLiveHandle {
                 .is_some()
     }
 
+    /// Revision of the run's current live snapshot (0 when it has none).
+    pub fn revision_of(&self, run_id: &str) -> u64 {
+        self.snapshot(Some(run_id))
+            .ok()
+            .flatten()
+            .map_or(0, |snapshot| snapshot.revision)
+    }
+
     /// End the live view of a run whose attempt failed but which the user
     /// can continue. The snapshot becomes `Paused` with `error` (items that
     /// were running go back to pending, nothing is marked failed) and the
     /// active slot is released, so the next run or an explicit Continue can
-    /// attach. Returns `None` when `run_id` does not own the slot.
-    pub fn suspend_run(
-        &self,
-        run_id: &str,
-        error: Option<TransientError>,
-    ) -> Option<TransientRunSnapshot> {
+    /// attach.
+    ///
+    /// A cancel that already reached the control wins: nothing is changed and
+    /// [`SuspendOutcome::Cancelled`] tells the caller to finish as cancelled.
+    /// The check and the change happen under the active lock that `cancel`
+    /// also takes, so they cannot interleave.
+    pub fn suspend_run(&self, run_id: &str, error: Option<TransientError>) -> SuspendOutcome {
         let (snapshot, control) = {
             let mut active = self
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let current = active.as_mut()?;
+            let Some(current) = active.as_mut() else {
+                return SuspendOutcome::NotOwner;
+            };
             if current.run_id != run_id {
-                return None;
+                return SuspendOutcome::NotOwner;
+            }
+            if current.control.is_cancelled() {
+                return SuspendOutcome::Cancelled;
             }
             current.snapshot.revision += 1;
             current.snapshot.state = TransientRunState::Paused;
@@ -630,7 +648,7 @@ impl YouTubeLiveHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
         self.emit(&snapshot);
-        Some(snapshot)
+        SuspendOutcome::Suspended(snapshot)
     }
 
     fn clear_discovery(&self, operation_id: &str) {
@@ -647,17 +665,6 @@ impl YouTubeLiveHandle {
     }
 
     fn emit(&self, snapshot: &TransientRunSnapshot) {
-        {
-            let mut revisions = self
-                .last_revisions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if revisions.len() >= 256 && !revisions.contains_key(&snapshot.run_id) {
-                revisions.clear();
-            }
-            let entry = revisions.entry(snapshot.run_id.clone()).or_insert(0);
-            *entry = (*entry).max(snapshot.revision);
-        }
         if let Some(sink) = self
             .sink
             .lock()
@@ -839,28 +846,44 @@ mod tests {
     }
 
     #[test]
-    fn a_reattached_run_keeps_counting_revisions_up() {
+    fn a_reattached_run_continues_from_the_durable_revision_base() {
         let (live, item) = live_with_run("run-continue");
         tick(&live, "run-continue", &item, 0.5);
-        tick(&live, "run-continue", &item, 0.6);
-        let before = live.snapshot(Some("run-continue")).unwrap().unwrap().revision;
-        live.suspend_run("run-continue", None).unwrap();
-        let after_suspend = live.snapshot(Some("run-continue")).unwrap().unwrap().revision;
-        assert!(after_suspend > before);
+        let before = live.revision_of("run-continue");
+        assert!(matches!(
+            live.suspend_run("run-continue", None),
+            SuspendOutcome::Suspended(_)
+        ));
+        let paused_at = before + 1;
 
-        live.attach_run(
-            "run-continue".to_string(),
-            "sub".to_string(),
-            "fp".to_string(),
-            std::slice::from_ref(&item),
-        )
-        .unwrap();
+        // A different handle (or one that has forgotten everything) attaching
+        // with the durable base still moves forward.
+        let fresh = YouTubeLiveHandle::default();
+        fresh
+            .attach_run_at(
+                "run-continue".to_string(),
+                "sub".to_string(),
+                "fp".to_string(),
+                std::slice::from_ref(&item),
+                paused_at,
+            )
+            .unwrap();
 
-        let reattached = live.snapshot(Some("run-continue")).unwrap().unwrap().revision;
         assert!(
-            reattached > after_suspend,
+            fresh.revision_of("run-continue") > paused_at,
             "the UI discards events whose revision does not exceed the last one it saw"
         );
+    }
+
+    #[test]
+    fn suspending_a_cancelled_run_changes_nothing() {
+        let (live, _item) = live_with_run("run-cancelled");
+        live.cancel("run-cancelled").unwrap();
+        assert!(matches!(
+            live.suspend_run("run-cancelled", None),
+            SuspendOutcome::Cancelled
+        ));
+        assert!(live.has_active_run("run-cancelled"));
     }
 
     #[test]
@@ -1110,6 +1133,16 @@ mod tests {
         assert!(!live.has_active_run(&run_id));
         assert!(!submit_error.to_string().is_empty());
     }
+}
+
+/// Result of [`YouTubeLiveHandle::suspend_run`].
+#[derive(Debug)]
+pub enum SuspendOutcome {
+    Suspended(TransientRunSnapshot),
+    /// The run was cancelled first; finish it as cancelled.
+    Cancelled,
+    /// The run does not own the active slot.
+    NotOwner,
 }
 
 pub struct DiscoveryGuard<'a> {

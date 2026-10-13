@@ -71,6 +71,9 @@ pub struct RunResumeRecord {
     /// Bumped every time the run enters a pause, so Continue can name the
     /// pause it answers.
     pub generation: i64,
+    /// Highest live-snapshot revision published before the last pause, so a
+    /// re-attached run keeps counting up whatever the in-memory caches did.
+    pub last_revision: u64,
 }
 
 /// What a restart reconcile did.

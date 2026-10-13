@@ -786,7 +786,8 @@ pub(super) fn cancel_youtube_download_blocking(
         Ok::<_, YouTubeError>((snapshot, unowned))
     })?;
     if let Some(run) = unowned_paused {
-        resume::discard_paused_run_staging(&run);
+        let shared = resume::staging_shared_with_others(runtime, run_id, &run.output_root);
+        resume::discard_paused_run_staging(&run, &shared);
         live.publish_snapshot(snapshot.clone());
     }
     Ok(snapshot)

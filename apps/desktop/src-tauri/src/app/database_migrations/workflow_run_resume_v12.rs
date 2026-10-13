@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS workflow_run_resume (
     expected_bytes INTEGER CHECK(expected_bytes IS NULL OR expected_bytes >= 0),
     expected_item_key TEXT,
     updated_at INTEGER NOT NULL,
-    generation INTEGER NOT NULL DEFAULT 0
+    generation INTEGER NOT NULL DEFAULT 0,
+    last_revision INTEGER NOT NULL DEFAULT 0
 );
 "#;
 
@@ -37,6 +38,7 @@ pub fn install_and_verify(connection: &Connection) -> Result<()> {
     connection.execute_batch("SAVEPOINT workflow_run_resume_v12")?;
     let result = (|| {
         connection.execute_batch(INSTALL)?;
+        add_missing_columns(connection)?;
         verify(connection)
     })();
     if result.is_ok() {
@@ -48,6 +50,28 @@ pub fn install_and_verify(connection: &Connection) -> Result<()> {
          RELEASE workflow_run_resume_v12;",
     );
     result
+}
+
+/// Databases created by an earlier build of this (unreleased) schema lack the
+/// later columns; `CREATE TABLE IF NOT EXISTS` leaves them untouched, so add
+/// each missing column in place. Existing rows take the default.
+fn add_missing_columns(connection: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_revision", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let present: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('workflow_run_resume') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            connection.execute_batch(&format!(
+                "ALTER TABLE workflow_run_resume ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 fn verify(connection: &Connection) -> Result<()> {
@@ -75,6 +99,7 @@ fn verify(connection: &Connection) -> Result<()> {
         ("expected_item_key", "TEXT", 0, 0),
         ("updated_at", "INTEGER", 1, 0),
         ("generation", "INTEGER", 1, 0),
+        ("last_revision", "INTEGER", 1, 0),
     ];
     if columns
         != expected
@@ -200,6 +225,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, 1, "existing runs survive the migration");
+    }
+
+    #[test]
+    fn persistence_gate_a_database_from_the_first_v12_build_gains_the_later_columns() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("linkvault.sqlite3");
+        {
+            let (connection, _) = initialize_database(&db_path).unwrap();
+            insert_run(&connection, "run-old");
+            // The table exactly as the first v12 build created it.
+            connection
+                .execute_batch(
+                    "DROP TABLE workflow_run_resume;
+                     CREATE TABLE workflow_run_resume (
+                        run_id TEXT NOT NULL PRIMARY KEY REFERENCES workflow_runs(id) ON DELETE CASCADE,
+                        state TEXT NOT NULL CHECK(state IN ('auto_pending', 'needs_user', 'resuming')),
+                        auto_resume_used INTEGER NOT NULL DEFAULT 0 CHECK(auto_resume_used IN (0, 1)),
+                        last_interruption_reason TEXT,
+                        reason_code TEXT,
+                        expected_bytes INTEGER CHECK(expected_bytes IS NULL OR expected_bytes >= 0),
+                        expected_item_key TEXT,
+                        updated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO workflow_run_resume (run_id, state, updated_at)
+                        VALUES ('run-old', 'auto_pending', 5);
+                     PRAGMA user_version = 12;",
+                )
+                .unwrap();
+        }
+
+        let (connection, initialization) = initialize_database(&db_path).unwrap();
+        assert_eq!(initialization.from_version, 12);
+        assert_eq!(initialization.to_version, CURRENT_SCHEMA_VERSION);
+        let (generation, revision): (i64, i64) = connection
+            .query_row(
+                "SELECT generation, last_revision FROM workflow_run_resume WHERE run_id = 'run-old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((generation, revision), (0, 0));
+        // And the resume code can use the upgraded table.
+        connection
+            .execute_batch(
+                "UPDATE workflow_runs SET state = 'running' WHERE id = 'run-old'",
+            )
+            .unwrap();
+        let summary = crate::workflow::infrastructure::sqlite_repository::SqliteWorkflowRepository
+            .reconcile_for_resume(&connection, "youtube_download", "restart", 10)
+            .unwrap();
+        assert_eq!(summary.resumable, 1);
     }
 
     #[test]

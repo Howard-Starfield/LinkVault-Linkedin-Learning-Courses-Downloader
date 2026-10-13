@@ -486,6 +486,7 @@ impl WorkflowRepositoryService {
         step_id: String,
         reason: String,
         reason_code: Option<String>,
+        last_revision: u64,
         now: i64,
     ) -> Result<bool, WorkflowError> {
         let id = run_id.clone();
@@ -496,6 +497,7 @@ impl WorkflowRepositoryService {
                 &step_id,
                 &reason,
                 reason_code.as_deref(),
+                last_revision,
                 now,
             )
         })
@@ -507,10 +509,18 @@ impl WorkflowRepositoryService {
         reason: String,
         reason_code: Option<String>,
         now: i64,
+        expected_generation: Option<i64>,
     ) -> Result<bool, WorkflowError> {
         let id = run_id.clone();
         self.with_connection("workflow_park_for_user", Some(id), move |repo, conn| {
-            repo.park_for_user(conn, &run_id, &reason, reason_code.as_deref(), now)
+            repo.park_for_user(
+                conn,
+                &run_id,
+                &reason,
+                reason_code.as_deref(),
+                now,
+                expected_generation,
+            )
         })
     }
 

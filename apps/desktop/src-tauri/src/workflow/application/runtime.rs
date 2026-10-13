@@ -790,11 +790,12 @@ impl WorkflowRuntime {
         reason: String,
         reason_code: Option<String>,
         now: i64,
+        expected_generation: Option<i64>,
     ) -> Result<bool, WorkflowError> {
         self.after_mutation(
             self.inner
                 .service
-                .park_for_user(run_id, reason, reason_code, now),
+                .park_for_user(run_id, reason, reason_code, now, expected_generation),
         )
     }
 
@@ -806,6 +807,7 @@ impl WorkflowRuntime {
         run_id: String,
         reason: String,
         reason_code: String,
+        last_revision: u64,
     ) -> Result<bool, WorkflowError> {
         let steps = self.inner.service.list_steps_for_run(run_id.clone())?;
         let step_id = steps
@@ -818,6 +820,7 @@ impl WorkflowRuntime {
             step_id,
             reason,
             Some(reason_code),
+            last_revision,
             chrono::Utc::now().timestamp(),
         ))
     }
@@ -1364,6 +1367,7 @@ fn apply_executor_outcome(
             step_id.to_string(),
             reason,
             outcome.pause_code.clone(),
+            0,
             now,
         )? {
             return Ok(false);

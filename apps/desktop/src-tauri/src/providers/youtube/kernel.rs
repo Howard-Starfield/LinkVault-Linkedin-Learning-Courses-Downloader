@@ -6,6 +6,7 @@ use crate::app::managed_process::{
 };
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::resume::{discard_run_staging, pause_reason, ChangeNotifier};
+use crate::providers::youtube::live::SuspendOutcome;
 use crate::providers::youtube::live::{
     apply_item_failure, apply_item_outcome, executor_from_request, finish_snapshot,
     YouTubeLiveHandle, YoutubeDurableRequest,
@@ -38,7 +39,15 @@ pub trait ResumeLedger: Send + Sync {
     /// Durably pause the running run for the user. Called before the live
     /// snapshot is published, so the UI never shows a pause that is not
     /// committed.
-    fn pause_for_user(&self, run_id: &str, reason: &str, code: &str) -> bool;
+    ///
+    /// `last_revision` is recorded so a re-attached run keeps counting up.
+    /// Returns `false` when the run is no longer running (it is being
+    /// cancelled), in which case nothing was committed.
+    fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, last_revision: u64) -> bool;
+
+    /// Staging directory names that other unfinished runs under `root` still
+    /// reference; they must survive this run's cleanup.
+    fn shared_staging(&self, run_id: &str, root: &str) -> std::collections::HashSet<String>;
 }
 
 impl ResumeLedger for WorkflowRuntime {
@@ -52,9 +61,18 @@ impl ResumeLedger for WorkflowRuntime {
             })
     }
 
-    fn pause_for_user(&self, run_id: &str, reason: &str, code: &str) -> bool {
-        self.pause_running_for_user(run_id.to_string(), reason.to_string(), code.to_string())
-            .unwrap_or(false)
+    fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, last_revision: u64) -> bool {
+        self.pause_running_for_user(
+            run_id.to_string(),
+            reason.to_string(),
+            code.to_string(),
+            last_revision,
+        )
+        .unwrap_or(false)
+    }
+
+    fn shared_staging(&self, run_id: &str, root: &str) -> std::collections::HashSet<String> {
+        crate::providers::youtube::resume::staging_shared_with_others(self, run_id, root)
     }
 
     fn record_expected_bytes(&self, run_id: &str, item_key: &str, bytes: u64) {
@@ -120,7 +138,12 @@ impl StepExecutor for YoutubeDownloadExecutor {
         if !outcome.succeeded && !outcome.pause_for_user {
             // Cancelled or failed for good: nothing will resume from the
             // partial files, so remove them now.
-            discard_run_staging(&staging_root, &request.work_items);
+            let shared = self
+                .resume
+                .as_ref()
+                .map(|ledger| ledger.shared_staging(&run.id, &run.output_root))
+                .unwrap_or_default();
+            discard_run_staging(&staging_root, &request.work_items, &shared);
         }
         outcome
     }
@@ -209,21 +232,48 @@ impl YoutubeDownloadExecutor {
             code: error.code.clone(),
             message: reason.clone(),
         };
-        // Commit first, publish second: the panel must never show a pause
-        // the database does not have yet.
-        if let Some(ledger) = &self.resume {
-            ledger.pause_for_user(run_id, &reason, &error.code);
+        // Commit first, publish second: the panel must never show a pause the
+        // database does not have yet.
+        let revision = self.live.revision_of(run_id).saturating_add(1);
+        let committed = self.resume.as_ref().map_or(true, |ledger| {
+            ledger.pause_for_user(run_id, &reason, &error.code, revision)
+        });
+        let cancelled = self
+            .live
+            .control_for(run_id)
+            .is_some_and(|control| control.is_cancelled());
+        if !committed || cancelled {
+            // A cancel got there first (or in between): it wins, and the
+            // outcome says so. Staging is cleaned up by the caller.
+            return self.end_cancelled(run_id, snapshot, &reason);
         }
-        if self.live.suspend_run(run_id, Some(shown.clone())).is_none() {
-            snapshot.state = crate::app::managed_process::TransientRunState::Paused;
-            snapshot.error = Some(shown);
-            snapshot.revision += 1;
-            self.live.publish_snapshot(snapshot.clone());
+        match self.live.suspend_run(run_id, Some(shown.clone())) {
+            SuspendOutcome::Suspended(_) => {}
+            SuspendOutcome::Cancelled => return self.end_cancelled(run_id, snapshot, &reason),
+            SuspendOutcome::NotOwner => {
+                snapshot.state = crate::app::managed_process::TransientRunState::Paused;
+                snapshot.error = Some(shown);
+                snapshot.revision += 1;
+                self.live.publish_snapshot(snapshot.clone());
+            }
         }
         if let Some(notify) = &self.notify_resume_changed {
             notify();
         }
         ExecutorOutcome::paused_for_user(reason, Some(error.code.clone()))
+    }
+
+    fn end_cancelled(
+        &self,
+        run_id: &str,
+        snapshot: &mut TransientRunSnapshot,
+        message: &str,
+    ) -> ExecutorOutcome {
+        self.commit(run_id, snapshot, |live| finish_snapshot(live, true, None));
+        if let Some(notify) = &self.notify_resume_changed {
+            notify();
+        }
+        ExecutorOutcome::cancelled(message.to_string())
     }
 
     /// Drive every work item through `executor`. When `resumed`, a failure
@@ -856,7 +906,11 @@ mod tests {
                 .push((item_key.to_string(), bytes));
         }
 
-        fn pause_for_user(&self, run_id: &str, reason: &str, code: &str) -> bool {
+        fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
+            Default::default()
+        }
+
+        fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, _: u64) -> bool {
             self.pauses
                 .lock()
                 .unwrap()
@@ -1038,7 +1092,10 @@ mod tests {
                 true
             }
             fn record_expected_bytes(&self, _: &str, _: &str, _: u64) {}
-            fn pause_for_user(&self, run_id: &str, _: &str, _: &str) -> bool {
+            fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
+                Default::default()
+            }
+            fn pause_for_user(&self, run_id: &str, _: &str, _: &str, _: u64) -> bool {
                 let already = self
                     .published
                     .lock()
@@ -1084,5 +1141,104 @@ mod tests {
             Some(false),
             "the durable pause must be committed before the paused snapshot is emitted"
         );
+    }
+
+    #[test]
+    fn a_cancel_that_lands_after_the_pause_commit_wins() {
+        struct CancelsAfterCommit {
+            live: Arc<YouTubeLiveHandle>,
+        }
+        impl ResumeLedger for CancelsAfterCommit {
+            fn is_resumed_attempt(&self, _: &str) -> bool {
+                true
+            }
+            fn record_expected_bytes(&self, _: &str, _: &str, _: u64) {}
+            fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
+                Default::default()
+            }
+            fn pause_for_user(&self, run_id: &str, _: &str, _: &str, _: u64) -> bool {
+                // The durable pause committed; the user's cancel arrives
+                // before the live view is suspended.
+                self.live.cancel(run_id).unwrap();
+                true
+            }
+        }
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-race".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: Some(Arc::new(CancelsAfterCommit {
+                live: Arc::clone(&live),
+            })),
+            notify_resume_changed: None,
+        };
+
+        let outcome = kernel.run_items_with(
+            "yt-race",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            true,
+        );
+
+        assert!(outcome.cancelled, "{outcome:?}");
+        assert!(!outcome.pause_for_user);
+        assert!(!live.has_active_run("yt-race"));
+        let last = published.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            last.state,
+            TransientRunState::Cancelled,
+            "the live view must agree with the cancelled durable run"
+        );
+    }
+
+    #[test]
+    fn a_pause_that_cannot_commit_because_the_run_is_cancelling_ends_as_cancelled() {
+        struct RefusesPause;
+        impl ResumeLedger for RefusesPause {
+            fn is_resumed_attempt(&self, _: &str) -> bool {
+                true
+            }
+            fn record_expected_bytes(&self, _: &str, _: &str, _: u64) {}
+            fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
+                Default::default()
+            }
+            fn pause_for_user(&self, _: &str, _: &str, _: &str, _: u64) -> bool {
+                false
+            }
+        }
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-refused".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: Some(Arc::new(RefusesPause)),
+            notify_resume_changed: None,
+        };
+        let outcome = kernel.run_items_with(
+            "yt-refused",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            true,
+        );
+        assert!(outcome.cancelled);
+        assert!(!live.has_active_run("yt-refused"));
     }
 }

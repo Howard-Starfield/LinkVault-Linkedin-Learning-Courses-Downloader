@@ -12,7 +12,8 @@ use crate::providers::youtube::download_progress::{
     ProgressReading, FORMATS_PRINT, FORMAT_ID_PRINT, PROGRESS_TEMPLATE,
 };
 use crate::providers::youtube::resume::{
-    classify_helper_failure, keep_staging_after, pause_reason, pinned_format_unavailable,
+    classify_helper_failure, has_incomplete_partials, keep_staging_after, pause_reason,
+    pinned_format_unavailable,
     stale_part_leaves, FailureKind, FORMAT_MARKER,
 };
 use crate::app::safe_output_filesystem::resume::StagingDisposition;
@@ -232,6 +233,8 @@ struct VerifiedArtifact {
 enum FfprobeVerificationError {
     ManagedProcess(ManagedProcessError),
     Message(String),
+    /// FFmpeg proved the downloaded file is not valid media.
+    Corrupt(String),
 }
 
 impl From<String> for FfprobeVerificationError {
@@ -671,9 +674,26 @@ impl YouTubeExecutor {
         if preserved_bytes > 0 && !matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
             match read_format_marker(cleanup.lease()) {
                 Some(selection) => pinned = Some(selection),
-                None => wipe_staging(cleanup.lease())
-                    .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?,
+                None => {
+                    // No record of the format. Unfinished downloads could be
+                    // any format and are removed; complete files cannot be
+                    // mixed and are kept.
+                    let names = cleanup
+                        .lease()
+                        .leaf_names()
+                        .map_err(|error| transient_error("OUTPUT_VERIFY_FAILED", error.to_string()))?;
+                    if has_incomplete_partials(&names) {
+                        wipe_staging(cleanup.lease())
+                            .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
+                    }
+                }
             }
+        }
+        if preserved_bytes > 0 {
+            // Derived files of an earlier, interrupted finalization are
+            // regenerated from the media; stale ones would collide.
+            remove_derived_files(cleanup.lease())
+                .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         }
         let kept_bytes = if preserved_bytes > 0 {
             cleanup.lease().leaf_bytes().unwrap_or(0)
@@ -786,9 +806,6 @@ impl YouTubeExecutor {
         }
         purge_stale_parts(cleanup.lease(), &chosen_formats)
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
-        // The marker is bookkeeping, not an artifact: gone before verification.
-        remove_format_marker(cleanup.lease())
-            .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         // Publish the last bytes if the throttle was still holding them back.
         if let Some(reading) = download_progress.flush(clock()) {
             report_download_progress(progress, item, download_phase, &reading);
@@ -866,15 +883,29 @@ impl YouTubeExecutor {
             &self.mode,
             YouTubeDownloadMode::VideoOnly | YouTubeDownloadMode::VideoAndTranscript
         ) {
-            verify_media_with_ffprobe(
+            match verify_media_with_ffprobe(
                 cleanup.lease(),
                 self.item_context(item)
                     .map_err(|message| transient_error("MEDIA_POLICY_MISSING", message))?,
                 &verified,
                 control,
                 self.runner.as_ref(),
-            )
-            .map_err(map_fresh_ffprobe_error)?
+            ) {
+                Ok(warnings) => warnings,
+                Err(FfprobeVerificationError::Corrupt(message)) => {
+                    // FFmpeg proved the file invalid: delete just the media
+                    // (and only after its verification handles are released);
+                    // everything else in staging stays.
+                    drop(initial_leaf_handles);
+                    for artifact in verified.iter().filter(|artifact| artifact.kind == "media") {
+                        let _ = cleanup.lease().remove_leaf(&artifact.name);
+                    }
+                    return Err(transient_error("MEDIA_CORRUPT", message));
+                }
+                // An I/O or process failure proves nothing about the file:
+                // the download is kept so Continue only re-verifies.
+                Err(other) => return Err(map_fresh_ffprobe_error(other)),
+            }
         } else {
             Vec::new()
         };
@@ -968,6 +999,10 @@ impl YouTubeExecutor {
         // before the atomic directory rename, then recheck the same hashes at
         // the published path before reporting completion.
         drop(held_leaf_handles);
+        // Kept through verification so a crash there still resumes with the
+        // media; it must not be published.
+        remove_format_marker(cleanup.lease())
+            .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         let destination = self
             .output_root
             .publish_attempt_lease(cleanup.take_lease(), stem)
@@ -1360,9 +1395,9 @@ fn verify_media_with_ffprobe(
             .into());
     }
     if !output.status.success() {
-        return Err("The downloaded file failed the FFmpeg media check: it could not be read"
-            .to_string()
-            .into());
+        return Err(FfprobeVerificationError::Corrupt(
+            "The downloaded file failed the FFmpeg media check: it could not be read".to_string(),
+        ));
     }
     let verified = verify_ffmpeg_copy_probe(
         &FfmpegCopyProbeOutput {
@@ -1374,7 +1409,7 @@ fn verify_media_with_ffprobe(
         MediaMode::VideoAndAudio,
         context.source_duration_seconds.map(|value| value as f64),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| FfprobeVerificationError::Corrupt(error.to_string()))?;
     Ok(if verified.warnings.is_empty() {
         Vec::new()
     } else {
@@ -1490,6 +1525,10 @@ fn verify_artifacts(
             .and_then(|name| name.to_str())
             .ok_or_else(|| format!("staging contained an unnamed artifact: {}", path.display()))?;
         validate_output_component(name).map_err(|error| error.to_string())?;
+        // Resume bookkeeping, not an artifact; removed just before publication.
+        if name == FORMAT_MARKER {
+            continue;
+        }
         if name == "manifest.json" {
             if allow_manifest {
                 continue;
@@ -2407,6 +2446,7 @@ fn map_fresh_ffprobe_error(error: FfprobeVerificationError) -> TransientError {
         FfprobeVerificationError::Message(message) => {
             transient_error("MEDIA_VERIFY_FAILED", message)
         }
+        FfprobeVerificationError::Corrupt(message) => transient_error("MEDIA_CORRUPT", message),
     }
 }
 
@@ -2424,6 +2464,7 @@ fn map_existing_output_verification_error(
             error,
         )) => existing_output_collision_error(error.to_string()),
         ExistingOutputVerificationError::Ffprobe(FfprobeVerificationError::Message(message))
+        | ExistingOutputVerificationError::Ffprobe(FfprobeVerificationError::Corrupt(message))
         | ExistingOutputVerificationError::Message(message) => {
             existing_output_collision_error(message)
         }
@@ -2494,6 +2535,17 @@ fn remove_format_marker(lease: &OutputAttemptLease) -> Result<(), String> {
         lease
             .remove_leaf(FORMAT_MARKER)
             .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Delete files derived from the media (normalized transcripts, manifest) so a
+/// resumed attempt regenerates them instead of colliding with leftovers.
+fn remove_derived_files(lease: &OutputAttemptLease) -> Result<(), String> {
+    for name in lease.leaf_names().map_err(|error| error.to_string())? {
+        if name == "manifest.json" || name.to_ascii_lowercase().ends_with(".transcript.json") {
+            lease.remove_leaf(&name).map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -3157,6 +3209,8 @@ mod tests {
         seen_args: std::sync::Mutex<Vec<Vec<String>>>,
         /// Refuse any pinned `--format` as no longer available.
         reject_pinned: std::sync::atomic::AtomicBool,
+        /// Make the next media check fail: 1 = timed out, 2 = unreadable file.
+        probe_failure: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeRunner {
@@ -3175,6 +3229,7 @@ mod tests {
                 fail_lines: std::sync::Mutex::new(Vec::new()),
                 seen_args: std::sync::Mutex::new(Vec::new()),
                 reject_pinned: std::sync::atomic::AtomicBool::new(false),
+                probe_failure: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -3189,6 +3244,7 @@ mod tests {
                 fail_lines: std::sync::Mutex::new(Vec::new()),
                 seen_args: std::sync::Mutex::new(Vec::new()),
                 reject_pinned: std::sync::atomic::AtomicBool::new(false),
+                probe_failure: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -3268,6 +3324,18 @@ mod tests {
                 }
                 (String::new(), String::new())
             } else {
+                let failure = self.probe_failure.swap(0, Ordering::SeqCst);
+                if failure != 0 {
+                    return Ok(ManagedProcessOutput {
+                        status: std::process::ExitStatus::from_raw(if failure == 2 { 1 } else { 0 }),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        timed_out: failure == 1,
+                        cancelled: false,
+                    });
+                }
                 let input = arg_after(&args, "-i").expect("probe has -i");
                 (
                     "frame=10\nout_time_us=1000000\nprogress=end\n".to_string(),
@@ -3675,6 +3743,109 @@ mod tests {
             runner.seen_at_start.lock().unwrap().is_empty(),
             "the retry starts from an empty directory"
         );
+    }
+
+    #[test]
+    fn a_verification_io_failure_keeps_the_downloaded_media_and_resume_does_not_wipe_it() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            VALID_VTT,
+            vec![ScriptStep::Line("LVFORMATID 137+140".to_string())],
+        );
+        runner.probe_failure.store(1, Ordering::SeqCst);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(error.code, "MEDIA_VERIFY_FAILED");
+        let kept = staging_dirs(temp.path());
+        assert_eq!(kept.len(), 1, "the finished download must be kept");
+        let files = fs::read_dir(temp.path().join(".lv").join(&kept[0]))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(files.contains(&"media.mp4".to_string()), "{files:?}");
+        assert!(
+            files.contains(&FORMAT_MARKER.to_string()),
+            "the marker stays until publication: {files:?}"
+        );
+
+        // Resume (the app was killed during verification): the media is
+        // still there, pinned to its format, and the item publishes.
+        run_collecting(&executor, &item).0.expect("re-verified");
+        let at_start = runner.seen_at_start.lock().unwrap().clone();
+        assert!(
+            at_start.iter().any(|(name, _)| name == "media.mp4"),
+            "completed media must reach yt-dlp untouched: {at_start:?}"
+        );
+        let seen = runner.seen_args.lock().unwrap().clone();
+        assert_eq!(format_of(&seen[1]).as_deref(), Some("137+140"));
+        let published = published_files(temp.path());
+        assert!(published.contains(&"media.mp4".to_string()), "{published:?}");
+        assert!(!published.contains(&FORMAT_MARKER.to_string()), "{published:?}");
+        assert!(staging_dirs(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn complete_media_without_a_format_marker_is_kept_but_partials_are_not() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        runner.probe_failure.store(1, Ordering::SeqCst);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+
+        run_collecting(&executor, &item).0.expect("re-verified");
+
+        assert!(
+            runner
+                .seen_at_start
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == "media.mp4"),
+            "complete files cannot be mixed across formats, so they stay"
+        );
+    }
+
+    #[test]
+    fn media_that_ffmpeg_proves_corrupt_is_deleted_but_the_rest_of_staging_stays() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            VALID_VTT,
+            vec![ScriptStep::Line("LVFORMATID 18".to_string())],
+        );
+        runner.probe_failure.store(2, Ordering::SeqCst);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+
+        assert_eq!(error.code, "MEDIA_CORRUPT");
+        let kept = staging_dirs(temp.path());
+        assert_eq!(kept.len(), 1);
+        let files = fs::read_dir(temp.path().join(".lv").join(&kept[0]))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!files.contains(&"media.mp4".to_string()), "{files:?}");
+        assert!(files.contains(&FORMAT_MARKER.to_string()), "{files:?}");
+        run_collecting(&executor, &item).0.expect("downloads again");
     }
 
     #[test]
