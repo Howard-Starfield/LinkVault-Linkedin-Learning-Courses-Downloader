@@ -3,7 +3,10 @@ use crate::providers::youtube::error::YouTubeInternalError;
 use crate::providers::youtube::helper::{invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES};
 use crate::providers::youtube::models::{
     PlannedYouTubeTranscriptInspection, ScanYouTubeSourceRequest, ScanYouTubeSourceResponse,
-    YouTubeAvailability, YouTubePlaylistMode, YouTubeScanItem,
+    YouTubeAvailability, YouTubePlaylistMode, YouTubeScanItem, YouTubeTranscriptTrack,
+};
+use crate::providers::youtube::transcript_inspection::{
+    into_plan_inspection, tracks_from_scan_metadata, TranscriptInspectionResult,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use sha2::{Digest, Sha256};
@@ -214,7 +217,7 @@ fn discovery_args(source: &ValidatedSource) -> Vec<String> {
     args
 }
 
-fn parse_scan_plan(
+pub(crate) fn parse_scan_plan(
     source: ValidatedSource,
     stdout: &str,
 ) -> Result<YouTubeScanPlan, YouTubeInternalError> {
@@ -242,6 +245,8 @@ fn parse_scan_plan(
     };
     let truncated = entries.len() > MAX_SCAN_ENTRIES;
     let mut items = Vec::new();
+    // Caption tracks derived from the scan's own metadata, parallel to `items`.
+    let mut scanned_tracks: Vec<Option<Vec<YouTubeTranscriptTrack>>> = Vec::new();
     for (index, entry) in entries.into_iter().take(MAX_SCAN_ENTRIES).enumerate() {
         let Some(video_id) = entry
             .get("id")
@@ -288,6 +293,15 @@ fn parse_scan_plan(
             duration_seconds.map_or_else(String::new, |duration| duration.to_string()),
             availability_label(&availability),
         ));
+        // A video scan runs the same `--dump-single-json --no-playlist` a dedicated
+        // transcript inspection would, so its captions are already in hand.  Flat
+        // playlist entries carry no caption data and stay lazily inspected.
+        scanned_tracks.push(match source.kind {
+            YouTubePlaylistMode::Video => {
+                tracks_from_scan_metadata(&occurrence_id, &entry, stdout.len())
+            }
+            YouTubePlaylistMode::Playlist => None,
+        });
         items.push(PlannedYouTubeItem {
             public: YouTubeScanItem {
                 occurrence_id,
@@ -312,6 +326,19 @@ fn parse_scan_plan(
         ));
     }
     let source_snapshot_digest = snapshot_digest(&source, &items);
+    for (item, tracks) in items.iter_mut().zip(scanned_tracks) {
+        if let Some(tracks) = tracks {
+            item.transcript_inspection = Some(into_plan_inspection(
+                TranscriptInspectionResult {
+                    occurrence_id: item.public.occurrence_id.clone(),
+                    video_id: item.public.video_id.clone(),
+                    tracks,
+                },
+                &source_snapshot_digest,
+                &item.public.metadata_digest,
+            ));
+        }
+    }
     let scan_plan_id = opaque_id("plan");
     let response = ScanYouTubeSourceResponse {
         scan_plan_id,
@@ -662,5 +689,70 @@ mod tests {
             revalidate_selected_items(&frozen, &shifted, &selected),
             Err(YouTubeInternalError::ScanPlanStale)
         ));
+    }
+
+    const VIDEO_WITH_CAPTIONS: &str = r#"{"id":"abc123_XY","title":"Video","channel":"Channel","availability":"public","subtitles":{"en":[{"ext":"vtt","url":"https://signed.example/u","name":"English"}],"fr":[{"ext":"srv3","url":"https://signed.example/f"}]},"automatic_captions":{"en":[{"ext":"vtt","url":"https://signed.example/a","name":"English (auto-generated)"}],"live_chat":[{"ext":"json","url":"https://signed.example/c"}]}}"#;
+
+    #[test]
+    fn video_scan_stores_the_tracks_a_dedicated_inspection_would_compute() {
+        use crate::providers::youtube::transcript_inspection::{
+            parse_transcript_tracks, stored_inspection,
+        };
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, VIDEO_WITH_CAPTIONS).unwrap();
+        let item = &plan.items[0];
+        let stored = item
+            .transcript_inspection
+            .as_ref()
+            .expect("a video scan carries full caption metadata");
+        let from_dedicated_run =
+            parse_transcript_tracks(&item.public.occurrence_id, VIDEO_WITH_CAPTIONS).unwrap();
+        assert_eq!(stored.tracks, from_dedicated_run);
+        assert_eq!(stored.tracks.len(), 3);
+        assert_eq!(
+            stored.context.source_snapshot_digest,
+            plan.source_snapshot_digest
+        );
+        assert_eq!(stored.context.metadata_digest, item.public.metadata_digest);
+        let answered = stored_inspection(item, &plan.source_snapshot_digest).unwrap();
+        assert_eq!(answered.tracks, from_dedicated_run);
+        // A different snapshot never reuses the stored answer.
+        assert!(stored_inspection(item, "other-snapshot").is_none());
+    }
+
+    #[test]
+    fn video_scan_without_caption_blocks_stores_an_empty_answer_like_inspection() {
+        use crate::providers::youtube::transcript_inspection::parse_transcript_tracks;
+        let payload = r#"{"id":"abc123_XY","title":"Video","availability":"public"}"#;
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, payload).unwrap();
+        let stored = plan.items[0].transcript_inspection.as_ref().unwrap();
+        assert_eq!(
+            stored.tracks,
+            parse_transcript_tracks(&plan.items[0].public.occurrence_id, payload).unwrap()
+        );
+        assert!(stored.tracks.is_empty());
+    }
+
+    #[test]
+    fn video_scan_with_malformed_captions_leaves_inspection_to_the_fallback() {
+        let payload = r#"{"id":"abc123_XY","title":"Video","subtitles":[]}"#;
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, payload).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert!(plan.items[0].transcript_inspection.is_none());
+    }
+
+    #[test]
+    fn flat_playlist_entries_never_claim_caption_data() {
+        // `--flat-playlist` entries carry no captions; an empty answer here would
+        // wrongly say "no captions".
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let plan = parse_scan_plan(
+            source,
+            r#"{"id":"PL_12345","entries":[{"id":"abc123_XY","title":"A","availability":"public"}]}"#,
+        )
+        .unwrap();
+        assert!(plan.items.iter().all(|item| item.transcript_inspection.is_none()));
     }
 }

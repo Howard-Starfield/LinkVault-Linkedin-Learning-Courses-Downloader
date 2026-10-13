@@ -1,5 +1,5 @@
 use crate::app::managed_process::{
-    helper_identity, HelperIdentity, ManagedProcessError, TransientRunSnapshot, TransientWorkItem,
+    helper_identity, DiscoveryOperation, HelperIdentity, ManagedProcessError, TransientRunSnapshot, TransientWorkItem,
     MAX_SELECTED_ITEMS,
 };
 use crate::app::safe_output_filesystem::validate_output_root;
@@ -23,7 +23,10 @@ use crate::providers::youtube::models::{
 };
 use crate::shell::open_folder_in_explorer;
 use crate::providers::youtube::scan::{revalidate_selected_source, scan_source, YouTubeScanPlan};
-use crate::providers::youtube::transcript_inspection::{inspect_transcripts, into_plan_inspection};
+use crate::providers::youtube::scan::PlannedYouTubeItem;
+use crate::providers::youtube::transcript_inspection::{
+    inspect_transcripts, into_plan_inspection, stored_inspection, TranscriptInspectionResult,
+};
 use crate::workflow::WorkflowRuntime;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -297,15 +300,31 @@ fn inspect_youtube_transcripts_blocking(
     state: &YouTubePlanStore,
     request: InspectYouTubeTranscriptsRequest,
 ) -> Result<InspectYouTubeTranscriptsResponse, YouTubeError> {
+    inspect_youtube_transcripts_with(live, state, request, &inspect_transcripts)
+}
+
+/// Launches the helper for one occurrence that has no stored inspection.
+type InspectionLauncher<'a> = &'a dyn Fn(
+    &PlannedYouTubeItem,
+    &DiscoveryOperation,
+) -> Result<TranscriptInspectionResult, YouTubeInternalError>;
+
+/// Answers from the plan's stored inspection data (filled at scan time for a
+/// video, or by an earlier inspection) and launches the helper only for
+/// occurrences without it, e.g. flat playlist entries.  The discovery slot is
+/// taken only when a launch is actually needed, so a fully stored answer is
+/// instant and cannot collide with other discovery work or a running download.
+fn inspect_youtube_transcripts_with(
+    live: &YouTubeLiveHandle,
+    state: &YouTubePlanStore,
+    request: InspectYouTubeTranscriptsRequest,
+    launch: InspectionLauncher<'_>,
+) -> Result<InspectYouTubeTranscriptsResponse, YouTubeError> {
     validate_operation_id(&request.client_operation_id)?;
-    let guard = live
-        .begin_discovery(request.client_operation_id)
-        .map_err(YouTubeError::from)?;
     let plan = get_plan(state, &request.scan_plan_id)?;
     let mut seen = std::collections::HashSet::new();
-    let mut occurrences = Vec::new();
-    let mut plan_inspections = Vec::new();
-    for occurrence_id in request.occurrence_ids {
+    let mut targets: Vec<(&PlannedYouTubeItem, Option<TranscriptInspectionResult>)> = Vec::new();
+    for occurrence_id in &request.occurrence_ids {
         if !seen.insert(occurrence_id.clone()) {
             return Err(YouTubeError::from(
                 YouTubeInternalError::DuplicateOccurrence,
@@ -314,35 +333,57 @@ fn inspect_youtube_transcripts_blocking(
         let item = plan
             .items
             .iter()
-            .find(|item| item.public.occurrence_id == occurrence_id)
+            .find(|item| &item.public.occurrence_id == occurrence_id)
             .ok_or_else(|| YouTubeError::from(YouTubeInternalError::UnknownOccurrence))?;
         if item.public.availability != YouTubeAvailability::Available {
             return Err(YouTubeError::from(YouTubeInternalError::ScanPlanStale));
         }
-        if guard.operation.cancellation_requested() {
-            return Err(YouTubeError::new(
-                "DISCOVERY_CANCELLED",
-                "transcript inspection was cancelled",
-            ));
-        }
-        let inspected = inspect_transcripts(item, &guard.operation).map_err(YouTubeError::from)?;
-        occurrences.push(YouTubeTranscriptOccurrence {
-            occurrence_id: inspected.occurrence_id.clone(),
-            video_id: inspected.video_id.clone(),
-            tracks: inspected.tracks.clone(),
-        });
-        plan_inspections.push(into_plan_inspection(
-            inspected,
-            &plan.source_snapshot_digest,
-            &item.public.metadata_digest,
-        ));
+        targets.push((item, stored_inspection(item, &plan.source_snapshot_digest)));
     }
-    state
-        .plans
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .apply_transcript_inspections(&request.scan_plan_id, plan_inspections)
-        .map_err(YouTubeError::from)?;
+    let guard = if targets.iter().any(|(_, stored)| stored.is_none()) {
+        Some(
+            live.begin_discovery(request.client_operation_id.clone())
+                .map_err(YouTubeError::from)?,
+        )
+    } else {
+        None
+    };
+    let mut occurrences = Vec::new();
+    let mut new_inspections = Vec::new();
+    for (item, stored) in targets {
+        let inspected = match (stored, guard.as_ref()) {
+            (Some(stored), _) => stored,
+            (None, Some(guard)) => {
+                if guard.operation.cancellation_requested() {
+                    return Err(YouTubeError::new(
+                        "DISCOVERY_CANCELLED",
+                        "transcript inspection was cancelled",
+                    ));
+                }
+                let inspected = launch(item, &guard.operation).map_err(YouTubeError::from)?;
+                new_inspections.push(into_plan_inspection(
+                    inspected.clone(),
+                    &plan.source_snapshot_digest,
+                    &item.public.metadata_digest,
+                ));
+                inspected
+            }
+            (None, None) => return Err(runtime_state_unavailable()),
+        };
+        occurrences.push(YouTubeTranscriptOccurrence {
+            occurrence_id: inspected.occurrence_id,
+            video_id: inspected.video_id,
+            tracks: inspected.tracks,
+        });
+    }
+    if !new_inspections.is_empty() {
+        state
+            .plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .apply_transcript_inspections(&request.scan_plan_id, new_inspections)
+            .map_err(YouTubeError::from)?;
+    }
     Ok(InspectYouTubeTranscriptsResponse { occurrences })
 }
 
@@ -1239,5 +1280,205 @@ mod tests {
             unreachable!("install probe is only for integrity failures")
         });
         assert_eq!(error.code, "HELPER_FAILED");
+    }
+
+    mod stored_inspection {
+        use super::*;
+        use crate::providers::youtube::models::{YouTubeTranscriptSource, YouTubeTranscriptTrack};
+        use crate::providers::youtube::scan::{parse_scan_plan, validate_url};
+        use crate::providers::youtube::transcript_inspection::parse_transcript_tracks;
+        use std::cell::Cell;
+
+        const VIDEO: &str = r#"{"id":"abc123_XY","title":"Video","availability":"public","subtitles":{"en":[{"ext":"vtt","name":"English"}]},"automatic_captions":{"de":[{"ext":"vtt"}]}}"#;
+        const FLAT_PLAYLIST: &str = r#"{"id":"PL_12345","title":"List","entries":[{"id":"abc123_XY","title":"A","availability":"public"},{"id":"def456_ZZ","title":"B","availability":"public"}]}"#;
+
+        fn store_with(url: &str, payload: &str) -> (YouTubePlanStore, YouTubeScanPlan) {
+            let plan = parse_scan_plan(validate_url(url, None).unwrap(), payload).unwrap();
+            let store = YouTubePlanStore::default();
+            store.plans.lock().unwrap().insert(plan.clone());
+            (store, plan)
+        }
+
+        fn request(plan: &YouTubeScanPlan, operation: &str) -> InspectYouTubeTranscriptsRequest {
+            InspectYouTubeTranscriptsRequest {
+                client_operation_id: operation.to_string(),
+                scan_plan_id: plan.response.scan_plan_id.clone(),
+                occurrence_ids: plan
+                    .items
+                    .iter()
+                    .map(|item| item.public.occurrence_id.clone())
+                    .collect(),
+            }
+        }
+
+        fn fake_tracks(occurrence_id: &str) -> Vec<YouTubeTranscriptTrack> {
+            parse_transcript_tracks(
+                occurrence_id,
+                r#"{"subtitles":{"it":[{"ext":"vtt","name":"Italian"}]}}"#,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn stored_scan_data_answers_without_launching_a_helper_or_taking_the_slot() {
+            let (store, plan) = store_with("https://www.youtube.com/watch?v=abc123_XY", VIDEO);
+            let live = YouTubeLiveHandle::default();
+            // Another discovery already owns the single slot: a launch would be
+            // refused with RUNTIME_BUSY, a stored answer must not care.
+            let _busy = live
+                .begin_discovery("busy-operation-01".to_string())
+                .unwrap();
+            let launches = Cell::new(0);
+            let response = inspect_youtube_transcripts_with(
+                &live,
+                &store,
+                request(&plan, "inspect-operation-01"),
+                &|_, _| {
+                    launches.set(launches.get() + 1);
+                    Err(YouTubeInternalError::Helper("must not launch".to_string()))
+                },
+            )
+            .unwrap();
+            assert_eq!(launches.get(), 0);
+            assert_eq!(response.occurrences.len(), 1);
+            // Identical to what a dedicated inspection computes from the same JSON.
+            let occurrence_id = &plan.items[0].public.occurrence_id;
+            assert_eq!(
+                response.occurrences[0].tracks,
+                parse_transcript_tracks(occurrence_id, VIDEO).unwrap()
+            );
+            assert_eq!(response.occurrences[0].tracks.len(), 2);
+            assert!(response.occurrences[0]
+                .tracks
+                .iter()
+                .any(|track| track.source == YouTubeTranscriptSource::Automatic));
+        }
+
+        #[test]
+        fn stored_scan_data_leaves_the_slot_free_for_the_next_discovery() {
+            let (store, plan) = store_with("https://www.youtube.com/watch?v=abc123_XY", VIDEO);
+            let live = YouTubeLiveHandle::default();
+            inspect_youtube_transcripts_with(
+                &live,
+                &store,
+                request(&plan, "inspect-operation-02"),
+                &|_, _| Err(YouTubeInternalError::Helper("must not launch".to_string())),
+            )
+            .unwrap();
+            assert!(live
+                .begin_discovery("next-operation-02".to_string())
+                .is_ok());
+        }
+
+        #[test]
+        fn occurrences_without_stored_data_fall_back_to_a_launch_once() {
+            let (store, plan) = store_with(
+                "https://www.youtube.com/playlist?list=PL_12345",
+                FLAT_PLAYLIST,
+            );
+            let live = YouTubeLiveHandle::default();
+            let launches = Cell::new(0);
+            let launcher = |item: &PlannedYouTubeItem, _: &DiscoveryOperation| {
+                launches.set(launches.get() + 1);
+                Ok(TranscriptInspectionResult {
+                    occurrence_id: item.public.occurrence_id.clone(),
+                    video_id: item.public.video_id.clone(),
+                    tracks: fake_tracks(&item.public.occurrence_id),
+                })
+            };
+            let first = inspect_youtube_transcripts_with(
+                &live,
+                &store,
+                request(&plan, "inspect-operation-03"),
+                &launcher,
+            )
+            .unwrap();
+            assert_eq!(launches.get(), 2);
+            assert_eq!(first.occurrences.len(), 2);
+            assert_eq!(first.occurrences[0].tracks[0].language_tag, "it");
+
+            // The launched answers are stored on the plan, so a repeat is instant.
+            let second = inspect_youtube_transcripts_with(
+                &live,
+                &store,
+                request(&plan, "inspect-operation-04"),
+                &launcher,
+            )
+            .unwrap();
+            assert_eq!(launches.get(), 2);
+            assert_eq!(second.occurrences, first.occurrences);
+        }
+
+        #[test]
+        fn a_launch_is_still_refused_while_another_discovery_holds_the_slot() {
+            let (store, plan) = store_with(
+                "https://www.youtube.com/playlist?list=PL_12345",
+                FLAT_PLAYLIST,
+            );
+            let live = YouTubeLiveHandle::default();
+            let _busy = live
+                .begin_discovery("busy-operation-05".to_string())
+                .unwrap();
+            let launches = Cell::new(0);
+            let error = inspect_youtube_transcripts_with(
+                &live,
+                &store,
+                request(&plan, "inspect-operation-05"),
+                &|_, _| {
+                    launches.set(launches.get() + 1);
+                    Err(YouTubeInternalError::Helper("must not launch".to_string()))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "RUNTIME_BUSY");
+            assert_eq!(launches.get(), 0);
+        }
+
+        #[test]
+        fn a_mixed_request_launches_only_for_the_occurrences_without_stored_data() {
+            let (store, plan) = store_with(
+                "https://www.youtube.com/playlist?list=PL_12345",
+                FLAT_PLAYLIST,
+            );
+            let live = YouTubeLiveHandle::default();
+            // Store the first occurrence as an earlier inspection would have.
+            let first = &plan.items[0];
+            store
+                .plans
+                .lock()
+                .unwrap()
+                .apply_transcript_inspections(
+                    &plan.response.scan_plan_id,
+                    vec![into_plan_inspection(
+                        TranscriptInspectionResult {
+                            occurrence_id: first.public.occurrence_id.clone(),
+                            video_id: first.public.video_id.clone(),
+                            tracks: fake_tracks(&first.public.occurrence_id),
+                        },
+                        &plan.source_snapshot_digest,
+                        &first.public.metadata_digest,
+                    )],
+                )
+                .unwrap();
+            let launched = std::cell::RefCell::new(Vec::new());
+            let response = inspect_youtube_transcripts_with(
+                &live,
+                &store,
+                request(&plan, "inspect-operation-06"),
+                &|item, _| {
+                    launched.borrow_mut().push(item.public.video_id.clone());
+                    Ok(TranscriptInspectionResult {
+                        occurrence_id: item.public.occurrence_id.clone(),
+                        video_id: item.public.video_id.clone(),
+                        tracks: Vec::new(),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(*launched.borrow(), vec!["def456_ZZ".to_string()]);
+            assert_eq!(response.occurrences.len(), 2);
+            assert_eq!(response.occurrences[0].tracks.len(), 1);
+            assert!(response.occurrences[1].tracks.is_empty());
+        }
     }
 }

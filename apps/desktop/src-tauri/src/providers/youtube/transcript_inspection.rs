@@ -127,11 +127,7 @@ pub(crate) fn parse_transcript_tracks(
     occurrence_id: &str,
     stdout: &str,
 ) -> Result<Vec<YouTubeTranscriptTrack>, YouTubeInternalError> {
-    if occurrence_id.trim().is_empty() {
-        return Err(YouTubeInternalError::InvalidRequest(
-            "transcript occurrence identity is empty".to_string(),
-        ));
-    }
+    ensure_occurrence_identity(occurrence_id)?;
     if stdout.len() > MAX_RECORD_STDOUT_BYTES {
         return Err(YouTubeInternalError::Helper(
             "transcript inspection output exceeded the safety limit".to_string(),
@@ -142,6 +138,18 @@ pub(crate) fn parse_transcript_tracks(
             "yt-dlp returned malformed transcript inspection output".to_string(),
         )
     })?;
+    tracks_from_metadata(occurrence_id, &value)
+}
+
+/// Project an already-parsed yt-dlp metadata object to transcript tracks.
+/// This is the single parser behind both the dedicated inspection run
+/// ([`parse_transcript_tracks`]) and the scan-time shortcut
+/// ([`tracks_from_scan_metadata`]), so the two can never disagree.
+pub(crate) fn tracks_from_metadata(
+    occurrence_id: &str,
+    value: &Value,
+) -> Result<Vec<YouTubeTranscriptTrack>, YouTubeInternalError> {
+    ensure_occurrence_identity(occurrence_id)?;
     let object = value.as_object().ok_or_else(|| {
         YouTubeInternalError::Helper(
             "yt-dlp transcript inspection result was not an object".to_string(),
@@ -171,6 +179,57 @@ pub(crate) fn parse_transcript_tracks(
         ));
     }
     Ok(tracks)
+}
+
+fn ensure_occurrence_identity(occurrence_id: &str) -> Result<(), YouTubeInternalError> {
+    if occurrence_id.trim().is_empty() {
+        return Err(YouTubeInternalError::InvalidRequest(
+            "transcript occurrence identity is empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Derive an occurrence's tracks from the metadata object of a scan.
+///
+/// Only a video-mode scan (`--dump-single-json --no-playlist`) yields the full
+/// metadata a dedicated inspection run would see; flat playlist entries carry
+/// no caption data, so the caller must not use this for them.  Returns `None`
+/// whenever a dedicated run could not have produced the same tracks (output
+/// beyond the inspection safety limit, or malformed caption metadata), which
+/// leaves the occurrence to the lazy per-item inspection fallback and its
+/// original error reporting.
+pub(crate) fn tracks_from_scan_metadata(
+    occurrence_id: &str,
+    metadata: &Value,
+    scan_stdout_bytes: usize,
+) -> Option<Vec<YouTubeTranscriptTrack>> {
+    if scan_stdout_bytes > MAX_RECORD_STDOUT_BYTES {
+        return None;
+    }
+    tracks_from_metadata(occurrence_id, metadata).ok()
+}
+
+/// Answer an inspection from the plan's stored data when it is bound to this
+/// exact snapshot and item metadata, so no helper process is needed.
+pub(crate) fn stored_inspection(
+    item: &PlannedYouTubeItem,
+    source_snapshot_digest: &str,
+) -> Option<TranscriptInspectionResult> {
+    let stored = item.transcript_inspection.as_ref()?;
+    let context = &stored.context;
+    if context.source_snapshot_digest != source_snapshot_digest
+        || context.occurrence_id != item.public.occurrence_id
+        || context.video_id != item.public.video_id
+        || context.metadata_digest != item.public.metadata_digest
+    {
+        return None;
+    }
+    Some(TranscriptInspectionResult {
+        occurrence_id: context.occurrence_id.clone(),
+        video_id: context.video_id.clone(),
+        tracks: stored.tracks.clone(),
+    })
 }
 
 fn deduplicate_tracks(occurrence_id: &str, tracks: &mut Vec<YouTubeTranscriptTrack>) {
