@@ -61,6 +61,14 @@ import {
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
 import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
+import {
+  WAITING_FOR_LOOKUP_MESSAGE,
+  describeBusyFailure,
+  isRowDownloadDisabled,
+  retryWhileBusy,
+  supersededClickMessage,
+  type InspectionOutcome
+} from "../../lib/youtube/startFlow";
 
 type HelperStatus = "pending" | "ready" | "failed";
 type HelperRefreshResult = "ready" | "blocked" | "superseded";
@@ -133,6 +141,7 @@ interface TranscriptLanguageOption {
 }
 
 const NO_CAPTION_OPTION: TranscriptLanguageOption = { tag: "", label: "No caption" };
+const NO_OCCURRENCES: ReadonlySet<string> = new Set();
 /** Matches `.youtube-search-input` min/max-height; keep in sync with CSS. */
 const YOUTUBE_SEARCH_MIN_HEIGHT_PX = 40;
 const YOUTUBE_SEARCH_MAX_HEIGHT_PX = 132;
@@ -414,6 +423,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const [isScanning, setIsScanning] = useState(false);
   const [isDetectingLanguages, setIsDetectingLanguages] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  /** Occurrences of the group whose start is in flight; their rows show the loading state. */
+  const [startingOccurrenceIds, setStartingOccurrenceIds] = useState<ReadonlySet<string>>(NO_OCCURRENCES);
+  /** True while a Download click waits for another lookup to release the single discovery slot. */
+  const [waitingForLookup, setWaitingForLookup] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
   const [isResuming, setIsResuming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -863,8 +876,16 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
         setSelectedOccurrenceIds(new Set(available.map((item) => item.occurrenceId)));
       }
       if (generation === scanGenerationRef.current) {
+        // A video scan already carries its captions, so this probe answers instantly. Playlist
+        // entries carry none: probing a sample would launch yt-dlp per entry and hold the single
+        // discovery slot for a minute, so playlists are probed lazily (Language focus, or Download).
+        const captionedVideos = mergedVideos.filter((video) => mergedPlans.some(
+          (plan) => plan.scanPlanId === video.scanPlanId && plan.kind === "video"
+        ));
         // Probe a bounded sample only — never full-playlist caption inspection after scan.
-        await refreshDetectedLanguages(mergedVideos, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
+        if (captionedVideos.length > 0) {
+          await refreshDetectedLanguages(captionedVideos, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
+        }
       }
     } catch (error) {
       if (generation !== scanGenerationRef.current) return;
@@ -974,30 +995,53 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     }
   }
 
+  /**
+   * Inspects the captions of a Download click's occurrences. Every outcome is explicit so the
+   * click is never dropped silently: `failed` has already toasted its reason, and the caller
+   * reports `superseded`. While another lookup holds the discovery slot this waits and retries
+   * for a bounded time instead of failing.
+   */
   async function requestTranscriptInspection(
     scanPlanId: string,
     occurrenceIds: string[]
-  ): Promise<InspectYouTubeTranscriptsResponse | null> {
-    if (occurrenceIds.length === 0 || !helperReady) return null;
+  ): Promise<InspectionOutcome<InspectYouTubeTranscriptsResponse>> {
+    if (occurrenceIds.length === 0) {
+      toast.error("Choose at least one public occurrence");
+      return { kind: "failed" };
+    }
+    if (!helperReady) {
+      toast.error("YouTube helper is not ready", {
+        description: helperError?.message ?? "Download YouTube helpers to continue."
+      });
+      return { kind: "failed" };
+    }
     const requestGeneration = transcriptInspectionGenerationRef.current + 1;
     transcriptInspectionGenerationRef.current = requestGeneration;
+    const isCurrent = () => requestGeneration === transcriptInspectionGenerationRef.current;
     try {
-      const response = await inspectYouTubeTranscripts({
-        clientOperationId: createClientId("youtube-transcript-operation"),
-        scanPlanId,
-        occurrenceIds
-      });
-      if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
+      const response = await retryWhileBusy(
+        () => inspectYouTubeTranscripts({
+          clientOperationId: createClientId("youtube-transcript-operation"),
+          scanPlanId,
+          occurrenceIds
+        }),
+        { isCurrent, onWaiting: () => setWaitingForLookup(true) }
+      );
+      if (!isCurrent()) return { kind: "superseded" };
       const requestedOccurrenceIds = occurrenceIds;
       const responseMatchesRequest = response.occurrences.length === requestedOccurrenceIds.length
         && response.occurrences.every((occurrence, index) => occurrence.occurrenceId === requestedOccurrenceIds[index]);
       if (!responseMatchesRequest) throw new Error("Transcript inspection response did not match the current occurrence selection.");
-      return response;
+      return { kind: "ready", response };
     } catch (error) {
-      if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
-      toast.error("Transcript inspection failed", { description: formatYouTubeInvokeError(error) });
+      if (!isCurrent()) return { kind: "superseded" };
+      toast.error("Transcript inspection failed", {
+        description: describeBusyFailure(error) ?? formatYouTubeInvokeError(error)
+      });
       recoverFromHelperFailure(error);
-      return null;
+      return { kind: "failed" };
+    } finally {
+      setWaitingForLookup(false);
     }
   }
 
@@ -1042,12 +1086,23 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     setSelectedOccurrenceIds(new Set(group.occurrenceIds));
     startingGroupRef.current = true;
     setIsStarting(true);
+    setStartingOccurrenceIds(new Set(group.occurrenceIds));
     try {
       const resolvedOutputDir = outputDir.trim() || await pickOutputDirectory();
-      if (!resolvedOutputDir) return false;
+      if (!resolvedOutputDir) {
+        toast.message("Download not started", { description: "Choose a destination folder to start downloading." });
+        return false;
+      }
       if (downloadMode !== "video_only") {
-        const inspected = await requestTranscriptInspection(group.scanPlanId, group.occurrenceIds);
-        if (!inspected) return false;
+        const inspection = await requestTranscriptInspection(group.scanPlanId, group.occurrenceIds);
+        if (inspection.kind === "superseded") {
+          const notice = supersededClickMessage();
+          toast.message(notice.title, { description: notice.description });
+          return false;
+        }
+        // A failed inspection has already told the user why.
+        if (inspection.kind !== "ready") return false;
+        const inspected = inspection.response;
         const missingCaptions = inspected.occurrences.some((occurrence) => occurrence.tracks.length === 0);
         if (missingCaptions && downloadMode === "video_and_transcript") {
           toast.message("No captions on YouTube", {
@@ -1055,18 +1110,23 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           });
         }
       }
-      const response = await startYouTubeDownload({
-        clientSubmissionId: createClientId("youtube-submission"),
-        scanPlanId: scan.scanPlanId,
-        selectedOccurrenceIds: group.occurrenceIds,
-        outputDir: resolvedOutputDir,
-        mode: downloadMode,
-        maxHeight,
-        preferredLanguage,
-        fallbackLanguages,
-        allowAutomaticCaptions: true,
-        continueWithoutTranscript: true
-      });
+      // One submission id for every attempt: the backend replays an identical resubmission.
+      const clientSubmissionId = createClientId("youtube-submission");
+      const response = await retryWhileBusy(
+        () => startYouTubeDownload({
+          clientSubmissionId,
+          scanPlanId: scan.scanPlanId,
+          selectedOccurrenceIds: group.occurrenceIds,
+          outputDir: resolvedOutputDir,
+          mode: downloadMode,
+          maxHeight,
+          preferredLanguage,
+          fallbackLanguages,
+          allowAutomaticCaptions: true,
+          continueWithoutTranscript: true
+        }),
+        { onWaiting: () => setWaitingForLookup(true) }
+      );
       latestRunIdRef.current = response.receipt.runId;
       latestRevisionRef.current = 0;
       runOutputDirRef.current = resolvedOutputDir;
@@ -1076,16 +1136,23 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       applyRunSnapshot(snapshot, true);
       return true;
     } catch (error) {
-      toast.error("YouTube download could not start", { description: formatYouTubeInvokeError(error) });
+      toast.error("YouTube download could not start", {
+        description: describeBusyFailure(error) ?? formatYouTubeInvokeError(error)
+      });
       recoverFromHelperFailure(error);
       return false;
     } finally {
       startingGroupRef.current = false;
       setIsStarting(false);
+      setStartingOccurrenceIds(NO_OCCURRENCES);
+      setWaitingForLookup(false);
     }
   }
 
   async function startDownloads(targets: ResultVideo[]): Promise<void> {
+    // A repeat click while a start is in flight is ignored: its button already shows the loading
+    // state, and a second call would supersede the first one's inspection and drop that click.
+    if (startingGroupRef.current) return;
     const groups = groupsForVideos(targets);
     if (groups.length === 0) {
       toast.error("Choose at least one public occurrence");
@@ -1113,6 +1180,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   }
 
   async function handleDownloadOne(video: ResultVideo): Promise<void> {
+    if (startingGroupRef.current) return;
     downloadQueueRef.current = [];
     await startDownloads([video]);
   }
@@ -1477,9 +1545,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                           variant="primary"
                           className="youtube-download-overlay-button"
                           onClick={() => void handleDownloadOne(video)}
-                          loading={isStarting}
+                          loading={startingOccurrenceIds.has(video.item.occurrenceId)}
                           loadingLabel="Starting"
-                          disabled={!available || activeRun || !helperReady}
+                          disabled={isRowDownloadDisabled({ available, activeRun, helperReady, startInFlight: isStarting })}
                           aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
                         >
                           Download
@@ -1491,7 +1559,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                           size="xs"
                           variant="ghost"
                           onClick={() => void handleDownloadOne(video)}
-                          disabled={!available || activeRun || !helperReady}
+                          loading={startingOccurrenceIds.has(video.item.occurrenceId)}
+                          loadingLabel="Starting"
+                          disabled={isRowDownloadDisabled({ available, activeRun, helperReady, startInFlight: isStarting })}
                           aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
                         >
                           Download
@@ -1518,6 +1588,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
             </ol>
             {isScanning && queueSection === "queue" ? (
               <p className="youtube-scanning" role="status">Finding videos…</p>
+            ) : null}
+            {waitingForLookup ? (
+              <p className="youtube-scanning" role="status">{WAITING_FOR_LOOKUP_MESSAGE}</p>
             ) : null}
           </div>
         </section>

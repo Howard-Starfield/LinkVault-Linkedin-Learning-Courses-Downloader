@@ -9,9 +9,10 @@ async function read(relativePath) {
   return readFile(path.join(desktop, relativePath), "utf8");
 }
 
-const [app, view, ipc, types, detect, preferences, styles, packageText, rootPackageText] = await Promise.all([
+const [app, view, startFlow, ipc, types, detect, preferences, styles, packageText, rootPackageText] = await Promise.all([
   read("src/App.tsx"),
   read("src/components/youtube/YouTubeView.tsx"),
+  read("src/lib/youtube/startFlow.ts"),
   read("src/lib/youtube/ipc.ts"),
   read("src/lib/youtube/types.ts"),
   read("src/lib/youtube/detect.ts"),
@@ -146,7 +147,8 @@ matches(view, /response\.status === "ready"/, "Helper status response is not map
 matches(view, /youtube-helper-error[\s\S]*?role="alert"/, "Helper failures are not exposed through an accessible alert");
 matches(view, /new Set\(available\.map\(\(item\) => item\.occurrenceId\)\)/, "Select-all does not preserve occurrence identity");
 matches(view, /item\.availability === "available"/, "Available occurrences are not represented explicitly");
-matches(view, /disabled=\{!available \|\| activeRun/, "Non-public or unconfirmed occurrences remain selectable");
+matches(view, /disabled=\{isRowDownloadDisabled\(\{ available, activeRun, helperReady, startInFlight: isStarting \}\)\}/, "Non-public or unconfirmed occurrences remain selectable");
+matches(startFlow, /return !input\.available \|\| input\.activeRun \|\| !input\.helperReady \|\| input\.startInFlight;/, "Row Download is not gated on availability, an active run, helper readiness, and an in-flight start");
 matches(view, /item\.availability === "unknown" \? "Unconfirmed" : "Unavailable"/, "Unknown availability is not distinguished from confirmed public content");
 matches(view, /aria-label=\{`Download occurrence \$\{video\.item\.ordinal\}: \$\{video\.item\.title\}`\}/, "Occurrence download lacks an accessible name");
 matches(ipc, /const playlist = request\.playlistMode === "playlist"/, "Playlist URL handling is not explicit");
@@ -270,7 +272,25 @@ matches(view, /mode: downloadMode/, "Download request does not send downloadMode
 matches(view, /disabled=\{!activeRun\}/, "Cancel action is not gated on an active run");
 matches(view, /inspectYouTubeTranscripts\(/, "Transcript inspection is not mounted through the typed adapter");
 matches(view, /transcriptInspectionGenerationRef\.current/, "Transcript inspection does not correlate responses with the active selection");
-matches(view, /requestGeneration !== transcriptInspectionGenerationRef\.current/, "Stale transcript inspection responses are accepted");
+matches(view, /requestGeneration === transcriptInspectionGenerationRef\.current/, "Stale transcript inspection responses are accepted");
+matches(view, /if \(!isCurrent\(\)\) return \{ kind: "superseded" \}/, "A superseded transcript inspection is not reported to the caller");
+// A Download click is never dropped silently: repeats are ignored while the row shows loading,
+// a busy lookup is waited for, and every non-starting outcome tells the user.
+matches(view, /async function startDownloads\([^)]*\): Promise<void> \{\s*[^]*?if \(startingGroupRef\.current\) return;[^]*?downloadQueueRef\.current = groups\.slice\(1\)/, "A repeat click can still reach the queue reset while a start is in flight");
+matches(view, /async function handleDownloadOne\([^)]*\): Promise<void> \{\s*if \(startingGroupRef\.current\) return;\s*downloadQueueRef\.current = \[\];/, "A repeat row click can clear the queue of the start already in flight");
+matches(view, /loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/, "Row Download buttons do not show a per-row loading state");
+assert.equal((view.match(/loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/g) ?? []).length, 2, "Both the single-result and the inline Download buttons need the loading state");
+matches(view, /retryWhileBusy\(\s*\(\) => inspectYouTubeTranscripts\(/, "Transcript inspection does not wait for a busy discovery slot");
+matches(view, /retryWhileBusy\(\s*\(\) => startYouTubeDownload\(/, "Start does not wait for a busy discovery slot");
+matches(view, /WAITING_FOR_LOOKUP_MESSAGE/, "The wait for the current lookup is not shown");
+matches(view, /inspection\.kind === "superseded"[^]*?toast\.message\(/, "A superseded Download click gives no feedback");
+matches(view, /if \(!resolvedOutputDir\) \{\s*toast\.message\(/, "A Download click without a folder gives no feedback");
+const inspectionSource = view.slice(
+  view.indexOf("async function requestTranscriptInspection"),
+  view.indexOf("async function pickOutputDirectory")
+);
+assert.ok(inspectionSource.length > 0, "requestTranscriptInspection was not found");
+assert.doesNotMatch(inspectionSource, /\breturn null;/, "requestTranscriptInspection must not return a silent null");
 matches(view, /response\.occurrences\.every\(\(occurrence, index\) => occurrence\.occurrenceId === requestedOccurrenceIds\[index\]\)/, "Transcript response identities are not checked against the request");
 matches(view, /scanYouTubeSource\([\s\S]*?transcriptInspectionGenerationRef\.current \+= 1;[\s\S]*?setScanPlans/, "A committed rescan does not invalidate overlapping transcript inspection");
 matches(view, /expectedRevision: runSnapshot\.revision/, "Pause/resume actions are not revision-aware");
@@ -308,7 +328,7 @@ assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are sti
 
 assert.equal(
   packageJson.scripts["verify:youtube-ui"],
-  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status",
+  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status && npm run verify:youtube-start-flow",
   "Desktop YouTube UI verifier is not wired"
 );
 includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");
