@@ -11,6 +11,7 @@ pub mod database_migrations;
 pub mod database_writer;
 pub mod dpapi;
 pub mod managed_process;
+pub mod media_range;
 pub mod media_toolchain;
 #[cfg(feature = "crop-baseline")]
 pub mod newspaper_clipping_crop_baseline;
