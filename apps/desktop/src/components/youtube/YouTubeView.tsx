@@ -58,7 +58,7 @@ import {
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
-import { youtubeItemStatusText, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
+import { youtubeItemStatusText, youtubeProgressText, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
 
 type HelperStatus = "pending" | "ready" | "failed";
@@ -1416,6 +1416,12 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                   ? formatYouTubeFailure(outcome.error)
                   : null;
                 const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
+                // Byte counts describe the item that is downloading now; the UI mock reuses the fields for item counts.
+                const runBytes = state === "running"
+                  && runSnapshot?.item?.occurrenceId === video.item.occurrenceId
+                  && !runSnapshot.runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX)
+                  ? runSnapshot.progress
+                  : null;
                 const duration = formatDuration(video.item.durationSeconds);
                 const plan = scanPlans.find((candidate) => candidate.scanPlanId === video.scanPlanId);
                 const kind = plan?.kind === "playlist" ? "playlist" : "video";
@@ -1434,7 +1440,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                           <Progress value={percent} />
                           <span className="youtube-result-stage">
                             {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
-                            {status}{percent > 0 ? ` · ${Math.round(percent)}%` : ""}
+                            {youtubeProgressText(status, percent, runBytes)}
                           </span>
                         </div>
                       ) : status ? (

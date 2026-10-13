@@ -1,11 +1,14 @@
 use crate::app::managed_process::{
-    run, ManagedProcessContext, ManagedProcessError, ManagedProcessOutput, ManagedProcessSpec,
-    TransientError, TransientExecutionOutcome, TransientExecutor, TransientItemPhase,
-    TransientProgressUpdate, TransientRunControl, TransientWorkItem,
+    run, run_with_stdout_lines, ManagedProcessContext, ManagedProcessError, ManagedProcessOutput,
+    ManagedProcessSpec, TransientError, TransientExecutionOutcome, TransientExecutor,
+    TransientItemPhase, TransientProgressUpdate, TransientRunControl, TransientWorkItem,
 };
 use crate::app::safe_output_filesystem::{
     validate_output_component, ExistingOutputDirectoryLease, OutputAttemptLease, SafeOutputError,
     ValidatedOutputRoot,
+};
+use crate::providers::youtube::download_progress::{
+    DownloadProgress, ProgressReading, FORMATS_PRINT, PROGRESS_TEMPLATE,
 };
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::helper::{
@@ -32,15 +35,16 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES: u64 = 32 * 1024 * 1024;
 /// Longest transcript failure reason carried into a user-visible warning.
 const MAX_WARNING_REASON_CHARS: usize = 240;
 
-/// Coarse per-item progress fractions. Downloading owns `0.0..STAGE_NORMALIZING`;
-/// the live byte-progress follow-up fills that range in, so later stages start
-/// at or above it and stay monotonic.
+/// Coarse per-item progress fractions. Downloading owns `0.0..=STAGE_NORMALIZING`
+/// and live byte progress fills that range in, so later stages start at or
+/// above it and the fraction stays monotonic.
 const STAGE_START: f64 = 0.0;
 const STAGE_NORMALIZING: f64 = 0.8;
 const STAGE_VERIFYING: f64 = 0.85;
@@ -56,6 +60,15 @@ trait ProcessRunner: Send + Sync + std::fmt::Debug {
         spec: ManagedProcessSpec,
         control: &TransientRunControl,
     ) -> Result<ManagedProcessOutput, ManagedProcessError>;
+
+    /// Like [`ProcessRunner::run`], also streaming each complete stdout line to
+    /// `on_line` while the helper runs.
+    fn run_streaming(
+        &self,
+        spec: ManagedProcessSpec,
+        control: &TransientRunControl,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ManagedProcessOutput, ManagedProcessError>;
 }
 
 #[derive(Debug)]
@@ -69,10 +82,19 @@ impl ProcessRunner for ManagedProcessRunner {
     ) -> Result<ManagedProcessOutput, ManagedProcessError> {
         run(spec, ManagedProcessContext::Run(control))
     }
+
+    fn run_streaming(
+        &self,
+        spec: ManagedProcessSpec,
+        control: &TransientRunControl,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+        run_with_stdout_lines(spec, ManagedProcessContext::Run(control), on_line)
+    }
 }
 
-/// Report a stage boundary. Bytes stay `None` here; the byte-progress task
-/// adds them to this same update shape.
+/// Report a stage boundary. Bytes stay `None`; live download bytes go through
+/// [`report_download_progress`].
 fn report_stage(
     progress: &mut dyn FnMut(TransientProgressUpdate),
     item: &TransientWorkItem,
@@ -85,6 +107,22 @@ fn report_stage(
         bytes_completed: None,
         bytes_total: None,
         fraction: Some(fraction),
+    });
+}
+
+/// Publish live download bytes inside the download stage's fraction range.
+fn report_download_progress(
+    progress: &mut dyn FnMut(TransientProgressUpdate),
+    item: &TransientWorkItem,
+    phase: TransientItemPhase,
+    reading: &ProgressReading,
+) {
+    progress(TransientProgressUpdate {
+        occurrence_id: item.occurrence_id.clone(),
+        phase,
+        bytes_completed: Some(reading.bytes_completed),
+        bytes_total: reading.bytes_total,
+        fraction: Some(STAGE_START + (STAGE_NORMALIZING - STAGE_START) * reading.ratio),
     });
 }
 
@@ -101,6 +139,8 @@ pub struct YouTubeExecutor {
     continue_without_transcript: bool,
     context: Option<YouTubeExecutorContext>,
     runner: Arc<dyn ProcessRunner>,
+    /// Time source for the progress throttle; tests substitute a fake.
+    clock: fn() -> Instant,
 }
 
 /// Immutable execution facts captured by the command layer after scan and
@@ -258,6 +298,7 @@ impl YouTubeExecutor {
             continue_without_transcript: request.continue_without_transcript,
             context: None,
             runner: Arc::new(ManagedProcessRunner),
+            clock: Instant::now,
         }))
     }
 
@@ -280,6 +321,7 @@ impl YouTubeExecutor {
             continue_without_transcript: request.continue_without_transcript,
             context: Some(context),
             runner,
+            clock: Instant::now,
         }))
     }
 
@@ -305,6 +347,7 @@ impl YouTubeExecutor {
             continue_without_transcript: request.continue_without_transcript,
             context: Some(context),
             runner: Arc::new(ManagedProcessRunner),
+            clock: Instant::now,
         }))
     }
 
@@ -331,7 +374,7 @@ impl YouTubeExecutor {
             "--windows-filenames".to_string(),
             "--newline".to_string(),
             "--progress-template".to_string(),
-            "%(progress.downloaded_bytes)s/%(progress.total_bytes)s".to_string(),
+            PROGRESS_TEMPLATE.to_string(),
             "--output".to_string(),
             output_template.to_string_lossy().into_owned(),
         ];
@@ -370,6 +413,13 @@ impl YouTubeExecutor {
                 args.push("--format".to_string());
                 args.push(self.format_selector());
             }
+        }
+        if !matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
+            // `--print` implies `--quiet`, which would drop the progress
+            // records unless progress is requested explicitly.
+            args.push("--progress".to_string());
+            args.push("--print".to_string());
+            args.push(FORMATS_PRINT.to_string());
         }
         args.push(item.source_url.clone());
         Ok(args)
@@ -585,15 +635,11 @@ impl TransientExecutor for YouTubeExecutor {
         // download is in flight; the descriptive name belongs to the final
         // item directory, not the temporary media leaf.
         let output_template = staging.join("media.%(ext)s");
-        report_stage(
-            progress,
-            item,
-            match &self.mode {
-                YouTubeDownloadMode::TranscriptOnly => TransientItemPhase::Transcript,
-                _ => TransientItemPhase::Media,
-            },
-            STAGE_START,
-        );
+        let download_phase = match &self.mode {
+            YouTubeDownloadMode::TranscriptOnly => TransientItemPhase::Transcript,
+            _ => TransientItemPhase::Media,
+        };
+        report_stage(progress, item, download_phase.clone(), STAGE_START);
         cleanup
             .lease()
             .revalidate()
@@ -620,9 +666,15 @@ impl TransientExecutor for YouTubeExecutor {
                 source_duration_seconds,
             )
         };
+        let mut download_progress = DownloadProgress::new();
+        let clock = self.clock;
         let output = self
             .runner
-            .run(helper_spec, control)
+            .run_streaming(helper_spec, control, &mut |line| {
+                if let Some(reading) = download_progress.observe_line(line, clock()) {
+                    report_download_progress(progress, item, download_phase.clone(), &reading);
+                }
+            })
             .map_err(|error| match error {
                 ManagedProcessError::HelperTemp(reason) => {
                     transient_error("HELPER_TEMP_ROOT_INVALID", reason)
@@ -647,6 +699,10 @@ impl TransientExecutor for YouTubeExecutor {
         }
         if control.is_cancelled() {
             return Err(transient_error("CANCELLED", "download was cancelled"));
+        }
+        // Publish the last bytes if the throttle was still holding them back.
+        if let Some(reading) = download_progress.flush(clock()) {
+            report_download_progress(progress, item, download_phase, &reading);
         }
         // Set when the video is kept but its transcript could not be processed.
         let mut transcript_failure: Option<String> = None;
@@ -2711,11 +2767,35 @@ mod tests {
 
     // ---- Execute-level tests with a fake process launcher -----------------
 
+    use std::cell::Cell;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// One step of the stdout a fake yt-dlp download prints.
+    #[derive(Clone, Debug)]
+    enum ScriptStep {
+        Line(String),
+        AdvanceClockMs(u64),
+    }
+
+    thread_local! {
+        static CLOCK_BASE: Instant = Instant::now();
+        static CLOCK_OFFSET_MS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Deterministic per-thread clock for the progress throttle; the fake
+    /// runner advances it, so no test sleeps.
+    fn test_clock() -> Instant {
+        CLOCK_BASE.with(|base| *base) + Duration::from_millis(CLOCK_OFFSET_MS.with(Cell::get))
+    }
+
+    fn advance_test_clock(millis: u64) {
+        CLOCK_OFFSET_MS.with(|offset| offset.set(offset.get() + millis));
+    }
 
     /// Stands in for yt-dlp and FFmpeg: the download call writes the media
     /// file and, when the request asks for subtitles, a VTT with the chosen
@@ -2724,28 +2804,26 @@ mod tests {
     struct FakeRunner {
         vtt: &'static str,
         downloads: AtomicUsize,
+        script: Vec<ScriptStep>,
     }
 
     impl FakeRunner {
         fn new(vtt: &'static str) -> Arc<Self> {
+            Self::with_script(vtt, Vec::new())
+        }
+
+        fn with_script(vtt: &'static str, script: Vec<ScriptStep>) -> Arc<Self> {
             Arc::new(Self {
                 vtt,
                 downloads: AtomicUsize::new(0),
+                script,
             })
         }
-    }
 
-    fn arg_after(args: &[String], flag: &str) -> Option<String> {
-        args.iter()
-            .position(|argument| argument == flag)
-            .and_then(|index| args.get(index + 1).cloned())
-    }
-
-    impl ProcessRunner for FakeRunner {
-        fn run(
+        fn execute(
             &self,
             spec: ManagedProcessSpec,
-            _control: &TransientRunControl,
+            on_line: &mut dyn FnMut(&str),
         ) -> Result<ManagedProcessOutput, ManagedProcessError> {
             let args = spec
                 .args
@@ -2761,6 +2839,12 @@ mod tests {
                 }
                 if args.iter().any(|argument| argument == "--write-subs") {
                     fs::write(staging.join("media.en-US.vtt"), self.vtt).unwrap();
+                }
+                for step in &self.script {
+                    match step {
+                        ScriptStep::Line(line) => on_line(line),
+                        ScriptStep::AdvanceClockMs(millis) => advance_test_clock(*millis),
+                    }
                 }
                 (String::new(), String::new())
             } else {
@@ -2784,6 +2868,31 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
             })
+        }
+    }
+
+    fn arg_after(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|argument| argument == flag)
+            .and_then(|index| args.get(index + 1).cloned())
+    }
+
+    impl ProcessRunner for FakeRunner {
+        fn run(
+            &self,
+            spec: ManagedProcessSpec,
+            _control: &TransientRunControl,
+        ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+            self.execute(spec, &mut |_| {})
+        }
+
+        fn run_streaming(
+            &self,
+            spec: ManagedProcessSpec,
+            _control: &TransientRunControl,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+            self.execute(spec, on_line)
         }
     }
 
@@ -3215,5 +3324,248 @@ mod tests {
             "normalized transcript has no cues"
         );
         assert!(normalized.cues.iter().all(|cue| cue.end_ms >= cue.start_ms));
+    }
+    // ---- Live download progress ------------------------------------------
+
+    fn line(text: impl Into<String>) -> ScriptStep {
+        ScriptStep::Line(text.into())
+    }
+
+    struct Recorded {
+        at: Instant,
+        update: TransientProgressUpdate,
+    }
+
+    fn run_recording(
+        executor: &YouTubeExecutor,
+        item: &TransientWorkItem,
+    ) -> (
+        Result<TransientExecutionOutcome, TransientError>,
+        Vec<Recorded>,
+    ) {
+        let mut recorded = Vec::new();
+        let control = TransientRunControl::default();
+        let result = TransientExecutor::execute(executor, item, &control, &mut |update| {
+            recorded.push(Recorded {
+                at: test_clock(),
+                update,
+            });
+        });
+        (result, recorded)
+    }
+
+    fn executor_with_script(
+        root: &ValidatedOutputRoot,
+        mode: YouTubeDownloadMode,
+        script: Vec<ScriptStep>,
+    ) -> (Arc<YouTubeExecutor>, TransientWorkItem) {
+        let (mut executor, item) =
+            executor_with_fake(root, mode, true, FakeRunner::with_script(VALID_VTT, script));
+        Arc::get_mut(&mut executor)
+            .expect("the test owns the only executor handle")
+            .clock = test_clock;
+        (executor, item)
+    }
+
+    fn byte_updates(recorded: &[Recorded]) -> Vec<&Recorded> {
+        recorded
+            .iter()
+            .filter(|entry| entry.update.bytes_completed.is_some())
+            .collect()
+    }
+
+    /// Video stream (1000 bytes over 400 ms) followed by an audio stream
+    /// (200 bytes over 1 s), with lines the parser must ignore mixed in.
+    fn two_stream_script() -> Vec<ScriptStep> {
+        let mut script = vec![
+            line("[download] Destination: media.f160.mp4"),
+            line("LVFORMATS 160, 139"),
+            line("noise LVPROGRESS 1 2 3 4"),
+        ];
+        for step in 1..=40u64 {
+            script.push(line(format!("LVPROGRESS {} 1000 NA 160", step * 25)));
+            script.push(ScriptStep::AdvanceClockMs(10));
+        }
+        script.push(line("LVPROGRESS 0 NA NA 139"));
+        for step in 1..=20u64 {
+            script.push(line(format!("LVPROGRESS {} 200 NA 139", step * 10)));
+            script.push(ScriptStep::AdvanceClockMs(50));
+        }
+        script.push(line("[Merger] Merging formats into media.mp4"));
+        script
+    }
+
+    #[test]
+    fn download_progress_is_monotonic_throttled_and_carries_bytes() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_script(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            two_stream_script(),
+        );
+
+        let (result, recorded) = run_recording(&executor, &item);
+
+        result.unwrap();
+        let fractions = recorded
+            .iter()
+            .map(|entry| entry.update.fraction.unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            fractions.windows(2).all(|pair| pair[0] <= pair[1]),
+            "fractions must never go backwards: {fractions:?}"
+        );
+        let bytes = byte_updates(&recorded);
+        assert!(
+            bytes.len() > 3,
+            "expected live updates, got {}",
+            bytes.len()
+        );
+        assert!(
+            bytes.len() < 12,
+            "61 progress lines over 1.4 s must be throttled, got {}",
+            bytes.len()
+        );
+        assert!(bytes
+            .iter()
+            .all(|entry| entry.update.phase == TransientItemPhase::Media));
+        assert!(bytes
+            .iter()
+            .all(|entry| entry.update.fraction.unwrap() <= STAGE_NORMALIZING));
+        // At most four per second: consecutive live updates are 250 ms apart,
+        // except the final flush that publishes whatever the throttle held.
+        let spaced = &bytes[..bytes.len() - 1];
+        assert!(
+            spaced
+                .windows(2)
+                .all(|pair| pair[1].at.duration_since(pair[0].at) >= Duration::from_millis(250)),
+            "live updates were published faster than four per second"
+        );
+        let last = bytes.last().unwrap();
+        assert_eq!(last.update.bytes_completed, Some(1200));
+        assert_eq!(last.update.bytes_total, Some(1200));
+        assert_eq!(last.update.fraction, Some(STAGE_NORMALIZING));
+        // The transcript stage follows without the fraction dropping.
+        let next = recorded
+            .iter()
+            .position(|entry| entry.update.phase == TransientItemPhase::NormalizingTranscript)
+            .unwrap();
+        assert!(recorded[next].update.fraction.unwrap() >= STAGE_NORMALIZING);
+    }
+
+    #[test]
+    fn download_progress_lands_in_the_run_snapshot() {
+        use crate::providers::youtube::live::{apply_item_progress, initial_snapshot};
+
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_script(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            two_stream_script(),
+        );
+        let (result, recorded) = run_recording(&executor, &item);
+        result.unwrap();
+
+        let mut snapshot = initial_snapshot(
+            "run".to_string(),
+            "submission".to_string(),
+            "plan".to_string(),
+            std::slice::from_ref(&item),
+        );
+        let mut applied = 0;
+        for entry in recorded
+            .iter()
+            .take_while(|entry| entry.update.phase != TransientItemPhase::NormalizingTranscript)
+        {
+            apply_item_progress(
+                &mut snapshot,
+                &item,
+                entry.update.phase.clone(),
+                entry.update.bytes_completed,
+                entry.update.bytes_total,
+                entry.update.fraction,
+            );
+            applied += 1;
+        }
+
+        assert_eq!(snapshot.revision, 1 + applied);
+        assert_eq!(snapshot.progress.bytes_completed, Some(1200));
+        assert_eq!(snapshot.progress.bytes_total, Some(1200));
+        assert_eq!(snapshot.progress.fraction, Some(STAGE_NORMALIZING));
+    }
+
+    #[test]
+    fn unknown_totals_publish_bytes_without_a_total_or_fraction_jump() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let mut script = Vec::new();
+        for step in 1..=3u64 {
+            script.push(line(format!("LVPROGRESS {} NA NA 18", step * 5000)));
+            script.push(ScriptStep::AdvanceClockMs(300));
+        }
+        let (executor, item) =
+            executor_with_script(&root, YouTubeDownloadMode::VideoAndTranscript, script);
+
+        let (result, recorded) = run_recording(&executor, &item);
+
+        result.unwrap();
+        let bytes = byte_updates(&recorded);
+        assert_eq!(bytes.len(), 3);
+        assert!(bytes.iter().all(|entry| entry.update.bytes_total.is_none()));
+        assert!(bytes
+            .iter()
+            .all(|entry| entry.update.fraction == Some(STAGE_START)));
+        assert_eq!(bytes[2].update.bytes_completed, Some(15000));
+    }
+
+    #[test]
+    fn transcript_only_subtitle_records_and_garbage_publish_no_bytes() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let script = vec![
+            line("LVPROGRESS 440 NA 440 NA"),
+            line("LVPROGRESS 440 440 NA NA"),
+            line("LVPROGRESS"),
+            line("not progress at all"),
+        ];
+        let (executor, item) =
+            executor_with_script(&root, YouTubeDownloadMode::TranscriptOnly, script);
+
+        let (result, recorded) = run_recording(&executor, &item);
+
+        result.unwrap();
+        assert!(byte_updates(&recorded).is_empty());
+    }
+
+    #[test]
+    fn helper_arguments_request_prefixed_progress_records() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        for (mode, expects_print) in [
+            (YouTubeDownloadMode::VideoAndTranscript, true),
+            (YouTubeDownloadMode::TranscriptOnly, false),
+        ] {
+            let (executor, item) =
+                executor_with_fake(&root, mode, true, FakeRunner::new(VALID_VTT));
+            let args = executor
+                .args_for(&item, Path::new("C:/staging/media.%(ext)s"))
+                .unwrap();
+            assert_eq!(
+                arg_after(&args, "--progress-template").as_deref(),
+                Some(PROGRESS_TEMPLATE)
+            );
+            assert!(args.iter().any(|argument| argument == "--newline"));
+            assert_eq!(
+                arg_after(&args, "--print").as_deref(),
+                expects_print.then_some(FORMATS_PRINT)
+            );
+            assert_eq!(
+                args.iter().any(|argument| argument == "--progress"),
+                expects_print
+            );
+        }
+        assert!(PROGRESS_TEMPLATE.starts_with("download:LVPROGRESS "));
     }
 }

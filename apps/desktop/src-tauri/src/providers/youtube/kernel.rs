@@ -5,8 +5,8 @@ use crate::app::managed_process::{
 };
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::live::{
-    apply_item_failure, apply_item_outcome, apply_item_progress, executor_from_request,
-    finish_snapshot, YouTubeLiveHandle, YoutubeDurableRequest,
+    apply_item_failure, apply_item_outcome, executor_from_request, finish_snapshot,
+    YouTubeLiveHandle, YoutubeDurableRequest,
 };
 use crate::workflow::domain::types::{RunRecord, StepRecord};
 use crate::workflow::ports::executor::{ExecutorOutcome, StepExecutor};
@@ -111,21 +111,14 @@ impl YoutubeDownloadExecutor {
                 return ExecutorOutcome::cancelled("YouTube download was cancelled".to_string());
             }
 
-            let live = Arc::clone(&self.live);
-            let mut item_snapshot = snapshot.clone();
-            let work_item = item.clone();
+            // Progress ticks mutate the live snapshot in place so a pause or
+            // cancel requested meanwhile is not overwritten; re-read it after.
             let outcome = TransientExecutor::execute(executor, item, control, &mut |update| {
-                apply_item_progress(
-                    &mut item_snapshot,
-                    &work_item,
-                    update.phase,
-                    update.bytes_completed,
-                    update.bytes_total,
-                    update.fraction,
-                );
-                live.publish_snapshot(item_snapshot.clone());
+                self.live.publish_item_progress(run_id, item, update);
             });
-            snapshot = item_snapshot;
+            if let Ok(Some(current)) = self.live.snapshot(Some(run_id)) {
+                snapshot = current;
+            }
 
             match outcome {
                 Ok(outcome) => {
@@ -446,5 +439,99 @@ mod tests {
             "missing live control must not publish a snapshot"
         );
         assert!(live.control_for(&run.id).is_none());
+    }
+    /// Reports progress, receives a pause request from the UI mid-item, then
+    /// keeps reporting progress before it completes.
+    struct PausedMidItemExecutor {
+        live: Arc<YouTubeLiveHandle>,
+        run_id: String,
+    }
+
+    impl TransientExecutor for PausedMidItemExecutor {
+        fn execute(
+            &self,
+            item: &TransientWorkItem,
+            _control: &TransientRunControl,
+            progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            let mut report = |fraction: f64| {
+                progress(TransientProgressUpdate {
+                    occurrence_id: item.occurrence_id.clone(),
+                    phase: TransientItemPhase::Media,
+                    bytes_completed: Some((fraction * 1000.0) as u64),
+                    bytes_total: Some(1000),
+                    fraction: Some(fraction),
+                });
+            };
+            report(0.1);
+            report(0.2);
+            let seen = self
+                .live
+                .snapshot(Some(&self.run_id))
+                .expect("live snapshot")
+                .expect("active run");
+            self.live
+                .pause(&self.run_id, seen.revision)
+                .expect("pause on the revision the UI last saw");
+            report(0.3);
+            report(0.4);
+            Ok(TransientExecutionOutcome::completed(vec![
+                "video".to_string()
+            ]))
+        }
+    }
+
+    #[test]
+    fn progress_ticks_never_overwrite_a_pause_or_move_the_revision_backwards() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-pause-run".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+        };
+        let executor = PausedMidItemExecutor {
+            live: Arc::clone(&live),
+            run_id: "yt-pause-run".to_string(),
+        };
+
+        let outcome =
+            kernel.run_items("yt-pause-run", &durable_request(items), &control, &executor);
+
+        assert!(outcome.succeeded);
+        let snapshots = published.lock().expect("published lock").clone();
+        let revisions = snapshots
+            .iter()
+            .map(|snapshot| snapshot.revision)
+            .collect::<Vec<_>>();
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] < pair[1]),
+            "every published revision must be strictly greater: {revisions:?}"
+        );
+        let pause_at = snapshots
+            .iter()
+            .position(|snapshot| snapshot.state == TransientRunState::PauseRequested)
+            .expect("the pause is published");
+        let after_pause = &snapshots[pause_at..snapshots.len() - 1];
+        assert!(
+            after_pause.len() >= 3,
+            "progress and the item outcome follow the pause"
+        );
+        assert!(
+            after_pause
+                .iter()
+                .all(|snapshot| snapshot.state == TransientRunState::PauseRequested),
+            "a progress tick or item outcome reverted the pause"
+        );
+        let last = snapshots.last().expect("terminal snapshot");
+        assert_eq!(last.state, TransientRunState::Completed);
+        assert_eq!(last.items[0].state, TransientItemState::Completed);
     }
 }

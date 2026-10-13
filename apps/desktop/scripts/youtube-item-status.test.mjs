@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { youtubeItemStatusText, youtubeStageLabel } from "../src/lib/youtube/itemStatus.ts";
+import {
+  formatYouTubeBytes,
+  youtubeItemStatusText,
+  youtubeProgressText,
+  youtubeStageLabel
+} from "../src/lib/youtube/itemStatus.ts";
 
 test("a pending item is Queued while the run is active and Not started once it ended", () => {
   assert.equal(youtubeItemStatusText("pending", "waiting", true, "active"), "Queued");
@@ -41,4 +46,68 @@ test("finished and failed items keep their plain status", () => {
 test("unavailable videos are labelled before anything else", () => {
   assert.equal(youtubeItemStatusText("skipped", null, false, "idle"), "Unavailable");
   assert.equal(youtubeItemStatusText("pending", null, false, "idle"), "Unconfirmed");
+});
+
+test("byte counts use the total's decimal unit for both numbers", () => {
+  const nb = "\u00A0";
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 18_300_000, bytesTotal: 43_600_000 }),
+    ["18.3", "/", `43.6${nb}MB`].join(nb)
+  );
+  // A small completed amount is shown in the total's unit, not its own.
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 800_000, bytesTotal: 43_600_000 }),
+    ["0.8", "/", `43.6${nb}MB`].join(nb)
+  );
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 512, bytesTotal: 2_048 }),
+    ["0.5", "/", `2.0${nb}KB`].join(nb)
+  );
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 1_500_000_000, bytesTotal: 3_000_000_000 }),
+    ["1.5", "/", `3.0${nb}GB`].join(nb)
+  );
+});
+
+test("an unknown total shows only the completed bytes in their own unit", () => {
+  const nb = "\u00A0";
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 18_300_000, bytesTotal: null }), `18.3${nb}MB`);
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 750, bytesTotal: null }), `750${nb}B`);
+});
+
+test("missing, zero or invalid byte progress shows nothing", () => {
+  assert.equal(formatYouTubeBytes(null), null);
+  assert.equal(formatYouTubeBytes({ bytesCompleted: null, bytesTotal: 100 }), null);
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 0, bytesTotal: 100 }), null);
+  assert.equal(formatYouTubeBytes({ bytesCompleted: Number.NaN, bytesTotal: 100 }), null);
+});
+
+test("completed bytes never exceed the total", () => {
+  const nb = "\u00A0";
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 5_000_000, bytesTotal: 4_000_000 }),
+    ["4.0", "/", `4.0${nb}MB`].join(nb)
+  );
+});
+
+test("a downloading row combines stage, percent and bytes", () => {
+  const nb = "\u00A0";
+  assert.equal(
+    youtubeProgressText("Downloading video…", 42, { bytesCompleted: 18_300_000, bytesTotal: 43_600_000 }),
+    `Downloading video… · 42% · 18.3${nb}/${nb}43.6${nb}MB`
+  );
+  assert.equal(
+    youtubeProgressText("Downloading video…", 42.4, { bytesCompleted: 18_300_000, bytesTotal: null }),
+    `Downloading video… · 42% · 18.3${nb}MB`
+  );
+});
+
+test("rows without bytes or percent keep the existing text", () => {
+  assert.equal(youtubeProgressText("Fetching video…", 0, null), "Fetching video…");
+  assert.equal(youtubeProgressText("Saved", 100, null), "Saved · 100%");
+  assert.equal(
+    youtubeProgressText("Downloading video…", 0, { bytesCompleted: null, bytesTotal: null }),
+    "Downloading video…"
+  );
+  assert.equal(youtubeProgressText(null, 0, null), "");
 });
