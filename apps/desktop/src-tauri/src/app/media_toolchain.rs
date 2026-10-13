@@ -129,7 +129,9 @@ pub struct MediaToolchainStatus {
     pub error: Option<String>,
 }
 
-/// Paths and digests from the active install after signature + hash verification.
+/// Paths and digests from the active install after manifest signature
+/// verification.  Whether file contents were also hashed depends on the
+/// resolver that produced it (`status` hashes, `active_component_paths` does not).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedToolchainPaths {
     pub root: PathBuf,
@@ -1021,7 +1023,16 @@ fn replace_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()>
     fs::rename(source, destination)
 }
 
+// Counts whole-file content passes made on the current thread, so tests can
+// prove a code path hashes the helpers the intended number of times.
+#[cfg(test)]
+thread_local! {
+    static CONTENT_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn sha256_file(path: &Path) -> ToolchainResult<String> {
+    #[cfg(test)]
+    CONTENT_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
     let mut file = fs::File::open(path).map_err(|error| {
         MediaToolchainError::new(
             MediaToolchainErrorCode::Io,
@@ -1048,6 +1059,17 @@ fn sha256_file(path: &Path) -> ToolchainResult<String> {
 fn verify_component_hashes(
     root: &Path,
     platform: &MediaToolchainPlatformManifest,
+) -> ToolchainResult<()> {
+    verify_component_files(root, platform, true)
+}
+
+/// Checks every component's presence, type and size and that the `bin`
+/// directory holds nothing else.  With `hash_contents` it also reads each
+/// file in full and compares its SHA-256 with the manifest.
+fn verify_component_files(
+    root: &Path,
+    platform: &MediaToolchainPlatformManifest,
+    hash_contents: bool,
 ) -> ToolchainResult<()> {
     for component in &platform.components {
         let path = safe_join(root, &component.path)?;
@@ -1080,6 +1102,9 @@ fn verify_component_hashes(
                     component_name(&component.kind)
                 ),
             ));
+        }
+        if !hash_contents {
+            continue;
         }
         let actual = sha256_file(&path)?;
         if actual != component.sha256 {
@@ -1222,6 +1247,13 @@ fn build_verified_paths(
 fn read_verified_active(
     layout: &MediaToolchainLayout,
 ) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, VerifiedToolchainPaths)>> {
+    read_active(layout, true)
+}
+
+fn read_active(
+    layout: &MediaToolchainLayout,
+    hash_contents: bool,
+) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, VerifiedToolchainPaths)>> {
     let state = read_install_state(layout)?;
     let Some(active_version) = state.active_version.clone() else {
         return Ok(None);
@@ -1244,7 +1276,7 @@ fn read_verified_active(
     }
     verify_manifest_signature(&manifest, &production_trust_store())?;
     let platform = manifest.platform_for_host()?.clone();
-    verify_component_hashes(&version_root, &platform)?;
+    verify_component_files(&version_root, &platform, hash_contents)?;
     let paths = build_verified_paths(version_root, active_version.clone(), &platform)?;
     Ok(Some((active_version, platform, paths)))
 }
@@ -1368,10 +1400,17 @@ fn managed_install_present_in(layout: &MediaToolchainLayout) -> bool {
     }
 }
 
-/// Re-verify the active install and return helper paths plus manifest digests.
-pub fn verified_component_paths() -> ToolchainResult<Option<VerifiedToolchainPaths>> {
+/// Resolve the active install's helper paths plus the manifest digests they
+/// must match, for a caller that is about to open and hash those exact files.
+///
+/// The signed manifest, the component paths, types and sizes, and the absence
+/// of stray files in `bin` are verified here; the file contents are NOT read.
+/// The launcher pins each file with an open handle and hashes that handle once,
+/// right before it executes, so hashing the same bytes here would only repeat
+/// ~230 MB of reads.  Use [`status`] for a full content check.
+pub fn active_component_paths() -> ToolchainResult<Option<VerifiedToolchainPaths>> {
     let layout = MediaToolchainLayout::resolve()?;
-    Ok(read_verified_active(&layout)?.map(|(_, _, paths)| paths))
+    Ok(read_active(&layout, false)?.map(|(_, _, paths)| paths))
 }
 
 /// Download, verify, extract, health-check, and atomically activate the latest
@@ -2471,5 +2510,47 @@ mod tests {
         fs::create_dir_all(&layout.root).unwrap();
         fs::write(layout.state_path(), b"{ not json").unwrap();
         assert!(managed_install_present_in(&layout));
+    }
+
+    #[test]
+    fn launch_resolution_checks_structure_without_reading_helper_contents() {
+        let platform = MediaToolchainPlatformManifest {
+            target: MEDIA_TOOLCHAIN_V1_TARGET.to_string(),
+            archive: MediaToolchainArchive {
+                url: "https://github.com/Howard-Starfield/Infield-media-toolchain/releases/latest/download/toolchain.zip".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: None,
+            },
+            components: vec![
+                sample_component(MediaToolchainComponentKind::YtDlp, "bin/yt-dlp.exe", b"yt"),
+                sample_component(MediaToolchainComponentKind::Ffmpeg, "bin/ffmpeg.exe", b"ffmpeg"),
+                sample_component(MediaToolchainComponentKind::Deno, "bin/deno.exe", b"deno"),
+            ],
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/yt-dlp.exe"), b"yt").unwrap();
+        fs::write(root.join("bin/ffmpeg.exe"), b"ffmpeg").unwrap();
+        fs::write(root.join("bin/deno.exe"), b"deno").unwrap();
+        let passes = || CONTENT_HASH_PASSES.with(std::cell::Cell::get);
+
+        let before = passes();
+        verify_component_files(root, &platform, false).unwrap();
+        assert_eq!(passes() - before, 0, "structure checks must not read contents");
+
+        let before = passes();
+        verify_component_hashes(root, &platform).unwrap();
+        assert_eq!(passes() - before, 3, "a full check hashes each file once");
+
+        // The structure-only check still rejects a missing, resized, or extra file.
+        fs::write(root.join("bin/ffmpeg.exe"), b"ffmpeg+").unwrap();
+        assert!(verify_component_files(root, &platform, false).is_err());
+        fs::write(root.join("bin/ffmpeg.exe"), b"ffmpeg").unwrap();
+        fs::write(root.join("bin/extra.exe"), b"x").unwrap();
+        assert!(verify_component_files(root, &platform, false).is_err());
+        fs::remove_file(root.join("bin/extra.exe")).unwrap();
+        fs::remove_file(root.join("bin/deno.exe")).unwrap();
+        assert!(verify_component_files(root, &platform, false).is_err());
     }
 }

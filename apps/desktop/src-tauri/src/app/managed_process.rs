@@ -188,11 +188,12 @@ pub fn lock_test_executable(
     let expected_size = fs::metadata(&executable)
         .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?
         .len();
-    open_verified_executable(executable, expected_digest, expected_digest, expected_size).map(
-        |verified| TestVerifiedExecutable {
-            _verified: verified,
-        },
-    )
+    let verified =
+        open_pinned_executable(executable, expected_digest, expected_digest, expected_size)?;
+    verified.revalidate()?;
+    Ok(TestVerifiedExecutable {
+        _verified: verified,
+    })
 }
 
 #[derive(Debug)]
@@ -231,9 +232,16 @@ pub struct HelperIdentity {
     pub digest: String,
 }
 
+/// A helper executable pinned by an open, write-denying handle.
+///
+/// Opening it checks the file's type, size, and PE header and records the
+/// approved SHA-256 it must have, but does not read its contents.  The
+/// contents are hashed by [`VerifiedExecutable::revalidate`], which each
+/// launch (and `helper_identity`) calls exactly once on this same handle.
 pub(super) struct VerifiedExecutable {
     path: PathBuf,
     _file: File,
+    /// Approved SHA-256 (lowercase) from the signed manifest or reviewed lock.
     digest: String,
     lock_digest: String,
     size: u64,
@@ -244,6 +252,11 @@ pub(super) struct VerifiedExecutable {
 }
 
 impl VerifiedExecutable {
+    /// Re-checks the pinned handle's type, size, and file identity and hashes
+    /// its contents once against the approved digest.  This is the only content
+    /// pass a launch makes per helper file, run immediately before the helper
+    /// executes (the process is still suspended) on the exact handle that is
+    /// held open against writes.
     pub(super) fn revalidate(&self) -> Result<(), ManagedProcessError> {
         let metadata = self
             ._file
@@ -262,7 +275,7 @@ impl VerifiedExecutable {
             .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
         if digest != self.digest {
             return Err(ManagedProcessError::Integrity(
-                "verified helper contents changed before launch".to_string(),
+                "helper digest does not match the approved helper lock".to_string(),
             ));
         }
         #[cfg(windows)]
@@ -319,11 +332,20 @@ impl VerifiedHelperSet {
     }
 }
 
+/// Resolves the helper set and proves its contents match the approved digests,
+/// reading each helper file exactly once.
 pub fn helper_identity(kind: HelperKind) -> Result<HelperIdentity, ManagedProcessError> {
     ensure_execution_hardened()?;
-    let verified = resolve_and_verify(kind)?;
+    let verified = resolve_helpers(kind)?;
+    identity_of(&verified)
+}
+
+fn identity_of(helpers: &VerifiedHelperSet) -> Result<HelperIdentity, ManagedProcessError> {
+    for executable in helpers.identities() {
+        executable.revalidate()?;
+    }
     Ok(HelperIdentity {
-        digest: verified.lock_digest().to_string(),
+        digest: helpers.lock_digest().to_string(),
     })
 }
 
@@ -358,7 +380,9 @@ fn run_observed(
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     ensure_execution_hardened()?;
     let kind = spec.helper;
-    let verified = resolve_and_verify(kind)?;
+    // Resolving pins the helper files but does not read them: the supervisor
+    // hashes each pinned handle once, right before the process is resumed.
+    let verified = resolve_helpers(kind)?;
     verified.apply_controlled_args(kind, &mut spec);
     let executable = verified.executable(kind).path.clone();
     let identities = verified.identities();
@@ -749,7 +773,10 @@ impl TransientCleanupVerifier for HelperTempCleanupVerifier {
     }
 }
 
-fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProcessError> {
+/// Locates the helper set and pins each file (see [`VerifiedExecutable`]).
+/// Content hashing is deliberately left to the caller's single
+/// [`VerifiedExecutable::revalidate`] pass.
+fn resolve_helpers(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProcessError> {
     if !matches!(kind, HelperKind::YouTubeYtDlp | HelperKind::YouTubeFfmpeg) {
         return Err(ManagedProcessError::Integrity(
             "unsupported helper set".to_string(),
@@ -777,7 +804,7 @@ fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProc
         let expected = locked.components.remove(name).ok_or_else(|| {
             ManagedProcessError::Integrity(format!("the {name} lock entry is unavailable"))
         })?;
-        open_verified_executable(
+        open_pinned_executable(
             install_dir.join(format!("{name}.exe")),
             &expected.asset_digest,
             &lock_digest,
@@ -792,7 +819,7 @@ fn resolve_and_verify(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProc
 }
 
 fn resolve_from_media_toolchain() -> Result<Option<VerifiedHelperSet>, ManagedProcessError> {
-    let paths = match crate::app::media_toolchain::verified_component_paths() {
+    let paths = match crate::app::media_toolchain::active_component_paths() {
         Ok(paths) => paths,
         Err(error) => {
             return Err(ManagedProcessError::Integrity(error.to_string()));
@@ -811,19 +838,19 @@ fn resolve_from_media_toolchain() -> Result<Option<VerifiedHelperSet>, ManagedPr
             .len())
     };
     Ok(Some(VerifiedHelperSet {
-        ytdlp: open_verified_executable(
+        ytdlp: open_pinned_executable(
             paths.yt_dlp.clone(),
             &paths.yt_dlp_sha256,
             &lock_digest,
             size_or(paths.yt_dlp_size_bytes, &paths.yt_dlp)?,
         )?,
-        deno: open_verified_executable(
+        deno: open_pinned_executable(
             paths.deno.clone(),
             &paths.deno_sha256,
             &lock_digest,
             size_or(paths.deno_size_bytes, &paths.deno)?,
         )?,
-        ffmpeg: open_verified_executable(
+        ffmpeg: open_pinned_executable(
             paths.ffmpeg.clone(),
             &paths.ffmpeg_sha256,
             &lock_digest,
@@ -1007,7 +1034,11 @@ fn canonical_json(value: &Value) -> Option<Vec<u8>> {
     Some(output.into_bytes())
 }
 
-fn open_verified_executable(
+/// Opens a helper with a write-denying handle and checks what can be checked
+/// without reading it: regular non-reparse file, approved size, stable path,
+/// x86_64 PE header, and file identity.  The content hash is checked by
+/// [`VerifiedExecutable::revalidate`].
+fn open_pinned_executable(
     path: PathBuf,
     expected_digest: &str,
     lock_digest: &str,
@@ -1059,13 +1090,6 @@ fn open_verified_executable(
             "helper path identity changed while it was opened".to_string(),
         ));
     }
-    let actual = digest_reader(&mut file)
-        .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
-    if !actual.eq_ignore_ascii_case(expected_digest) {
-        return Err(ManagedProcessError::Integrity(
-            "helper digest does not match the approved helper lock".to_string(),
-        ));
-    }
     verify_pe_x86_64(&mut file)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
@@ -1074,7 +1098,7 @@ fn open_verified_executable(
     Ok(VerifiedExecutable {
         path: canonical_path,
         _file: file,
-        digest: actual,
+        digest: expected_digest.to_ascii_lowercase(),
         lock_digest: lock_digest.to_string(),
         size: metadata.len(),
         #[cfg(windows)]
@@ -1147,7 +1171,16 @@ fn verify_pe_x86_64(file: &mut File) -> Result<(), ManagedProcessError> {
     Ok(())
 }
 
+// Counts whole-file content passes made on the current thread, so tests can
+// prove a code path reads each helper the intended number of times.
+#[cfg(test)]
+thread_local! {
+    static CONTENT_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn digest_reader(file: &mut File) -> std::io::Result<String> {
+    #[cfg(test)]
+    CONTENT_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -1326,7 +1359,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn delegated_helper_paths_are_app_owned_and_deterministic() {
-        use super::{open_verified_executable, ManagedProcessSpec, VerifiedHelperSet};
+        use super::{open_pinned_executable, ManagedProcessSpec, VerifiedHelperSet};
         use std::ffi::OsString;
         use std::fs;
         use std::time::Duration;
@@ -1339,7 +1372,7 @@ mod tests {
         let open = |name: &str| {
             let path = temp.path().join(format!("{name}.exe"));
             fs::write(&path, &bytes).unwrap();
-            open_verified_executable(path, &digest, &"b".repeat(64), bytes.len() as u64).unwrap()
+            open_pinned_executable(path, &digest, &"b".repeat(64), bytes.len() as u64).unwrap()
         };
         let helpers = VerifiedHelperSet {
             ytdlp: open("yt-dlp"),
@@ -1411,6 +1444,162 @@ mod tests {
             .take_cleanup_verifier()
             .expect("permanent uncertainty must be registered before returning");
         assert!(verifier.verify_cleanup().is_err());
+    }
+
+    /// Content-pass accounting for helper verification: every launch and every
+    /// `helper_identity` must read each helper file exactly once.
+    #[cfg(windows)]
+    mod content_passes {
+        use super::super::{
+            identity_of, open_pinned_executable, run_with_capability, ManagedProcessError,
+            ManagedProcessSpec, TestFaultSelection, VerifiedExecutable, VerifiedHelperSet,
+            CONTENT_HASH_PASSES,
+        };
+        use crate::app::safe_output_filesystem::HelperTempCapability;
+        use sha2::{Digest, Sha256};
+        use std::ffi::OsString;
+        use std::fs;
+        use std::path::Path;
+        use std::time::Duration;
+
+        fn passes() -> usize {
+            CONTENT_HASH_PASSES.with(std::cell::Cell::get)
+        }
+
+        /// Smallest file the pin step accepts: an x86_64 PE header.
+        fn fake_pe(tag: u8) -> Vec<u8> {
+            let mut bytes = vec![0u8; 256];
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+            bytes[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+            bytes[200] = tag;
+            bytes
+        }
+
+        fn sha256(bytes: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(bytes))
+        }
+
+        fn pin(dir: &Path, name: &str, approved: &[u8], on_disk: &[u8]) -> VerifiedExecutable {
+            let path = dir.join(format!("{name}.exe"));
+            fs::write(&path, on_disk).unwrap();
+            open_pinned_executable(
+                path,
+                &sha256(approved),
+                &"b".repeat(64),
+                approved.len() as u64,
+            )
+            .unwrap()
+        }
+
+        fn helper_set(dir: &Path, corrupt: Option<&str>) -> VerifiedHelperSet {
+            let pin_named = |name: &str, tag: u8| {
+                let approved = fake_pe(tag);
+                let on_disk = if corrupt == Some(name) {
+                    fake_pe(tag.wrapping_add(1))
+                } else {
+                    approved.clone()
+                };
+                pin(dir, name, &approved, &on_disk)
+            };
+            VerifiedHelperSet {
+                ytdlp: pin_named("yt-dlp", 1),
+                deno: pin_named("deno", 2),
+                ffmpeg: pin_named("ffmpeg", 3),
+            }
+        }
+
+        #[test]
+        fn pinning_the_helper_set_reads_no_contents() {
+            let temp = tempfile::tempdir().unwrap();
+            let before = passes();
+            let _set = helper_set(temp.path(), None);
+            assert_eq!(passes() - before, 0);
+        }
+
+        #[test]
+        fn helper_identity_reads_each_helper_file_exactly_once() {
+            let temp = tempfile::tempdir().unwrap();
+            let set = helper_set(temp.path(), None);
+            let before = passes();
+            let identity = identity_of(&set).unwrap();
+            assert_eq!(passes() - before, 3);
+            assert_eq!(identity.digest, "b".repeat(64));
+        }
+
+        #[test]
+        fn helper_identity_detects_a_helper_that_does_not_match_its_approved_digest() {
+            for corrupt in ["yt-dlp", "deno", "ffmpeg"] {
+                let temp = tempfile::tempdir().unwrap();
+                let set = helper_set(temp.path(), Some(corrupt));
+                assert!(
+                    matches!(identity_of(&set), Err(ManagedProcessError::Integrity(_))),
+                    "{corrupt} was corrupted but identity succeeded"
+                );
+            }
+        }
+
+        #[test]
+        fn pinning_still_rejects_the_wrong_size_without_reading_contents() {
+            let temp = tempfile::tempdir().unwrap();
+            let bytes = fake_pe(1);
+            let path = temp.path().join("yt-dlp.exe");
+            fs::write(&path, &bytes).unwrap();
+            let before = passes();
+            let result = open_pinned_executable(
+                path,
+                &sha256(&bytes),
+                &"b".repeat(64),
+                bytes.len() as u64 + 1,
+            );
+            assert!(matches!(result, Err(ManagedProcessError::Integrity(_))));
+            assert_eq!(passes() - before, 0);
+        }
+
+        fn launch(set: &VerifiedHelperSet) -> Result<(), ManagedProcessError> {
+            let parent = tempfile::tempdir().unwrap();
+            let capability = HelperTempCapability::create_for_test(parent.path()).unwrap();
+            // Any real executable works: the supervisor revalidates the pinned
+            // helpers and launches the path it is given.
+            let spec = ManagedProcessSpec::youtube_ytdlp(
+                vec![OsString::from("--list")],
+                1024 * 1024,
+                1024 * 1024,
+                Duration::from_secs(60),
+            );
+            run_with_capability(
+                std::env::current_exe().unwrap(),
+                &set.identities(),
+                spec,
+                capability,
+                None,
+                TestFaultSelection::None,
+                None,
+            )
+            .map(|output| assert!(output.status.success()))
+        }
+
+        #[test]
+        fn a_launch_reads_each_helper_file_exactly_once() {
+            let temp = tempfile::tempdir().unwrap();
+            let set = helper_set(temp.path(), None);
+            let before = passes();
+            launch(&set).unwrap();
+            assert_eq!(passes() - before, 3);
+        }
+
+        #[test]
+        fn a_launch_refuses_a_helper_that_does_not_match_its_approved_digest() {
+            for corrupt in ["yt-dlp", "deno", "ffmpeg"] {
+                let temp = tempfile::tempdir().unwrap();
+                let set = helper_set(temp.path(), Some(corrupt));
+                assert!(
+                    matches!(launch(&set), Err(ManagedProcessError::Integrity(_))),
+                    "{corrupt} was corrupted but the launch went ahead"
+                );
+            }
+        }
     }
 }
 
