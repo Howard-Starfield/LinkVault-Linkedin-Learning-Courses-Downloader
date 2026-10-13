@@ -1,0 +1,67 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { helperRecoveryKind } from "../src/lib/youtube/helperRecovery.ts";
+
+test("missing and integrity codes need reinstall", () => {
+  for (const code of ["HELPER_MISSING", "HELPER_INTEGRITY_FAILED"]) {
+    assert.equal(helperRecoveryKind({ code, message: "m" }), "reinstall", code);
+  }
+});
+
+test("runtime integrity failure surfaced as HELPER_FAILED needs reinstall", () => {
+  assert.equal(
+    helperRecoveryKind({ code: "HELPER_FAILED", message: "helper integrity validation failed: ffmpeg hash mismatch" }),
+    "reinstall"
+  );
+});
+
+test("helperLockDigest contract error needs reinstall, in object or string form", () => {
+  assert.equal(helperRecoveryKind({ code: "MANIFEST_CONTRACT_INVALID", message: "helperLockDigest must be a lowercase SHA-256 digest" }), "reinstall");
+  assert.equal(helperRecoveryKind("MANIFEST_CONTRACT_INVALID: helperLockDigest must be a lowercase SHA-256 digest"), "reinstall");
+});
+
+test("ordinary helper run failures are runtime, not reinstall", () => {
+  assert.equal(helperRecoveryKind({ code: "HELPER_FAILED", message: "ERROR: [youtube] abc: Video unavailable" }), "runtime");
+  assert.equal(helperRecoveryKind({ code: "HELPER_TIMEOUT", message: "yt-dlp helper timed out" }), "runtime");
+  assert.equal(helperRecoveryKind({ code: "HELPER_TEMP_ROOT_INVALID", message: "temp root is a junction" }), "runtime");
+});
+
+test("media and collision failures are not helper failures unless they carry the integrity code", () => {
+  assert.equal(helperRecoveryKind({ code: "MEDIA_VERIFY_FAILED", message: "The downloaded file failed the FFmpeg media check: it could not be read" }), null);
+  assert.equal(helperRecoveryKind({ code: "OUTPUT_COLLISION", message: "existing output is not an exact verified match: x" }), null);
+  // Task 1 Step 6 maps probe-time integrity failures to this code.
+  assert.equal(helperRecoveryKind({ code: "HELPER_INTEGRITY_FAILED", message: "ffmpeg hash mismatch" }), "reinstall");
+});
+
+test("unrelated and malformed errors are not helper failures", () => {
+  assert.equal(helperRecoveryKind({ code: "MANIFEST_CONTRACT_INVALID", message: "videoId must not be empty" }), null);
+  assert.equal(helperRecoveryKind({ code: "SCAN_PLAN_STALE", message: "m" }), null);
+  assert.equal(helperRecoveryKind(new Error("network down")), null);
+  assert.equal(helperRecoveryKind(null), null);
+  assert.equal(helperRecoveryKind(42), null);
+});
+
+test("string-form codes are parsed", () => {
+  assert.equal(helperRecoveryKind("HELPER_INTEGRITY_FAILED: x"), "reinstall");
+});
+
+test("integrity prefix tolerates leading whitespace and realistic scan messages", () => {
+  assert.equal(
+    helperRecoveryKind({ code: "HELPER_FAILED", message: "  \n helper integrity validation failed: ffmpeg hash mismatch" }),
+    "reinstall"
+  );
+  assert.equal(
+    helperRecoveryKind({ code: "HELPER_FAILED", message: "helper integrity validation failed: the yt-dlp lock entry is unavailable" }),
+    "reinstall"
+  );
+});
+
+test("helper start failures are runtime, not reinstall", () => {
+  assert.equal(helperRecoveryKind({ code: "HELPER_FAILED", message: "failed to start trusted helper: access denied" }), "runtime");
+});
+
+test("malformed code shapes and status-unavailable are not helper failures", () => {
+  assert.equal(helperRecoveryKind({ code: 42 }), null);
+  assert.equal(helperRecoveryKind({ code: "HELPER_TIMEOUT" }), "runtime");
+  assert.equal(helperRecoveryKind({ code: "HELPER_STATUS_UNAVAILABLE", message: "m" }), null);
+});

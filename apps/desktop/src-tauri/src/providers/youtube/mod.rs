@@ -6,6 +6,7 @@
 //! uses `crate::app::managed_process`.
 
 pub mod commands;
+mod download_progress;
 mod error;
 mod executor;
 mod helper;

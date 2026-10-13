@@ -129,9 +129,11 @@ pub struct MediaToolchainStatus {
     pub error: Option<String>,
 }
 
-/// Paths and digests from the active install after signature + hash verification.
+/// Paths and digests from the active install after manifest signature
+/// verification.  Whether file contents were also hashed depends on the
+/// resolver that produced it (`status` hashes, `active_component_paths` does not).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedToolchainPaths {
+pub struct ActiveToolchainPaths {
     pub root: PathBuf,
     pub version: String,
     pub yt_dlp: PathBuf,
@@ -742,27 +744,63 @@ fn default_state_schema_version() -> u32 {
     MEDIA_TOOLCHAIN_STATE_SCHEMA_VERSION
 }
 
+/// Why `state.json` could not be turned into an install state. Only `Malformed`
+/// justifies quarantining the file; the others must leave it untouched.
+#[derive(Debug)]
+enum InstallStateReadFailure {
+    /// Transient or environmental read failure (permissions, AV lock, races).
+    Io(MediaToolchainError),
+    /// Content is not valid install state: bad JSON, invalid field or version.
+    Malformed(MediaToolchainError),
+    /// Written by a newer build than this one understands.
+    NewerSchema(MediaToolchainError),
+}
+
+impl InstallStateReadFailure {
+    fn into_error(self) -> MediaToolchainError {
+        match self {
+            Self::Io(error) | Self::Malformed(error) | Self::NewerSchema(error) => error,
+        }
+    }
+}
+
 fn read_install_state(layout: &MediaToolchainLayout) -> ToolchainResult<MediaToolchainInstallState> {
+    read_install_state_classified(layout).map_err(InstallStateReadFailure::into_error)
+}
+
+fn read_install_state_classified(
+    layout: &MediaToolchainLayout,
+) -> Result<MediaToolchainInstallState, InstallStateReadFailure> {
     let path = layout.state_path();
     if !path.exists() {
         return Ok(MediaToolchainInstallState::default());
     }
     let bytes = fs::read(&path).map_err(|error| {
-        MediaToolchainError::new(
+        InstallStateReadFailure::Io(MediaToolchainError::new(
             MediaToolchainErrorCode::Io,
             format!("Read media-toolchain install state: {error}"),
-        )
+        ))
     })?;
     let state: MediaToolchainInstallState = serde_json::from_slice(&bytes).map_err(|_| {
-        MediaToolchainError::new(
+        InstallStateReadFailure::Malformed(MediaToolchainError::new(
             MediaToolchainErrorCode::ActivationFailed,
             "Media-toolchain install state is unreadable",
-        )
+        ))
     })?;
+    if state.schema_version > MEDIA_TOOLCHAIN_STATE_SCHEMA_VERSION {
+        return Err(InstallStateReadFailure::NewerSchema(
+            MediaToolchainError::new(
+                MediaToolchainErrorCode::ActivationFailed,
+                "The helper install state was written by a newer LinkedVault; update LinkedVault.",
+            ),
+        ));
+    }
     if state.schema_version != MEDIA_TOOLCHAIN_STATE_SCHEMA_VERSION {
-        return Err(MediaToolchainError::new(
-            MediaToolchainErrorCode::ActivationFailed,
-            "Media-toolchain install state uses an unsupported schema",
+        return Err(InstallStateReadFailure::Malformed(
+            MediaToolchainError::new(
+                MediaToolchainErrorCode::ActivationFailed,
+                "Media-toolchain install state uses an unsupported schema",
+            ),
         ));
     }
     for version in [
@@ -773,13 +811,110 @@ fn read_install_state(layout: &MediaToolchainLayout) -> ToolchainResult<MediaToo
     .flatten()
     {
         if validate_version(version).is_err() {
-            return Err(MediaToolchainError::new(
-                MediaToolchainErrorCode::ActivationFailed,
-                "Media-toolchain install state contains an invalid version",
+            return Err(InstallStateReadFailure::Malformed(
+                MediaToolchainError::new(
+                    MediaToolchainErrorCode::ActivationFailed,
+                    "Media-toolchain install state contains an invalid version",
+                ),
             ));
         }
     }
     Ok(state)
+}
+
+/// Install-time read that never touches the file: a malformed state is treated
+/// as "no active version" in memory (the flag reports it), while I/O failures
+/// and newer-schema files propagate unchanged.
+fn read_install_state_lenient(
+    layout: &MediaToolchainLayout,
+) -> ToolchainResult<(MediaToolchainInstallState, bool)> {
+    match read_install_state_classified(layout) {
+        Ok(state) => Ok((state, false)),
+        Err(InstallStateReadFailure::Malformed(_)) => {
+            Ok((MediaToolchainInstallState::default(), true))
+        }
+        Err(other) => Err(other.into_error()),
+    }
+}
+
+/// Writes the new install state for an activation. When the previous state was
+/// malformed it is first moved aside to `state.json.corrupt-<unix-seconds>`
+/// (never deleted), and moved back if the write fails so a failed repair leaves
+/// the user's files as they were. `write` is a seam for failure-injection tests.
+fn commit_install_state(
+    layout: &MediaToolchainLayout,
+    state: MediaToolchainInstallState,
+    previous_state_malformed: bool,
+    unix_seconds: u64,
+    write: impl FnOnce(&MediaToolchainLayout, MediaToolchainInstallState) -> ToolchainResult<()>,
+) -> ToolchainResult<()> {
+    let quarantined = if previous_state_malformed {
+        let path = quarantine_install_state(layout, unix_seconds).map_err(|error| {
+            MediaToolchainError::new(
+                MediaToolchainErrorCode::ActivationFailed,
+                format!("Set aside unreadable media-toolchain install state: {error}"),
+            )
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+    write(layout, state).inspect_err(|_| {
+        if let Some(path) = quarantined.as_deref() {
+            restore_quarantined_state(layout, path);
+        }
+    })
+}
+
+/// Best-effort move of a quarantined state file back to `state.json`. Never
+/// overwrites a file that is already there.
+fn restore_quarantined_state(layout: &MediaToolchainLayout, quarantined: &Path) {
+    let destination = layout.state_path();
+    let outcome = if fs::symlink_metadata(&destination).is_ok() {
+        Err("a state file already exists".to_string())
+    } else {
+        fs::rename(quarantined, &destination).map_err(|error| error.to_string())
+    };
+    match outcome {
+        Ok(()) => eprintln!(
+            "media-toolchain: activation failed; restored the unreadable install state file"
+        ),
+        Err(reason) => eprintln!(
+            "media-toolchain: activation failed and the unreadable install state could not be restored ({reason}); it remains in the quarantine file"
+        ),
+    }
+}
+
+/// Renames `state.json` to a unique `state.json.corrupt-<unix-seconds>[-n]` name
+/// in the same directory. `rename` acts on the directory entry itself, so a
+/// symlinked `state.json` is moved, not followed. An existing quarantine file is
+/// never overwritten.
+fn quarantine_install_state(
+    layout: &MediaToolchainLayout,
+    unix_seconds: u64,
+) -> std::io::Result<PathBuf> {
+    let source = layout.state_path();
+    // symlink_metadata does not follow links; absent means nothing to quarantine.
+    fs::symlink_metadata(&source)?;
+    let mut target = layout
+        .root
+        .join(format!("state.json.corrupt-{unix_seconds}"));
+    let mut suffix = 1_u32;
+    while fs::symlink_metadata(&target).is_ok() {
+        target = layout
+            .root
+            .join(format!("state.json.corrupt-{unix_seconds}-{suffix}"));
+        suffix += 1;
+    }
+    fs::rename(&source, &target)?;
+    eprintln!(
+        "media-toolchain: install state was unreadable; moved it to {} and continuing as a fresh install",
+        target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    Ok(target)
 }
 
 fn write_install_state_atomic(
@@ -888,7 +1023,16 @@ fn replace_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()>
     fs::rename(source, destination)
 }
 
+// Counts whole-file content passes made on the current thread, so tests can
+// prove a code path hashes the helpers the intended number of times.
+#[cfg(test)]
+thread_local! {
+    static CONTENT_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn sha256_file(path: &Path) -> ToolchainResult<String> {
+    #[cfg(test)]
+    CONTENT_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
     let mut file = fs::File::open(path).map_err(|error| {
         MediaToolchainError::new(
             MediaToolchainErrorCode::Io,
@@ -915,6 +1059,17 @@ fn sha256_file(path: &Path) -> ToolchainResult<String> {
 fn verify_component_hashes(
     root: &Path,
     platform: &MediaToolchainPlatformManifest,
+) -> ToolchainResult<()> {
+    verify_component_files(root, platform, true)
+}
+
+/// Checks every component's presence, type and size and that the `bin`
+/// directory holds nothing else.  With `hash_contents` it also reads each
+/// file in full and compares its SHA-256 with the manifest.
+fn verify_component_files(
+    root: &Path,
+    platform: &MediaToolchainPlatformManifest,
+    hash_contents: bool,
 ) -> ToolchainResult<()> {
     for component in &platform.components {
         let path = safe_join(root, &component.path)?;
@@ -947,6 +1102,9 @@ fn verify_component_hashes(
                     component_name(&component.kind)
                 ),
             ));
+        }
+        if !hash_contents {
+            continue;
         }
         let actual = sha256_file(&path)?;
         if actual != component.sha256 {
@@ -1067,11 +1225,11 @@ fn build_verified_paths(
     version_root: PathBuf,
     version: String,
     platform: &MediaToolchainPlatformManifest,
-) -> ToolchainResult<VerifiedToolchainPaths> {
+) -> ToolchainResult<ActiveToolchainPaths> {
     let yt_dlp = artifact_for(platform, MediaToolchainComponentKind::YtDlp)?;
     let ffmpeg = artifact_for(platform, MediaToolchainComponentKind::Ffmpeg)?;
     let deno = artifact_for(platform, MediaToolchainComponentKind::Deno)?;
-    Ok(VerifiedToolchainPaths {
+    Ok(ActiveToolchainPaths {
         yt_dlp: safe_join(&version_root, &yt_dlp.path)?,
         ffmpeg: safe_join(&version_root, &ffmpeg.path)?,
         deno: safe_join(&version_root, &deno.path)?,
@@ -1088,7 +1246,14 @@ fn build_verified_paths(
 
 fn read_verified_active(
     layout: &MediaToolchainLayout,
-) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, VerifiedToolchainPaths)>> {
+) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, ActiveToolchainPaths)>> {
+    read_active(layout, true)
+}
+
+fn read_active(
+    layout: &MediaToolchainLayout,
+    hash_contents: bool,
+) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, ActiveToolchainPaths)>> {
     let state = read_install_state(layout)?;
     let Some(active_version) = state.active_version.clone() else {
         return Ok(None);
@@ -1111,12 +1276,14 @@ fn read_verified_active(
     }
     verify_manifest_signature(&manifest, &production_trust_store())?;
     let platform = manifest.platform_for_host()?.clone();
-    verify_component_hashes(&version_root, &platform)?;
+    verify_component_files(&version_root, &platform, hash_contents)?;
     let paths = build_verified_paths(version_root, active_version.clone(), &platform)?;
     Ok(Some((active_version, platform, paths)))
 }
 
 fn status_from_layout(layout: &MediaToolchainLayout) -> MediaToolchainStatus {
+    // NOTE: `root.exists()` differs from `managed_install_present()` (recorded
+    // active version); reconcile in a follow-up.
     let managed_install_present = layout.root.exists();
     let state = match read_install_state(layout) {
         Ok(state) => state,
@@ -1216,10 +1383,34 @@ pub fn status() -> ToolchainResult<MediaToolchainStatus> {
     Ok(status_from_layout(&layout))
 }
 
-/// Re-verify the active install and return helper paths plus manifest digests.
-pub fn verified_component_paths() -> ToolchainResult<Option<VerifiedToolchainPaths>> {
+/// Whether an install has been recorded, without verifying it. A failed first
+/// download leaves `root/` and `root/staging/` behind, so directory existence is
+/// not enough: an install counts once `state.json` names an active version, or
+/// when `state.json` is unreadable (a broken install, not a missing one).
+pub fn managed_install_present() -> bool {
+    MediaToolchainLayout::resolve()
+        .map(|layout| managed_install_present_in(&layout))
+        .unwrap_or(false)
+}
+
+fn managed_install_present_in(layout: &MediaToolchainLayout) -> bool {
+    match read_install_state(layout) {
+        Ok(state) => state.active_version.is_some(),
+        Err(_) => true,
+    }
+}
+
+/// Resolve the active install's helper paths plus the manifest digests they
+/// must match, for a caller that is about to open and hash those exact files.
+///
+/// The signed manifest, the component paths, types and sizes, and the absence
+/// of stray files in `bin` are verified here; the file contents are NOT read.
+/// The launcher pins each file with an open handle and hashes that handle once,
+/// right before it executes, so hashing the same bytes here would only repeat
+/// ~230 MB of reads.  Use [`status`] for a full content check.
+pub fn active_component_paths() -> ToolchainResult<Option<ActiveToolchainPaths>> {
     let layout = MediaToolchainLayout::resolve()?;
-    Ok(read_verified_active(&layout)?.map(|(_, _, paths)| paths))
+    Ok(read_active(&layout, false)?.map(|(_, _, paths)| paths))
 }
 
 /// Download, verify, extract, health-check, and atomically activate the latest
@@ -1240,18 +1431,28 @@ pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
 
     let result = (|| -> ToolchainResult<()> {
         let (manifest_bytes, manifest) = fetch_verified_manifest()?;
-        let installed = read_install_state(&layout)?;
+        // Never renames: a malformed state is only set aside once an activation
+        // is ready to write a replacement, after the download has succeeded.
+        let (installed, _) = read_install_state_lenient(&layout)?;
         reject_downgrade(installed.active_version.as_deref(), &manifest.version)?;
 
         // Same version already verified: refresh state timestamps and return.
-        if installed.active_version.as_deref() == Some(manifest.version.as_str()) {
-            if read_verified_active(&layout)?.is_some() {
-                let mut state = installed;
-                state.last_checked_at = Some(Utc::now().to_rfc3339());
-                state.latest_available = Some(manifest.version.clone());
-                write_install_state_atomic(&layout, state)?;
-                return Ok(());
-            }
+        // A same-version install that fails verification falls through and is
+        // reinstalled from the freshly verified signed manifest and archive.
+        let active_is_latest =
+            installed.active_version.as_deref() == Some(manifest.version.as_str());
+        if active_is_latest
+            && same_version_install_is_current(
+                installed.active_version.as_deref(),
+                &manifest.version,
+                read_verified_active(&layout).map(|active| active.is_some()),
+            )
+        {
+            let mut state = installed;
+            state.last_checked_at = Some(Utc::now().to_rfc3339());
+            state.latest_available = Some(manifest.version.clone());
+            write_install_state_atomic(&layout, state)?;
+            return Ok(());
         }
 
         let platform = manifest.platform_for_host()?.clone();
@@ -1276,9 +1477,48 @@ pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
         Ok(())
     })();
 
-    let _ = fs::remove_dir_all(&stage);
-    result?;
+    finish_install_stage(&stage, result)?;
     Ok(status_from_layout(&layout))
+}
+
+/// Clean up the install staging directory and report the install result.
+/// When a failed activation parked the previous install in
+/// `<stage>/replaced-version`, only that tree is kept (it may be the only
+/// copy); the archive and candidate are still removed so nothing else leaks.
+fn finish_install_stage(stage: &Path, result: ToolchainResult<()>) -> ToolchainResult<()> {
+    let parked_previous = stage.join("replaced-version");
+    let parked = parked_previous.exists();
+    if stage_cleanup_allowed(result.is_err(), parked) {
+        let _ = fs::remove_dir_all(stage);
+    } else {
+        let _ = fs::remove_file(stage.join("toolchain.zip"));
+        let _ = fs::remove_dir_all(stage.join("candidate"));
+    }
+    result.map_err(|mut error| {
+        if parked {
+            error.message.push_str(&format!(
+                "; the previous helper install was preserved at {}",
+                parked_previous.display()
+            ));
+        }
+        error
+    })
+}
+
+/// True only when the active install already *is* the signed latest version
+/// and still verifies. A failed verification means "repair", not "abort".
+fn same_version_install_is_current(
+    active_version: Option<&str>,
+    latest_version: &str,
+    active_verifies: ToolchainResult<bool>,
+) -> bool {
+    active_version == Some(latest_version) && matches!(active_verifies, Ok(true))
+}
+
+/// The staging tree may be removed unless a failed activation left the prior
+/// install parked inside it (`replaced-version`), which is then the only copy.
+fn stage_cleanup_allowed(install_failed: bool, replaced_version_parked: bool) -> bool {
+    !(install_failed && replaced_version_parked)
 }
 
 fn fetch_verified_manifest() -> ToolchainResult<(Vec<u8>, MediaToolchainManifest)> {
@@ -1674,7 +1914,7 @@ fn activate_candidate(
             "Media-toolchain candidate is incomplete",
         ));
     }
-    let mut state = read_install_state(layout)?;
+    let (mut state, previous_state_malformed) = read_install_state_lenient(layout)?;
     fs::create_dir_all(layout.versions_dir()).map_err(|error| {
         MediaToolchainError::new(
             MediaToolchainErrorCode::ActivationFailed,
@@ -1737,7 +1977,17 @@ fn activate_candidate(
     state.latest_available = Some(version.to_string());
     state.latest_manifest_size_bytes = manifest_size_bytes;
     state.last_checked_at = Some(Utc::now().to_rfc3339());
-    if let Err(error) = write_install_state_atomic(layout, state) {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Err(error) = commit_install_state(
+        layout,
+        state,
+        previous_state_malformed,
+        unix_seconds,
+        write_install_state_atomic,
+    ) {
         let mut recovery_failures = Vec::new();
         if let Err(restore_error) = fs::rename(&destination, candidate) {
             recovery_failures.push(format!("restore candidate: {restore_error}"));
@@ -1909,5 +2159,398 @@ mod tests {
             layout.version_dir("1.0.0"),
             PathBuf::from("C:/tmp/media-toolchain/versions/1.0.0")
         );
+    }
+
+    #[test]
+    fn same_version_install_is_current_only_when_verification_passes() {
+        let verified: ToolchainResult<bool> = Ok(true);
+        assert!(same_version_install_is_current(
+            Some("0.1.1"),
+            "0.1.1",
+            verified
+        ));
+        // Regression: a failed verification used to abort the install instead of repairing it.
+        let corrupted: ToolchainResult<bool> = Err(MediaToolchainError::new(
+            MediaToolchainErrorCode::ComponentIntegrityFailed,
+            "hash mismatch",
+        ));
+        assert!(!same_version_install_is_current(
+            Some("0.1.1"),
+            "0.1.1",
+            corrupted
+        ));
+        assert!(!same_version_install_is_current(
+            Some("0.1.1"),
+            "0.1.1",
+            Ok(false)
+        ));
+        assert!(!same_version_install_is_current(
+            Some("0.1.0"),
+            "0.1.1",
+            Ok(true)
+        ));
+        assert!(!same_version_install_is_current(None, "0.1.1", Ok(true)));
+    }
+
+    #[test]
+    fn stage_cleanup_is_refused_only_when_a_failed_install_parked_the_previous_tree() {
+        assert!(stage_cleanup_allowed(false, false));
+        assert!(stage_cleanup_allowed(false, true));
+        assert!(stage_cleanup_allowed(true, false));
+        assert!(!stage_cleanup_allowed(true, true));
+    }
+
+    #[test]
+    fn activation_replaces_a_corrupted_same_version_tree() {
+        const VERSION: &str = "0.1.1";
+        let platform = MediaToolchainPlatformManifest {
+            target: MEDIA_TOOLCHAIN_V1_TARGET.to_string(),
+            archive: MediaToolchainArchive {
+                url: "https://github.com/Howard-Starfield/Infield-media-toolchain/releases/latest/download/toolchain.zip".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: None,
+            },
+            components: vec![
+                sample_component(MediaToolchainComponentKind::YtDlp, "bin/yt-dlp.exe", b"yt"),
+                sample_component(MediaToolchainComponentKind::Ffmpeg, "bin/ffmpeg.exe", b"ffmpeg"),
+                sample_component(MediaToolchainComponentKind::Deno, "bin/deno.exe", b"deno"),
+            ],
+        };
+        let write_tree = |root: &Path, ffmpeg: &[u8]| {
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::write(root.join("bin/yt-dlp.exe"), b"yt").unwrap();
+            fs::write(root.join("bin/ffmpeg.exe"), ffmpeg).unwrap();
+            fs::write(root.join("bin/deno.exe"), b"deno").unwrap();
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        let installed = layout.version_dir(VERSION);
+        write_tree(&installed, b"ffmpeg");
+        write_install_state_atomic(
+            &layout,
+            MediaToolchainInstallState {
+                active_version: Some(VERSION.to_string()),
+                ..MediaToolchainInstallState::default()
+            },
+        )
+        .unwrap();
+        verify_component_hashes(&installed, &platform).unwrap();
+
+        // Corrupt the installed tree by one byte.
+        fs::write(installed.join("bin/ffmpeg.exe"), b"ffmpeG").unwrap();
+        assert!(verify_component_hashes(&installed, &platform).is_err());
+
+        let stage = layout.staging_dir("install-test");
+        let candidate = stage.join("candidate");
+        write_tree(&candidate, b"ffmpeg");
+
+        activate_candidate(&layout, VERSION, &candidate, None).unwrap();
+
+        verify_component_hashes(&layout.version_dir(VERSION), &platform).unwrap();
+        assert_eq!(
+            read_install_state(&layout)
+                .unwrap()
+                .active_version
+                .as_deref(),
+            Some(VERSION)
+        );
+        assert!(!stage.join("replaced-version").exists());
+    }
+
+    fn corrupt_state_candidate(layout: &MediaToolchainLayout) -> PathBuf {
+        let candidate = layout.staging_dir("install-test").join("candidate");
+        fs::create_dir_all(candidate.join("bin")).unwrap();
+        fs::write(candidate.join("bin/ffmpeg.exe"), b"ffmpeg").unwrap();
+        candidate
+    }
+
+    #[test]
+    fn activation_recovers_from_an_unreadable_state_file_and_preserves_it() {
+        const VERSION: &str = "0.1.1";
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        let corrupt_bytes: &[u8] = b"{ this is not json";
+        fs::write(layout.state_path(), corrupt_bytes).unwrap();
+        // Repair status and the old read path both still see a broken install.
+        assert!(managed_install_present_in(&layout));
+        assert!(read_install_state(&layout).is_err());
+        let candidate = corrupt_state_candidate(&layout);
+
+        activate_candidate(&layout, VERSION, &candidate, None).unwrap();
+
+        let state = read_install_state(&layout).unwrap();
+        assert_eq!(state.active_version.as_deref(), Some(VERSION));
+        assert_eq!(state.previous_version, None);
+        let quarantined: Vec<_> = fs::read_dir(&layout.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("state.json.corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(
+            fs::read(layout.root.join(&quarantined[0])).unwrap(),
+            corrupt_bytes
+        );
+    }
+
+    #[test]
+    fn quarantine_keeps_earlier_quarantined_files_and_ignores_absent_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        // Absent state is "no active version", not corruption.
+        assert_eq!(
+            read_install_state_lenient(&layout).unwrap(),
+            (MediaToolchainInstallState::default(), false)
+        );
+        assert_eq!(fs::read_dir(&layout.root).unwrap().count(), 0);
+
+        fs::write(layout.state_path(), b"first").unwrap();
+        let first = quarantine_install_state(&layout, 1_700_000_000).unwrap();
+        fs::write(layout.state_path(), b"second").unwrap();
+        let second = quarantine_install_state(&layout, 1_700_000_000).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            "state.json.corrupt-1700000000"
+        );
+        assert_eq!(fs::read(first).unwrap(), b"first");
+        assert_eq!(fs::read(second).unwrap(), b"second");
+        assert!(!layout.state_path().exists());
+    }
+
+    /// Names of `state.json` and any quarantine siblings under the root.
+    fn state_dir_entries(layout: &MediaToolchainLayout) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&layout.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("state.json"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn io_class_state_read_failures_neither_quarantine_nor_proceed() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        // A directory named state.json exists but cannot be read as a file.
+        fs::create_dir_all(layout.state_path()).unwrap();
+
+        assert!(matches!(
+            read_install_state_classified(&layout),
+            Err(InstallStateReadFailure::Io(_))
+        ));
+        let lenient = read_install_state_lenient(&layout).unwrap_err();
+        assert_eq!(lenient.code, MediaToolchainErrorCode::Io);
+        let candidate = corrupt_state_candidate(&layout);
+        let activation = activate_candidate(&layout, "0.1.1", &candidate, None).unwrap_err();
+        assert_eq!(activation.code, MediaToolchainErrorCode::Io);
+
+        assert!(layout.state_path().is_dir());
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    #[test]
+    fn newer_schema_state_is_a_clear_error_and_left_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        let newer: &[u8] = br#"{"schema_version": 999, "active_version": "9.9.9"}"#;
+        fs::write(layout.state_path(), newer).unwrap();
+
+        assert!(matches!(
+            read_install_state_classified(&layout),
+            Err(InstallStateReadFailure::NewerSchema(_))
+        ));
+        let install_path = read_install_state_lenient(&layout).unwrap_err();
+        assert!(install_path.message.contains("newer LinkedVault"));
+        let candidate = corrupt_state_candidate(&layout);
+        let activation = activate_candidate(&layout, "0.1.1", &candidate, None).unwrap_err();
+        assert!(activation.message.contains("update LinkedVault"));
+
+        assert_eq!(fs::read(layout.state_path()).unwrap(), newer);
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    #[test]
+    fn install_time_read_leaves_a_malformed_state_file_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        fs::write(layout.state_path(), b"{ not json").unwrap();
+
+        let (state, malformed) = read_install_state_lenient(&layout).unwrap();
+
+        assert_eq!(state, MediaToolchainInstallState::default());
+        assert!(malformed);
+        assert_eq!(fs::read(layout.state_path()).unwrap(), b"{ not json");
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    #[test]
+    fn failed_state_write_restores_the_quarantined_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        fs::write(layout.state_path(), b"{ not json").unwrap();
+
+        let error = commit_install_state(
+            &layout,
+            MediaToolchainInstallState::default(),
+            true,
+            1_700_000_000,
+            |layout, _state| {
+                // The old file must already be set aside when the write is attempted.
+                assert!(!layout.state_path().exists());
+                Err(MediaToolchainError::new(
+                    MediaToolchainErrorCode::Io,
+                    "injected write failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.message, "injected write failure");
+        assert_eq!(fs::read(layout.state_path()).unwrap(), b"{ not json");
+        assert_eq!(state_dir_entries(&layout), vec!["state.json".to_string()]);
+    }
+
+    fn failed_install() -> ToolchainResult<()> {
+        Err(MediaToolchainError::new(
+            MediaToolchainErrorCode::ActivationFailed,
+            "activation failed",
+        ))
+    }
+
+    #[test]
+    fn failed_install_keeps_only_the_parked_previous_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("install-test");
+        let parked = stage.join("replaced-version");
+        fs::create_dir_all(parked.join("bin")).unwrap();
+        fs::write(parked.join("bin/ffmpeg.exe"), b"previous").unwrap();
+        fs::write(stage.join("toolchain.zip"), b"zip").unwrap();
+        fs::create_dir_all(stage.join("candidate/bin")).unwrap();
+        fs::write(stage.join("candidate/bin/ffmpeg.exe"), b"new").unwrap();
+
+        let error = finish_install_stage(&stage, failed_install()).unwrap_err();
+
+        assert_eq!(error.code, MediaToolchainErrorCode::ActivationFailed);
+        assert!(error.message.starts_with("activation failed"));
+        assert!(error.message.contains(&parked.display().to_string()));
+        assert_eq!(
+            fs::read(parked.join("bin/ffmpeg.exe")).unwrap(),
+            b"previous"
+        );
+        assert!(!stage.join("toolchain.zip").exists());
+        assert!(!stage.join("candidate").exists());
+    }
+
+    #[test]
+    fn failed_install_without_a_parked_tree_removes_the_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("install-test");
+        fs::create_dir_all(stage.join("candidate")).unwrap();
+        fs::write(stage.join("toolchain.zip"), b"zip").unwrap();
+
+        let error = finish_install_stage(&stage, failed_install()).unwrap_err();
+
+        assert_eq!(error.message, "activation failed");
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn successful_install_removes_the_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("install-test");
+        fs::create_dir_all(stage.join("candidate")).unwrap();
+        fs::write(stage.join("toolchain.zip"), b"zip").unwrap();
+
+        finish_install_stage(&stage, Ok(())).unwrap();
+
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn managed_install_present_ignores_leftover_staging_from_a_failed_first_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(layout.staging_dir("install-failed")).unwrap();
+        assert!(!managed_install_present_in(&layout));
+    }
+
+    #[test]
+    fn managed_install_present_requires_a_recorded_active_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+
+        write_install_state_atomic(&layout, MediaToolchainInstallState::default()).unwrap();
+        assert!(!managed_install_present_in(&layout));
+
+        write_install_state_atomic(
+            &layout,
+            MediaToolchainInstallState {
+                active_version: Some("2026.10.1".to_string()),
+                ..MediaToolchainInstallState::default()
+            },
+        )
+        .unwrap();
+        assert!(managed_install_present_in(&layout));
+    }
+
+    #[test]
+    fn managed_install_present_treats_an_unreadable_state_file_as_a_broken_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = MediaToolchainLayout::for_root(temp.path().join("media-toolchain"));
+        fs::create_dir_all(&layout.root).unwrap();
+        fs::write(layout.state_path(), b"{ not json").unwrap();
+        assert!(managed_install_present_in(&layout));
+    }
+
+    #[test]
+    fn launch_resolution_checks_structure_without_reading_helper_contents() {
+        let platform = MediaToolchainPlatformManifest {
+            target: MEDIA_TOOLCHAIN_V1_TARGET.to_string(),
+            archive: MediaToolchainArchive {
+                url: "https://github.com/Howard-Starfield/Infield-media-toolchain/releases/latest/download/toolchain.zip".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: None,
+            },
+            components: vec![
+                sample_component(MediaToolchainComponentKind::YtDlp, "bin/yt-dlp.exe", b"yt"),
+                sample_component(MediaToolchainComponentKind::Ffmpeg, "bin/ffmpeg.exe", b"ffmpeg"),
+                sample_component(MediaToolchainComponentKind::Deno, "bin/deno.exe", b"deno"),
+            ],
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/yt-dlp.exe"), b"yt").unwrap();
+        fs::write(root.join("bin/ffmpeg.exe"), b"ffmpeg").unwrap();
+        fs::write(root.join("bin/deno.exe"), b"deno").unwrap();
+        let passes = || CONTENT_HASH_PASSES.with(std::cell::Cell::get);
+
+        let before = passes();
+        verify_component_files(root, &platform, false).unwrap();
+        assert_eq!(passes() - before, 0, "structure checks must not read contents");
+
+        let before = passes();
+        verify_component_hashes(root, &platform).unwrap();
+        assert_eq!(passes() - before, 3, "a full check hashes each file once");
+
+        // The structure-only check still rejects a missing, resized, or extra file.
+        fs::write(root.join("bin/ffmpeg.exe"), b"ffmpeg+").unwrap();
+        assert!(verify_component_files(root, &platform, false).is_err());
+        fs::write(root.join("bin/ffmpeg.exe"), b"ffmpeg").unwrap();
+        fs::write(root.join("bin/extra.exe"), b"x").unwrap();
+        assert!(verify_component_files(root, &platform, false).is_err());
+        fs::remove_file(root.join("bin/extra.exe")).unwrap();
+        fs::remove_file(root.join("bin/deno.exe")).unwrap();
+        assert!(verify_component_files(root, &platform, false).is_err());
     }
 }

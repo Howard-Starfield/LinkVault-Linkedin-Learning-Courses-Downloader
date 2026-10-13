@@ -1,6 +1,7 @@
+use super::stdout_lines::{read_bounded_observed, OBSERVED_LINE_QUEUE};
 use super::{
     read_bounded, ManagedProcessError, ManagedProcessOutput, ManagedProcessSpec,
-    TestFaultSelection, TransientRunControl, VerifiedExecutable,
+    StdoutLineObserver, TestFaultSelection, TransientRunControl, VerifiedExecutable,
 };
 use crate::app::safe_output_filesystem::{HelperTempCapability, HelperTempDirectory};
 use std::collections::BTreeMap;
@@ -13,7 +14,7 @@ use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
@@ -153,15 +154,27 @@ struct ReaderTask {
     thread: JoinHandle<()>,
 }
 
+/// What the caller supplies for the wait loop to service: cancellation sources
+/// and an optional live stdout observer.
+pub(super) struct SupervisorHooks<'a, 'o> {
+    pub(super) control: Option<&'a TransientRunControl>,
+    pub(super) discovery_cancel: Option<&'a AtomicBool>,
+    pub(super) observer: Option<StdoutLineObserver<'o>>,
+}
+
 pub(super) fn run(
     executable: PathBuf,
     verified: &[&VerifiedExecutable],
     spec: ManagedProcessSpec,
     capability: &HelperTempCapability,
-    control: Option<&TransientRunControl>,
-    discovery_cancel: Option<&AtomicBool>,
+    hooks: SupervisorHooks<'_, '_>,
     fault: TestFaultSelection,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+    let SupervisorHooks {
+        control,
+        discovery_cancel,
+        mut observer,
+    } = hooks;
     ensure_absolute_executable(&executable)?;
     let job = create_kill_on_close_job()?;
     let pipes = create_child_pipes()?;
@@ -186,6 +199,14 @@ pub(super) fn run(
     capability
         .revalidate()
         .map_err(super::helper_temp_from_safe)?;
+    // The single content pass per helper file: hash the pinned handles before
+    // anything is created, so corrupt bytes never reach CreateProcessW (which
+    // would otherwise report them as a start error, not an integrity failure).
+    for verified in verified {
+        verified.verify_contents()?;
+    }
+    #[cfg(test)]
+    super::launch_probe::record_creation();
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -255,7 +276,7 @@ pub(super) fn run(
         ));
     }
     for verified in verified {
-        if let Err(error) = verified.revalidate() {
+        if let Err(error) = verified.check_identity() {
             terminate_suspended_child(&job, &process);
             return Err(error);
         }
@@ -283,14 +304,21 @@ pub(super) fn run(
         ));
     }
 
-    let stdout_task = match spawn_reader("stdout", stdout_read, spec.stdout_limit) {
+    let (line_sender, line_receiver) = match observer {
+        Some(_) => {
+            let (sender, receiver) = mpsc::sync_channel(OBSERVED_LINE_QUEUE);
+            (Some(sender), Some(receiver))
+        }
+        None => (None, None),
+    };
+    let stdout_task = match spawn_reader("stdout", stdout_read, spec.stdout_limit, line_sender) {
         Ok(task) => task,
         Err(error) => {
             terminate_suspended_child(&job, &process);
             return Err(error);
         }
     };
-    let stderr_task = match spawn_reader("stderr", stderr_read, spec.stderr_limit) {
+    let stderr_task = match spawn_reader("stderr", stderr_read, spec.stderr_limit, None) {
         Ok(task) => task,
         Err(error) => {
             terminate_suspended_child(&job, &process);
@@ -326,6 +354,7 @@ pub(super) fn run(
     if terminal_error.is_none() {
         let started = Instant::now();
         loop {
+            deliver_observed_lines(line_receiver.as_ref(), &mut observer);
             if control.is_some_and(TransientRunControl::is_cancelled)
                 || discovery_cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
             {
@@ -371,6 +400,8 @@ pub(super) fn run(
     }
 
     let stdout_result = finish_reader(stdout_task);
+    // The reader has reached end of stream, so every line it queued is ready.
+    deliver_observed_lines(line_receiver.as_ref(), &mut observer);
     let stderr_result = finish_reader(stderr_task);
     if let Err(error) = capability.revalidate() {
         return Err(super::helper_temp_from_safe(error));
@@ -400,16 +431,35 @@ pub(super) fn run(
     })
 }
 
+/// Hand queued stdout lines to the observer on the supervising thread. Bounded
+/// per call so a fast helper cannot keep the wait loop from checking for exit.
+fn deliver_observed_lines(
+    receiver: Option<&Receiver<String>>,
+    observer: &mut Option<StdoutLineObserver<'_>>,
+) {
+    let (Some(receiver), Some(observer)) = (receiver, observer.as_mut()) else {
+        return;
+    };
+    for line in receiver.try_iter().take(OBSERVED_LINE_QUEUE) {
+        observer(&line);
+    }
+}
+
 fn spawn_reader(
     label: &'static str,
     reader: File,
     limit: usize,
+    lines: Option<SyncSender<String>>,
 ) -> Result<ReaderTask, ManagedProcessError> {
     let (sender, receiver) = mpsc::channel();
     let thread = thread::Builder::new()
         .name(format!("linkvault-youtube-{label}"))
         .spawn(move || {
-            let _ = sender.send(read_bounded(reader, limit));
+            let result = match lines.as_ref() {
+                Some(lines) => read_bounded_observed(reader, limit, lines),
+                None => read_bounded(reader, limit),
+            };
+            let _ = sender.send(result);
         })
         .map_err(|error| ManagedProcessError::Reader(error.to_string()))?;
     Ok(ReaderTask {

@@ -9,9 +9,10 @@ async function read(relativePath) {
   return readFile(path.join(desktop, relativePath), "utf8");
 }
 
-const [app, view, ipc, types, detect, preferences, styles, packageText, rootPackageText] = await Promise.all([
+const [app, view, startFlow, ipc, types, detect, preferences, styles, packageText, rootPackageText] = await Promise.all([
   read("src/App.tsx"),
   read("src/components/youtube/YouTubeView.tsx"),
+  read("src/lib/youtube/startFlow.ts"),
   read("src/lib/youtube/ipc.ts"),
   read("src/lib/youtube/types.ts"),
   read("src/lib/youtube/detect.ts"),
@@ -146,7 +147,8 @@ matches(view, /response\.status === "ready"/, "Helper status response is not map
 matches(view, /youtube-helper-error[\s\S]*?role="alert"/, "Helper failures are not exposed through an accessible alert");
 matches(view, /new Set\(available\.map\(\(item\) => item\.occurrenceId\)\)/, "Select-all does not preserve occurrence identity");
 matches(view, /item\.availability === "available"/, "Available occurrences are not represented explicitly");
-matches(view, /disabled=\{!available \|\| activeRun/, "Non-public or unconfirmed occurrences remain selectable");
+matches(view, /disabled=\{isRowDownloadDisabled\(\{ available, activeRun, helperReady, startInFlight: isStarting \}\)\}/, "Non-public or unconfirmed occurrences remain selectable");
+matches(startFlow, /return !input\.available \|\| input\.activeRun \|\| !input\.helperReady \|\| input\.startInFlight;/, "Row Download is not gated on availability, an active run, helper readiness, and an in-flight start");
 matches(view, /item\.availability === "unknown" \? "Unconfirmed" : "Unavailable"/, "Unknown availability is not distinguished from confirmed public content");
 matches(view, /aria-label=\{`Download occurrence \$\{video\.item\.ordinal\}: \$\{video\.item\.title\}`\}/, "Occurrence download lacks an accessible name");
 matches(ipc, /const playlist = request\.playlistMode === "playlist"/, "Playlist URL handling is not explicit");
@@ -270,7 +272,45 @@ matches(view, /mode: downloadMode/, "Download request does not send downloadMode
 matches(view, /disabled=\{!activeRun\}/, "Cancel action is not gated on an active run");
 matches(view, /inspectYouTubeTranscripts\(/, "Transcript inspection is not mounted through the typed adapter");
 matches(view, /transcriptInspectionGenerationRef\.current/, "Transcript inspection does not correlate responses with the active selection");
-matches(view, /requestGeneration !== transcriptInspectionGenerationRef\.current/, "Stale transcript inspection responses are accepted");
+matches(view, /requestGeneration === transcriptInspectionGenerationRef\.current/, "Stale transcript inspection responses are accepted");
+matches(view, /if \(!isCurrent\(\)\) return \{ kind: "superseded" \}/, "A superseded transcript inspection is not reported to the caller");
+// A Download click is never dropped silently: repeats are ignored while the row shows loading,
+// a busy lookup is waited for, and every non-starting outcome tells the user.
+matches(view, /async function startDownloads\([^)]*\): Promise<void> \{\s*[^]*?if \(batches\.isStarting\(\)\) return;[^]*?await batches\.begin\(groups\)/, "A repeat click can still reach the batch queue while a start is in flight");
+matches(view, /async function handleDownloadOne\([^)]*\): Promise<void> \{\s*if \(batches\.isStarting\(\)\) return;\s*batches\.clear\(\);/, "A repeat row click can clear the queue of the start already in flight");
+assert.doesNotMatch(view, /downloadQueueRef/, "Batch sequencing must live in the tested sequencer, not in a view ref");
+matches(view, /createBatchSequencer<DownloadGroup>\(/, "The view does not use the batch sequencer");
+matches(view, /batches\.onRunTerminal\(runSnapshot\.runId\)/, "A finished run does not start the next batch");
+matches(view, /\[runSnapshot, isStarting, batches\]/, "A run that ended during its own start would strand the queue");
+matches(view, /handleCancel\(\)[^]*?batches\.clear\(\)/, "Cancel does not drop the batches that were not started");
+matches(view, /captionsNoticeShownRef/, "The no-captions notice can repeat for every batch");
+matches(view, /loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/, "Row Download buttons do not show a per-row loading state");
+assert.equal((view.match(/loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/g) ?? []).length, 2, "Both the single-result and the inline Download buttons need the loading state");
+matches(view, /retryWhileBusy\(\s*\(\) => inspectYouTubeTranscripts\(/, "Transcript inspection does not wait for a busy discovery slot");
+matches(view, /retryWhileBusy\(\s*\(\) => startYouTubeDownload\(/, "Start does not wait for a busy discovery slot");
+matches(view, /const clickStillWanted = \(\) => helperViewMountedRef\.current && scanGenerationRef\.current === clickScanGeneration;/, "A Download click is not tied to the view and scan it was made on");
+matches(view, /isCurrent: clickStillWanted/, "The start retry does not stop when the view unmounts or the click is superseded");
+matches(view, /const isCurrent = \(\) => helperViewMountedRef\.current\s*&& requestGeneration === transcriptInspectionGenerationRef\.current/, "The inspection retry does not stop when the view unmounts");
+matches(view, /error instanceof BusyRetryCancelled/, "A cancelled start wait is not handled");
+// Large playlists: the scan's truncation is shown, and a selection over the per-run cap queues as batches.
+matches(view, /playlistTruncationNote\(plan\)/, "A truncated playlist scan is not noted in the view");
+matches(view, /className="youtube-scan-notes" role="status" aria-live="polite"/, "The truncation notes are not in one persistent status region");
+matches(view, /<p key=\{note\.key\} className="youtube-scan-note">/, "The truncation notes are not keyed by scan plan");
+matches(view, /key: plan\.scanPlanId/, "The truncation notes are not keyed by scan plan id");
+matches(view, /splitIntoRuns\(planGroups\)/, "Download all does not split a selection over the per-run cap");
+matches(view, /batchingNotice\(/, "A split selection is not announced");
+matches(types, /totalCount: number \| null;/, "The scan response type omits the playlist total");
+matches(startFlow, /MAX_SELECTED_PER_RUN = 100/, "The per-run cap does not match the backend limit");
+includes(styles, ".youtube-scan-note", "The truncation note has no style");
+matches(view, /WAITING_FOR_LOOKUP_MESSAGE/, "The wait for the current lookup is not shown");
+matches(view, /inspection\.kind === "superseded"[^]*?toast\.message\(/, "A superseded Download click gives no feedback");
+matches(view, /if \(!resolvedOutputDir\) \{\s*toast\.message\(/, "A Download click without a folder gives no feedback");
+const inspectionSource = view.slice(
+  view.indexOf("async function requestTranscriptInspection"),
+  view.indexOf("async function pickOutputDirectory")
+);
+assert.ok(inspectionSource.length > 0, "requestTranscriptInspection was not found");
+assert.doesNotMatch(inspectionSource, /\breturn null;/, "requestTranscriptInspection must not return a silent null");
 matches(view, /response\.occurrences\.every\(\(occurrence, index\) => occurrence\.occurrenceId === requestedOccurrenceIds\[index\]\)/, "Transcript response identities are not checked against the request");
 matches(view, /scanYouTubeSource\([\s\S]*?transcriptInspectionGenerationRef\.current \+= 1;[\s\S]*?setScanPlans/, "A committed rescan does not invalidate overlapping transcript inspection");
 matches(view, /expectedRevision: runSnapshot\.revision/, "Pause/resume actions are not revision-aware");
@@ -306,8 +346,24 @@ matches(styles, /\.youtube-control-cluster[\s\S]*?select \{[\s\S]*?border-radius
 matches(styles, /\.youtube-search-input \{[\s\S]*?max-height: 132px;/, "Search box height cap is missing");
 assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are still present");
 
-assert.equal(packageJson.scripts["verify:youtube-ui"], "node ./scripts/verify-youtube-ui.mjs", "Desktop YouTube UI verifier is not wired");
+assert.equal(
+  packageJson.scripts["verify:youtube-ui"],
+  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status && npm run verify:youtube-start-flow",
+  "Desktop YouTube UI verifier is not wired"
+);
+includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");
 assert.equal(rootPackageJson.scripts["verify:youtube-ui"], "npm --prefix apps/desktop run verify:youtube-ui", "Root YouTube UI verifier is not wired");
+
+// Tauri 2 runs sync commands on the main thread; these hash ~230 MB of helpers or run yt-dlp,
+// so they must stay `async` and do their work in spawn_blocking.
+const youtubeCommands = await read("src-tauri/src/providers/youtube/commands.rs");
+for (const name of ["scan_youtube_source", "inspect_youtube_transcripts", "start_youtube_download"]) {
+  matches(
+    youtubeCommands,
+    new RegExp(String.raw`#\[tauri::command\]\s*pub async fn ${name}\(`),
+    `${name} must be declared as an async #[tauri::command] so it stays off the main thread`
+  );
+}
 
 // Item outcome warnings are Rust TransientWarning objects ({ code, message }), not bare string codes.
 // formatYouTubeWarning must accept unknown and never call .trim() on a non-string.
@@ -338,8 +394,8 @@ matches(
 );
 matches(
   view,
-  /formatYouTubeWarning\(outcome\.warnings\[0\]/,
-  "Result-row warning text must format the full warning payload, not a bare code string"
+  /\(outcome\?\.warnings \?\? \[\]\)\.map\(\(warning\) => formatYouTubeWarning\(warning\)\)/,
+  "Result-row warning text must format each full warning payload, not a bare code string"
 );
 
 // Runtime contract: object payloads must never throw on .trim(), and useful messages are preferred.
@@ -359,6 +415,7 @@ function formatYouTubeWarningContract(value) {
   }
   switch (code) {
     case "TRANSCRIPT_MISSING":
+      if (message && message !== code) return message;
       return "No captions were available on YouTube for this video, so only the media file was saved.";
     default:
       if (message && message !== code) return message;

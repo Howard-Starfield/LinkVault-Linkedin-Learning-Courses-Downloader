@@ -103,6 +103,10 @@ pub enum MediaVerificationError {
     MissingDuration,
     #[error("expected source duration is invalid")]
     InvalidExpectedDuration,
+    #[error("ffmpeg progress report did not reach progress=end")]
+    IncompleteProgress,
+    #[error("ffmpeg copied no video frames")]
+    NoFramesCopied,
 }
 
 /// Parse and validate one complete FFprobe JSON report.
@@ -208,6 +212,198 @@ pub fn verify_ffprobe_json(
     })
 }
 
+/// FFmpeg output captured for [`verify_ffmpeg_copy_probe`].
+pub struct FfmpegCopyProbeOutput<'a> {
+    /// stdout from `-progress pipe:1`: FFmpeg-generated `key=value` lines only.
+    pub progress: &'a str,
+    /// stderr at `-v info`; used only for the container line and best-effort codecs.
+    pub log: &'a str,
+    /// stderr exceeded the retained prefix; codecs are then not inferred at all.
+    pub log_truncated: bool,
+    /// The exact `-i` argument, as passed to FFmpeg.
+    pub input_path: &'a str,
+}
+
+/// Arguments for the FFmpeg-only media check. Stream presence is enforced by
+/// mandatory `-map`s and demux integrity by `-xerror`; both fail the process,
+/// so neither depends on text that media metadata can influence.
+pub fn ffmpeg_copy_probe_args(input_path: &str, mode: MediaMode) -> Vec<String> {
+    let audio_map = match mode {
+        MediaMode::VideoAndAudio => "0:a:0",
+        MediaMode::VideoOnly => "0:a:0?",
+    };
+    [
+        "-hide_banner",
+        "-nostdin",
+        "-nostats",
+        "-v",
+        "info",
+        "-xerror",
+        "-i",
+        input_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        audio_map,
+        "-map_metadata",
+        "-1",
+        "-map_metadata:s:v",
+        "-1",
+        "-map_metadata:s:a",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-c",
+        "copy",
+        "-progress",
+        "pipe:1",
+        "-fflags",
+        "+bitexact",
+        "-f",
+        "null",
+        "-",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_string())
+    .collect()
+}
+
+/// Validate a successful (exit 0) FFmpeg copy probe. Callers must already have
+/// rejected non-zero exit, timeout, cancellation, and stdout truncation.
+pub fn verify_ffmpeg_copy_probe(
+    output: &FfmpegCopyProbeOutput<'_>,
+    mode: MediaMode,
+    source_duration_seconds: Option<f64>,
+) -> Result<VerifiedMedia, MediaVerificationError> {
+    validate_expected_duration(source_duration_seconds)?;
+    if output.progress.len() > MAX_FFPROBE_JSON_BYTES || output.log.len() > MAX_FFPROBE_JSON_BYTES {
+        return Err(MediaVerificationError::InputTooLarge);
+    }
+    // `source_duration_seconds` is validated for shape only: FFmpeg may report
+    // `out_time_us=N/A` for a successful stream copy, so duration is a projection.
+    let progress = read_progress(output.progress)?;
+    if progress.frames == 0 {
+        return Err(MediaVerificationError::NoFramesCopied);
+    }
+    let duration = progress
+        .out_time_us
+        .filter(|us| *us > 0)
+        .map(|us| us / 1000);
+    let container = input_container(output.log, output.input_path)?;
+    let (video_codec, audio_codec) = if output.log_truncated {
+        (None, None)
+    } else {
+        output_codecs(output.log).unwrap_or((None, None))
+    };
+    // Presence is proven by the mandatory maps, not by the parsed codecs.
+    let audio_streams = match mode {
+        MediaMode::VideoAndAudio => 1,
+        MediaMode::VideoOnly => usize::from(audio_codec.is_some()),
+    };
+    let codecs_known =
+        video_codec.is_some() && (audio_codec.is_some() || matches!(mode, MediaMode::VideoOnly));
+    let warnings = if !codecs_known
+        || needs_compatibility_warning(&container, &video_codec, &audio_codec, mode)
+    {
+        vec![MediaCompatibilityWarning {
+            code: PLAYBACK_COMPATIBILITY_WARNING,
+            container: container.clone(),
+            video_codec: video_codec.clone(),
+            audio_codec: audio_codec.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(VerifiedMedia {
+        container,
+        video_codec,
+        audio_codec,
+        video_streams: 1,
+        audio_streams,
+        duration_ms: duration,
+        warnings,
+    })
+}
+
+struct ProbeProgress {
+    frames: u64,
+    out_time_us: Option<u64>,
+}
+
+/// Reads the last value of each key; FFmpeg repeats the block every period
+/// and the final block (ending `progress=end`) holds the totals.
+fn read_progress(progress: &str) -> Result<ProbeProgress, MediaVerificationError> {
+    let mut frames = 0;
+    let mut out_time_us = None;
+    let mut ended = false;
+    for line in progress.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        match key {
+            "frame" => frames = value.trim().parse::<u64>().unwrap_or(0),
+            "out_time_us" => out_time_us = value.trim().parse::<u64>().ok(),
+            "progress" => ended = value.trim() == "end",
+            _ => {}
+        }
+    }
+    if !ended {
+        return Err(MediaVerificationError::IncompleteProgress);
+    }
+    Ok(ProbeProgress {
+        frames,
+        out_time_us,
+    })
+}
+
+fn input_container(log: &str, input_path: &str) -> Result<String, MediaVerificationError> {
+    let suffix = format!(", from '{input_path}':");
+    log.lines()
+        .find(|line| line.starts_with("Input #0, "))
+        .and_then(|line| line.strip_prefix("Input #0, "))
+        .and_then(|rest| rest.strip_suffix(suffix.as_str()))
+        .ok_or(MediaVerificationError::MissingContainer)
+        .and_then(container_identity)
+}
+
+/// Best-effort codecs from the metadata-stripped final `Output #0` section.
+/// `None` when the section is missing or holds anything except one video and
+/// at most one audio stream line, so callers fall back to a warning.
+fn output_codecs(log: &str) -> Option<(Option<String>, Option<String>)> {
+    let lines: Vec<&str> = log.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| *line == "Output #0, null, to 'pipe:':")?;
+    let (mut video, mut audio) = (None, None);
+    for line in &lines[start + 1..] {
+        let Some(body) = line.strip_prefix("  ") else {
+            break;
+        };
+        // FFmpeg prints sub-blocks (side data, display matrix, HDR mastering
+        // data) four spaces deep under the stream line they belong to.
+        if body.starts_with("  ") && (video.is_some() || audio.is_some()) {
+            continue;
+        }
+        let rest = body.strip_prefix("Stream #0:")?;
+        let (index, described) = rest.split_once(": ")?;
+        if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+            return None;
+        }
+        let (kind, details) = described.split_once(": ")?;
+        let codec = normalize_identity(details.split([' ', ',']).next()?).ok()?;
+        let slot = match kind {
+            "Video" => &mut video,
+            "Audio" => &mut audio,
+            _ => return None,
+        };
+        if slot.replace(codec).is_some() {
+            return None;
+        }
+    }
+    video.as_ref()?;
+    Some((video, audio))
+}
+
 fn validate_expected_duration(value: Option<f64>) -> Result<(), MediaVerificationError> {
     if let Some(seconds) = value {
         if !seconds.is_finite() || seconds < 0.0 || seconds > (u64::MAX as f64 / 1000.0) {
@@ -222,6 +418,10 @@ fn read_container(format: &Map<String, Value>) -> Result<String, MediaVerificati
         .get("format_name")
         .and_then(Value::as_str)
         .ok_or(MediaVerificationError::MissingContainer)?;
+    container_identity(raw)
+}
+
+fn container_identity(raw: &str) -> Result<String, MediaVerificationError> {
     if raw.trim().len() > MAX_MEDIA_CONTAINER_BYTES {
         return Err(MediaVerificationError::UnsafeIdentity);
     }
@@ -548,5 +748,229 @@ mod tests {
         assert_eq!(media.warnings[0].audio_codec.as_deref(), Some("opus"));
         let serialized = serde_json::to_string(&media.warnings).unwrap();
         assert!(!serialized.contains("evil.test"));
+    }
+
+    const PROBE_PATH: &str = "C:\\out\\media.mp4";
+    const PROGRESS_END: &str = "frame=2\nfps=0.00\nbitrate=N/A\ntotal_size=N/A\nout_time_us=400000\nout_time_ms=400000\nout_time=00:00:00.400000\nspeed= 234x\nprogress=end\n";
+    const CLEAN_LOG: &str = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'C:\\out\\media.mp4':\n  Metadata:\n    major_brand     : isom\n  Duration: 00:00:00.40, start: 0.000000, bitrate: 47 kb/s\n  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 64x64, 5 fps (default)\n  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, mono, fltp, 1 kb/s (default)\nStream mapping:\n  Stream #0:0 -> #0:0 (copy)\n  Stream #0:1 -> #0:1 (copy)\nOutput #0, null, to 'pipe:':\n  Stream #0:0: Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 64x64, q=2-31, 5 fps (default)\n  Stream #0:1: Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, mono, fltp, 1 kb/s (default)\n[out#0/null @ 000001a034002580] video:1KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown\n";
+
+    fn probe<'a>(progress: &'a str, log: &'a str) -> FfmpegCopyProbeOutput<'a> {
+        FfmpegCopyProbeOutput {
+            progress,
+            log,
+            log_truncated: false,
+            input_path: PROBE_PATH,
+        }
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_args_enforce_streams_and_demux_errors() {
+        let args = ffmpeg_copy_probe_args(PROBE_PATH, MediaMode::VideoAndAudio);
+        let joined = args.join(" ");
+        for required in [
+            "-xerror",
+            "-map 0:v:0",
+            "-map 0:a:0 ",
+            "-progress pipe:1",
+            "-c copy",
+            "-map_metadata -1",
+            "-map_metadata:s:v -1",
+            "-map_metadata:s:a -1",
+            "-map_chapters -1",
+            "-fflags +bitexact",
+            "-f null -",
+        ] {
+            assert!(joined.contains(required), "missing {required}: {joined}");
+        }
+        let video_only = ffmpeg_copy_probe_args(PROBE_PATH, MediaMode::VideoOnly).join(" ");
+        assert!(video_only.contains("-map 0:a:0? "));
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == PROBE_PATH).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_projects_clean_report() {
+        let media = verify_ffmpeg_copy_probe(
+            &probe(PROGRESS_END, CLEAN_LOG),
+            MediaMode::VideoAndAudio,
+            Some(0.4),
+        )
+        .unwrap();
+        assert_eq!(media.container, "mov,mp4,m4a,3gp,3g2,mj2");
+        assert_eq!(media.video_codec.as_deref(), Some("h264"));
+        assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert_eq!((media.video_streams, media.audio_streams), (1, 1));
+        assert_eq!(media.duration_ms, Some(400));
+        assert!(media.warnings.is_empty());
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_skips_output_stream_sub_blocks() {
+        let marker = "q=2-31, 5 fps (default)\n";
+        let rotated = CLEAN_LOG.replacen(
+            marker,
+            "q=2-31, 5 fps (default)\n    Side data:\n      Display Matrix: rotation of -90.00 degrees\n",
+            1,
+        );
+        assert_ne!(rotated, CLEAN_LOG, "fixture edit must apply");
+        let media = verify_ffmpeg_copy_probe(
+            &probe(PROGRESS_END, &rotated),
+            MediaMode::VideoAndAudio,
+            Some(0.4),
+        )
+        .unwrap();
+        assert_eq!(media.video_codec.as_deref(), Some("h264"));
+        assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert!(media.warnings.is_empty());
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_accepts_crlf_output() {
+        let log = CLEAN_LOG.replace('\n', "\r\n");
+        let progress = PROGRESS_END.replace('\n', "\r\n");
+        let media =
+            verify_ffmpeg_copy_probe(&probe(&progress, &log), MediaMode::VideoAndAudio, Some(0.4))
+                .unwrap();
+        assert_eq!(media.container, "mov,mp4,m4a,3gp,3g2,mj2");
+        assert_eq!(media.video_codec.as_deref(), Some("h264"));
+        assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert_eq!((media.video_streams, media.audio_streams), (1, 1));
+        assert_eq!(media.duration_ms, Some(400));
+        assert!(media.warnings.is_empty());
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_ignores_forged_lines_in_the_input_section() {
+        // Round-2 reproductions: a metadata key and a stream language value
+        // injecting stream lines and even a fake Output header.
+        let forged = CLEAN_LOG
+            .replace(
+                "    major_brand     : isom\n",
+                "    major_brand     : isom\n    Stream #0:9: Audio: aac, 48000 Hz\n",
+            )
+            .replace(
+                "  Stream #0:0[0x1](und): Video: h264",
+                "  Stream #0:0[0x1](eng): Audio: aac, ): Video: vp9\nOutput #0, null, to 'pipe:':\n  Stream #0:0: Video: h264 (High)\n  Stream #0:1: Audio: aac (LC)\n  x(und): Video: h264",
+            )
+            .replace(
+                "Output #0, null, to 'pipe:':\n  Stream #0:0: Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 64x64, q=2-31",
+                "Output #0, null, to 'pipe:':\n  Stream #0:0: Video: vp9 (Profile 0), yuv420p, 64x64, q=2-31",
+            );
+        let media = verify_ffmpeg_copy_probe(
+            &probe(PROGRESS_END, &forged),
+            MediaMode::VideoAndAudio,
+            Some(0.4),
+        )
+        .unwrap();
+        assert_eq!(media.video_codec.as_deref(), Some("vp9")); // from the real (last) Output section
+        assert_eq!(media.warnings.len(), 1);
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_falls_back_to_a_warning_when_output_section_is_unexpected() {
+        let tagged = CLEAN_LOG.replace(
+            "  Stream #0:0: Video: h264",
+            "  Stream #0:0(eng): Video: h264",
+        );
+        let media = verify_ffmpeg_copy_probe(
+            &probe(PROGRESS_END, &tagged),
+            MediaMode::VideoAndAudio,
+            None,
+        )
+        .unwrap();
+        assert_eq!(media.video_codec, None);
+        assert_eq!(media.warnings.len(), 1);
+        let with_metadata = CLEAN_LOG.replace(
+            "Output #0, null, to 'pipe:':\n",
+            "Output #0, null, to 'pipe:':\n  Metadata:\n    encoder         : Lavf62.6.101\n",
+        );
+        let media = verify_ffmpeg_copy_probe(
+            &probe(PROGRESS_END, &with_metadata),
+            MediaMode::VideoAndAudio,
+            None,
+        )
+        .unwrap();
+        assert_eq!(media.warnings.len(), 1);
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_requires_completed_progress_with_copied_frames() {
+        let unfinished = PROGRESS_END.replace("progress=end", "progress=continue");
+        assert_eq!(
+            verify_ffmpeg_copy_probe(
+                &probe(&unfinished, CLEAN_LOG),
+                MediaMode::VideoAndAudio,
+                None
+            ),
+            Err(MediaVerificationError::IncompleteProgress)
+        );
+        let no_frames = PROGRESS_END.replace("frame=2", "frame=0");
+        assert_eq!(
+            verify_ffmpeg_copy_probe(
+                &probe(&no_frames, CLEAN_LOG),
+                MediaMode::VideoAndAudio,
+                Some(0.4)
+            ),
+            Err(MediaVerificationError::NoFramesCopied)
+        );
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_accepts_unavailable_out_time_as_unknown_duration() {
+        // Captured in review round 3: a clean MKV stream copy exits 0 with
+        // `frame=2`, `out_time_us=N/A`, `progress=end`.
+        let mkv_progress = "frame=2\nfps=0.00\nbitrate=N/A\ntotal_size=N/A\nout_time_us=N/A\nout_time_ms=N/A\nout_time=N/A\nspeed=N/A\nprogress=end\n";
+        let media = verify_ffmpeg_copy_probe(
+            &probe(mkv_progress, CLEAN_LOG),
+            MediaMode::VideoAndAudio,
+            Some(0.4),
+        )
+        .unwrap();
+        assert_eq!(media.duration_ms, None);
+        let zero_time = PROGRESS_END.replace("out_time_us=400000", "out_time_us=0");
+        let media = verify_ffmpeg_copy_probe(
+            &probe(&zero_time, CLEAN_LOG),
+            MediaMode::VideoAndAudio,
+            Some(0.4),
+        )
+        .unwrap();
+        assert_eq!(media.duration_ms, None);
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_ignores_codecs_when_stderr_was_truncated() {
+        // The retained prefix holds a forged Output section from input
+        // metadata; the real final section was cut off.
+        let forged_prefix = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'C:\\out\\media.mp4':\n  Stream #0:0[0x1](eng): Audio: aac, ): Video: vp9\nOutput #0, null, to 'pipe:':\n  Stream #0:0: Video: h264 (High)\n  Stream #0:1: Audio: aac (LC)\n";
+        let output = FfmpegCopyProbeOutput {
+            progress: PROGRESS_END,
+            log: forged_prefix,
+            log_truncated: true,
+            input_path: PROBE_PATH,
+        };
+        let media = verify_ffmpeg_copy_probe(&output, MediaMode::VideoAndAudio, None).unwrap();
+        assert_eq!(media.video_codec, None);
+        assert_eq!(media.warnings.len(), 1);
+    }
+
+    #[test]
+    fn ffmpeg_copy_probe_requires_the_input_line_for_our_exact_path() {
+        let other_path =
+            CLEAN_LOG.replace("from 'C:\\out\\media.mp4':", "from 'C:\\elsewhere.mp4':");
+        assert_eq!(
+            verify_ffmpeg_copy_probe(
+                &probe(PROGRESS_END, &other_path),
+                MediaMode::VideoAndAudio,
+                None
+            ),
+            Err(MediaVerificationError::MissingContainer)
+        );
+        let huge = "x".repeat(MAX_FFPROBE_JSON_BYTES + 1);
+        assert_eq!(
+            verify_ffmpeg_copy_probe(&probe(PROGRESS_END, &huge), MediaMode::VideoAndAudio, None),
+            Err(MediaVerificationError::InputTooLarge)
+        );
     }
 }

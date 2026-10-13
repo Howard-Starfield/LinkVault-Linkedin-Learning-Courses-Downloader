@@ -1,9 +1,10 @@
 #![cfg(windows)]
 
 use linkvault_lib::managed_process::{
-    helper_identity, lock_test_executable, run, run_test, run_test_in_parent, DiscoveryOperation,
-    HelperKind, ManagedProcessContext, ManagedProcessError, ManagedProcessOutput,
-    ManagedProcessSpec, TestManagedProcessFault, TestManagedProcessSpec, TransientRunControl,
+    helper_identity, lock_test_executable, run, run_test, run_test_in_parent,
+    run_test_with_stdout_lines, DiscoveryOperation, HelperKind, ManagedProcessContext,
+    ManagedProcessError, ManagedProcessOutput, ManagedProcessSpec, TestManagedProcessFault,
+    TestManagedProcessSpec, TransientRunControl,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -494,6 +495,76 @@ fn noisy_stdout_and_stderr_are_drained_and_bounded() {
     assert_eq!(output.stderr.len(), 3072);
     assert!(output.stdout_truncated);
     assert!(output.stderr_truncated);
+}
+
+#[test]
+fn stdout_lines_reach_the_observer_in_order_before_the_helper_exits() {
+    let mut observed: Vec<(String, Instant)> = Vec::new();
+    let output = run_test_with_stdout_lines(
+        fixture_spec(&["trickle", "250"], Duration::from_secs(20)),
+        None,
+        &mut |line| observed.push((line.to_string(), Instant::now())),
+    )
+    .expect("trickle fixture should complete");
+    let finished = Instant::now();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, "alpha\r\nbeta\ngamma");
+    let lines = observed
+        .iter()
+        .map(|(line, _)| line.as_str())
+        .collect::<Vec<_>>();
+    // CRLF is stripped, the split "beta" is reassembled, and the unterminated
+    // final line is flushed at end of stream.
+    assert_eq!(lines, vec!["alpha", "beta", "gamma"]);
+    // The fixture keeps running for about 1s after writing "alpha"; seeing it
+    // well before the helper exited proves it was streamed, not replayed.
+    assert!(
+        finished.duration_since(observed[0].1) >= Duration::from_millis(500),
+        "first line arrived only after the helper exited"
+    );
+}
+
+#[test]
+fn stdout_lines_keep_flowing_after_the_capture_limit_without_changing_it() {
+    let mut spec = fixture_spec(&["many_lines", "500"], Duration::from_secs(20));
+    spec.spec.stdout_limit = 64;
+    let mut observed = Vec::new();
+    let output = run_test_with_stdout_lines(spec, None, &mut |line| {
+        observed.push(line.to_string());
+    })
+    .expect("many-lines fixture should complete");
+
+    assert_eq!(output.stdout.len(), 64);
+    assert!(output.stdout_truncated);
+    let expected = (0..500)
+        .map(|index| format!("line-{index}"))
+        .collect::<Vec<_>>();
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn over_long_stdout_lines_are_dropped_from_the_observer_but_still_captured() {
+    let mut observed = Vec::new();
+    let output = run_test_with_stdout_lines(
+        fixture_spec(&["long_line"], Duration::from_secs(20)),
+        None,
+        &mut |line| observed.push(line.to_string()),
+    )
+    .expect("long-line fixture should complete");
+
+    assert_eq!(observed, vec!["after".to_string()]);
+    assert_eq!(output.stdout.len(), 64 * 1024 + "\nafter\n".len());
+}
+
+#[test]
+fn runs_without_an_observer_are_unaffected_by_line_forwarding() {
+    let output = run_test(
+        fixture_spec(&["many_lines", "50"], Duration::from_secs(20)),
+        None,
+    )
+    .expect("many-lines fixture should complete");
+    assert_eq!(output.stdout.lines().count(), 50);
 }
 
 #[test]

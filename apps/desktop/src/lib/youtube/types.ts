@@ -39,6 +39,7 @@ export type YouTubeItemPhase =
   | "merging"
   | "normalizing_transcript"
   | "verifying"
+  | "finalizing"
   | "completed"
   | "warning"
   | "failed"
@@ -48,6 +49,7 @@ export type YouTubeWarningCode =
   | "PLAYLIST_TRUNCATED"
   | "TRANSCRIPT_FALLBACK_USED"
   | "TRANSCRIPT_MISSING"
+  | "TRANSCRIPT_INVALID"
   | "ITEM_UNAVAILABLE"
   | "METADATA_DRIFT"
   | "PLAYBACK_COMPATIBILITY_WARNING"
@@ -117,7 +119,10 @@ export interface ScanYouTubeSourceResponse {
   sourceId: string;
   canonicalUrl: string;
   playlistId: string | null;
+  /** More entries exist than the scan keeps (500). */
   truncated: boolean;
+  /** The playlist's total size when YouTube reports it. */
+  totalCount: number | null;
   items: YouTubeScanItem[];
 }
 

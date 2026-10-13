@@ -6,8 +6,8 @@
 use crate::app::managed_process::{
     DiscoveryOperation, TransientCounts, TransientCurrentItem, TransientError,
     TransientItemOutcomeSnapshot, TransientItemPhase, TransientItemState, TransientProgress,
-    TransientRunControl, TransientRunSnapshot, TransientRunState, TransientRuntimeError,
-    TransientWorkItem, EVENT_NAME,
+    TransientProgressUpdate, TransientRunControl, TransientRunSnapshot, TransientRunState,
+    TransientRuntimeError, TransientWorkItem, EVENT_NAME,
 };
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::executor::{YouTubeExecutor, YouTubeExecutorContext};
@@ -39,6 +39,14 @@ pub struct YoutubeDurableRequest {
     pub client_submission_id: String,
 }
 
+impl ActiveDownload {
+    /// A control request is current when the client has seen every change
+    /// since `control_revision` (only progress ticks may have followed).
+    fn accepts_revision(&self, expected_revision: u64) -> bool {
+        (self.control_revision..=self.snapshot.revision).contains(&expected_revision)
+    }
+}
+
 struct DiscoverySlot {
     operation_id: String,
     cancel: Arc<AtomicBool>,
@@ -46,7 +54,11 @@ struct DiscoverySlot {
 
 struct ActiveDownload {
     run_id: String,
-    expected_revision: u64,
+    /// Revision of the last change that is not a byte/stage progress tick.
+    /// Pause and resume accept any revision from here up to the current one,
+    /// so the frequent progress events cannot make a click on the revision
+    /// the UI last rendered fail as stale.
+    control_revision: u64,
     control: Arc<TransientRunControl>,
     snapshot: TransientRunSnapshot,
 }
@@ -60,6 +72,10 @@ pub struct YouTubeLiveHandle {
     shutting_down: AtomicBool,
     submissions: Mutex<HashMap<String, SubmissionLedgerEntry>>,
     submission_order: Mutex<VecDeque<String>>,
+    /// Runs once, just before the next `update_snapshot` takes the active
+    /// lock, so a test can land a pause in what used to be the race window.
+    #[cfg(test)]
+    before_update: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Default for YouTubeLiveHandle {
@@ -73,6 +89,8 @@ impl Default for YouTubeLiveHandle {
             shutting_down: AtomicBool::new(false),
             submissions: Mutex::new(HashMap::new()),
             submission_order: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            before_update: Mutex::new(None),
         }
     }
 }
@@ -86,6 +104,15 @@ impl YouTubeLiveHandle {
             .sink
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    /// Run `hook` once, right before the next `update_snapshot` locks the run.
+    #[cfg(test)]
+    pub(crate) fn set_before_update(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     #[cfg(test)]
@@ -165,6 +192,17 @@ impl YouTubeLiveHandle {
         Ok(())
     }
 
+    /// Takes the single discovery slot (scan, transcript inspection, or a
+    /// download's source check).
+    ///
+    /// Discovery and a download are mutually exclusive: this refuses with
+    /// `Busy` while another discovery or an active run exists.  Starting a
+    /// download therefore takes this slot itself and keeps it until its run is
+    /// attached, which refuses any discovery that begins afterwards, so no
+    /// download starts while a discovery process runs and vice versa.  Callers
+    /// treat `Busy` (RUNTIME_BUSY) as "wait and retry".  `attach_run` does not
+    /// itself check the slot because queued runs are also attached from the
+    /// workflow drain.
     pub fn begin_discovery(
         &self,
         operation_id: String,
@@ -246,7 +284,7 @@ impl YouTubeLiveHandle {
         );
         *active = Some(ActiveDownload {
             run_id,
-            expected_revision: 1,
+            control_revision: 1,
             control: Arc::clone(&control),
             snapshot,
         });
@@ -322,7 +360,7 @@ impl YouTubeLiveHandle {
         if current.run_id != run_id {
             return Err(TransientRuntimeError::RunNotFound);
         }
-        if current.expected_revision != expected_revision {
+        if !current.accepts_revision(expected_revision) {
             return Err(TransientRuntimeError::StaleRevision);
         }
         if current.snapshot.state.is_terminal() {
@@ -331,7 +369,7 @@ impl YouTubeLiveHandle {
         current.control.request_pause();
         current.snapshot.state = TransientRunState::PauseRequested;
         current.snapshot.revision += 1;
-        current.expected_revision = current.snapshot.revision;
+        current.control_revision = current.snapshot.revision;
         let snapshot = current.snapshot.clone();
         self.emit(&snapshot);
         Ok(snapshot)
@@ -350,7 +388,7 @@ impl YouTubeLiveHandle {
         if current.run_id != run_id {
             return Err(TransientRuntimeError::RunNotFound);
         }
-        if current.expected_revision != expected_revision {
+        if !current.accepts_revision(expected_revision) {
             return Err(TransientRuntimeError::StaleRevision);
         }
         if current.snapshot.state.is_terminal() {
@@ -359,7 +397,7 @@ impl YouTubeLiveHandle {
         current.control.withdraw_pause();
         current.snapshot.state = TransientRunState::Running;
         current.snapshot.revision += 1;
-        current.expected_revision = current.snapshot.revision;
+        current.control_revision = current.snapshot.revision;
         let snapshot = current.snapshot.clone();
         self.emit(&snapshot);
         Ok(snapshot)
@@ -378,7 +416,7 @@ impl YouTubeLiveHandle {
         if !current.snapshot.state.is_terminal() {
             current.snapshot.state = TransientRunState::Cancelling;
             current.snapshot.revision += 1;
-            current.expected_revision = current.snapshot.revision;
+            current.control_revision = current.snapshot.revision;
         }
         let snapshot = current.snapshot.clone();
         self.emit(&snapshot);
@@ -395,6 +433,101 @@ impl YouTubeLiveHandle {
             .and_then(|current| (current.run_id == run_id).then(|| Arc::clone(&current.control)))
     }
 
+    /// Apply a stage or byte-progress tick to the live snapshot and emit it.
+    ///
+    /// Unlike [`Self::publish_snapshot`] this mutates the live copy in place,
+    /// so a concurrent pause/resume/cancel state is never overwritten by a
+    /// stale copy held by the item loop, and it does not move
+    /// `control_revision`.
+    pub fn publish_item_progress(
+        &self,
+        run_id: &str,
+        item: &TransientWorkItem,
+        update: TransientProgressUpdate,
+    ) {
+        let snapshot = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(current) = active.as_mut() else {
+                return;
+            };
+            if current.run_id != run_id || current.snapshot.state.is_terminal() {
+                return;
+            }
+            apply_item_progress(
+                &mut current.snapshot,
+                item,
+                update.phase,
+                update.bytes_completed,
+                update.bytes_total,
+                update.fraction,
+            );
+            current.snapshot.clone()
+        };
+        self.emit(&snapshot);
+    }
+
+    /// Change the live snapshot in place under the active lock and emit it.
+    ///
+    /// Item outcomes, failures and the terminal transition go through here, so
+    /// a pause, resume or cancel that lands meanwhile is part of the snapshot
+    /// being changed and cannot be overwritten by a stale copy. Returns `None`
+    /// without calling `apply` when `run_id` does not own the active slot.
+    /// The revision is guaranteed to move forward; `control_revision` is left
+    /// alone because an item change is not a control change. A terminal result
+    /// releases the slot, exactly like [`Self::publish_snapshot`].
+    pub fn update_snapshot(
+        &self,
+        run_id: &str,
+        mut apply: impl FnMut(&mut TransientRunSnapshot),
+    ) -> Option<TransientRunSnapshot> {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_update
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let (snapshot, control_to_retry) = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = active.as_mut()?;
+            if current.run_id != run_id {
+                return None;
+            }
+            let before = current.snapshot.revision;
+            apply(&mut current.snapshot);
+            if current.snapshot.revision <= before {
+                current.snapshot.revision = before + 1;
+            }
+            let snapshot = current.snapshot.clone();
+            let control = Arc::clone(&current.control);
+            if snapshot.state.is_terminal() {
+                *active = None;
+                (snapshot, Some(control))
+            } else {
+                (snapshot, None)
+            }
+        };
+        if let Some(control) = control_to_retry {
+            let _ = control.retry_cleanup_verifiers();
+        }
+        *self
+            .most_recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
+        self.emit(&snapshot);
+        Some(snapshot)
+    }
+
     pub fn publish_snapshot(&self, snapshot: TransientRunSnapshot) {
         let terminal = snapshot.state.is_terminal();
         let control_to_retry = {
@@ -409,14 +542,16 @@ impl YouTubeLiveHandle {
             } else {
                 None
             };
+            // Only the run that owns the active slot may update or release it;
+            // a stray terminal publish for another run must leave it alone.
             if let Some(current) = active.as_mut() {
                 if current.run_id == snapshot.run_id {
-                    current.expected_revision = snapshot.revision;
+                    current.control_revision = snapshot.revision;
                     current.snapshot = snapshot.clone();
+                    if terminal {
+                        *active = None;
+                    }
                 }
-            }
-            if terminal {
-                *active = None;
             }
             control
         };
@@ -584,6 +719,235 @@ mod tests {
         assert!(live.has_active_run(&run_id));
         let run = runtime.get_run(run_id).unwrap().unwrap();
         assert_eq!(run.state, crate::workflow::domain::state::RunState::Queued);
+    }
+
+    fn one_item() -> Vec<TransientWorkItem> {
+        vec![TransientWorkItem {
+            occurrence_id: "occ-1".to_string(),
+            artifact_fingerprint: "af-1".to_string(),
+            video_id: "vid-1".to_string(),
+            ordinal: 1,
+            title: "t".to_string(),
+            source_url: "https://www.youtube.com/watch?v=vid-1".to_string(),
+        }]
+    }
+
+    fn tick(live: &YouTubeLiveHandle, run_id: &str, item: &TransientWorkItem, fraction: f64) {
+        live.publish_item_progress(
+            run_id,
+            item,
+            TransientProgressUpdate {
+                occurrence_id: item.occurrence_id.clone(),
+                phase: TransientItemPhase::Media,
+                bytes_completed: Some(1),
+                bytes_total: None,
+                fraction: Some(fraction),
+            },
+        );
+    }
+
+    fn live_with_run(run_id: &str) -> (YouTubeLiveHandle, TransientWorkItem) {
+        let live = YouTubeLiveHandle::default();
+        let items = one_item();
+        live.attach_run(
+            run_id.to_string(),
+            "sub".to_string(),
+            "fp".to_string(),
+            &items,
+        )
+        .unwrap();
+        (live, items[0].clone())
+    }
+
+    #[test]
+    fn pause_and_resume_accept_a_revision_the_ui_saw_before_progress_ticks() {
+        let (live, item) = live_with_run("run-ticks");
+        for step in 1..=5 {
+            tick(&live, "run-ticks", &item, f64::from(step) / 10.0);
+        }
+        let current = live.snapshot(Some("run-ticks")).unwrap().unwrap().revision;
+        assert_eq!(current, 6);
+
+        // The UI last rendered revision 3; only progress ticks have followed.
+        let paused = live.pause("run-ticks", 3).unwrap();
+        assert_eq!(paused.state, TransientRunState::PauseRequested);
+        assert_eq!(paused.revision, 7);
+
+        // More ticks, then resume from the pause snapshot or from before the
+        // ticks that followed it.
+        tick(&live, "run-ticks", &item, 0.6);
+        tick(&live, "run-ticks", &item, 0.7);
+        let resumed = live.resume("run-ticks", 7).unwrap();
+        assert_eq!(resumed.state, TransientRunState::Running);
+        assert_eq!(resumed.revision, 10);
+    }
+
+    #[test]
+    fn pause_still_rejects_a_revision_older_than_the_last_control_change() {
+        let (live, item) = live_with_run("run-stale");
+        live.pause("run-stale", 1).unwrap();
+        tick(&live, "run-stale", &item, 0.1);
+
+        // Revision 1 predates the pause, so a second client action on it is stale.
+        assert_eq!(
+            live.resume("run-stale", 1).unwrap_err(),
+            TransientRuntimeError::StaleRevision
+        );
+        // A revision from the future is stale too.
+        assert_eq!(
+            live.resume("run-stale", 99).unwrap_err(),
+            TransientRuntimeError::StaleRevision
+        );
+        live.resume("run-stale", 3).unwrap();
+    }
+
+    #[test]
+    fn progress_ticks_keep_a_requested_pause_and_ignore_other_runs() {
+        let (live, item) = live_with_run("run-keep");
+        live.pause("run-keep", 1).unwrap();
+
+        tick(&live, "run-keep", &item, 0.4);
+        tick(&live, "other-run", &item, 0.9);
+
+        let snapshot = live.snapshot(Some("run-keep")).unwrap().unwrap();
+        assert_eq!(snapshot.state, TransientRunState::PauseRequested);
+        assert_eq!(snapshot.revision, 3, "only the matching run advances");
+        assert_eq!(snapshot.progress.fraction, Some(0.4));
+        assert_eq!(snapshot.progress.bytes_completed, Some(1));
+    }
+
+    #[test]
+    fn progress_ticks_after_the_run_ended_are_dropped() {
+        let (live, item) = live_with_run("run-done");
+        let mut snapshot = live.snapshot(Some("run-done")).unwrap().unwrap();
+        finish_snapshot(&mut snapshot, false, None);
+        live.publish_snapshot(snapshot);
+
+        tick(&live, "run-done", &item, 0.5);
+
+        let recent = live.snapshot(Some("run-done")).unwrap().unwrap();
+        assert_eq!(recent.state, TransientRunState::Completed);
+        assert_eq!(recent.revision, 2);
+    }
+
+    #[test]
+    fn item_outcome_warning_carries_its_human_message_when_one_is_given() {
+        use crate::app::managed_process::TransientExecutionOutcome;
+        let items = one_item();
+        let mut snapshot = initial_snapshot(
+            "run-w".to_string(),
+            "sub-w".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        let outcome = TransientExecutionOutcome::warning("TRANSCRIPT_INVALID", Vec::new())
+            .with_warning_message("TRANSCRIPT_INVALID", "Video saved; the transcript is bad");
+
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+
+        let warning = &snapshot.items[0].warnings[0];
+        assert_eq!(warning.code, "TRANSCRIPT_INVALID");
+        assert_eq!(warning.message, "Video saved; the transcript is bad");
+        assert_eq!(snapshot.counts.completed_with_warnings, 1);
+    }
+
+    #[test]
+    fn terminal_publish_for_another_run_does_not_release_the_active_run() {
+        let live = YouTubeLiveHandle::default();
+        let items = one_item();
+        live.attach_run(
+            "run-active".to_string(),
+            "sub-a".to_string(),
+            "fp".to_string(),
+            &items,
+        )
+        .unwrap();
+        let mut stray = initial_snapshot(
+            "run-other".to_string(),
+            "sub-o".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        finish_snapshot(&mut stray, false, None);
+
+        live.publish_snapshot(stray);
+
+        assert!(live.has_active_run("run-active"));
+        assert!(live.control_for("run-active").is_some());
+        assert_eq!(
+            live.attach_run(
+                "run-next".to_string(),
+                "sub-n".to_string(),
+                "fp".to_string(),
+                &items
+            )
+            .unwrap_err(),
+            TransientRuntimeError::RunAlreadyActive
+        );
+    }
+
+    #[test]
+    fn terminal_publish_for_the_active_run_still_releases_it() {
+        let live = YouTubeLiveHandle::default();
+        let items = one_item();
+        live.attach_run(
+            "run-active".to_string(),
+            "sub-a".to_string(),
+            "fp".to_string(),
+            &items,
+        )
+        .unwrap();
+        let mut done = initial_snapshot(
+            "run-active".to_string(),
+            "sub-a".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        finish_snapshot(&mut done, false, None);
+
+        live.publish_snapshot(done);
+
+        assert!(!live.has_active_run("run-active"));
+    }
+
+    #[test]
+    fn warning_outcome_counts_once_and_makes_the_run_completed_with_warnings() {
+        use crate::app::managed_process::TransientExecutionOutcome;
+        let items = one_item();
+        let mut snapshot = initial_snapshot(
+            "run-c".to_string(),
+            "sub-c".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        let outcome =
+            TransientExecutionOutcome::warning("TRANSCRIPT_MISSING", vec!["media".to_string()]);
+
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+        finish_snapshot(&mut snapshot, false, None);
+
+        assert_eq!(snapshot.counts.completed_with_warnings, 1);
+        assert_eq!(snapshot.counts.completed, 0);
+        assert_eq!(snapshot.counts.skipped, 0);
+        assert_eq!(snapshot.state, TransientRunState::CompletedWithWarnings);
+    }
+
+    #[test]
+    fn item_outcome_warning_without_a_message_falls_back_to_its_code() {
+        use crate::app::managed_process::TransientExecutionOutcome;
+        let items = one_item();
+        let mut snapshot = initial_snapshot(
+            "run-w".to_string(),
+            "sub-w".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        let outcome = TransientExecutionOutcome::warning("TRANSCRIPT_MISSING", Vec::new());
+
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+
+        assert_eq!(snapshot.items[0].warnings[0].message, "TRANSCRIPT_MISSING");
     }
 
     #[test]
@@ -761,12 +1125,60 @@ pub fn apply_item_outcome(
             .map(|code| crate::app::managed_process::TransientWarning {
                 occurrence_id: Some(item.occurrence_id.clone()),
                 code: code.clone(),
-                message: code.clone(),
+                message: outcome
+                    .warning_messages
+                    .iter()
+                    .find(|(candidate, _)| candidate == code)
+                    .map_or_else(|| code.clone(), |(_, message)| message.clone()),
             })
             .collect();
         entry.error = outcome.error.clone();
         entry.published_artifact_kinds = outcome.published_artifact_kinds.clone();
     }
+    recount_items(snapshot);
+    snapshot.item = Some(TransientCurrentItem {
+        occurrence_id: item.occurrence_id.clone(),
+        artifact_fingerprint: item.artifact_fingerprint.clone(),
+        video_id: item.video_id.clone(),
+        ordinal: item.ordinal,
+        title: item.title.clone(),
+        state: outcome.state.clone(),
+        phase: outcome.phase.clone(),
+    });
+}
+
+/// Mark `item` failed with `error` when the item executor returned `Err`.
+///
+/// Items that never started stay `Pending`; the run-level terminal state is set
+/// separately by `finish_snapshot`.
+pub fn apply_item_failure(
+    snapshot: &mut TransientRunSnapshot,
+    item: &TransientWorkItem,
+    error: &TransientError,
+) {
+    snapshot.revision += 1;
+    if let Some(entry) = snapshot
+        .items
+        .iter_mut()
+        .find(|entry| entry.occurrence_id == item.occurrence_id)
+    {
+        entry.state = TransientItemState::Failed;
+        entry.phase = TransientItemPhase::Failed;
+        entry.error = Some(error.clone());
+    }
+    recount_items(snapshot);
+    snapshot.item = Some(TransientCurrentItem {
+        occurrence_id: item.occurrence_id.clone(),
+        artifact_fingerprint: item.artifact_fingerprint.clone(),
+        video_id: item.video_id.clone(),
+        ordinal: item.ordinal,
+        title: item.title.clone(),
+        state: TransientItemState::Failed,
+        phase: TransientItemPhase::Failed,
+    });
+}
+
+fn recount_items(snapshot: &mut TransientRunSnapshot) {
     snapshot.counts.completed = snapshot
         .items
         .iter()
@@ -797,15 +1209,6 @@ pub fn apply_item_outcome(
         .iter()
         .filter(|entry| entry.state == TransientItemState::Cancelled)
         .count() as u32;
-    snapshot.item = Some(TransientCurrentItem {
-        occurrence_id: item.occurrence_id.clone(),
-        artifact_fingerprint: item.artifact_fingerprint.clone(),
-        video_id: item.video_id.clone(),
-        ordinal: item.ordinal,
-        title: item.title.clone(),
-        state: outcome.state.clone(),
-        phase: outcome.phase.clone(),
-    });
 }
 
 pub fn finish_snapshot(

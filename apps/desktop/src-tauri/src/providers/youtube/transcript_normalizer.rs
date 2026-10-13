@@ -11,7 +11,15 @@ use thiserror::Error;
 
 pub const NORMALIZED_TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
 pub const TRANSCRIPT_PROVIDER: &str = "youtube";
-pub const MAX_VTT_BYTES: usize = 16 * 1024 * 1024;
+/// Largest raw VTT accepted.  Twelve hours of word-timed rolling auto-captions
+/// is roughly 8-10 MB and dense speech can pass 16 MiB; 64 MiB leaves ample room
+/// while the whole file is still read into memory once.
+pub const MAX_VTT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest normalized transcript JSON written or reused.  Enforced by
+/// [`normalize_vtt_json`], which both the fresh write and the reuse check call,
+/// so what is written fresh can always be reused.  Equal to the VTT cap: the
+/// JSON drops the markup but adds a few dozen bytes per cue.
+pub const MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptMetadata {
@@ -46,6 +54,8 @@ pub struct NormalizedTranscript {
 pub enum TranscriptNormalizationError {
     #[error("raw VTT is too large: {size_bytes} bytes exceeds {max_bytes} bytes")]
     InputTooLarge { size_bytes: usize, max_bytes: usize },
+    #[error("normalized transcript is too large: {size_bytes} bytes exceeds {max_bytes} bytes")]
+    OutputTooLarge { size_bytes: usize, max_bytes: usize },
     #[error("raw VTT is not valid UTF-8")]
     InvalidUtf8,
     #[error("raw VTT is missing the WEBVTT header")]
@@ -84,6 +94,7 @@ pub fn normalize_vtt(
         std::str::from_utf8(raw_vtt).map_err(|_| TranscriptNormalizationError::InvalidUtf8)?;
     let normalized_lines = normalize_line_endings(source);
     let cues = parse_vtt(&normalized_lines)?;
+    drop(normalized_lines);
 
     Ok(NormalizedTranscript {
         schema_version: NORMALIZED_TRANSCRIPT_SCHEMA_VERSION,
@@ -102,10 +113,73 @@ pub fn normalize_vtt_json(
     raw_vtt: &[u8],
     metadata: TranscriptMetadata,
 ) -> Result<Vec<u8>, TranscriptNormalizationError> {
+    normalize_vtt_json_within(raw_vtt, metadata, MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES)
+}
+
+fn normalize_vtt_json_within(
+    raw_vtt: &[u8],
+    metadata: TranscriptMetadata,
+    max_json_bytes: usize,
+) -> Result<Vec<u8>, TranscriptNormalizationError> {
     let normalized = normalize_vtt(raw_vtt, metadata)?;
-    serde_json::to_vec(&normalized).map_err(|error| TranscriptNormalizationError::Serialization {
-        message: error.to_string(),
-    })
+    // Serialize into a writer that refuses to grow past the cap, so a transcript whose
+    // escapes expand it (a control character becomes a 6-byte \u00XX) fails as soon as it
+    // crosses the cap instead of after the whole JSON was built.
+    let mut writer = BoundedJsonWriter::new(max_json_bytes);
+    match serde_json::to_writer(&mut writer, &normalized) {
+        Ok(()) => Ok(writer.into_bytes()),
+        Err(_) if writer.refused_at.is_some() => Err(TranscriptNormalizationError::OutputTooLarge {
+            size_bytes: writer.refused_at.unwrap_or(max_json_bytes),
+            max_bytes: max_json_bytes,
+        }),
+        Err(error) => Err(TranscriptNormalizationError::Serialization {
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// A `Vec<u8>` sink that errors on the write that would take it past `max` bytes and never
+/// reserves more than `max`, so its memory stays within the cap.
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    max: usize,
+    /// Total size the refused write would have reached.
+    refused_at: Option<usize>,
+}
+
+impl BoundedJsonWriter {
+    fn new(max: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max,
+            refused_at: None,
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let needed = self.bytes.len().saturating_add(data.len());
+        if needed > self.max {
+            self.refused_at = Some(needed);
+            return Err(std::io::Error::other("normalized transcript exceeds its size cap"));
+        }
+        if needed > self.bytes.capacity() {
+            // Grow geometrically, but never beyond the cap.
+            let target = needed.max(self.bytes.capacity().saturating_mul(2)).min(self.max);
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn validate_metadata(metadata: &TranscriptMetadata) -> Result<(), TranscriptNormalizationError> {
@@ -130,7 +204,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn normalize_line_endings(source: &str) -> String {
+/// Returns the source untouched when it has no carriage return (YouTube's VTT), so a large
+/// transcript is not copied; otherwise a copy with `\r\n` and lone `\r` turned into `\n`.
+fn normalize_line_endings(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains('\r') {
+        return std::borrow::Cow::Borrowed(source);
+    }
     let mut normalized = String::with_capacity(source.len());
     let mut characters = source.chars().peekable();
     while let Some(character) = characters.next() {
@@ -143,7 +222,7 @@ fn normalize_line_endings(source: &str) -> String {
             normalized.push(character);
         }
     }
-    normalized
+    std::borrow::Cow::Owned(normalized)
 }
 
 fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalizationError> {
@@ -191,14 +270,10 @@ fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalization
         let (start_ms, end_ms) = parse_timing_line(timing_line)?;
         index = timing_index + 1;
         let text_start = index;
-        while index < lines.len() && !lines[index].trim().is_empty() {
+        while index < lines.len() && !ends_cue_text(&lines, index) {
             index += 1;
         }
-        let text = lines[text_start..index]
-            .iter()
-            .map(|line| normalize_cue_text(line))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = join_cue_text(&lines[text_start..index]);
         cues.push(TranscriptCue {
             start_ms,
             end_ms,
@@ -207,6 +282,51 @@ fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalization
     }
 
     Ok(cues)
+}
+
+/// Per the WebVTT spec only a truly empty line ends cue text. YouTube
+/// auto-captions put whitespace-only lines inside cues, so those stay part of
+/// the text unless the next line starts a new cue (a timing line, or a cue
+/// identifier followed by a timing line) or a NOTE, STYLE or REGION block.
+fn ends_cue_text(lines: &[&str], index: usize) -> bool {
+    let line = lines[index];
+    if line.is_empty() {
+        return true;
+    }
+    if !line.trim().is_empty() {
+        return false;
+    }
+    match lines.get(index + 1) {
+        Some(next) if next.contains("-->") || is_ignored_block_start(next) => true,
+        Some(next) if !next.trim().is_empty() => lines
+            .get(index + 2)
+            .is_some_and(|after| after.contains("-->")),
+        _ => false,
+    }
+}
+
+/// Normalizes each cue text line and joins them, dropping blank lines at
+/// either end (whitespace-only lines normalize to empty text).
+fn join_cue_text(cue_lines: &[&str]) -> String {
+    let normalized: Vec<String> = cue_lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                normalize_cue_text(line)
+            }
+        })
+        .collect();
+    let is_blank = |line: &String| line.trim().is_empty();
+    let Some(first) = normalized.iter().position(|line| !is_blank(line)) else {
+        return String::new();
+    };
+    let last = normalized
+        .iter()
+        .rposition(|line| !is_blank(line))
+        .unwrap_or(first);
+    normalized[first..=last].join("\n")
 }
 
 fn is_webvtt_header(line: &str) -> bool {
@@ -355,19 +475,19 @@ fn normalize_cue_text(line: &str) -> String {
     decode_entities(&text)
 }
 
+const MAX_ENTITY_BYTES: usize = 32;
+
 fn decode_entities(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut remainder = value;
     while let Some(ampersand_index) = remainder.find('&') {
         output.push_str(&remainder[..ampersand_index]);
         let after_ampersand = &remainder[ampersand_index + 1..];
-        let Some(semicolon_index) = after_ampersand.find(';') else {
-            output.push_str(&remainder[ampersand_index..]);
-            break;
-        };
-        let entity = &after_ampersand[..semicolon_index];
-        if entity.len() <= 32 {
-            if let Some(decoded) = decode_entity(entity) {
+        // An entity is at most 32 bytes, so look for its terminator only that far:
+        // an unbounded search made a long run of '&' quadratic in the line length.
+        let window = &after_ampersand.as_bytes()[..after_ampersand.len().min(MAX_ENTITY_BYTES + 1)];
+        if let Some(semicolon_index) = window.iter().position(|byte| *byte == b';') {
+            if let Some(decoded) = decode_entity(&after_ampersand[..semicolon_index]) {
                 output.push_str(&decoded);
                 remainder = &after_ampersand[semicolon_index + 1..];
                 continue;
@@ -541,6 +661,112 @@ mod tests {
     }
 
     #[test]
+    fn parses_youtube_auto_caption_cues_with_whitespace_only_lines() {
+        let raw = concat!(
+            "WEBVTT\n",
+            "Kind: captions\n",
+            "Language: en\n",
+            "\n",
+            "00:00:00.160 --> 00:00:02.230 align:start position:0%\n",
+            " \n",
+            "You<00:00:00.240><c> are</c><00:00:00.320><c> sitting</c><00:00:00.600><c> in</c><00:00:00.680><c> a</c><00:00:00.720><c> meeting</c>\n",
+            "\n",
+            "00:00:02.230 --> 00:00:02.240 align:start position:0%\n",
+            "You are sitting in a meeting\n",
+            " \n",
+            "\n",
+            "00:00:02.240 --> 00:00:04.990 align:start position:0%\n",
+            "You are sitting in a meeting\n",
+            "and<00:00:02.560><c> someone</c><00:00:02.880><c> says</c>\n",
+        );
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).expect("auto captions parse");
+        assert_eq!(normalized.cues.len(), 3);
+        assert_eq!(
+            (normalized.cues[0].start_ms, normalized.cues[0].end_ms),
+            (160, 2_230)
+        );
+        assert_eq!(normalized.cues[0].text, "You are sitting in a meeting");
+        assert_eq!(
+            (normalized.cues[1].start_ms, normalized.cues[1].end_ms),
+            (2_230, 2_240)
+        );
+        assert_eq!(normalized.cues[1].text, "You are sitting in a meeting");
+        assert_eq!(
+            (normalized.cues[2].start_ms, normalized.cues[2].end_ms),
+            (2_240, 4_990)
+        );
+        assert_eq!(
+            normalized.cues[2].text,
+            "You are sitting in a meeting\nand someone says"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_line_before_next_cue_terminates_the_cue() {
+        let raw = concat!(
+            "WEBVTT\n\n",
+            "00:00:00.000 --> 00:00:01.000\n",
+            "first\n",
+            " \n",
+            "00:00:01.000 --> 00:00:02.000\n",
+            "second\n",
+            "\t\n",
+            "cue-3\n",
+            "00:00:02.000 --> 00:00:03.000\n",
+            "third\n",
+        );
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).expect("fixture should parse");
+        let cues: Vec<_> = normalized
+            .cues
+            .iter()
+            .map(|cue| (cue.start_ms, cue.end_ms, cue.text.as_str()))
+            .collect();
+        assert_eq!(
+            cues,
+            vec![
+                (0, 1_000, "first"),
+                (1_000, 2_000, "second"),
+                (2_000, 3_000, "third"),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_line_before_note_style_or_region_block_terminates_the_cue() {
+        for block in [
+            "NOTE a comment\nspanning two lines",
+            "STYLE\n::cue { color: red }",
+            "REGION\nid:fred",
+        ] {
+            let raw = format!(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nfirst\n \n{block}\n\n00:00:01.000 --> 00:00:02.000\nsecond\n"
+            );
+            let normalized =
+                normalize_vtt(raw.as_bytes(), metadata()).expect("fixture should parse");
+            let cues: Vec<_> = normalized
+                .cues
+                .iter()
+                .map(|cue| (cue.start_ms, cue.end_ms, cue.text.as_str()))
+                .collect();
+            assert_eq!(
+                cues,
+                vec![(0, 1_000, "first"), (1_000, 2_000, "second")],
+                "block leaked into the cue: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_cues_whose_text_is_only_whitespace_with_empty_text() {
+        let raw =
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n \n\n00:00:01.000 --> 00:00:02.000\nx\n";
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).expect("fixture should parse");
+        assert_eq!(normalized.cues.len(), 2);
+        assert_eq!(normalized.cues[0].text, "");
+        assert_eq!(normalized.cues[1].text, "x");
+    }
+
+    #[test]
     fn emits_deterministic_versioned_json() {
         let raw = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n";
         let first = normalize_vtt_json(raw, metadata()).expect("JSON should serialize");
@@ -550,5 +776,163 @@ mod tests {
         assert!(json.contains("\"schemaVersion\":1"));
         assert!(json.contains("\"provider\":\"youtube\""));
         assert!(json.contains("\"startMs\":0"));
+    }
+
+    /// Twelve hours of YouTube-style rolling auto-captions: every 0.5 s a cue
+    /// that repeats the previous line, holds a whitespace-only line, and adds a
+    /// word-timed line, i.e. about 430k lines and about 10 MB.
+    fn rolling_auto_caption_vtt(hours: u64) -> String {
+        const WORDS: [&str; 8] = ["so", "today", "we", "are", "going", "to", "talk", "about"];
+        let cue_count = hours * 3600 * 2;
+        let mut vtt = String::with_capacity(cue_count as usize * 130);
+        vtt.push_str("WEBVTT\nKind: captions\nLanguage: en\n\n");
+        let stamp = |ms: u64| {
+            format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1_000 % 60,
+                ms % 1_000
+            )
+        };
+        for cue in 0..cue_count {
+            let start = cue * 500;
+            let previous = WORDS[(cue as usize) % WORDS.len()];
+            let word = WORDS[(cue as usize + 1) % WORDS.len()];
+            vtt.push_str(&format!(
+                "{} --> {} align:start position:0%\n{previous} {previous}\n \n{word}<{}><c> {word}</c><{}><c> &gt;&gt; {previous}</c>\n\n",
+                stamp(start),
+                stamp(start + 500),
+                stamp(start + 150),
+                stamp(start + 300)
+            ));
+        }
+        vtt
+    }
+
+    #[test]
+    fn twelve_hours_of_rolling_auto_captions_normalize_within_the_caps_and_in_linear_time() {
+        let vtt = rolling_auto_caption_vtt(12);
+        assert!(vtt.len() > 8_000_000, "fixture is {} bytes", vtt.len());
+        assert!(vtt.len() < MAX_VTT_BYTES);
+        let line_count = vtt.lines().count();
+        assert!(line_count > 400_000, "fixture has {line_count} lines");
+
+        let started = std::time::Instant::now();
+        let json = normalize_vtt_json(vtt.as_bytes(), metadata()).expect("12 h must normalize");
+        let elapsed = started.elapsed();
+        eprintln!("12h fixture: {} bytes, {line_count} lines, json {} bytes, {elapsed:?}", vtt.len(), json.len());
+        assert!(json.len() <= MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES);
+        let normalized: NormalizedTranscript = serde_json::from_slice(&json).unwrap();
+        assert_eq!(normalized.cues.len(), 12 * 3600 * 2);
+        assert_eq!(normalized.cues[0].text, "so so\n\ntoday today >> so");
+        assert_eq!(normalized.cues.last().unwrap().end_ms, 12 * 3_600_000);
+        // Unoptimized test builds do this in a few seconds; a quadratic pass would not finish.
+        assert!(elapsed < std::time::Duration::from_secs(60), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_huge_run_of_ampersands_in_one_cue_line_is_linear() {
+        // 4 MiB of '&' followed by one distant ';' made the entity scan quadratic: every
+        // '&' searched to the end of the line for its terminator.
+        let run = format!("{};", "&".repeat(4 * 1024 * 1024));
+        let raw = format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{run}\n");
+        let started = std::time::Instant::now();
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).unwrap();
+        assert_eq!(normalized.cues[0].text, run);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Entities still decode next to the run.
+        let mixed = format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{}&amp;&{}&lt;\n", "&".repeat(40), "x".repeat(40));
+        let normalized = normalize_vtt(mixed.as_bytes(), metadata()).unwrap();
+        assert_eq!(
+            normalized.cues[0].text,
+            format!("{}&&{}<", "&".repeat(40), "x".repeat(40))
+        );
+    }
+
+    #[test]
+    fn an_entity_is_decoded_only_within_its_32_byte_limit() {
+        let at_limit = format!("#x{}41", "0".repeat(28));
+        let over_limit = format!("#x{}41", "0".repeat(29));
+        assert_eq!(at_limit.len(), 32);
+        let raw = format!("WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+&{at_limit}; &{over_limit}; &#x41;
+");
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).unwrap();
+        assert_eq!(normalized.cues[0].text, format!("A &{over_limit}; A"));
+    }
+
+    #[test]
+    fn normalized_json_over_its_cap_is_refused_with_a_dedicated_error() {
+        let raw = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello world\n";
+        let json = normalize_vtt_json(raw.as_bytes(), metadata()).unwrap();
+        assert_eq!(
+            normalize_vtt_json_within(raw.as_bytes(), metadata(), json.len()).unwrap(),
+            json
+        );
+        assert_eq!(
+            normalize_vtt_json_within(raw.as_bytes(), metadata(), json.len() - 1),
+            Err(TranscriptNormalizationError::OutputTooLarge {
+                size_bytes: json.len(),
+                max_bytes: json.len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn the_json_writer_never_holds_more_than_its_cap() {
+        use std::io::Write;
+        let max = 1000;
+        let mut writer = BoundedJsonWriter::new(max);
+        let mut written = 0;
+        let refused = loop {
+            match writer.write(&[b'x'; 37]) {
+                Ok(count) => written += count,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(refused.to_string(), "normalized transcript exceeds its size cap");
+        assert!(written <= max && writer.bytes.len() == written);
+        assert!(writer.bytes.capacity() <= max, "capacity {} passed the cap", writer.bytes.capacity());
+        assert_eq!(writer.refused_at, Some(written + 37));
+        // A single write that alone exceeds the cap is refused before anything is reserved.
+        let mut fresh = BoundedJsonWriter::new(max);
+        assert!(fresh.write(&vec![b'y'; max + 1]).is_err());
+        assert_eq!(fresh.bytes.capacity(), 0);
+    }
+
+    #[test]
+    fn control_characters_that_expand_past_the_cap_fail_as_soon_as_they_cross_it() {
+        // Each "&#1;" is one control character that JSON escapes as the 6 bytes \u0001.
+        let text = "&#1;".repeat(20_000);
+        let raw = format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{text}\n");
+        let full = normalize_vtt_json(raw.as_bytes(), metadata()).unwrap();
+        assert!(full.len() > 6 * 20_000);
+        let cap = 10_000;
+        match normalize_vtt_json_within(raw.as_bytes(), metadata(), cap) {
+            Err(TranscriptNormalizationError::OutputTooLarge { size_bytes, max_bytes }) => {
+                assert_eq!(max_bytes, cap);
+                // Refused at the first write past the cap, long before the ~130 KB the
+                // whole document needs.
+                assert!(size_bytes > cap && size_bytes <= cap + 64, "refused at {size_bytes}");
+            }
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+        // At exactly the needed size it still succeeds.
+        assert_eq!(
+            normalize_vtt_json_within(raw.as_bytes(), metadata(), full.len()).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn line_endings_are_only_copied_when_they_need_rewriting() {
+        assert!(matches!(
+            normalize_line_endings("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(normalize_line_endings("a\r\nb\rc\n"), "a\nb\nc\n");
     }
 }

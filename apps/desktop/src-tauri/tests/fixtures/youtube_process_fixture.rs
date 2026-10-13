@@ -37,6 +37,9 @@ fn run() -> Result<(), String> {
         "grandchild" => run_grandchild_parent(&remaining),
         "survivor" => run_survivor(&remaining),
         "noisy" => run_noisy(&remaining),
+        "trickle" => run_trickle(&remaining),
+        "many_lines" => run_many_lines(&remaining),
+        "long_line" => run_long_line(),
         "invalid_utf8" => {
             io::stdout()
                 .write_all(&[0xff, 0xfe, 0xfd])
@@ -139,6 +142,45 @@ fn run_noisy(args: &[std::ffi::OsString]) -> Result<(), String> {
         .join()
         .map_err(|_| "stderr fixture writer panicked".to_string())?
         .map_err(|error| error.to_string())
+}
+
+/// Writes lines incrementally, splitting one across two writes and ending with
+/// an unterminated line, so the supervisor's line framing can be observed
+/// while the process is still alive.
+fn run_trickle(args: &[std::ffi::OsString]) -> Result<(), String> {
+    let pause = parse_duration(args, 0)?;
+    let mut stdout = io::stdout().lock();
+    for chunk in [&b"alpha\r\n"[..], &b"be"[..], &b"ta\n"[..], &b"gamma"[..]] {
+        stdout.write_all(chunk).map_err(|error| error.to_string())?;
+        stdout.flush().map_err(|error| error.to_string())?;
+        thread::sleep(pause);
+    }
+    Ok(())
+}
+
+fn run_many_lines(args: &[std::ffi::OsString]) -> Result<(), String> {
+    let count = args
+        .first()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "missing line count".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid line count: {error}"))?;
+    let mut stdout = io::stdout().lock();
+    for index in 0..count {
+        writeln!(stdout, "line-{index}").map_err(|error| error.to_string())?;
+    }
+    stdout.flush().map_err(|error| error.to_string())
+}
+
+fn run_long_line() -> Result<(), String> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(&vec![b'L'; 64 * 1024])
+        .map_err(|error| error.to_string())?;
+    stdout
+        .write_all(b"\nafter\n")
+        .map_err(|error| error.to_string())?;
+    stdout.flush().map_err(|error| error.to_string())
 }
 
 fn parse_duration(args: &[std::ffi::OsString], index: usize) -> Result<Duration, String> {

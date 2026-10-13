@@ -55,7 +55,8 @@ import {
 } from "./components/primitives";
 import { CourseraView } from "./components/coursera/CourseraView";
 import { YouTubeView } from "./components/youtube/YouTubeView";
-import { formatYouTubeInvokeError, startYouTubeUiMock } from "./lib/youtube/ipc";
+import { formatYouTubeInvokeError, getYouTubeHelperStatus, startYouTubeUiMock } from "./lib/youtube/ipc";
+import { YOUTUBE_HELPER_STATUS_EVENT } from "./lib/youtube/helperRecovery";
 import { ensureDestination, parseDestination } from "./lib/destinations";
 import { commitLinkedInDestination } from "./lib/linkedin/ipc";
 import { nextPollDelayMs, nextPollRetryDelayMs, pollScheduleKey } from "./lib/linkedin/poll-schedule";
@@ -276,7 +277,7 @@ const DEFAULT_VIDEO_WAIT_MIN_SECONDS = 20;
 const DEFAULT_VIDEO_WAIT_MAX_SECONDS = 40;
 const TOKEN_GUIDE_DISMISSED_STORAGE_KEY = "linkvault.liAtGuideDismissed";
 const THEME_STORAGE_KEY = "linkvault.theme";
-const APP_VERSION = "0.2.28";
+const APP_VERSION = "0.2.29";
 const UPDATE_TOAST_ID = "linkvault-update";
 type AppTheme = "light" | "dark";
 type AppView = "downloads" | "linkedin-history" | "coursera" | "coursera-history" | "newspaper-download" | "newspaper-library" | "newspaper-clippings" | "youtube" | "youtube-history";
@@ -363,6 +364,37 @@ export default function App() {
   const initialStoredVideoWait = useRef(readStoredVideoWaitBounds());
   const initialNewspaperReaderPreferences = useRef(readNewspaperReaderPreferences());
   const [courseUrls, setCourseUrls] = useState("");
+  const [youtubeHelperSetupNeeded, setYouTubeHelperSetupNeeded] = useState(false);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let statusEventSeen = false;
+    const onStatus = (event: Event) => {
+      if (event instanceof CustomEvent && typeof event.detail === "boolean") {
+        statusEventSeen = true;
+        setYouTubeHelperSetupNeeded(!event.detail);
+      }
+    };
+    window.addEventListener(YOUTUBE_HELPER_STATUS_EVENT, onStatus);
+    // Deferred so the ~230 MB integrity hash never competes with first paint.
+    const timer = window.setTimeout(() => {
+      // YouTubeView already reported; skip a redundant hash.
+      if (statusEventSeen) return;
+      void getYouTubeHelperStatus()
+        .then((response) => response.status !== "ready")
+        .catch(() => true)
+        .then((setupNeeded) => {
+          // A YouTubeView refresh or install that reported meanwhile is newer; keep it.
+          if (!disposed && !statusEventSeen) setYouTubeHelperSetupNeeded(setupNeeded);
+        });
+    }, 4000);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      window.removeEventListener(YOUTUBE_HELPER_STATUS_EVENT, onStatus);
+    };
+  }, []);
   const [folder, setFolder] = useState("");
   const [token, setToken] = useState("");
   const courseUrlsInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2479,7 +2511,9 @@ export default function App() {
                 className="lv-nav-child"
                 active={activeView === "youtube"}
                 icon={<Download aria-hidden="true" />}
-                aria-label="Download YouTube video"
+                aria-label={youtubeHelperSetupNeeded ? "Download YouTube video, helper setup needed" : "Download YouTube video"}
+                trailing={youtubeHelperSetupNeeded ? <span className="lv-nav-setup-badge" aria-hidden="true" /> : undefined}
+                title={youtubeHelperSetupNeeded ? "YouTube helper setup needed" : undefined}
                 onClick={() => void requestNavigation("youtube")}
               >
                 Download video
@@ -2527,7 +2561,7 @@ export default function App() {
             >
               <div className="text-xs font-semibold text-muted-strong">LinkedVault</div>
               <p className="mt-2 text-xs leading-5 text-muted">
-                LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts; the signed helper pack is downloaded once after install when you open YouTube.
+                LinkedIn and Coursera course downloads use a saved local session cookie. YouTube downloads public videos and playlists with transcripts. It needs a one-time signed helper pack (~220 MB): click Download YouTube helpers on the YouTube page.
               </p>
             </Popover>
           </div>

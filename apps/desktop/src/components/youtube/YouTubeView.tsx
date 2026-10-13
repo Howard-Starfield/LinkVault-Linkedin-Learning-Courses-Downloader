@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import {
   Folder,
   FolderOpen,
+  LoaderCircle,
   Pause,
   Play,
   Square
@@ -33,7 +34,8 @@ import {
   subscribeYouTubeRunChanged,
   youtubeErrorFromUnknown,
   isYouTubeRunSnapshot,
-  YOUTUBE_UI_MOCK_RUN_PREFIX
+  YOUTUBE_UI_MOCK_RUN_PREFIX,
+  isYouTubeSimulatedRun
 } from "../../lib/youtube/ipc";
 import {
   detectYouTubeLinks,
@@ -56,9 +58,28 @@ import {
   type YouTubeScanItem,
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
+import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
+import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
+import {
+  BusyRetryCancelled,
+  WAITING_FOR_LOOKUP_MESSAGE,
+  batchingNotice,
+  createBatchSequencer,
+  describeBusyFailure,
+  isRowDownloadDisabled,
+  playlistTruncationNote,
+  retryWhileBusy,
+  splitIntoRuns,
+  supersededClickMessage,
+  type BatchContext,
+  type BatchSequencer,
+  type BatchStartResult,
+  type InspectionOutcome
+} from "../../lib/youtube/startFlow";
 
 type HelperStatus = "pending" | "ready" | "failed";
+type HelperRefreshResult = "ready" | "blocked" | "superseded";
 type YouTubeQueueSection = "queue" | "active" | "completed" | "failed";
 
 function queueSectionForItemState(state: YouTubeItemState): YouTubeQueueSection {
@@ -128,6 +149,7 @@ interface TranscriptLanguageOption {
 }
 
 const NO_CAPTION_OPTION: TranscriptLanguageOption = { tag: "", label: "No caption" };
+const NO_OCCURRENCES: ReadonlySet<string> = new Set();
 /** Matches `.youtube-search-input` min/max-height; keep in sync with CSS. */
 const YOUTUBE_SEARCH_MIN_HEIGHT_PX = 40;
 const YOUTUBE_SEARCH_MAX_HEIGHT_PX = 132;
@@ -259,21 +281,16 @@ function itemProgressPercent(
 ): number | null {
   if (state === "completed" || state === "skipped_existing") return 100;
   if (state === "running" && runSnapshot?.item?.occurrenceId === occurrenceId) return runPercent;
-  if (state === "pending" && runSnapshot && !isYouTubeRunTerminal(runSnapshot.state)) return 0;
   return null;
 }
 
-function itemStatusText(state: YouTubeItemState, available: boolean): string | null {
-  if (!available) return state === "skipped" ? "Unavailable" : "Unconfirmed";
-  switch (state) {
-    case "completed": return "Saved";
-    case "completed_with_warnings": return "Saved with warnings";
-    case "running": return "Downloading";
-    case "failed": return "Failed";
-    case "cancelled": return "Cancelled";
-    case "skipped_existing": return "Already saved";
-    default: return null;
-  }
+/** Error text for a failed item or run, with the next step the user can take. */
+function formatYouTubeFailure(error: YouTubeError): string {
+  const nextStep = helperRecoveryKind(error) === "reinstall"
+    ? "Download YouTube helpers to repair."
+    : "Retry the download, or check the link.";
+  const message = error.message.trim();
+  return `${message}${/[.!?]$/.test(message) ? "" : "."} ${nextStep}`;
 }
 
 function readTrimmedString(value: unknown): string | null {
@@ -296,6 +313,7 @@ function formatYouTubeWarning(value: unknown): string {
 
   switch (code) {
     case "TRANSCRIPT_MISSING":
+      if (message && message !== code) return message;
       return "No captions were available on YouTube for this video, so only the media file was saved.";
     default:
       if (message && message !== code) return message;
@@ -310,27 +328,64 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const [isInstallingHelpers, setIsInstallingHelpers] = useState(false);
   const helperReady = !nativeRuntime || helperStatus === "ready";
 
-  const refreshHelperStatus = useCallback(async () => {
+  const helperStatusGenerationRef = useRef(0);
+  const helperViewMountedRef = useRef(true);
+  const helperRecoveryRunRef = useRef<string | null>(null);
+  const helperRefreshInFlightRef = useRef(0);
+
+  const refreshHelperStatus = useCallback(async (): Promise<HelperRefreshResult> => {
     if (!nativeRuntime) {
       setHelperStatus("ready");
       setHelperError(null);
-      return;
+      return "ready";
     }
+    // An install that finishes after unmount must not start a refresh that broadcasts.
+    if (!helperViewMountedRef.current) return "superseded";
+    const generation = helperStatusGenerationRef.current + 1;
+    helperStatusGenerationRef.current = generation;
+    let ready = false;
+    let failure: YouTubeError | null = null;
+    helperRefreshInFlightRef.current += 1;
     try {
       const response = await getYouTubeHelperStatus();
-      const ready = response.status === "ready";
-      setHelperStatus(ready ? "ready" : "failed");
-      setHelperError(ready
+      ready = response.status === "ready";
+      failure = ready
         ? null
         : {
             code: response.code ?? "HELPER_INTEGRITY_FAILED",
             message: response.message || "YouTube helper integrity validation failed."
-          });
+          };
     } catch (error: unknown) {
-      setHelperStatus("failed");
-      setHelperError(helperStatusFailure(error));
+      failure = helperStatusFailure(error);
+    } finally {
+      helperRefreshInFlightRef.current -= 1;
     }
+    // A newer refresh (or unmount) owns the UI; an older response must not
+    // set state, broadcast, or report a result a caller could act on.
+    if (generation !== helperStatusGenerationRef.current || !helperViewMountedRef.current) return "superseded";
+    setHelperStatus(ready ? "ready" : "failed");
+    setHelperError(failure);
+    window.dispatchEvent(new CustomEvent<boolean>(YOUTUBE_HELPER_STATUS_EVENT, { detail: ready }));
+    return ready ? "ready" : "blocked";
   }, [nativeRuntime]);
+
+  // Must stay declared before the first-load refresh effect (StrictMode runs mount effects in order).
+  useEffect(() => {
+    helperViewMountedRef.current = true;
+    return () => {
+      // Invalidate in-flight and future refreshes so an unmounted view never broadcasts.
+      helperViewMountedRef.current = false;
+      helperStatusGenerationRef.current += 1;
+    };
+  }, []);
+
+  const recoverFromHelperFailure = useCallback((error: unknown) => {
+    // Skip while a check is already running: a concurrent check reads the same helper files, so it
+    // will observe the same state. The install path calls refreshHelperStatus directly.
+    if (helperRecoveryKind(error) === "reinstall" && helperRefreshInFlightRef.current === 0) {
+      void refreshHelperStatus();
+    }
+  }, [refreshHelperStatus]);
 
   async function installYouTubeHelpers() {
     if (!nativeRuntime || isInstallingHelpers) return;
@@ -340,12 +395,18 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       if (!status.ready) {
         throw new Error(status.error ?? "Media toolchain install did not become ready.");
       }
-      await refreshHelperStatus();
-      toast.success("YouTube helpers ready", {
-        description: status.active_version
-          ? `Media toolchain ${status.active_version} is installed.`
-          : "Signed helpers are ready for downloads."
-      });
+      const result = await refreshHelperStatus();
+      if (result === "blocked") {
+        throw new Error("Helpers installed but did not pass the final YouTube check. Try Download YouTube helpers again.");
+      }
+      // "superseded": a newer refresh owns the banner, so show no success claim from a stale check.
+      if (result === "ready") {
+        toast.success("YouTube helpers ready", {
+          description: status.active_version
+            ? `Media toolchain ${status.active_version} is installed.`
+            : "Signed helpers are ready for downloads."
+        });
+      }
     } catch (error: unknown) {
       toast.error("Could not install YouTube helpers", {
         description: formatYouTubeInvokeError(error)
@@ -370,6 +431,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const [isScanning, setIsScanning] = useState(false);
   const [isDetectingLanguages, setIsDetectingLanguages] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  /** Occurrences of the group whose start is in flight; their rows show the loading state. */
+  const [startingOccurrenceIds, setStartingOccurrenceIds] = useState<ReadonlySet<string>>(NO_OCCURRENCES);
+  /** True while a Download click waits for another lookup to release the single discovery slot. */
+  const [waitingForLookup, setWaitingForLookup] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
   const [isResuming, setIsResuming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -387,8 +452,19 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const playlistModeRef = useRef(playlistMode);
   playlistModeRef.current = playlistMode;
   const lastFingerprintRef = useRef("");
-  const downloadQueueRef = useRef<DownloadGroup[]>([]);
-  const startingGroupRef = useRef(false);
+  /** Set once the "no captions" notice was shown for the current Download all. */
+  const captionsNoticeShownRef = useRef(false);
+  const startGroupRef = useRef(startGroup);
+  startGroupRef.current = startGroup;
+  // Runs a large selection as batches, one after another; see lib/youtube/startFlow.ts.
+  const batchesRef = useRef<BatchSequencer<DownloadGroup> | null>(null);
+  if (batchesRef.current === null) {
+    batchesRef.current = createBatchSequencer<DownloadGroup>({
+      start: (group, context) => startGroupRef.current(group, context),
+      notify: (notice) => toast.error(notice.title, { description: notice.description })
+    });
+  }
+  const batches = batchesRef.current;
   const warnedRunIdRef = useRef<string | null>(null);
   const autoScanTimerRef = useRef<number | null>(null);
   const lastHeightSyncKeyRef = useRef<string | null>(null);
@@ -489,6 +565,18 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   }, []);
 
   useEffect(() => {
+    if (!runSnapshot) return;
+    const failures = [runSnapshot.error, ...runSnapshot.items.map((item) => item.error)];
+    if (!failures.some((failure) => helperRecoveryKind(failure) === "reinstall")) return;
+    // Later queued groups would only start against the same broken helpers.
+    if (isYouTubeRunTerminal(runSnapshot.state)) batches.clear();
+    if (helperRecoveryRunRef.current === runSnapshot.runId) return;
+    helperRecoveryRunRef.current = runSnapshot.runId; // once per run, not per revision
+    // A check already in flight reads the same helper files and will see the same state.
+    if (helperRefreshInFlightRef.current === 0) void refreshHelperStatus();
+  }, [runSnapshot, refreshHelperStatus]);
+
+  useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void (async () => {
@@ -513,7 +601,11 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
         if (disposed) cleanup();
         else unlisten = cleanup;
         const snapshot = await getYouTubeDownloadState({ runId: null });
-        if (!disposed) applyRunSnapshot(snapshot, true);
+        if (!disposed) {
+          // The first-load helper check already covers a run that finished before this mount.
+          if (snapshot && isYouTubeRunTerminal(snapshot.state)) helperRecoveryRunRef.current = snapshot.runId;
+          applyRunSnapshot(snapshot, true);
+        }
       } catch (error) {
         if (!disposed && nativeRuntime) {
           toast.error("YouTube runtime state unavailable", { description: formatYouTubeInvokeError(error) });
@@ -574,6 +666,13 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     }),
     [videos, runItems]
   );
+  const scanNotes = useMemo(
+    () => scanPlans.flatMap((plan) => {
+      const text = playlistTruncationNote(plan);
+      return text ? [{ key: plan.scanPlanId, text }] : [];
+    }),
+    [scanPlans]
+  );
   const queueCounts = useMemo(() => {
     const counts = { queue: 0, active: 0, completed: 0, failed: 0 };
     for (const entry of videosWithSection) {
@@ -586,6 +685,14 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     [videosWithSection, queueSection]
   );
   const activeRun = runSnapshot !== null && !isYouTubeRunTerminal(runSnapshot.state);
+  // A run that failed before any item could report an error (for example a bad
+  // request) still has to say why; otherwise the rows just look stalled.
+  const runFailureNotice = runSnapshot !== null
+    && runSnapshot.state === "failed"
+    && runSnapshot.error !== null
+    && runSnapshot.items.every((item) => item.error === null)
+    ? formatYouTubeFailure(runSnapshot.error)
+    : null;
   const canPauseRun = activeRun && runSnapshot?.state === "running";
   const canResumeRun = activeRun && (runSnapshot?.state === "paused" || runSnapshot?.state === "pause_requested");
   const currentProgress = runSnapshot?.progress.fraction === null || runSnapshot?.progress.fraction === undefined
@@ -608,6 +715,19 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
         ? `${videos.length} video${videos.length === 1 ? "" : "s"} detected.`
         : "Paste a YouTube link to detect videos.";
 
+  const failedTabRunRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!runSnapshot || !isYouTubeRunTerminal(runSnapshot.state)) return;
+    if (failedTabRunRef.current === runSnapshot.runId) return;
+    failedTabRunRef.current = runSnapshot.runId;
+    // A failed row leaves the Active tab; follow it so the failure is not hidden
+    // behind an empty "No active videos" panel.
+    const target: YouTubeQueueSection | null = queueCounts.failed > 0
+      ? "failed"
+      : runSnapshot.state === "failed" ? "queue" : null;
+    if (target) setQueueSection((current) => (current === "active" ? target : current));
+  }, [runSnapshot, queueCounts.failed]);
+
   useEffect(() => {
     if (!runSnapshot || runSnapshot.state !== "completed_with_warnings") return;
     if (warnedRunIdRef.current === runSnapshot.runId) return;
@@ -616,7 +736,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       ...runSnapshot.warnings,
       ...runSnapshot.items.flatMap((item) => item.warnings)
     ];
-    const first = warnings.find((warning) => warning.code === "TRANSCRIPT_MISSING") ?? warnings[0] ?? null;
+    const first = warnings.find((warning) => warning.code === "TRANSCRIPT_MISSING")
+      ?? warnings.find((warning) => warning.code === "TRANSCRIPT_INVALID")
+      ?? warnings[0]
+      ?? null;
     if (!first) return;
     toast.warning("Saved with warnings", { description: formatYouTubeWarning(first) });
   }, [runSnapshot]);
@@ -632,7 +755,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     setLanguageOptions([NO_CAPTION_OPTION]);
     setPreferredLanguage(null);
     setIsDetectingLanguages(false);
-    downloadQueueRef.current = [];
+    batches.clear();
   }
 
   function applySourceText(next: string): DetectedYouTubeLink[] {
@@ -686,7 +809,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           for (const occurrence of response.occurrences) {
             tracks.push(...occurrence.tracks);
           }
-        } catch {
+        } catch (error) {
+          recoverFromHelperFailure(error);
+          // Every remaining probe would hit the same broken helper.
+          if (helperRecoveryKind(error) === "reinstall") break;
           continue;
         }
       }
@@ -776,12 +902,21 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
         setSelectedOccurrenceIds(new Set(available.map((item) => item.occurrenceId)));
       }
       if (generation === scanGenerationRef.current) {
+        // A video scan already carries its captions, so this probe answers instantly. Playlist
+        // entries carry none: probing a sample would launch yt-dlp per entry and hold the single
+        // discovery slot for a minute, so playlists are probed lazily (Language focus, or Download).
+        const captionedVideos = mergedVideos.filter((video) => mergedPlans.some(
+          (plan) => plan.scanPlanId === video.scanPlanId && plan.kind === "video"
+        ));
         // Probe a bounded sample only — never full-playlist caption inspection after scan.
-        await refreshDetectedLanguages(mergedVideos, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
+        if (captionedVideos.length > 0) {
+          await refreshDetectedLanguages(captionedVideos, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
+        }
       }
     } catch (error) {
       if (generation !== scanGenerationRef.current) return;
       toast.error("YouTube scan failed", { description: formatYouTubeInvokeError(error) });
+      recoverFromHelperFailure(error);
     } finally {
       if (generation === scanGenerationRef.current) setIsScanning(false);
     }
@@ -886,29 +1021,55 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     }
   }
 
+  /**
+   * Inspects the captions of a Download click's occurrences. Every outcome is explicit so the
+   * click is never dropped silently: `failed` has already toasted its reason, and the caller
+   * reports `superseded`. While another lookup holds the discovery slot this waits and retries
+   * for a bounded time instead of failing.
+   */
   async function requestTranscriptInspection(
     scanPlanId: string,
     occurrenceIds: string[]
-  ): Promise<InspectYouTubeTranscriptsResponse | null> {
-    if (occurrenceIds.length === 0 || !helperReady) return null;
+  ): Promise<InspectionOutcome<InspectYouTubeTranscriptsResponse>> {
+    if (occurrenceIds.length === 0) {
+      toast.error("Choose at least one public occurrence");
+      return { kind: "failed" };
+    }
+    if (!helperReady) {
+      toast.error("YouTube helper is not ready", {
+        description: helperError?.message ?? "Download YouTube helpers to continue."
+      });
+      return { kind: "failed" };
+    }
     const requestGeneration = transcriptInspectionGenerationRef.current + 1;
     transcriptInspectionGenerationRef.current = requestGeneration;
+    // Stop waiting, and never launch another attempt, once the view is gone or a newer request or scan replaced this one.
+    const isCurrent = () => helperViewMountedRef.current
+      && requestGeneration === transcriptInspectionGenerationRef.current;
     try {
-      const response = await inspectYouTubeTranscripts({
-        clientOperationId: createClientId("youtube-transcript-operation"),
-        scanPlanId,
-        occurrenceIds
-      });
-      if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
+      const response = await retryWhileBusy(
+        () => inspectYouTubeTranscripts({
+          clientOperationId: createClientId("youtube-transcript-operation"),
+          scanPlanId,
+          occurrenceIds
+        }),
+        { isCurrent, onWaiting: () => setWaitingForLookup(true) }
+      );
+      if (!isCurrent()) return { kind: "superseded" };
       const requestedOccurrenceIds = occurrenceIds;
       const responseMatchesRequest = response.occurrences.length === requestedOccurrenceIds.length
         && response.occurrences.every((occurrence, index) => occurrence.occurrenceId === requestedOccurrenceIds[index]);
       if (!responseMatchesRequest) throw new Error("Transcript inspection response did not match the current occurrence selection.");
-      return response;
+      return { kind: "ready", response };
     } catch (error) {
-      if (requestGeneration !== transcriptInspectionGenerationRef.current) return null;
-      toast.error("Transcript inspection failed", { description: formatYouTubeInvokeError(error) });
-      return null;
+      if (!isCurrent()) return { kind: "superseded" };
+      toast.error("Transcript inspection failed", {
+        description: describeBusyFailure(error) ?? formatYouTubeInvokeError(error)
+      });
+      recoverFromHelperFailure(error);
+      return { kind: "failed" };
+    } finally {
+      setWaitingForLookup(false);
     }
   }
 
@@ -934,41 +1095,74 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     window.setTimeout(() => sourceInputRef.current?.focus(), 0);
   }
 
-  async function startGroup(group: DownloadGroup): Promise<boolean> {
+  /** Starts one batch.  The reason it did not start is returned so a sequence can report it. */
+  async function startGroup(group: DownloadGroup, context: BatchContext): Promise<BatchStartResult> {
     const scan = scanPlans.find((plan) => plan.scanPlanId === group.scanPlanId) ?? null;
     if (!scan || group.occurrenceIds.length === 0) {
       toast.error("Choose at least one public occurrence");
-      return false;
+      return { started: false, reason: "no public videos were selected" };
     }
-    if (!helperReady) return false;
+    if (!helperReady) {
+      if (helperStatus === "pending") {
+        toast.error("Checking YouTube helpers…", { description: "Start the download again in a moment." });
+      } else {
+        toast.error("YouTube helper is not ready", {
+          description: helperError?.message ?? "Download YouTube helpers to continue."
+        });
+      }
+      return { started: false, reason: "the YouTube helpers are not ready" };
+    }
+    if (context.batchNumber === 1) captionsNoticeShownRef.current = false;
     setSelectedOccurrenceIds(new Set(group.occurrenceIds));
-    startingGroupRef.current = true;
     setIsStarting(true);
+    setStartingOccurrenceIds(new Set(group.occurrenceIds));
+    // A click belongs to the scan it was made on: a rescan or reset, or leaving the view, cancels it.
+    const clickScanGeneration = scanGenerationRef.current;
+    const clickStillWanted = () => helperViewMountedRef.current && scanGenerationRef.current === clickScanGeneration;
     try {
       const resolvedOutputDir = outputDir.trim() || await pickOutputDirectory();
-      if (!resolvedOutputDir) return false;
+      if (!resolvedOutputDir) {
+        toast.message("Download not started", { description: "Choose a destination folder to start downloading." });
+        return { started: false, reason: "no destination folder was chosen" };
+      }
       if (downloadMode !== "video_only") {
-        const inspected = await requestTranscriptInspection(group.scanPlanId, group.occurrenceIds);
-        if (!inspected) return false;
+        const inspection = await requestTranscriptInspection(group.scanPlanId, group.occurrenceIds);
+        if (inspection.kind === "superseded") {
+          if (helperViewMountedRef.current) {
+            const notice = supersededClickMessage();
+            toast.message(notice.title, { description: notice.description });
+          }
+          return { started: false, reason: "the video list changed" };
+        }
+        // A failed inspection has already told the user why.
+        if (inspection.kind !== "ready") return { started: false, reason: "transcript inspection failed" };
+        const inspected = inspection.response;
         const missingCaptions = inspected.occurrences.some((occurrence) => occurrence.tracks.length === 0);
-        if (missingCaptions && downloadMode === "video_and_transcript") {
+        // Once per Download all, not once per batch.
+        if (missingCaptions && downloadMode === "video_and_transcript" && !captionsNoticeShownRef.current) {
+          captionsNoticeShownRef.current = true;
           toast.message("No captions on YouTube", {
             description: "This video has no uploader or automatic captions. The download will continue and save the video only."
           });
         }
       }
-      const response = await startYouTubeDownload({
-        clientSubmissionId: createClientId("youtube-submission"),
-        scanPlanId: scan.scanPlanId,
-        selectedOccurrenceIds: group.occurrenceIds,
-        outputDir: resolvedOutputDir,
-        mode: downloadMode,
-        maxHeight,
-        preferredLanguage,
-        fallbackLanguages,
-        allowAutomaticCaptions: true,
-        continueWithoutTranscript: true
-      });
+      // One submission id for every attempt: the backend replays an identical resubmission.
+      const clientSubmissionId = createClientId("youtube-submission");
+      const response = await retryWhileBusy(
+        () => startYouTubeDownload({
+          clientSubmissionId,
+          scanPlanId: scan.scanPlanId,
+          selectedOccurrenceIds: group.occurrenceIds,
+          outputDir: resolvedOutputDir,
+          mode: downloadMode,
+          maxHeight,
+          preferredLanguage,
+          fallbackLanguages,
+          allowAutomaticCaptions: true,
+          continueWithoutTranscript: true
+        }),
+        { isCurrent: clickStillWanted, onWaiting: () => setWaitingForLookup(true) }
+      );
       latestRunIdRef.current = response.receipt.runId;
       latestRevisionRef.current = 0;
       runOutputDirRef.current = resolvedOutputDir;
@@ -976,51 +1170,70 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       setRunSnapshot(null);
       const snapshot = await getYouTubeDownloadState({ runId: response.receipt.runId });
       applyRunSnapshot(snapshot, true);
-      return true;
+      return { started: true, runId: response.receipt.runId };
     } catch (error) {
-      toast.error("YouTube download could not start", { description: formatYouTubeInvokeError(error) });
-      return false;
+      if (error instanceof BusyRetryCancelled) {
+        // Nothing was started: say so unless the view is already gone.
+        if (helperViewMountedRef.current) {
+          const notice = supersededClickMessage();
+          toast.message(notice.title, { description: notice.description });
+        }
+        return { started: false, reason: "the video list changed" };
+      }
+      const reason = describeBusyFailure(error) ?? formatYouTubeInvokeError(error);
+      toast.error("YouTube download could not start", { description: reason });
+      recoverFromHelperFailure(error);
+      return { started: false, reason };
     } finally {
-      startingGroupRef.current = false;
       setIsStarting(false);
+      setStartingOccurrenceIds(NO_OCCURRENCES);
+      setWaitingForLookup(false);
     }
   }
 
   async function startDownloads(targets: ResultVideo[]): Promise<void> {
-    const groups = groupsForVideos(targets);
-    if (groups.length === 0) {
+    // A repeat click while a start is in flight is ignored: its button already shows the loading
+    // state, and a second call would supersede the first one's inspection and drop that click.
+    if (batches.isStarting()) return;
+    const planGroups = groupsForVideos(targets);
+    if (planGroups.length === 0) {
       toast.error("Choose at least one public occurrence");
       return;
     }
-    const firstGroup = groups[0];
-    if (!firstGroup) return;
-    downloadQueueRef.current = groups.slice(1);
-    const started = await startGroup(firstGroup);
-    if (!started) downloadQueueRef.current = [];
+    // One run takes at most 100 videos: a larger selection queues as batches, one after another.
+    const groups = splitIntoRuns(planGroups);
+    const batching = batchingNotice(
+      planGroups.reduce((total, group) => total + group.occurrenceIds.length, 0),
+      planGroups.length,
+      groups.length
+    );
+    if (batching) toast.message(batching.title, { description: batching.description });
+    // The first batch starts now; each later one starts when the run before it ends.  A start that
+    // fails clears the rest and says how many videos were left.
+    await batches.begin(groups);
   }
 
-  const startGroupRef = useRef(startGroup);
-  startGroupRef.current = startGroup;
-
+  // `isStarting` is a dependency so a run that ended while its start was still finishing is seen.
   useEffect(() => {
-    if (!runSnapshot || !isYouTubeRunTerminal(runSnapshot.state) || startingGroupRef.current) return;
-    const next = downloadQueueRef.current.shift();
-    if (!next) return;
-    void startGroupRef.current(next);
-  }, [runSnapshot]);
+    if (!runSnapshot || !isYouTubeRunTerminal(runSnapshot.state)) return;
+    void batches.onRunTerminal(runSnapshot.runId);
+  }, [runSnapshot, isStarting, batches]);
 
   async function handleStart(): Promise<void> {
     await startDownloads(videos.filter((video) => selectedOccurrenceIds.has(video.item.occurrenceId)));
   }
 
   async function handleDownloadOne(video: ResultVideo): Promise<void> {
-    downloadQueueRef.current = [];
+    if (batches.isStarting()) return;
+    batches.clear();
     await startDownloads([video]);
   }
 
   async function handleCancel(): Promise<void> {
     if (!runSnapshot || !activeRun) return;
-    downloadQueueRef.current = [];
+    // Cancel also drops every batch not yet started.  (A start in flight cannot be cancelled: the
+    // Cancel control exists only once a run does, and a start has no run until it succeeds.)
+    batches.clear();
     setIsCancelling(true);
     try {
       const snapshot = await cancelYouTubeDownload({ runId: runSnapshot.runId });
@@ -1144,7 +1357,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
             <>
               <p>
                 {helperError?.message ??
-                  "YouTube needs a one-time signed helper pack (~220 MB). It installs beside LinkVaultData and is not bundled in the app installer."}
+                  "YouTube needs a one-time signed helper pack (~220 MB). It installs inside LinkVaultData and is not bundled in the app installer."}
               </p>
               <Button
                 type="button"
@@ -1263,6 +1476,15 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
               {renderRunControls()}
             </div>
           ) : null}
+          {runFailureNotice ? (
+            <p className="youtube-run-error" role="alert">{runFailureNotice}</p>
+          ) : null}
+          {/* One persistent live region, so a note added later is announced. */}
+          <div className="youtube-scan-notes" role="status" aria-live="polite">
+            {scanNotes.map((note) => (
+              <p key={note.key} className="youtube-scan-note">{note.text}</p>
+            ))}
+          </div>
           <div className="queue-section-tabs youtube-queue-section-tabs" role="group" aria-label="YouTube download queue sections">
             <YouTubeQueueSectionTab
               section="queue"
@@ -1306,11 +1528,22 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                 const outcome = runItems.get(video.item.occurrenceId);
                 const available = video.item.availability === "available";
                 const availabilityLabel = video.item.availability === "unknown" ? "Unconfirmed" : "Unavailable";
-                const status = itemStatusText(state, available);
-                const warningText = outcome?.warnings?.length
-                  ? formatYouTubeWarning(outcome.warnings[0] ?? "")
+                const rowRunContext: YouTubeRowRunContext = !outcome ? "idle" : activeRun ? "active" : "terminal";
+                const status = youtubeItemStatusText(state, outcome?.phase ?? null, available, rowRunContext);
+                const warningTexts = Array.from(new Set(
+                  (outcome?.warnings ?? []).map((warning) => formatYouTubeWarning(warning))
+                ));
+                const errorText = state === "failed" && outcome?.error
+                  ? formatYouTubeFailure(outcome.error)
                   : null;
                 const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
+                // Byte counts describe the item that is downloading now; browser-only runs reuse the fields for item counts.
+                const runBytes = state === "running"
+                  && runSnapshot?.item?.occurrenceId === video.item.occurrenceId
+                  && !isYouTubeSimulatedRun(runSnapshot.runId)
+                  ? runSnapshot.progress
+                  : null;
+                const progressDetail = percent !== null ? youtubeProgressDetail(percent, runBytes) : "";
                 const duration = formatDuration(video.item.durationSeconds);
                 const plan = scanPlans.find((candidate) => candidate.scanPlanId === video.scanPlanId);
                 const kind = plan?.kind === "playlist" ? "playlist" : "video";
@@ -1327,10 +1560,20 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                       {percent !== null ? (
                         <div className="youtube-result-progress">
                           <Progress value={percent} />
-                          <span>{status ?? "Downloading"}{percent > 0 ? ` · ${Math.round(percent)}%` : ""}</span>
+                          <span className="youtube-result-stage">
+                            {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
+                            <span aria-live="polite">{status}</span>
+                            {progressDetail ? <span>{` · ${progressDetail}`}</span> : null}
+                          </span>
                         </div>
-                      ) : status ? <span className="youtube-result-status">{status}</span> : null}
-                      {warningText ? <span className="youtube-result-warning">{warningText}</span> : null}
+                      ) : status ? (
+                        <span className="youtube-result-status youtube-result-stage">
+                          {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
+                          <span aria-live="polite">{status}</span>
+                        </span>
+                      ) : null}
+                      {warningTexts.map((text) => <span key={text} className="youtube-result-warning">{text}</span>)}
+                      {errorText ? <span className="youtube-result-error" title={errorText}>{errorText}</span> : null}
                       {!available ? <span className="youtube-result-status">{availabilityLabel}</span> : null}
                     </div>
                     <div className="youtube-result-overlay">
@@ -1354,9 +1597,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                           variant="primary"
                           className="youtube-download-overlay-button"
                           onClick={() => void handleDownloadOne(video)}
-                          loading={isStarting}
+                          loading={startingOccurrenceIds.has(video.item.occurrenceId)}
                           loadingLabel="Starting"
-                          disabled={!available || activeRun || !helperReady}
+                          disabled={isRowDownloadDisabled({ available, activeRun, helperReady, startInFlight: isStarting })}
                           aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
                         >
                           Download
@@ -1368,7 +1611,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                           size="xs"
                           variant="ghost"
                           onClick={() => void handleDownloadOne(video)}
-                          disabled={!available || activeRun || !helperReady}
+                          loading={startingOccurrenceIds.has(video.item.occurrenceId)}
+                          loadingLabel="Starting"
+                          disabled={isRowDownloadDisabled({ available, activeRun, helperReady, startInFlight: isStarting })}
                           aria-label={`Download occurrence ${video.item.ordinal}: ${video.item.title}`}
                         >
                           Download
@@ -1395,6 +1640,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
             </ol>
             {isScanning && queueSection === "queue" ? (
               <p className="youtube-scanning" role="status">Finding videos…</p>
+            ) : null}
+            {waitingForLookup ? (
+              <p className="youtube-scanning" role="status">{WAITING_FOR_LOOKUP_MESSAGE}</p>
             ) : null}
           </div>
         </section>

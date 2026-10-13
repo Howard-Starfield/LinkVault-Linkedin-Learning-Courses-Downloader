@@ -651,6 +651,18 @@ textarea {
   place-items: center;
 }
 
+/* Dot, not a pill: the sidebar is ~200px wide and a "Setup" pill would
+   truncate the "Download video" label. The state is announced via the item aria-label. */
+.lv-nav-setup-badge {
+  display: block;
+  width: 8px;
+  height: 8px;
+  margin-left: -6px;
+  border-radius: 999px;
+  background: var(--warning);
+  flex-shrink: 0;
+}
+
 .lv-nav-group {
   display: grid;
   gap: 2px;
@@ -1665,14 +1677,56 @@ textarea {
  line-height: 14px;
 }
 
-.youtube-result-warning {
+.youtube-result-copy > .youtube-result-warning,
+.download-history-copy > .youtube-result-warning {
  color: var(--warning);
  font-size: 11px;
  line-height: 15px;
+ white-space: normal;
+ overflow-wrap: anywhere;
+}
+
+.youtube-result-copy > .youtube-result-error {
+ color: var(--danger);
+ font-size: 11px;
+ line-height: 15px;
+ white-space: normal;
+ overflow-wrap: anywhere;
+}
+
+.youtube-result-spinner {
+ display: inline-block;
+ width: 12px;
+ height: 12px;
+ margin-right: 6px;
+ vertical-align: -2px;
+}
+
+.youtube-run-error {
+ margin: 0 0 8px;
+ border: 1px solid var(--danger);
+ border-radius: 10px;
+ color: var(--danger);
+ font-size: 12px;
+ line-height: 16px;
+ overflow-wrap: anywhere;
+ padding: 8px 12px;
 }
 
 .youtube-result-row[data-unavailable="true"] {
  opacity: 0.58;
+}
+
+.youtube-scan-notes {
+ margin: 0;
+}
+
+.youtube-scan-note {
+ margin: 8px 0 0;
+ color: var(--text-soft);
+ font-size: 12px;
+ line-height: 16px;
+ overflow-wrap: anywhere;
 }
 
 .youtube-scanning {

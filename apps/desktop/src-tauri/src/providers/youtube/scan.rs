@@ -1,11 +1,12 @@
-use crate::app::managed_process::{
-    run, DiscoveryOperation, ManagedProcessContext, ManagedProcessError,
-};
+use crate::app::managed_process::{run, DiscoveryOperation, ManagedProcessContext};
 use crate::providers::youtube::error::YouTubeInternalError;
 use crate::providers::youtube::helper::{invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES};
 use crate::providers::youtube::models::{
     PlannedYouTubeTranscriptInspection, ScanYouTubeSourceRequest, ScanYouTubeSourceResponse,
-    YouTubeAvailability, YouTubePlaylistMode, YouTubeScanItem,
+    YouTubeAvailability, YouTubePlaylistMode, YouTubeScanItem, YouTubeTranscriptTrack,
+};
+use crate::providers::youtube::transcript_inspection::{
+    into_plan_inspection, tracks_from_scan_metadata, TranscriptInspectionResult,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,9 @@ use url::Url;
 pub const MAX_SOURCE_URL_BYTES: usize = 4096;
 pub const MAX_SCAN_ENTRIES: usize = 500;
 pub const PLAN_TTL: Duration = Duration::from_secs(30 * 60);
+/// A plan scanned less than this long ago is trusted as-is when a download
+/// starts; older plans are re-scanned first.  Shorter than [`PLAN_TTL`].
+pub const START_REVALIDATION_FRESH_FOR: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug)]
 pub struct PlannedYouTubeItem {
@@ -29,7 +33,27 @@ pub struct YouTubeScanPlan {
     pub response: ScanYouTubeSourceResponse,
     pub items: Vec<PlannedYouTubeItem>,
     pub source_snapshot_digest: String,
+    /// When discovery produced this plan.
+    pub scanned_at: Instant,
     pub expires_at: Instant,
+}
+
+impl YouTubeScanPlan {
+    /// Keeps the plan in the cache until `now + PLAN_TTL`.  Expiry only bounds
+    /// cache lifetime: freshness of the data is decided by `scanned_at`
+    /// (`is_fresh_for_start`), so a plan kept alive this way is re-scanned at
+    /// start once it is old.
+    pub fn extend_expiry(&mut self, now: Instant) {
+        self.expires_at = now + PLAN_TTL;
+        self.response.expires_at =
+            (Utc::now() + ChronoDuration::seconds(PLAN_TTL.as_secs() as i64)).to_rfc3339();
+    }
+
+    /// Whether the scan is recent enough to start a download without
+    /// re-running discovery.  `now` is injected so the window is testable.
+    pub fn is_fresh_for_start(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.scanned_at) < START_REVALIDATION_FRESH_FOR
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +91,34 @@ pub fn revalidate_selected_source(
     revalidate_selected_items(plan, &current, selected_occurrence_ids)
 }
 
+/// Selects occurrences from the plan itself, applying the same selection rules
+/// as [`revalidate_selected_source`] but trusting the scan's own metadata.
+pub fn selected_items_from_plan(
+    plan: &YouTubeScanPlan,
+    selected_occurrence_ids: &[String],
+) -> Result<Vec<PlannedYouTubeItem>, YouTubeInternalError> {
+    if selected_occurrence_ids.is_empty() {
+        return Err(YouTubeInternalError::EmptySelection);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(selected_occurrence_ids.len());
+    let mut selected = Vec::with_capacity(selected_occurrence_ids.len());
+    for occurrence_id in selected_occurrence_ids {
+        if !seen.insert(occurrence_id) {
+            return Err(YouTubeInternalError::DuplicateOccurrence);
+        }
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.public.occurrence_id == occurrence_id.as_str())
+            .ok_or(YouTubeInternalError::UnknownOccurrence)?;
+        if matches!(&item.public.availability, YouTubeAvailability::Unavailable) {
+            return Err(YouTubeInternalError::ScanPlanStale);
+        }
+        selected.push(item.clone());
+    }
+    Ok(selected)
+}
+
 fn discovery_stdout(
     source: &ValidatedSource,
     operation: &DiscoveryOperation,
@@ -76,10 +128,7 @@ fn discovery_stdout(
         invocation(args, MAX_DISCOVERY_STDOUT_BYTES),
         ManagedProcessContext::Discovery(operation),
     )
-    .map_err(|error| match error {
-        ManagedProcessError::HelperTemp(reason) => YouTubeInternalError::HelperTemp(reason),
-        error => YouTubeInternalError::Helper(error.to_string()),
-    })?;
+    .map_err(YouTubeInternalError::from_helper_run)?;
     if operation.cancellation_requested() || output.cancelled {
         return Err(YouTubeInternalError::InvalidRequest(
             "discovery was cancelled".to_string(),
@@ -219,7 +268,7 @@ fn discovery_args(source: &ValidatedSource) -> Vec<String> {
     args
 }
 
-fn parse_scan_plan(
+pub(crate) fn parse_scan_plan(
     source: ValidatedSource,
     stdout: &str,
 ) -> Result<YouTubeScanPlan, YouTubeInternalError> {
@@ -247,6 +296,8 @@ fn parse_scan_plan(
     };
     let truncated = entries.len() > MAX_SCAN_ENTRIES;
     let mut items = Vec::new();
+    // Caption tracks derived from the scan's own metadata, parallel to `items`.
+    let mut scanned_tracks: Vec<Option<Vec<YouTubeTranscriptTrack>>> = Vec::new();
     for (index, entry) in entries.into_iter().take(MAX_SCAN_ENTRIES).enumerate() {
         let Some(video_id) = entry
             .get("id")
@@ -293,6 +344,15 @@ fn parse_scan_plan(
             duration_seconds.map_or_else(String::new, |duration| duration.to_string()),
             availability_label(&availability),
         ));
+        // A video scan runs the same `--dump-single-json --no-playlist` a dedicated
+        // transcript inspection would, so its captions are already in hand.  Flat
+        // playlist entries carry no caption data and stay lazily inspected.
+        scanned_tracks.push(match source.kind {
+            YouTubePlaylistMode::Video => {
+                tracks_from_scan_metadata(&occurrence_id, &entry)
+            }
+            YouTubePlaylistMode::Playlist => None,
+        });
         items.push(PlannedYouTubeItem {
             public: YouTubeScanItem {
                 occurrence_id,
@@ -317,6 +377,19 @@ fn parse_scan_plan(
         ));
     }
     let source_snapshot_digest = snapshot_digest(&source, &items);
+    for (item, tracks) in items.iter_mut().zip(scanned_tracks) {
+        if let Some(tracks) = tracks {
+            item.transcript_inspection = Some(into_plan_inspection(
+                TranscriptInspectionResult {
+                    occurrence_id: item.public.occurrence_id.clone(),
+                    video_id: item.public.video_id.clone(),
+                    tracks,
+                },
+                &source_snapshot_digest,
+                &item.public.metadata_digest,
+            ));
+        }
+    }
     let scan_plan_id = opaque_id("plan");
     let response = ScanYouTubeSourceResponse {
         scan_plan_id,
@@ -331,14 +404,21 @@ fn parse_scan_plan(
         canonical_url: source.canonical_url,
         playlist_id: source.playlist_id,
         truncated,
+        total_count: match source.kind {
+            YouTubePlaylistMode::Playlist => root
+                .get("playlist_count")
+                .and_then(serde_json::Value::as_u64),
+            YouTubePlaylistMode::Video => None,
+        },
         items: items.iter().map(|item| item.public.clone()).collect(),
     };
-    let _ = root;
+    let scanned_at = Instant::now();
     Ok(YouTubeScanPlan {
         response,
         items,
         source_snapshot_digest,
-        expires_at: Instant::now() + PLAN_TTL,
+        scanned_at,
+        expires_at: scanned_at + PLAN_TTL,
     })
 }
 
@@ -667,5 +747,152 @@ mod tests {
             revalidate_selected_items(&frozen, &shifted, &selected),
             Err(YouTubeInternalError::ScanPlanStale)
         ));
+    }
+
+    const VIDEO_WITH_CAPTIONS: &str = r#"{"id":"abc123_XY","title":"Video","channel":"Channel","availability":"public","subtitles":{"en":[{"ext":"vtt","url":"https://signed.example/u","name":"English"}],"fr":[{"ext":"srv3","url":"https://signed.example/f"}]},"automatic_captions":{"en":[{"ext":"vtt","url":"https://signed.example/a","name":"English (auto-generated)"}],"live_chat":[{"ext":"json","url":"https://signed.example/c"}]}}"#;
+
+    #[test]
+    fn video_scan_stores_the_tracks_a_dedicated_inspection_would_compute() {
+        use crate::providers::youtube::transcript_inspection::{
+            parse_transcript_tracks, stored_inspection,
+        };
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, VIDEO_WITH_CAPTIONS).unwrap();
+        let item = &plan.items[0];
+        let stored = item
+            .transcript_inspection
+            .as_ref()
+            .expect("a video scan carries full caption metadata");
+        let from_dedicated_run =
+            parse_transcript_tracks(&item.public.occurrence_id, VIDEO_WITH_CAPTIONS).unwrap();
+        assert_eq!(stored.tracks, from_dedicated_run);
+        assert_eq!(stored.tracks.len(), 3);
+        assert_eq!(
+            stored.context.source_snapshot_digest,
+            plan.source_snapshot_digest
+        );
+        assert_eq!(stored.context.metadata_digest, item.public.metadata_digest);
+        let answered = stored_inspection(item, &plan.source_snapshot_digest).unwrap();
+        assert_eq!(answered.tracks, from_dedicated_run);
+        // A different snapshot never reuses the stored answer.
+        assert!(stored_inspection(item, "other-snapshot").is_none());
+    }
+
+    #[test]
+    fn video_scan_without_caption_blocks_stores_an_empty_answer_like_inspection() {
+        use crate::providers::youtube::transcript_inspection::parse_transcript_tracks;
+        let payload = r#"{"id":"abc123_XY","title":"Video","availability":"public"}"#;
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, payload).unwrap();
+        let stored = plan.items[0].transcript_inspection.as_ref().unwrap();
+        assert_eq!(
+            stored.tracks,
+            parse_transcript_tracks(&plan.items[0].public.occurrence_id, payload).unwrap()
+        );
+        assert!(stored.tracks.is_empty());
+    }
+
+    #[test]
+    fn video_scan_with_malformed_captions_leaves_inspection_to_the_fallback() {
+        let payload = r#"{"id":"abc123_XY","title":"Video","subtitles":[]}"#;
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, payload).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert!(plan.items[0].transcript_inspection.is_none());
+    }
+
+    #[test]
+    fn flat_playlist_entries_never_claim_caption_data() {
+        // `--flat-playlist` entries carry no captions; an empty answer here would
+        // wrongly say "no captions".
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let plan = parse_scan_plan(
+            source,
+            r#"{"id":"PL_12345","entries":[{"id":"abc123_XY","title":"A","availability":"public"}]}"#,
+        )
+        .unwrap();
+        assert!(plan.items.iter().all(|item| item.transcript_inspection.is_none()));
+    }
+
+    #[test]
+    fn video_scan_over_the_inspection_output_limit_still_stores_its_tracks() {
+        use crate::providers::youtube::helper::MAX_RECORD_STDOUT_BYTES;
+        use crate::providers::youtube::transcript_inspection::parse_transcript_tracks;
+        // A multi-hour stream VOD: the `formats` array alone is megabytes, while the
+        // caption fields stay small.  The scan accepts up to 32 MiB of output.
+        let filler = "x".repeat(80);
+        let formats = (0..60_000)
+            .map(|index| {
+                format!(r#"{{"format_id":"f{index}","url":"https://rr.example/videoplayback?{filler}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(
+            r#"{{"id":"abc123_XY","title":"Long stream","availability":"public","formats":[{formats}],"subtitles":{{"en":[{{"ext":"vtt","name":"English"}}]}},"automatic_captions":{{"de":[{{"ext":"vtt"}}]}}}}"#
+        );
+        assert!(payload.len() > MAX_RECORD_STDOUT_BYTES);
+        assert!(payload.len() < MAX_DISCOVERY_STDOUT_BYTES);
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, &payload).unwrap();
+        let stored = plan.items[0]
+            .transcript_inspection
+            .as_ref()
+            .expect("a large scan whose captions are small must still store its tracks");
+        assert_eq!(stored.tracks.len(), 2);
+        // The same tracks a field-selected dedicated run would report.
+        let captions_only = r#"{"subtitles": {"en": [{"ext": "vtt", "name": "English"}]}, "automatic_captions": {"de": [{"ext": "vtt"}]}}"#;
+        assert_eq!(
+            stored.tracks,
+            parse_transcript_tracks(&plan.items[0].public.occurrence_id, captions_only).unwrap()
+        );
+    }
+
+    #[test]
+    fn video_scan_with_an_oversized_caption_subset_leaves_inspection_to_the_fallback() {
+        use crate::providers::youtube::helper::MAX_RECORD_STDOUT_BYTES;
+        // The refusal applies to the caption fields themselves, not the whole output.
+        let bulk = "x".repeat(MAX_RECORD_STDOUT_BYTES + 1);
+        let payload = format!(
+            r#"{{"id":"abc123_XY","title":"Video","availability":"public","subtitles":{{"en":[{{"ext":"vtt","url":"{bulk}"}}]}}}}"#
+        );
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, &payload).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert!(plan.items[0].transcript_inspection.is_none());
+    }
+
+    fn playlist_payload(entries: usize, playlist_count: Option<u64>) -> String {
+        let entries = (1..=entries)
+            .map(|index| format!(r#"{{"id":"v{index:05}","title":"Video {index}","availability":"public"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let count = playlist_count.map_or(String::new(), |count| format!(r#""playlist_count":{count},"#));
+        format!(r#"{{"id":"PL_12345","title":"Big list",{count}"entries":[{entries}]}}"#)
+    }
+
+    #[test]
+    fn a_playlist_past_the_scan_limit_is_marked_truncated_with_its_total() {
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        // The scan asks yt-dlp for one entry past the limit, so 501 comes back.
+        let plan = parse_scan_plan(source, &playlist_payload(MAX_SCAN_ENTRIES + 1, Some(1234))).unwrap();
+        assert_eq!(plan.response.items.len(), MAX_SCAN_ENTRIES);
+        assert!(plan.response.truncated);
+        assert_eq!(plan.response.total_count, Some(1234));
+        let json = serde_json::to_value(&plan.response).unwrap();
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["totalCount"], 1234);
+    }
+
+    #[test]
+    fn a_playlist_at_the_scan_limit_is_not_truncated_and_a_missing_total_is_null() {
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let plan = parse_scan_plan(source, &playlist_payload(MAX_SCAN_ENTRIES, None)).unwrap();
+        assert_eq!(plan.response.items.len(), MAX_SCAN_ENTRIES);
+        assert!(!plan.response.truncated);
+        assert_eq!(plan.response.total_count, None);
+        assert!(serde_json::to_value(&plan.response).unwrap()["totalCount"].is_null());
+        let video = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let video_plan = parse_scan_plan(video, VIDEO_WITH_CAPTIONS).unwrap();
+        assert_eq!(video_plan.response.total_count, None);
     }
 }

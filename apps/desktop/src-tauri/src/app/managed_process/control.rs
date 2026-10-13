@@ -71,6 +71,8 @@ pub enum TransientItemPhase {
     Merging,
     NormalizingTranscript,
     Verifying,
+    /// Writing the manifest and publishing the verified attempt.
+    Finalizing,
     Completed,
     Warning,
     Failed,
@@ -189,6 +191,9 @@ pub struct TransientExecutionOutcome {
     pub state: TransientItemState,
     pub phase: TransientItemPhase,
     pub warnings: Vec<String>,
+    /// Human-readable text for warning codes, as `(code, message)` pairs. A
+    /// warning without an entry here is shown with its code as the message.
+    pub warning_messages: Vec<(String, String)>,
     pub error: Option<TransientError>,
     pub published_artifact_kinds: Vec<String>,
 }
@@ -199,6 +204,7 @@ impl TransientExecutionOutcome {
             state: TransientItemState::Completed,
             phase: TransientItemPhase::Completed,
             warnings: Vec::new(),
+            warning_messages: Vec::new(),
             error: None,
             published_artifact_kinds: artifacts,
         }
@@ -209,6 +215,7 @@ impl TransientExecutionOutcome {
             state: TransientItemState::SkippedExisting,
             phase: TransientItemPhase::Completed,
             warnings: Vec::new(),
+            warning_messages: Vec::new(),
             error: None,
             published_artifact_kinds: artifacts,
         }
@@ -219,9 +226,20 @@ impl TransientExecutionOutcome {
             state: TransientItemState::CompletedWithWarnings,
             phase: TransientItemPhase::Warning,
             warnings: vec![code.into()],
+            warning_messages: Vec::new(),
             error: None,
             published_artifact_kinds: artifacts,
         }
+    }
+
+    /// Attach human-readable text to a warning code on this outcome.
+    pub fn with_warning_message(
+        mut self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        self.warning_messages.push((code.into(), message.into()));
+        self
     }
 }
 
