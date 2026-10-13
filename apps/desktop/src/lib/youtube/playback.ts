@@ -179,24 +179,77 @@ export function createProgressSaver(options: {
   now?: () => number;
   intervalMs?: number;
   onError?: (error: unknown) => void;
+  /** True once the session started closing: ordinary saves become no-ops. */
+  isClosing?: () => boolean;
 }) {
+  let lastCommitted: PlaybackSample | null = null;
+  const commit = (sample: PlaybackSample) => {
+    lastCommitted = sample;
+  };
   const throttle = createProgressThrottle(options.intervalMs);
   const clock = options.now ?? (() => Date.now());
   return {
     request(sample: PlaybackSample, force: boolean): Promise<void> {
       const now = clock();
+      if (options.isClosing?.()) return options.runner.drain();
       if (!throttle.shouldSave(sample, now, force)) return options.runner.drain();
       throttle.markAttempted(sample, now);
       return options.runner
         .run(() => options.save(sample))
         .then(
-          () => throttle.markSaved(now),
+          () => {
+            throttle.markSaved(now);
+            commit(sample);
+          },
           (error: unknown) => {
             throttle.markFailed(sample);
             options.onError?.(error);
           }
         )
         .then(() => options.runner.drain());
+    },
+    /**
+     * The close save: wait for every queued save first, then, if this exact
+     * position did not commit (it failed, or was never sent), save it once
+     * more. Works even while the session is closing.
+     */
+    async finalize(sample: PlaybackSample): Promise<void> {
+      await options.runner.drain();
+      if (!isSavableSample(sample)) return;
+      if (
+        lastCommitted !== null &&
+        lastCommitted.occurrenceId === sample.occurrenceId &&
+        Math.abs(lastCommitted.positionSeconds - sample.positionSeconds) < FORCED_SAVE_MIN_DELTA_SECONDS
+      ) {
+        return;
+      }
+      try {
+        await options.runner.run(() => options.save(sample));
+        commit(sample);
+      } catch (error) {
+        options.onError?.(error);
+      }
+    }
+  };
+}
+
+/**
+ * State shared by every video of one player session: the single save queue
+ * (so a switch-away save and the close save are serialized together) and the
+ * closing flag. After `beginClose`, navigation and ordinary saves must stop.
+ */
+export function createPlaybackSession() {
+  const runner = createSerialRunner();
+  let closing = false;
+  return {
+    runner,
+    isClosing: () => closing,
+    canNavigate: () => !closing,
+    /** Returns false when a close is already under way. */
+    beginClose(): boolean {
+      if (closing) return false;
+      closing = true;
+      return true;
     }
   };
 }
@@ -221,3 +274,5 @@ export function createEndedAdvance(options: { onAdvance: () => void }) {
     }
   };
 }
+
+export type PlaybackSession = ReturnType<typeof createPlaybackSession>;

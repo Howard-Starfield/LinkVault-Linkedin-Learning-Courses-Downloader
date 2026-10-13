@@ -4,6 +4,7 @@ import {
   PROGRESS_SAVE_INTERVAL_MS,
   adjacentPlayableVideo,
   createEndedAdvance,
+  createPlaybackSession,
   createProgressSaver,
   createProgressThrottle,
   createSerialRunner,
@@ -288,4 +289,57 @@ test("ended advance is invalidated by play, seeking, or a changed ended state", 
   assert.equal(advances, 1);
   await advance.afterSave(Promise.resolve(), () => true);
   assert.equal(advances, 2);
+});
+
+test("close retries the final position when the pending save for it fails", async () => {
+  const runner = createSerialRunner();
+  const calls = [];
+  const rejecters = [];
+  const saver = createProgressSaver({
+    runner,
+    now: () => 1_000,
+    onError: () => undefined,
+    save: (sample) => {
+      calls.push(sample.positionSeconds);
+      return calls.length === 1
+        ? new Promise((_, reject) => rejecters.push(reject))
+        : Promise.resolve();
+    }
+  });
+  // Pause at 10: the save is pending.
+  const pause = saver.request(sampleAt(10), true);
+  // Close while it is pending: the identical forced save is skipped, so the
+  // close must wait for the queue and then re-check what actually committed.
+  const closing = saver.finalize(sampleAt(10));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  rejecters[0](new Error("ipc down"));
+  await Promise.all([pause, closing]);
+  assert.deepEqual(calls, [10, 10], "the close retried 10 once after the failure");
+  // Already committed: a second close does nothing.
+  await saver.finalize(sampleAt(10));
+  assert.deepEqual(calls, [10, 10]);
+});
+
+test("once a session is closing, ordinary saves and navigation stop but the final save runs", async () => {
+  const session = createPlaybackSession();
+  const calls = [];
+  const saver = createProgressSaver({
+    runner: session.runner,
+    isClosing: session.isClosing,
+    now: () => 1_000,
+    save: async (sample) => {
+      calls.push(sample.positionSeconds);
+    }
+  });
+  assert.equal(session.canNavigate(), true);
+  assert.equal(session.beginClose(), true);
+  assert.equal(session.beginClose(), false, "a second close is ignored");
+  assert.equal(session.canNavigate(), false, "previous/next/auto-advance are blocked");
+  // A pane mounted by a late Previous/Next shares the session, so its
+  // periodic, pause and unmount saves are all no-ops.
+  await saver.request(sampleAt(5, "occ-2"), false);
+  await saver.request(sampleAt(5, "occ-2"), true);
+  assert.deepEqual(calls, []);
+  await saver.finalize(sampleAt(12));
+  assert.deepEqual(calls, [12]);
 });

@@ -4,14 +4,14 @@ import { saveYouTubePlaybackProgress } from "../../lib/youtube/ipc";
 import {
   adjacentPlayableVideo,
   createEndedAdvance,
+  createPlaybackSession,
   createProgressSaver,
-  createSerialRunner,
   formatPlaybackClock,
   isPlaybackCompleted,
   progressOfVideo,
   resumePositionSeconds,
   type PlaybackSample,
-  type SerialRunner
+  type PlaybackSession
 } from "../../lib/youtube/playback";
 import type { YouTubePlaybackProgress, YouTubePlayerSession, YouTubeRunVideo } from "../../lib/youtube/types";
 
@@ -51,22 +51,23 @@ export function YouTubePlayerPane({ session, onClose }: YouTubePlayerPaneProps) 
   // Latest known progress per video. Seeded from the listing and updated on
   // every save so moving between videos resumes where each one stopped.
   const progressRef = useRef(new Map<string, YouTubePlaybackProgress>());
-  const runnerRef = useRef(createSerialRunner());
+  // One save queue and one closing flag for the whole session, shared by the
+  // pane of every video, so switching videos cannot escape a close.
+  const playbackRef = useRef(createPlaybackSession());
   const flushRef = useRef<(() => Promise<void>) | null>(null);
-  const closingRef = useRef(false);
 
   const video = session.videos.find((item) => item.occurrenceId === currentId) ?? null;
   const previous = adjacentPlayableVideo(session.videos, currentId, -1);
   const next = adjacentPlayableVideo(session.videos, currentId, 1);
 
   const close = useCallback(async () => {
-    if (closingRef.current) return;
-    closingRef.current = true;
+    const playback = playbackRef.current;
+    if (!playback.beginClose()) return;
     try {
+      // From here on navigation and ordinary saves are no-ops; the pane only
+      // runs its own final save, then everything queued is drained.
       await flushRef.current?.();
-      // Always wait for every queued save, including those of earlier videos
-      // and saves already in flight, before the history reloads progress.
-      await runnerRef.current.drain();
+      await playback.runner.drain();
     } finally {
       onClose();
     }
@@ -102,17 +103,23 @@ export function YouTubePlayerPane({ session, onClose }: YouTubePlayerPaneProps) 
       resumeSeconds={resumeSeconds}
       captionsOn={captionsOn}
       onToggleCaptions={() => setCaptionsOn((value) => !value)}
-      runner={runnerRef.current}
+      playback={playbackRef.current}
       registerFlush={(flush) => {
         flushRef.current = flush;
       }}
       onRecord={recordProgress}
       onClose={() => void close()}
-      onPrevious={previous ? () => setCurrentId(previous.occurrenceId) : null}
+      onPrevious={
+        previous
+          ? () => {
+              if (playbackRef.current.canNavigate()) setCurrentId(previous.occurrenceId);
+            }
+          : null
+      }
       onNext={
         next
           ? () => {
-              if (!closingRef.current) setCurrentId(next.occurrenceId);
+              if (playbackRef.current.canNavigate()) setCurrentId(next.occurrenceId);
             }
           : null
       }
@@ -127,7 +134,7 @@ type PlayerPaneProps = {
   resumeSeconds: number;
   captionsOn: boolean;
   onToggleCaptions: () => void;
-  runner: SerialRunner;
+  playback: PlaybackSession;
   registerFlush: (flush: (() => Promise<void>) | null) => void;
   onRecord: (occurrenceId: string, progress: YouTubePlaybackProgress) => void;
   onClose: () => void;
@@ -142,7 +149,7 @@ function PlayerPane({
   resumeSeconds,
   captionsOn,
   onToggleCaptions,
-  runner,
+  playback,
   registerFlush,
   onRecord,
   onClose,
@@ -225,11 +232,10 @@ function PlayerPane({
     // A pending "ended" save may only advance if nothing happened since:
     // play, seeking, leaving the video and closing all invalidate it.
     const ended = createEndedAdvance({ onAdvance: () => onNextRef.current?.() });
-    // Set by the close flush: after the final save is queued, no periodic,
-    // pause-event or unmount save may follow it.
-    let frozen = false;
+    const runner = playback.runner;
     const saver = createProgressSaver({
       runner,
+      isClosing: playback.isClosing,
       now: () => performance.now(),
       save: (sample) =>
         saveYouTubePlaybackProgress({
@@ -245,7 +251,7 @@ function PlayerPane({
 
     function persist(force: boolean): Promise<void> {
       const sample = lastSample;
-      if (!sample || frozen) return runner.drain();
+      if (!sample || playback.isClosing()) return runner.drain();
       const position = Math.min(sample.positionSeconds, sample.durationSeconds);
       onRecord(sample.occurrenceId, {
         positionSeconds: position,
@@ -316,7 +322,7 @@ function PlayerPane({
       if (!(target instanceof HTMLVideoElement) || !primed) return;
       syncClock(target, true);
       sampleFrom(target);
-      void ended.afterSave(persist(true), () => target.ended && !frozen);
+      void ended.afterSave(persist(true), () => target.ended && playback.canNavigate());
     }
 
     function onLoadedMetadata(event: Event) {
@@ -334,9 +340,15 @@ function PlayerPane({
       ended.invalidate();
       media.pause();
       if (media.readyState >= HTMLMediaElement.HAVE_METADATA && primed) sampleFrom(media);
-      const final = persist(true);
-      frozen = true;
-      return final;
+      const sample = lastSample;
+      if (!sample) return runner.drain();
+      const position = Math.min(sample.positionSeconds, sample.durationSeconds);
+      onRecord(sample.occurrenceId, {
+        positionSeconds: position,
+        durationSeconds: sample.durationSeconds,
+        completed: isPlaybackCompleted(position, sample.durationSeconds)
+      });
+      return saver.finalize(sample);
     });
 
     media.addEventListener("timeupdate", onTimeUpdate);
