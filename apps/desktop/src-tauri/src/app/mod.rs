@@ -21,5 +21,7 @@ pub mod safe_output_filesystem;
 pub mod security;
 pub mod shell;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod updates;
 pub(crate) mod window_activation;

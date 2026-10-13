@@ -1,5 +1,5 @@
 {
-  "version": 22,
+  "version": 23,
   "scope": "Reviewed production provider write sites that remain on legacy persistence until provider cutover. Coursera, YouTube, LinkedIn, and newspaper start/process now write through the workflow kernel.",
   "directSqlPrimitiveCounts": {
     "src-tauri/src/providers/coursera/commands.rs": 0,
@@ -27,7 +27,8 @@
     "src-tauri/src/providers/newspaper/reader_service.rs": 4,
     "src-tauri/src/providers/newspaper/schedule_service.rs": 15,
     "src-tauri/src/providers/newspaper/storage.rs": 52,
-    "src-tauri/src/providers/newspaper/thumbnails.rs": 1
+    "src-tauri/src/providers/newspaper/thumbnails.rs": 1,
+    "src-tauri/src/providers/youtube/playback.rs": 2
   },
   "sharedWriteHelperCallCounts": {
     "src-tauri/src/providers/coursera/commands.rs": {

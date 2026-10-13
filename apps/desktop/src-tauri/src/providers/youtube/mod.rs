@@ -20,3 +20,5 @@ pub mod playback;
 mod scan;
 pub(crate) mod transcript_inspection;
 pub mod transcript_normalizer;
+#[cfg(test)]
+mod tests;
