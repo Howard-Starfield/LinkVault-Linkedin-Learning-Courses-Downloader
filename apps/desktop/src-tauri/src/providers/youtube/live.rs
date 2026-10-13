@@ -457,14 +457,16 @@ impl YouTubeLiveHandle {
             } else {
                 None
             };
+            // Only the run that owns the active slot may update or release it;
+            // a stray terminal publish for another run must leave it alone.
             if let Some(current) = active.as_mut() {
                 if current.run_id == snapshot.run_id {
                     current.control_revision = snapshot.revision;
                     current.snapshot = snapshot.clone();
+                    if terminal {
+                        *active = None;
+                    }
                 }
-            }
-            if terminal {
-                *active = None;
             }
             control
         };
@@ -762,6 +764,88 @@ mod tests {
         assert_eq!(warning.code, "TRANSCRIPT_INVALID");
         assert_eq!(warning.message, "Video saved; the transcript is bad");
         assert_eq!(snapshot.counts.completed_with_warnings, 1);
+    }
+
+    #[test]
+    fn terminal_publish_for_another_run_does_not_release_the_active_run() {
+        let live = YouTubeLiveHandle::default();
+        let items = one_item();
+        live.attach_run(
+            "run-active".to_string(),
+            "sub-a".to_string(),
+            "fp".to_string(),
+            &items,
+        )
+        .unwrap();
+        let mut stray = initial_snapshot(
+            "run-other".to_string(),
+            "sub-o".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        finish_snapshot(&mut stray, false, None);
+
+        live.publish_snapshot(stray);
+
+        assert!(live.has_active_run("run-active"));
+        assert!(live.control_for("run-active").is_some());
+        assert_eq!(
+            live.attach_run(
+                "run-next".to_string(),
+                "sub-n".to_string(),
+                "fp".to_string(),
+                &items
+            )
+            .unwrap_err(),
+            TransientRuntimeError::RunAlreadyActive
+        );
+    }
+
+    #[test]
+    fn terminal_publish_for_the_active_run_still_releases_it() {
+        let live = YouTubeLiveHandle::default();
+        let items = one_item();
+        live.attach_run(
+            "run-active".to_string(),
+            "sub-a".to_string(),
+            "fp".to_string(),
+            &items,
+        )
+        .unwrap();
+        let mut done = initial_snapshot(
+            "run-active".to_string(),
+            "sub-a".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        finish_snapshot(&mut done, false, None);
+
+        live.publish_snapshot(done);
+
+        assert!(!live.has_active_run("run-active"));
+    }
+
+    #[test]
+    fn warning_outcome_counts_once_and_makes_the_run_completed_with_warnings() {
+        use crate::app::managed_process::TransientExecutionOutcome;
+        let items = one_item();
+        let mut snapshot = initial_snapshot(
+            "run-c".to_string(),
+            "sub-c".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        let outcome =
+            TransientExecutionOutcome::warning("TRANSCRIPT_MISSING", vec!["media".to_string()]);
+
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+        finish_snapshot(&mut snapshot, false, None);
+
+        assert_eq!(snapshot.counts.completed_with_warnings, 1);
+        assert_eq!(snapshot.counts.completed, 0);
+        assert_eq!(snapshot.counts.skipped, 0);
+        assert_eq!(snapshot.state, TransientRunState::CompletedWithWarnings);
     }
 
     #[test]

@@ -387,6 +387,31 @@ mod tests {
     }
 
     #[test]
+    fn pre_loop_failure_for_an_inactive_run_leaves_the_active_run_alone() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let items = vec![work_item(1)];
+        live.attach_run(
+            "yt-still-active".to_string(),
+            "sub-kernel".to_string(),
+            "plan-fp".to_string(),
+            &items,
+        )
+        .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+        };
+
+        let outcome =
+            kernel.fail_before_start("yt-other-run", "REQUEST_INVALID", "bad".to_string());
+
+        assert!(!outcome.succeeded);
+        assert!(
+            live.has_active_run("yt-still-active"),
+            "failing another run must not release the active slot"
+        );
+    }
+
+    #[test]
     fn execute_without_live_control_fails_closed_without_publish() {
         let live = Arc::new(YouTubeLiveHandle::default());
         let published = Arc::new(AtomicBool::new(false));
