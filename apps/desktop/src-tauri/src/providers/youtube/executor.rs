@@ -69,6 +69,12 @@ const STAGE_VERIFYING: f64 = 0.85;
 const STAGE_FINALIZING: f64 = 0.95;
 const STAGE_DONE: f64 = 1.0;
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the read-back after publication fail, to test that path.
+    static FAIL_PUBLISHED_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Process launch seam. Production always goes through the managed-process
 /// port (identity-verified helpers in a kill-on-close job); tests substitute a
 /// fake so stage and publication logic run without the real helpers.
@@ -233,6 +239,11 @@ impl AttemptCleanup {
 
     fn disarm(&mut self) {
         self.lease = None;
+    }
+
+    /// The lease, unless publication already took it.
+    fn try_lease(&self) -> Option<&OutputAttemptLease> {
+        self.lease.as_ref()
     }
 
     /// Release the lease without deleting its partial files.
@@ -1107,6 +1118,13 @@ impl YouTubeExecutor {
             .output_root
             .publish_attempt_lease(cleanup.take_lease(), stem)
             .map_err(safe_output_error)?;
+        #[cfg(test)]
+        if FAIL_PUBLISHED_VERIFY.with(std::cell::Cell::get) {
+            return Err(transient_error(
+                "OUTPUT_VERIFY_FAILED",
+                "the published item could not be read back",
+            ));
+        }
         verify_published_artifacts(&destination, &published_expectations)
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         cleanup.disarm();
@@ -1224,7 +1242,12 @@ impl TransientExecutor for YouTubeExecutor {
                 if resumable
                     && matches!(error.code.as_str(), "MEDIA_VERIFY_FAILED" | "OUTPUT_VERIFY_FAILED") =>
             {
-                Err(note_verification_failure(cleanup.lease(), error))
+                // After publication the lease is gone: the files are in the
+                // final folder and there is no staging left to annotate.
+                match cleanup.try_lease() {
+                    Some(lease) => Err(note_verification_failure(lease, error)),
+                    None => Err(error),
+                }
             }
             other => other,
         };
@@ -2718,19 +2741,36 @@ fn discard_finished_download(lease: &OutputAttemptLease) -> Result<(), String> {
     Ok(())
 }
 
-/// Remember which check failed on a finished download. The same failure twice
-/// in a row means retrying the check cannot help, so the download is discarded
-/// and fetched again instead of looping.
+/// Remember which check failed on a finished download and how many times in a
+/// row (`CODE COUNT` in the marker). Repetition is not evidence of corruption:
+/// the download is always kept. From the second identical failure on, the
+/// pause reason says what keeps failing and what to try, so the user is not
+/// left clicking Continue blindly. Each Continue is still exactly one attempt.
 fn note_verification_failure(lease: &OutputAttemptLease, error: TransientError) -> TransientError {
-    if read_text_marker(lease, VERIFY_MARKER, 64).as_deref() == Some(error.code.as_str()) {
-        let _ = discard_finished_download(lease);
-        return transient_error(
-            "MEDIA_CORRUPT",
-            "Verification failed twice in a row, so the download was removed and will be fetched again.",
-        );
+    let previous = read_text_marker(lease, VERIFY_MARKER, 64).and_then(|text| {
+        let (code, count) = text.split_once(' ')?;
+        Some((code.to_string(), count.trim().parse::<u32>().ok()?))
+    });
+    let count = match previous {
+        Some((code, count)) if code == error.code => count.saturating_add(1),
+        _ => 1,
+    };
+    let _ = write_text_marker(lease, VERIFY_MARKER, &format!("{} {count}", error.code));
+    if count < 2 {
+        return error;
     }
-    let _ = write_text_marker(lease, VERIFY_MARKER, &error.code);
-    error
+    let advice = if error.code == "MEDIA_VERIFY_FAILED" {
+        "Check that antivirus or disk problems are not blocking FFmpeg"
+    } else {
+        "Close any program using the output folder and check free disk space"
+    };
+    transient_error(
+        error.code,
+        format!(
+            "Couldn't verify the finished download ({count} failures in a row): {}. {advice}, then click Continue. The video is kept.",
+            error.message.trim_end_matches('.')
+        ),
+    )
 }
 
 /// Delete files derived from the media (normalized transcripts, manifest) so a
@@ -4307,7 +4347,7 @@ mod tests {
     }
 
     #[test]
-    fn the_same_verification_failure_twice_in_a_row_discards_the_download_instead_of_looping() {
+    fn repeated_timeouts_keep_the_media_and_say_what_keeps_failing() {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
         let runner = FakeRunner::with_script(
@@ -4321,21 +4361,97 @@ mod tests {
             Arc::clone(&runner),
         );
         runner.probe_failure.store(1, Ordering::SeqCst);
-        assert_eq!(
-            run_collecting(&executor, &item).0.unwrap_err().code,
-            "MEDIA_VERIFY_FAILED"
-        );
-        // Continue: finished download, no yt-dlp, the same check fails again.
+        let first = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(first.code, "MEDIA_VERIFY_FAILED");
+        assert!(!first.message.contains("in a row"));
+
         runner.probe_failure.store(1, Ordering::SeqCst);
         let second = run_collecting(&executor, &item).0.unwrap_err();
-        assert_eq!(second.code, "MEDIA_CORRUPT", "{second:?}");
-        assert!(second.message.contains("twice"));
-        assert_eq!(runner.seen_args.lock().unwrap().len(), 1);
+        assert_eq!(second.code, "MEDIA_VERIFY_FAILED", "repetition is not corruption");
+        assert!(second.message.contains("2 failures in a row"), "{}", second.message);
+        assert!(second.message.contains("antivirus"), "{}", second.message);
+        let kept = staging_dirs(temp.path());
+        let files = fs::read_dir(temp.path().join(".lv").join(&kept[0]))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(files.contains(&"media.mp4".to_string()), "the video is kept: {files:?}");
 
-        // The next Continue fetches it again and publishes.
-        run_collecting(&executor, &item).0.expect("fetched again");
-        assert_eq!(runner.seen_args.lock().unwrap().len(), 2);
+        // Once the check works, Continue publishes without fetching anything.
+        run_collecting(&executor, &item).0.expect("published");
+        assert_eq!(runner.seen_args.lock().unwrap().len(), 1);
         assert!(staging_dirs(temp.path()).is_empty());
+    }
+
+    // Windows-only: clearing the read-only attribute is not the Unix world-writable case.
+    #[allow(clippy::permissions_set_readonly_false)]
+    #[cfg(windows)]
+    #[test]
+    fn a_manifest_held_open_twice_keeps_the_media() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            VALID_VTT,
+            vec![ScriptStep::Line("LVFORMATID 18".to_string())],
+        );
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        runner.probe_failure.store(1, Ordering::SeqCst);
+        run_collecting(&executor, &item).0.unwrap_err();
+        let kept = staging_dirs(temp.path());
+        let staging = temp.path().join(".lv").join(&kept[0]);
+        // manifest.json cannot be removed (read-only here; in the field another
+        // program holding it), so regenerating it fails.
+        let manifest = staging.join("manifest.json");
+        fs::write(&manifest, b"{}").unwrap();
+        let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&manifest, permissions).unwrap();
+
+        let first = run_collecting(&executor, &item).0.unwrap_err();
+        let second = run_collecting(&executor, &item).0.unwrap_err();
+
+        assert_eq!(first.code, "OUTPUT_VERIFY_FAILED");
+        assert_eq!(second.code, "OUTPUT_VERIFY_FAILED");
+        assert!(second.message.contains("output folder"), "{}", second.message);
+        assert!(
+            staging.join("media.mp4").exists(),
+            "an unrelated file lock must never cost the download"
+        );
+        let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&manifest, permissions).unwrap();
+        run_collecting(&executor, &item).0.expect("published once released");
+        assert_eq!(runner.seen_args.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_read_back_after_publication_does_not_panic_and_reflects_the_published_state() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        FAIL_PUBLISHED_VERIFY.with(|flag| flag.set(true));
+
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+
+        FAIL_PUBLISHED_VERIFY.with(|flag| flag.set(false));
+        assert_eq!(error.code, "OUTPUT_VERIFY_FAILED");
+        assert!(published_files(temp.path()).contains(&"media.mp4".to_string()));
+        assert!(staging_dirs(temp.path()).is_empty(), "nothing is left in staging");
+        // Continue recognizes the published item instead of downloading again.
+        let again = run_collecting(&executor, &item).0.expect("already saved");
+        assert_eq!(again.state, crate::app::managed_process::TransientItemState::SkippedExisting);
+        assert_eq!(runner.downloads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
