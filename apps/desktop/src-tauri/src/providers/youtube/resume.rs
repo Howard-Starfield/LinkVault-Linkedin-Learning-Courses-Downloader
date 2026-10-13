@@ -101,6 +101,17 @@ pub fn stale_part_leaves(names: &[String], chosen_format_ids: &[String]) -> Vec<
         .collect()
 }
 
+/// Marker file inside a staging directory recording the exact format
+/// selection its partial files belong to (`137+140`, or `18`). It is written
+/// when yt-dlp reports its choice, read on resume to pin the same selection,
+/// and removed before the item is verified and published.
+pub const FORMAT_MARKER: &str = "media.lvformat";
+
+/// Whether yt-dlp refused a pinned `--format` because it no longer exists.
+pub fn pinned_format_unavailable(stderr: &str) -> bool {
+    stderr.to_lowercase().contains("requested format is not available")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureKind {
     DiskFull,

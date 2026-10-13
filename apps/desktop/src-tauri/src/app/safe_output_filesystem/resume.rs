@@ -492,7 +492,6 @@ impl OutputAttemptLease {
     }
 
     /// Total size of the direct files (the bytes a resume keeps).
-    #[allow(dead_code)]
     pub fn leaf_bytes(&self) -> Result<u64, SafeOutputError> {
         let mut total = 0u64;
         for name in self.leaf_names()? {

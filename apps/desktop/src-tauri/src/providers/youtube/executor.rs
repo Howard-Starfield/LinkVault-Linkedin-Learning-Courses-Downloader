@@ -8,10 +8,12 @@ use crate::app::safe_output_filesystem::{
     ValidatedOutputRoot,
 };
 use crate::providers::youtube::download_progress::{
-    parse_formats_line, DownloadProgress, ProgressReading, FORMATS_PRINT, PROGRESS_TEMPLATE,
+    parse_format_id_line, parse_formats_line, parse_pinned_formats, DownloadProgress,
+    ProgressReading, FORMATS_PRINT, FORMAT_ID_PRINT, PROGRESS_TEMPLATE,
 };
 use crate::providers::youtube::resume::{
-    classify_helper_failure, keep_staging_after, pause_reason, stale_part_leaves, FailureKind,
+    classify_helper_failure, keep_staging_after, pause_reason, pinned_format_unavailable,
+    stale_part_leaves, FailureKind, FORMAT_MARKER,
 };
 use crate::app::safe_output_filesystem::resume::StagingDisposition;
 use crate::providers::youtube::error::YouTubeError;
@@ -368,10 +370,22 @@ impl YouTubeExecutor {
         }))
     }
 
+    #[cfg(test)]
     fn args_for(
         &self,
         item: &TransientWorkItem,
         output_template: &Path,
+    ) -> Result<Vec<String>, String> {
+        self.args_for_format(item, output_template, None)
+    }
+
+    /// Helper arguments; `pinned_format` replaces the policy's format
+    /// selector with the exact selection an interrupted attempt used.
+    fn args_for_format(
+        &self,
+        item: &TransientWorkItem,
+        output_template: &Path,
+        pinned_format: Option<&str>,
     ) -> Result<Vec<String>, String> {
         let mut args = vec![
             "--ignore-config".to_string(),
@@ -422,13 +436,13 @@ impl YouTubeExecutor {
                     args.push(selected.language_tag);
                 }
                 args.push("--format".to_string());
-                args.push(self.format_selector());
+                args.push(pinned_format.map_or_else(|| self.format_selector(), str::to_string));
             }
             YouTubeDownloadMode::VideoOnly => {
                 args.push("--concurrent-fragments".to_string());
                 args.push("4".to_string());
                 args.push("--format".to_string());
-                args.push(self.format_selector());
+                args.push(pinned_format.map_or_else(|| self.format_selector(), str::to_string));
             }
         }
         if !matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
@@ -440,6 +454,8 @@ impl YouTubeExecutor {
             args.push("--no-simulate".to_string());
             args.push("--print".to_string());
             args.push(FORMATS_PRINT.to_string());
+            args.push("--print".to_string());
+            args.push(FORMAT_ID_PRINT.to_string());
         }
         args.push(item.source_url.clone());
         Ok(args)
@@ -634,24 +650,10 @@ impl YouTubeExecutor {
             _ => TransientItemPhase::Media,
         };
         report_stage(progress, item, download_phase.clone(), STAGE_START);
-        if preserved_bytes > 0 {
-            // Show the resumed download starting from the bytes already on
-            // disk instead of from zero; yt-dlp's own readings take over.
-            progress(TransientProgressUpdate {
-                occurrence_id: item.occurrence_id.clone(),
-                phase: download_phase.clone(),
-                bytes_completed: Some(preserved_bytes),
-                bytes_total: None,
-                fraction: None,
-            });
-        }
         cleanup
             .lease()
             .revalidate()
             .map_err(|error| transient_error("SAFE_FILESYSTEM_VIOLATION", error.to_string()))?;
-        let helper_args = self
-            .args_for(item, &output_template)
-            .map_err(|message| transient_error("TRANSCRIPT_POLICY_MISSING", message))?;
         let source_duration_seconds = self
             .context
             .as_ref()
@@ -662,42 +664,110 @@ impl YouTubeExecutor {
                     .find(|candidate| candidate.occurrence_id == item.occurrence_id)
             })
             .and_then(|context| context.source_duration_seconds);
-        let helper_spec = if matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
-            invocation(helper_args, MAX_RECORD_STDOUT_BYTES)
+        // Partial media is only valid for the exact format selection that
+        // wrote it. A resume pins that selection; partial files with no
+        // record of it cannot be trusted and are removed.
+        let mut pinned: Option<String> = None;
+        if preserved_bytes > 0 && !matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
+            match read_format_marker(cleanup.lease()) {
+                Some(selection) => pinned = Some(selection),
+                None => wipe_staging(cleanup.lease())
+                    .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?,
+            }
+        }
+        let kept_bytes = if preserved_bytes > 0 {
+            cleanup.lease().leaf_bytes().unwrap_or(0)
         } else {
-            download_invocation(
-                helper_args,
-                MAX_RECORD_STDOUT_BYTES,
-                source_duration_seconds,
-            )
+            0
         };
+        if kept_bytes > 0 {
+            // Show the resumed download starting from the bytes that are
+            // really kept instead of from zero; yt-dlp's readings take over.
+            progress(TransientProgressUpdate {
+                occurrence_id: item.occurrence_id.clone(),
+                phase: download_phase.clone(),
+                bytes_completed: Some(kept_bytes),
+                bytes_total: None,
+                fraction: None,
+            });
+        }
         let mut download_progress = DownloadProgress::new();
         let clock = self.clock;
-        // Format ids yt-dlp chose for this attempt. A resumed attempt may pick
-        // different formats than the interrupted one (expired or changed
-        // streams); partial files of any other format must not be mixed in.
-        let mut chosen_formats: Vec<String> = Vec::new();
-        let lease_for_purge = cleanup.lease();
-        let output = self
-            .runner
-            .run_streaming(helper_spec, control, &mut |line| {
-                if let Some(ids) = parse_formats_line(line) {
-                    let _ = purge_stale_parts(lease_for_purge, &ids);
-                    chosen_formats = ids;
-                }
-                if let Some(reading) = download_progress.observe_line(line, clock()) {
-                    report_download_progress(progress, item, download_phase.clone(), &reading);
-                }
-            })
-            .map_err(|error| match error {
-                ManagedProcessError::HelperTemp(reason) => {
-                    transient_error("HELPER_TEMP_ROOT_INVALID", reason)
-                }
-                ManagedProcessError::Integrity(reason) => {
-                    transient_error("HELPER_INTEGRITY_FAILED", reason)
-                }
-                error => transient_error("HELPER_FAILED", error.to_string()),
-            })?;
+        let (output, chosen_formats) = loop {
+            let helper_args = self
+                .args_for_format(item, &output_template, pinned.as_deref())
+                .map_err(|message| transient_error("TRANSCRIPT_POLICY_MISSING", message))?;
+            let helper_spec = if matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly) {
+                invocation(helper_args, MAX_RECORD_STDOUT_BYTES)
+            } else {
+                download_invocation(
+                    helper_args,
+                    MAX_RECORD_STDOUT_BYTES,
+                    source_duration_seconds,
+                )
+            };
+            // Format ids yt-dlp chose for this attempt. Partial files of any
+            // other format must not be mixed in.
+            let mut chosen_formats: Vec<String> = Vec::new();
+            let mut selection_changed = false;
+            let lease_for_purge = cleanup.lease();
+            let pinned_now = pinned.clone();
+            let output = self
+                .runner
+                .run_streaming(helper_spec, control, &mut |line| {
+                    if let Some(ids) = parse_formats_line(line) {
+                        let _ = purge_stale_parts(lease_for_purge, &ids);
+                    }
+                    if let Some(ids) = parse_format_id_line(line) {
+                        let selection = ids.join("+");
+                        match pinned_now.as_deref() {
+                            Some(pin) if pin == selection => {}
+                            Some(_) => selection_changed = true,
+                            None => {
+                                let _ = write_format_marker(lease_for_purge, &selection);
+                            }
+                        }
+                        let _ = purge_stale_parts(lease_for_purge, &ids);
+                        chosen_formats = ids;
+                    }
+                    if let Some(reading) = download_progress.observe_line(line, clock()) {
+                        report_download_progress(progress, item, download_phase.clone(), &reading);
+                    }
+                })
+                .map_err(|error| match error {
+                    ManagedProcessError::HelperTemp(reason) => {
+                        transient_error("HELPER_TEMP_ROOT_INVALID", reason)
+                    }
+                    ManagedProcessError::Integrity(reason) => {
+                        transient_error("HELPER_INTEGRITY_FAILED", reason)
+                    }
+                    error => transient_error("HELPER_FAILED", error.to_string()),
+                })?;
+            if selection_changed {
+                // yt-dlp printed a selection other than the recorded one, so
+                // the bytes on disk may belong to a different format.
+                wipe_staging(cleanup.lease())
+                    .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
+                return Err(transient_error(
+                    "HELPER_FAILED",
+                    "the video's formats changed while resuming; starting over on the next attempt",
+                ));
+            }
+            if pinned.is_some()
+                && !output.status.success()
+                && !output.cancelled
+                && !control.is_cancelled()
+                && pinned_format_unavailable(&output.stderr)
+            {
+                // The recorded format no longer exists: drop every partial
+                // and retry once with the normal selection.
+                wipe_staging(cleanup.lease())
+                    .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
+                pinned = None;
+                continue;
+            }
+            break (output, chosen_formats);
+        };
         cleanup
             .lease()
             .revalidate()
@@ -715,6 +785,9 @@ impl YouTubeExecutor {
             return Err(transient_error("CANCELLED", "download was cancelled"));
         }
         purge_stale_parts(cleanup.lease(), &chosen_formats)
+            .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
+        // The marker is bookkeeping, not an artifact: gone before verification.
+        remove_format_marker(cleanup.lease())
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         // Publish the last bytes if the throttle was still holding them back.
         if let Some(reading) = download_progress.flush(clock()) {
@@ -2396,6 +2469,44 @@ fn helper_failure(stderr: &str, summary: &str) -> TransientError {
     }
 }
 
+/// The format selection recorded in a reused staging directory, if it is
+/// present and plain enough to hand back to yt-dlp.
+fn read_format_marker(lease: &OutputAttemptLease) -> Option<String> {
+    let mut file = lease.open_leaf(FORMAT_MARKER).ok()?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(&mut file, 256), &mut text).ok()?;
+    let selection = text.trim().to_string();
+    parse_pinned_formats(&selection).map(|_| selection)
+}
+
+fn write_format_marker(lease: &OutputAttemptLease, selection: &str) -> Result<(), String> {
+    let _ = lease.remove_leaf(FORMAT_MARKER);
+    let mut file = lease
+        .create_leaf(FORMAT_MARKER)
+        .map_err(|error| error.to_string())?;
+    file.write_all(selection.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn remove_format_marker(lease: &OutputAttemptLease) -> Result<(), String> {
+    let names = lease.leaf_names().map_err(|error| error.to_string())?;
+    if names.iter().any(|name| name == FORMAT_MARKER) {
+        lease
+            .remove_leaf(FORMAT_MARKER)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Remove every file in the staging directory (partials of unknown or
+/// outdated provenance); the directory itself stays leased.
+fn wipe_staging(lease: &OutputAttemptLease) -> Result<(), String> {
+    for name in lease.leaf_names().map_err(|error| error.to_string())? {
+        lease.remove_leaf(&name).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Delete staging files that belong to formats other than `chosen`.
 fn purge_stale_parts(lease: &OutputAttemptLease, chosen: &[String]) -> Result<(), String> {
     if chosen.is_empty() {
@@ -3040,6 +3151,12 @@ mod tests {
         fail_next: std::sync::Mutex<Option<(String, usize, String)>>,
         /// Files already in staging when a download starts: `(name, bytes)`.
         seen_at_start: std::sync::Mutex<Vec<(String, u64)>>,
+        /// Stdout lines the planned failure prints before it fails.
+        fail_lines: std::sync::Mutex<Vec<String>>,
+        /// Arguments of every download call.
+        seen_args: std::sync::Mutex<Vec<Vec<String>>>,
+        /// Refuse any pinned `--format` as no longer available.
+        reject_pinned: std::sync::atomic::AtomicBool,
     }
 
     impl FakeRunner {
@@ -3055,6 +3172,9 @@ mod tests {
                 second_vtt: false,
                 fail_next: std::sync::Mutex::new(None),
                 seen_at_start: std::sync::Mutex::new(Vec::new()),
+                fail_lines: std::sync::Mutex::new(Vec::new()),
+                seen_args: std::sync::Mutex::new(Vec::new()),
+                reject_pinned: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -3066,6 +3186,9 @@ mod tests {
                 second_vtt: true,
                 fail_next: std::sync::Mutex::new(None),
                 seen_at_start: std::sync::Mutex::new(Vec::new()),
+                fail_lines: std::sync::Mutex::new(Vec::new()),
+                seen_args: std::sync::Mutex::new(Vec::new()),
+                reject_pinned: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -3094,8 +3217,26 @@ mod tests {
                         ));
                     }
                 }
+                self.seen_args.lock().unwrap().push(args.clone());
+                if self.reject_pinned.load(Ordering::SeqCst) {
+                    let format = arg_after(&args, "--format").unwrap_or_default();
+                    if !format.starts_with("bestvideo") {
+                        return Ok(ManagedProcessOutput {
+                            status: std::process::ExitStatus::from_raw(1),
+                            stdout: String::new(),
+                            stderr: "ERROR: Requested format is not available".to_string(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                            timed_out: false,
+                            cancelled: false,
+                        });
+                    }
+                }
                 let planned_failure = self.fail_next.lock().unwrap().take();
                 if let Some((part_name, part_bytes, stderr)) = planned_failure {
+                    for line in self.fail_lines.lock().unwrap().iter() {
+                        on_line(line);
+                    }
                     fs::write(staging.join(part_name), vec![9u8; part_bytes]).unwrap();
                     return Ok(ManagedProcessOutput {
                         status: std::process::ExitStatus::from_raw(1),
@@ -3110,6 +3251,7 @@ mod tests {
                 if !args.iter().any(|argument| argument == "--skip-download") {
                     // A completed download consumes the stream it was resuming.
                     let _ = fs::remove_file(staging.join("media.f137.mp4.part"));
+                    let _ = fs::remove_file(staging.join("media.mp4.part"));
                     fs::write(staging.join("media.mp4"), b"media bytes").unwrap();
                 }
                 if args.iter().any(|argument| argument == "--write-subs") {
@@ -3257,6 +3399,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
         let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_lines.lock().unwrap() = vec!["LVFORMATID 137".to_string()];
         *runner.fail_next.lock().unwrap() = Some((
             "media.f137.mp4.part".to_string(),
             5000,
@@ -3278,9 +3421,14 @@ mod tests {
 
         let (second, stages) = run_collecting(&executor, &item);
         second.expect("the resumed attempt completes");
+        let mut at_start = runner.seen_at_start.lock().unwrap().clone();
+        at_start.sort();
         assert_eq!(
-            runner.seen_at_start.lock().unwrap().clone(),
-            vec![("media.f137.mp4.part".to_string(), 5000u64)],
+            at_start,
+            vec![
+                ("media.f137.mp4.part".to_string(), 5000u64),
+                ("media.lvformat".to_string(), 3u64),
+            ],
             "the resumed attempt must start with the earlier bytes in place"
         );
         assert!(
@@ -3295,6 +3443,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = validate_output_root(temp.path()).unwrap();
         let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_lines.lock().unwrap() = vec!["LVFORMATID 137".to_string()];
         *runner.fail_next.lock().unwrap() = Some((
             "media.f137.mp4.part".to_string(),
             7000,
@@ -3314,7 +3463,7 @@ mod tests {
             bytes.push(update.bytes_completed);
         })
         .unwrap();
-        assert!(bytes.contains(&Some(7000)), "{bytes:?}");
+        assert!(bytes.contains(&Some(7000 + 3)), "{bytes:?}");
     }
 
     #[test]
@@ -3405,6 +3554,126 @@ mod tests {
         assert!(
             !files.iter().any(|name| name.contains("f299")),
             "stale part published: {files:?}"
+        );
+    }
+
+    fn format_of(args: &[String]) -> Option<String> {
+        arg_after(args, "--format")
+    }
+
+    #[test]
+    fn a_merged_download_resumes_pinned_to_the_exact_formats_it_started_with() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_lines.lock().unwrap() = vec!["LVFORMATID 137+140".to_string()];
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f137.mp4.part".to_string(),
+            2048,
+            "ERROR: connection reset".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+
+        run_collecting(&executor, &item).0.expect("resumed");
+
+        let seen = runner.seen_args.lock().unwrap().clone();
+        assert_eq!(format_of(&seen[1]).as_deref(), Some("137+140"), "{seen:?}");
+        assert!(
+            !published_files(temp.path()).iter().any(|name| name == "media.lvformat"),
+            "the format marker must not be published"
+        );
+    }
+
+    #[test]
+    fn a_single_file_download_resumes_pinned_to_its_format_too() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        // A single format prints no requested_formats; its partial has no id.
+        *runner.fail_lines.lock().unwrap() = vec!["LVFORMATID 18".to_string()];
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.mp4.part".to_string(),
+            2048,
+            "ERROR: connection reset".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+
+        run_collecting(&executor, &item).0.expect("resumed");
+
+        let seen = runner.seen_args.lock().unwrap().clone();
+        assert_eq!(format_of(&seen[1]).as_deref(), Some("18"), "{seen:?}");
+        assert!(seen[1].iter().any(|argument| argument == FORMAT_ID_PRINT));
+    }
+
+    #[test]
+    fn partial_media_with_no_recorded_format_is_discarded_not_continued() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.mp4.part".to_string(),
+            4096,
+            "ERROR: connection reset".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+
+        run_collecting(&executor, &item).0.expect("fresh start");
+
+        assert!(
+            runner.seen_at_start.lock().unwrap().is_empty(),
+            "bytes of unknown provenance must not be handed to yt-dlp"
+        );
+        let seen = runner.seen_args.lock().unwrap().clone();
+        assert!(format_of(&seen[1]).unwrap().starts_with("bestvideo"));
+    }
+
+    #[test]
+    fn an_unavailable_pinned_format_wipes_the_partials_and_retries_with_normal_selection() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_lines.lock().unwrap() = vec!["LVFORMATID 137+140".to_string()];
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f137.mp4.part".to_string(),
+            2048,
+            "ERROR: connection reset".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+        runner.reject_pinned.store(true, Ordering::SeqCst);
+
+        run_collecting(&executor, &item).0.expect("falls back");
+
+        let seen = runner.seen_args.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "failed attempt, refused pin, fresh retry");
+        assert_eq!(format_of(&seen[1]).as_deref(), Some("137+140"));
+        assert!(format_of(&seen[2]).unwrap().starts_with("bestvideo"));
+        assert!(
+            runner.seen_at_start.lock().unwrap().is_empty(),
+            "the retry starts from an empty directory"
         );
     }
 

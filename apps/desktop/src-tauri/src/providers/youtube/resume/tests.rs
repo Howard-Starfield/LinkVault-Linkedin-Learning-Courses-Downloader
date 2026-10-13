@@ -797,3 +797,18 @@ fn a_delayed_duplicate_continue_cannot_start_another_attempt_after_a_failure() {
         RunState::Paused
     );
 }
+
+#[test]
+fn the_format_id_record_gives_the_exact_selection_for_merged_and_single_formats() {
+    use crate::providers::youtube::download_progress::{parse_format_id_line, parse_pinned_formats};
+    assert_eq!(
+        parse_format_id_line("LVFORMATID 137+140"),
+        Some(names(&["137", "140"]))
+    );
+    assert_eq!(parse_format_id_line("LVFORMATID 18"), Some(names(&["18"])));
+    assert_eq!(parse_format_id_line("LVFORMATID "), None);
+    assert_eq!(parse_pinned_formats("bestvideo*+bestaudio/best"), None);
+    assert_eq!(parse_pinned_formats("137+"), None);
+    assert!(pinned_format_unavailable("ERROR: Requested format is not available. Use --list-formats"));
+    assert!(!pinned_format_unavailable("HTTP Error 403"));
+}

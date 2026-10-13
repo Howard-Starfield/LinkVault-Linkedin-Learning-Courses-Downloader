@@ -35,9 +35,13 @@ use std::time::{Duration, Instant};
 pub const PROGRESS_TEMPLATE: &str = "download:LVPROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(info.format_id)s";
 /// yt-dlp `--print` record listing the formats about to be downloaded.
 pub const FORMATS_PRINT: &str = "before_dl:LVFORMATS %(requested_formats.:.format_id|)l";
+/// yt-dlp `--print` record with the exact selected format id: `137+140` for a
+/// merged download, `18` for a single file (which `LVFORMATS` leaves empty).
+pub const FORMAT_ID_PRINT: &str = "before_dl:LVFORMATID %(format_id)s";
 
 const PROGRESS_PREFIX: &str = "LVPROGRESS ";
 const FORMATS_PREFIX: &str = "LVFORMATS";
+const FORMAT_ID_PREFIX: &str = "LVFORMATID ";
 const UNAVAILABLE: &str = "NA";
 /// Larger values are treated as garbage rather than real byte counts (1 PiB).
 const MAX_BYTES: u64 = 1 << 50;
@@ -139,6 +143,29 @@ pub fn parse_formats_line(line: &str) -> Option<Vec<String>> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     (!ids.is_empty()).then_some(ids)
+}
+
+/// The selected format ids from a `LVFORMATID` record (`137+140` -> `137`, `140`).
+/// Every id must be plain (letters, digits, `_`, `-`, `.`) so it can be passed
+/// back to yt-dlp as `--format` without interpretation.
+pub fn parse_format_id_line(line: &str) -> Option<Vec<String>> {
+    parse_pinned_formats(line.strip_prefix(FORMAT_ID_PREFIX)?.trim())
+}
+
+/// Validate a recorded selection (`137+140`) and split it into ids.
+pub fn parse_pinned_formats(selection: &str) -> Option<Vec<String>> {
+    let ids = selection
+        .split('+')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let plain = |id: &String| {
+        !id.is_empty()
+            && id.len() <= MAX_FORMAT_ID_CHARS
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    (ids.len() <= MAX_STREAMS && ids.iter().all(plain)).then_some(ids)
 }
 
 #[derive(Clone, Debug)]
