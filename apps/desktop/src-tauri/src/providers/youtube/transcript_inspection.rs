@@ -11,7 +11,7 @@ use crate::app::managed_process::{
     run, DiscoveryOperation, ManagedProcessContext, ManagedProcessOutput,
 };
 use crate::providers::youtube::error::YouTubeInternalError;
-use crate::providers::youtube::helper::{invocation, output_error, MAX_RECORD_STDOUT_BYTES};
+use crate::providers::youtube::helper::{invocation, output_error, MAX_DISCOVERY_STDOUT_BYTES};
 use crate::providers::youtube::models::{
     PlannedYouTubeTranscriptInspection, YouTubeTranscriptInspectionContext,
     YouTubeTranscriptSource, YouTubeTranscriptTrack,
@@ -28,6 +28,10 @@ use std::cmp::Ordering;
 /// can pass the former 256.  512 leaves roughly 2x headroom while staying
 /// bounded: 512 tracks of at most 32 short format names is a few hundred KiB.
 pub const MAX_TRANSCRIPT_TRACKS: usize = 512;
+/// Largest inspection output accepted, equal to the scan's own limit: a video can carry 180+
+/// automatic languages with 147 signed-URL format entries each (about 11 MB), and the scan
+/// that already accepted such a video must not be contradicted by its inspection.
+pub const MAX_INSPECTION_OUTPUT_BYTES: usize = MAX_DISCOVERY_STDOUT_BYTES;
 /// Maximum number of extension names retained for one language/source track.
 pub const MAX_TRANSCRIPT_FORMATS_PER_TRACK: usize = 32;
 /// Maximum bytes accepted for one normalized language tag.
@@ -56,7 +60,7 @@ pub(crate) fn inspect_transcripts(
         ));
     }
     let output = run(
-        invocation(inspection_args(item), MAX_RECORD_STDOUT_BYTES),
+        invocation(inspection_args(item), MAX_INSPECTION_OUTPUT_BYTES),
         ManagedProcessContext::Discovery(operation),
     )
     .map_err(YouTubeInternalError::from_helper_run)?;
@@ -102,7 +106,7 @@ fn ensure_inspection_output(
             "transcript inspection timed out".to_string(),
         ));
     }
-    if output.stdout_truncated || output.stdout.len() > MAX_RECORD_STDOUT_BYTES {
+    if output.stdout_truncated || output.stdout.len() > MAX_INSPECTION_OUTPUT_BYTES {
         return Err(YouTubeInternalError::Helper(
             "transcript inspection output exceeded the safety limit".to_string(),
         ));
@@ -141,7 +145,7 @@ pub(crate) fn parse_transcript_tracks(
     stdout: &str,
 ) -> Result<Vec<YouTubeTranscriptTrack>, YouTubeInternalError> {
     ensure_occurrence_identity(occurrence_id)?;
-    if stdout.len() > MAX_RECORD_STDOUT_BYTES {
+    if stdout.len() > MAX_INSPECTION_OUTPUT_BYTES {
         return Err(YouTubeInternalError::Helper(
             "transcript inspection output exceeded the safety limit".to_string(),
         ));
@@ -185,12 +189,15 @@ pub(crate) fn tracks_from_metadata(
         &mut tracks,
     )?;
     deduplicate_tracks(occurrence_id, &mut tracks);
-    tracks.sort_by(track_order);
     if tracks.len() > MAX_TRANSCRIPT_TRACKS {
-        return Err(YouTubeInternalError::Helper(
-            "transcript inspection returned too many tracks".to_string(),
-        ));
+        // More languages than the cap: drop the least useful instead of failing the video.
+        // Order of survival: uploader tracks, English automatic, the original-language automatic
+        // track, everything else.  (A stable sort keeps the usual order within each class.)
+        tracks.sort_by(track_order);
+        tracks.sort_by_key(track_priority);
+        tracks.truncate(MAX_TRANSCRIPT_TRACKS);
     }
+    tracks.sort_by(track_order);
     Ok(tracks)
 }
 
@@ -218,8 +225,16 @@ pub(crate) fn tracks_from_scan_metadata(
     occurrence_id: &str,
     metadata: &Value,
 ) -> Option<Vec<YouTubeTranscriptTrack>> {
+    tracks_from_scan_metadata_within(occurrence_id, metadata, MAX_INSPECTION_OUTPUT_BYTES)
+}
+
+fn tracks_from_scan_metadata_within(
+    occurrence_id: &str,
+    metadata: &Value,
+    limit: usize,
+) -> Option<Vec<YouTubeTranscriptTrack>> {
     let object = metadata.as_object()?;
-    if yt_dlp_printed_len(object) > MAX_RECORD_STDOUT_BYTES {
+    if yt_dlp_printed_len(object) > limit {
         return None;
     }
     tracks_from_metadata(occurrence_id, metadata).ok()
@@ -359,6 +374,7 @@ fn deduplicate_tracks(occurrence_id: &str, tracks: &mut Vec<YouTubeTranscriptTra
             existing.formats.append(&mut track.formats);
             existing.formats.sort();
             existing.formats.dedup();
+            limit_formats(&mut existing.formats);
             if track.display_language < existing.display_language {
                 existing.display_language = track.display_language;
             }
@@ -394,12 +410,10 @@ fn append_source_tracks(
     let languages = value.as_object().ok_or_else(|| {
         YouTubeInternalError::Helper(format!("yt-dlp {field} metadata was malformed"))
     })?;
-    if languages.len() > MAX_TRANSCRIPT_TRACKS {
-        return Err(YouTubeInternalError::Helper(format!(
-            "yt-dlp {field} metadata exceeded the track limit"
-        )));
-    }
     for (raw_language, formats) in languages {
+        if tracks.len() >= MAX_LANGUAGES_EXAMINED {
+            break;
+        }
         if is_live_chat(raw_language) {
             continue;
         }
@@ -409,11 +423,8 @@ fn append_source_tracks(
         let format_entries = formats.as_array().ok_or_else(|| {
             YouTubeInternalError::Helper(format!("yt-dlp {field} track metadata was malformed"))
         })?;
-        if format_entries.len() > MAX_TRANSCRIPT_FORMATS_PER_TRACK {
-            return Err(YouTubeInternalError::Helper(format!(
-                "yt-dlp {field} format metadata exceeded the track limit"
-            )));
-        }
+        // The entry count is not limited: yt-dlp repeats each extension once per source group
+        // (147 entries for 7 extensions), and only the distinct extension names are kept.
         let mut format_names = Vec::new();
         let mut display_names = Vec::new();
         for entry in format_entries {
@@ -442,7 +453,7 @@ fn append_source_tracks(
         if format_names.is_empty() {
             continue;
         }
-        format_names.sort();
+        limit_formats(&mut format_names);
         display_names.sort();
         let display_language = display_names
             .into_iter()
@@ -458,14 +469,49 @@ fn append_source_tracks(
             is_likely_translated,
             formats: format_names,
         });
-        if tracks.len() > MAX_TRANSCRIPT_TRACKS {
-            return Err(YouTubeInternalError::Helper(
-                "transcript inspection returned too many tracks".to_string(),
-            ));
-        }
     }
     Ok(())
 }
+
+fn is_english(tag: &str) -> bool {
+    let tag = tag.to_ascii_lowercase();
+    tag == "en" || tag.starts_with("en-")
+}
+
+/// Lower survives longer when there are too many tracks.
+fn track_priority(track: &YouTubeTranscriptTrack) -> u8 {
+    if matches!(track.source, YouTubeTranscriptSource::Uploader) {
+        0
+    } else if is_english(&track.language_tag) {
+        1
+    } else if track.language_tag.to_ascii_lowercase().ends_with("-orig") {
+        2
+    } else {
+        3
+    }
+}
+
+/// Keeps at most the format cap of distinct extensions, preferring the known ones (vtt first,
+/// the format the downloader requests).
+fn limit_formats(format_names: &mut Vec<String>) {
+    if format_names.len() > MAX_TRANSCRIPT_FORMATS_PER_TRACK {
+        format_names.sort_by_key(|name| {
+            KNOWN_FORMATS
+                .iter()
+                .position(|known| known == name)
+                .unwrap_or(KNOWN_FORMATS.len())
+        });
+        format_names.truncate(MAX_TRANSCRIPT_FORMATS_PER_TRACK);
+    }
+    format_names.sort();
+}
+
+/// Hard ceiling on languages examined per field, only to bound work on hostile input; real videos
+/// have a few hundred.  Priority truncation to `MAX_TRANSCRIPT_TRACKS` happens afterwards.
+const MAX_LANGUAGES_EXAMINED: usize = 16_384;
+
+/// Subtitle extensions yt-dlp is known to offer, most useful first.
+const KNOWN_FORMATS: [&str; 7] = ["vtt", "srt", "ttml", "srv3", "srv2", "srv1", "json3"];
 
 fn track_order(left: &YouTubeTranscriptTrack, right: &YouTubeTranscriptTrack) -> Ordering {
     source_rank(&left.source)
@@ -506,7 +552,11 @@ fn normalize_language_tag(raw: &str) -> Option<String> {
             return None;
         }
         let normalized_part =
-            if part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            if part.eq_ignore_ascii_case("orig") {
+                // yt-dlp marks the original-language automatic track "en-orig"; --sub-langs matches it
+                // literally, so it must not be title-cased like a script subtag.
+                "orig".to_string()
+            } else if part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()) {
                 let mut chars = part.chars();
                 let first = chars.next()?.to_ascii_uppercase();
                 format!("{}{}", first, chars.as_str().to_ascii_lowercase())
@@ -685,7 +735,7 @@ mod tests {
         assert!(parse_transcript_tracks(OCCURRENCE, "not-json").is_err());
         assert!(parse_transcript_tracks(OCCURRENCE, r#"{"subtitles":[]}"#).is_err());
         assert!(
-            parse_transcript_tracks(OCCURRENCE, &"x".repeat(MAX_RECORD_STDOUT_BYTES + 1)).is_err()
+            parse_transcript_tracks(OCCURRENCE, &"x".repeat(MAX_INSPECTION_OUTPUT_BYTES + 1)).is_err()
         );
         assert!(parse_transcript_tracks(OCCURRENCE, r#"{} trailing"#).is_err());
     }
@@ -787,7 +837,75 @@ mod tests {
             r#"{{"automatic_captions":{{{}}}}}"#,
             languages("a", MAX_TRANSCRIPT_TRACKS + 1)
         );
-        assert!(parse_transcript_tracks(OCCURRENCE, &too_many).is_err());
+        // Past the cap the extra languages are dropped; the video does not fail.
+        let tracks = parse_transcript_tracks(OCCURRENCE, &too_many).unwrap();
+        assert_eq!(tracks.len(), MAX_TRANSCRIPT_TRACKS);
+    }
+
+    #[test]
+    fn repeated_format_groups_dedupe_to_their_extensions_and_do_not_fail() {
+        // Real shape from a production video: 182 automatic languages, each with 147 entries
+        // (21 source groups of 7 extensions).  Trimmed to 3 languages, URLs shortened.
+        let fixture = include_str!("fixtures/auto_captions_147_entries.json");
+        let tracks = parse_transcript_tracks(OCCURRENCE, fixture).unwrap();
+        assert_eq!(tracks.len(), 3);
+        for track in &tracks {
+            assert_eq!(track.formats, vec!["json3", "srt", "srv1", "srv2", "srv3", "ttml", "vtt"]);
+            assert_eq!(track.source, YouTubeTranscriptSource::Automatic);
+        }
+        let value: Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(value["automatic_captions"]["ab"].as_array().unwrap().len(), 147);
+        // The same tracks come from the scan's own metadata.
+        assert_eq!(tracks_from_scan_metadata(OCCURRENCE, &value).unwrap(), tracks);
+    }
+
+    #[test]
+    fn more_distinct_extensions_than_the_cap_keep_the_known_ones() {
+        let entries = (0..40)
+            .map(|index| format!(r#"{{"ext":"x{index:02}"}}"#))
+            .chain([r#"{"ext":"vtt"}"#.to_string()])
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(r#"{{"subtitles":{{"en":[{entries}]}}}}"#);
+        let tracks = parse_transcript_tracks(OCCURRENCE, &payload).unwrap();
+        assert_eq!(tracks[0].formats.len(), MAX_TRANSCRIPT_FORMATS_PER_TRACK);
+        assert!(tracks[0].formats.contains(&"vtt".to_string()));
+    }
+
+    /// An ~11 MB, 182-language output like the production video's (URLs ~390 bytes).
+    fn production_sized_captions() -> String {
+        let url = format!("https://www.youtube.com/api/timedtext?v=-wreCvpBdso&{}", "x".repeat(340));
+        let exts = ["json3", "srv1", "srv2", "srv3", "ttml", "srt", "vtt"];
+        let languages = (0..182)
+            .map(|language| {
+                let entries = (0..147)
+                    .map(|index| {
+                        format!(
+                            r#"{{"ext": "{}", "url": "{url}", "name": "Language {language}", "impersonate": true, "__yt_dlp_client": "visionos"}}"#,
+                            exts[index % 7]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(r#""l{language:03}": [{entries}]"#)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(r#"{{"automatic_captions": {{{languages}}}}}"#)
+    }
+
+    #[test]
+    fn an_eleven_megabyte_inspection_output_is_accepted() {
+        // The first language is English, as in the production video.
+        let output = production_sized_captions().replacen("\"l000\"", "\"en\"", 1);
+        assert!(output.len() > 11_000_000, "{} bytes", output.len());
+        assert!(output.len() > 4 * 1024 * 1024 && output.len() <= MAX_INSPECTION_OUTPUT_BYTES);
+        let tracks = parse_transcript_tracks(OCCURRENCE, &output).unwrap();
+        assert_eq!(tracks.len(), 182);
+        assert!(tracks.iter().any(|track| track.language_tag == "en"));
+        assert!(tracks.iter().all(|track| track.formats.len() == 7));
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(tracks_from_scan_metadata(OCCURRENCE, &value).unwrap(), tracks);
     }
 
     /// Live reproduction through the real managed supervisor and the installed
@@ -802,7 +920,7 @@ mod tests {
         use crate::providers::youtube::scan::scan_source;
         let urls = std::env::var("LV_LIVE_URLS")
             .unwrap_or_else(|_| {
-                "https://www.youtube.com/watch?v=jNQXAC9IVRw,https://www.youtube.com/watch?v=wbPMGczOVbk"
+                "https://www.youtube.com/watch?v=jNQXAC9IVRw,https://www.youtube.com/watch?v=wbPMGczOVbk,https://www.youtube.com/watch?v=-wreCvpBdso"
                     .to_string()
             });
         for url in urls.split(',') {
@@ -826,7 +944,7 @@ mod tests {
             let print = full_args.iter().position(|arg| arg == "--print").unwrap();
             full_args.splice(print..print + 2, ["--dump-single-json".to_string()]);
             let output = run(
-                invocation(full_args, MAX_RECORD_STDOUT_BYTES),
+                invocation(full_args, MAX_INSPECTION_OUTPUT_BYTES),
                 ManagedProcessContext::Discovery(&operation),
             )
             .expect("full dump run");
@@ -890,14 +1008,50 @@ mod tests {
             ))
             .unwrap()
         };
+        let limit = 4 * 1024 * 1024;
         let straddling = captions(1_600_000);
         let compact = serde_json::to_vec(&straddling).unwrap().len();
         let printed = yt_dlp_printed_len(straddling.as_object().unwrap());
-        assert!(compact < MAX_RECORD_STDOUT_BYTES && printed > MAX_RECORD_STDOUT_BYTES);
-        assert!(tracks_from_scan_metadata(OCCURRENCE, &straddling).is_none());
+        assert!(compact < limit && printed > limit);
+        assert!(tracks_from_scan_metadata_within(OCCURRENCE, &straddling, limit).is_none());
         // Comfortably inside the limit in both forms: tracks are stored.
         let small = captions(1_000_000);
-        assert!(yt_dlp_printed_len(small.as_object().unwrap()) < MAX_RECORD_STDOUT_BYTES);
-        assert_eq!(tracks_from_scan_metadata(OCCURRENCE, &small).unwrap().len(), 1);
+        assert!(yt_dlp_printed_len(small.as_object().unwrap()) < limit);
+        assert_eq!(tracks_from_scan_metadata_within(OCCURRENCE, &small, limit).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn past_the_track_cap_uploader_english_and_original_language_tracks_survive() {
+        let entry = r#"[{"ext":"vtt"}]"#;
+        let automatic = (0..700)
+            .map(|index| format!(r#""a{index:03}":{entry}"#))
+            .chain(["\"en\"", "\"en-orig\"", "\"zz-orig\"", "\"en-GB\""].map(|key| format!("{key}:{entry}")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let uploader = (0..3)
+            .map(|index| format!(r#""u{index}":{entry}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(r#"{{"subtitles":{{{uploader}}},"automatic_captions":{{{automatic}}}}}"#);
+        let tracks = parse_transcript_tracks(OCCURRENCE, &payload).unwrap();
+        assert_eq!(tracks.len(), MAX_TRANSCRIPT_TRACKS);
+        let has = |tag: &str, source: YouTubeTranscriptSource| {
+            tracks.iter().any(|track| track.language_tag == tag && track.source == source)
+        };
+        for tag in ["u0", "u1", "u2"] {
+            assert!(has(tag, YouTubeTranscriptSource::Uploader), "{tag}");
+        }
+        for tag in ["en", "en-orig", "en-GB", "zz-orig"] {
+            assert!(has(tag, YouTubeTranscriptSource::Automatic), "{tag}");
+        }
+        // The same input always yields the same, sorted result.
+        assert_eq!(tracks, parse_transcript_tracks(OCCURRENCE, &payload).unwrap());
+    }
+
+    #[test]
+    fn the_original_language_marker_keeps_its_literal_lowercase_form() {
+        assert_eq!(normalize_language_tag("en-orig").as_deref(), Some("en-orig"));
+        assert_eq!(normalize_language_tag("pt-BR-orig").as_deref(), Some("pt-BR-orig"));
+        assert_eq!(normalize_language_tag("zh-hans").as_deref(), Some("zh-Hans"));
     }
 }

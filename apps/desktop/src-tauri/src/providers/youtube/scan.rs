@@ -273,7 +273,13 @@ pub(crate) fn parse_scan_plan(
     stdout: &str,
 ) -> Result<YouTubeScanPlan, YouTubeInternalError> {
     let value = parse_json(stdout)?;
-    let (title, entries, root) = match &source.kind {
+    // Read what is needed from the root first, so a video's (possibly tens of MB) info dict is
+    // moved into its entry list rather than cloned.
+    let root_id = value.get("id").and_then(value_string).unwrap_or_default();
+    let playlist_count = value
+        .get("playlist_count")
+        .and_then(serde_json::Value::as_u64);
+    let (title, entries) = match &source.kind {
         YouTubePlaylistMode::Playlist => {
             let title = value
                 .get("title")
@@ -284,14 +290,14 @@ pub(crate) fn parse_scan_plan(
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            (title, entries, value.clone())
+            (title, entries)
         }
         YouTubePlaylistMode::Video => {
             let title = value
                 .get("title")
                 .and_then(value_string)
                 .unwrap_or_else(|| "YouTube video".to_string());
-            (title, vec![value.clone()], value.clone())
+            (title, vec![value])
         }
     };
     let truncated = entries.len() > MAX_SCAN_ENTRIES;
@@ -400,14 +406,12 @@ pub(crate) fn parse_scan_plan(
             .playlist_id
             .clone()
             .or_else(|| source.video_id.clone())
-            .unwrap_or_else(|| value.get("id").and_then(value_string).unwrap_or_default()),
+            .unwrap_or(root_id),
         canonical_url: source.canonical_url,
         playlist_id: source.playlist_id,
         truncated,
         total_count: match source.kind {
-            YouTubePlaylistMode::Playlist => root
-                .get("playlist_count")
-                .and_then(serde_json::Value::as_u64),
+            YouTubePlaylistMode::Playlist => playlist_count,
             YouTubePlaylistMode::Video => None,
         },
         items: items.iter().map(|item| item.public.clone()).collect(),
@@ -848,17 +852,42 @@ mod tests {
     }
 
     #[test]
-    fn video_scan_with_an_oversized_caption_subset_leaves_inspection_to_the_fallback() {
-        use crate::providers::youtube::helper::MAX_RECORD_STDOUT_BYTES;
-        // The refusal applies to the caption fields themselves, not the whole output.
-        let bulk = "x".repeat(MAX_RECORD_STDOUT_BYTES + 1);
+    fn video_scan_with_about_twelve_megabytes_of_captions_stores_its_tracks() {
+        // The production video: 182 automatic languages x 147 signed-URL entries (21 groups of
+        // the 7 extensions), ~11 MB of captions, ~12 MB of scan output, under the 32 MiB scan cap.
+        let url = format!("https://www.youtube.com/api/timedtext?v=-wreCvpBdso&{}", "x".repeat(340));
+        let exts = ["json3", "srv1", "srv2", "srv3", "ttml", "srt", "vtt"];
+        let languages = (0..182)
+            .map(|language| {
+                let entries = (0..147)
+                    .map(|index| {
+                        format!(
+                            r#"{{"ext":"{}","url":"{url}","name":"Language {language}","impersonate":true,"__yt_dlp_client":"visionos"}}"#,
+                            exts[index % 7]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(r#""l{language:03}":[{entries}]"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let formats = (0..3_000)
+            .map(|index| format!(r#"{{"format_id":"f{index}","url":"https://rr.example/{}"}}"#, "y".repeat(100)))
+            .collect::<Vec<_>>()
+            .join(",");
         let payload = format!(
-            r#"{{"id":"abc123_XY","title":"Video","availability":"public","subtitles":{{"en":[{{"ext":"vtt","url":"{bulk}"}}]}}}}"#
+            r#"{{"id":"abc123_XY","title":"Video","availability":"public","formats":[{formats}],"automatic_captions":{{{languages}}}}}"#
         );
+        assert!(payload.len() > 11_000_000 && payload.len() < MAX_DISCOVERY_STDOUT_BYTES);
         let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
         let plan = parse_scan_plan(source, &payload).unwrap();
-        assert_eq!(plan.items.len(), 1);
-        assert!(plan.items[0].transcript_inspection.is_none());
+        let stored = plan.items[0]
+            .transcript_inspection
+            .as_ref()
+            .expect("a scan the 32 MiB cap accepted must keep its tracks so no second launch is needed");
+        assert_eq!(stored.tracks.len(), 182);
+        assert!(stored.tracks.iter().all(|track| track.formats.len() == 7));
     }
 
     fn playlist_payload(entries: usize, playlist_count: Option<u64>) -> String {

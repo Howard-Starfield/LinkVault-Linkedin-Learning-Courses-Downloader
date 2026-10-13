@@ -935,4 +935,18 @@ mod tests {
         ));
         assert_eq!(normalize_line_endings("a\r\nb\rc\n"), "a\nb\nc\n");
     }
+
+    /// Normalizes real VTT files fetched with the executor's subtitle arguments.
+    /// `LV_VTT_FILES=a.vtt;b.vtt cargo test --lib live_vtt_files -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs VTT files fetched with the installed helper"]
+    fn live_vtt_files() {
+        let files = std::env::var("LV_VTT_FILES").expect("LV_VTT_FILES");
+        for path in files.split(';') {
+            let raw = std::fs::read(path).unwrap();
+            let normalized = normalize_vtt(&raw, metadata()).unwrap();
+            eprintln!("{path}: {} bytes -> {} cues", raw.len(), normalized.cues.len());
+            assert!(!normalized.cues.is_empty());
+        }
+    }
 }

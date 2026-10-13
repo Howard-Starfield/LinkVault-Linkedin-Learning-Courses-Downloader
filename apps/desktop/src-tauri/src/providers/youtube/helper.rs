@@ -2,7 +2,10 @@ use crate::app::managed_process::{HelperKind, ManagedProcessOutput, ManagedProce
 use std::ffi::OsString;
 use std::time::Duration;
 
-pub const MAX_DISCOVERY_STDOUT_BYTES: usize = 32 * 1024 * 1024;
+/// Scan and transcript-inspection output limit.  One production video prints 11.2 MB of caption
+/// fields alone (182 languages x 147 signed-URL entries), so 64 MiB leaves about 5x headroom.
+/// Reads stay bounded: the supervisor stops capturing at this limit.
+pub const MAX_DISCOVERY_STDOUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RECORD_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FFPROBE_STDOUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RETAINED_STDERR_BYTES: usize = 256 * 1024;
