@@ -45,6 +45,7 @@ import {
   type DetectedYouTubeLink
 } from "../../lib/youtube/detect";
 import {
+  isYouTubeRunSuspended,
   isYouTubeRunTerminal,
   type InspectYouTubeTranscriptsResponse,
   type ScanYouTubeSourceResponse,
@@ -60,6 +61,7 @@ import {
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
 import { YouTubeHistoryRow } from "./YouTubeHistoryRow";
+import { YouTubeResumePanel } from "./YouTubeResumePanel";
 import { YouTubePlayerPane } from "./YouTubePlayerPane";
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
 import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
@@ -712,7 +714,11 @@ export function YouTubeView({
     () => videosWithSection.filter((entry) => entry.section === queueSection),
     [videosWithSection, queueSection]
   );
-  const activeRun = runSnapshot !== null && !isYouTubeRunTerminal(runSnapshot.state);
+  // A run suspended after a failed resumed attempt is waiting for Continue in
+  // the interrupted-downloads panel; it is neither running nor finished.
+  const activeRun = runSnapshot !== null
+    && !isYouTubeRunTerminal(runSnapshot.state)
+    && !isYouTubeRunSuspended(runSnapshot);
   // A run that failed before any item could report an error (for example a bad
   // request) still has to say why; otherwise the rows just look stalled.
   const runFailureNotice = runSnapshot !== null
@@ -1396,6 +1402,7 @@ export function YouTubeView({
   return (
     <div className="youtube-view" data-has-results={videos.length > 0 || isScanning || undefined}>
       <div className="youtube-live-announcer" role="status" aria-live="polite">{liveAnnouncement}</div>
+      <YouTubeResumePanel />
       {helperStatus !== "ready" && nativeRuntime ? (
         <div className="youtube-helper-error" role="alert">
           {helperStatus === "pending" ? (

@@ -342,3 +342,41 @@ export interface YouTubePlayerSession {
   videos: YouTubeRunVideo[];
   startOccurrenceId: string;
 }
+
+/**
+ * A live snapshot that ended because a resumed attempt failed: the run is
+ * paused for the user (see `YouTubeResumableRun`), not running and not
+ * finished. It carries the reason in `error`.
+ */
+export function isYouTubeRunSuspended(
+  snapshot: { state: YouTubeRunState; error: YouTubeError | null } | null | undefined
+): boolean {
+  return snapshot?.state === "paused" && snapshot.error !== null;
+}
+
+/** Who moves an interrupted run next. */
+export type YouTubeResumeState = "auto_pending" | "needs_user" | "resuming";
+
+/** A run that was interrupted, or is in a resumed attempt (Rust `YouTubeResumableRun`). */
+export interface YouTubeResumableRun {
+  runId: string;
+  state: YouTubeResumeState;
+  reason: string | null;
+  reasonCode: string | null;
+  title: string;
+  videoCount: number;
+  outputDir: string;
+  autoResumeUsed: boolean;
+  /** Bytes of partial download a resume keeps. */
+  preservedBytes: number;
+  updatedAt: number;
+}
+
+export interface ContinueYouTubeRunRequest {
+  runId: string;
+}
+
+export interface ContinueYouTubeRunResponse {
+  /** False when nothing was started because the run was already resuming or finished. */
+  started: boolean;
+}

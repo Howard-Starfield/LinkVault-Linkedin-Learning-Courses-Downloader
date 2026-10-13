@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   CancelYouTubeRunRequest,
+  ContinueYouTubeRunRequest,
+  ContinueYouTubeRunResponse,
   GetYouTubePlaybackProgressRequest,
   GetYouTubeDownloadStateRequest,
   GetYouTubeHelperStatusResponse,
@@ -24,6 +26,7 @@ import type {
   YouTubeItemState,
   YouTubePlaybackProgress,
   YouTubeProgressEvent,
+  YouTubeResumableRun,
   YouTubeProgressItem,
   YouTubeRunVideo,
   YouTubeRunSnapshot,
@@ -37,6 +40,8 @@ const PREVIEW_SCAN_KEY = "linkvault.youtube.preview.scan";
 const PREVIEW_SCANS_KEY = "linkvault.youtube.preview.scans";
 const PREVIEW_RUN_KEY = "linkvault.youtube.preview.run";
 const PREVIEW_EVENT_NAME = "linkvault://youtube-run-changed";
+/** Emitted by the backend whenever the interrupted-runs list may have changed. */
+export const YOUTUBE_RESUME_EVENT_NAME = "linkvault://youtube-resume-changed";
 export const YOUTUBE_UI_MOCK_RUN_PREFIX = "youtube-ui-mock-";
 export const YOUTUBE_PREVIEW_RUN_PREFIX = "preview-run-";
 let previewRunIdPrefix = YOUTUBE_PREVIEW_RUN_PREFIX;
@@ -226,6 +231,29 @@ export async function resumeYouTubeDownload(
     return invoke<YouTubeRunSnapshot>("resume_youtube_download", { request });
   }
   return resumePreviewDownload(request);
+}
+
+/** Runs paused for a resume decision, or in a resumed attempt. Empty outside the desktop app. */
+export async function listYouTubeResumableRuns(): Promise<YouTubeResumableRun[]> {
+  if (isTauriRuntime()) {
+    return invoke<YouTubeResumableRun[]>("list_youtube_resumable_runs");
+  }
+  return [];
+}
+
+/** The Continue button: starts exactly one resumed attempt (idempotent). */
+export async function continueYouTubeRun(
+  request: ContinueYouTubeRunRequest
+): Promise<ContinueYouTubeRunResponse> {
+  if (isTauriRuntime()) {
+    return invoke<ContinueYouTubeRunResponse>("continue_youtube_run", { request });
+  }
+  return { started: false };
+}
+
+export async function subscribeYouTubeResumeChanged(handler: () => void): Promise<() => void> {
+  if (!isTauriRuntime()) return () => undefined;
+  return listen<unknown>(YOUTUBE_RESUME_EVENT_NAME, () => handler());
 }
 
 export async function openYouTubeDownloadFolder(

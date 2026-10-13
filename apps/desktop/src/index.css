@@ -7717,3 +7717,87 @@ textarea {
  overflow-wrap: break-word;
  }
 }
+
+/* Interrupted downloads: the single automatic resume, and runs paused for Continue. */
+.youtube-resume-panel {
+ min-width: 0;
+ margin: 0 0 12px;
+ border: 1px solid var(--border-soft);
+ border-radius: 10px;
+ background: var(--surface-faint);
+ padding: 4px;
+}
+
+.youtube-resume-list {
+ display: grid;
+ gap: 2px;
+ margin: 0;
+ padding: 0;
+ list-style: none;
+}
+
+.youtube-resume-row {
+ display: grid;
+ grid-template-columns: minmax(0, 1fr) auto;
+ align-items: center;
+ gap: 10px;
+ border-radius: 8px;
+ padding: 8px 10px;
+}
+
+.youtube-resume-row[data-state="needs_user"] {
+ background: color-mix(in srgb, var(--warning) 8%, transparent);
+}
+
+.youtube-resume-copy {
+ display: grid;
+ min-width: 0;
+ gap: 3px;
+}
+
+.youtube-resume-title {
+ overflow: hidden;
+ color: var(--foreground);
+ font-size: 13px;
+ font-weight: 600;
+ line-height: 18px;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+
+.youtube-resume-status {
+ color: var(--muted);
+ font-size: 12px;
+ line-height: 16px;
+ overflow-wrap: anywhere;
+}
+
+.youtube-resume-row[data-state="needs_user"] .youtube-resume-status {
+ color: var(--warning);
+}
+
+.youtube-resume-progress {
+ margin-top: 2px;
+}
+
+.youtube-resume-actions {
+ display: flex;
+ align-items: center;
+ gap: 2px;
+}
+
+@container lv-main (max-width: 520px) {
+ .youtube-resume-row {
+ grid-template-columns: minmax(0, 1fr);
+ gap: 6px;
+ }
+
+ .youtube-resume-actions {
+ justify-self: start;
+ }
+
+ .youtube-resume-title {
+ white-space: normal;
+ overflow-wrap: anywhere;
+ }
+}

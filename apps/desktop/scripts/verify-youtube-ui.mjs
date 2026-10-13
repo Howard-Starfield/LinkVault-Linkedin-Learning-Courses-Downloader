@@ -63,8 +63,18 @@ for (const command of [
   '"save_youtube_playback_progress"',
   '"get_youtube_helper_status"',
   '"get_youtube_preferences"',
-  '"save_youtube_preferences"'
+  '"save_youtube_preferences"',
+  '"list_youtube_resumable_runs"',
+  '"continue_youtube_run"'
 ]) includes(ipc, command, `YouTube IPC adapter omits ${command}`);
+// Interrupted downloads: Continue uses the same play icon as the LinkedIn queue, is
+// announced politely, and the view never treats a suspended run as running.
+const resumePanel = await read("src/components/youtube/YouTubeResumePanel.tsx");
+matches(resumePanel, /import \{ Play, Square \} from "lucide-react"/, "Continue does not use the LinkedIn queue play icon");
+matches(resumePanel, /aria-label=\{`Continue \$\{run\.title\}`\}/, "Continue button has no accessible name");
+includes(resumePanel, 'role="status" aria-live="polite"', "Interrupted-downloads panel has no live region");
+includes(view, "<YouTubeResumePanel />", "YouTube view does not mount the interrupted-downloads panel");
+includes(view, "!isYouTubeRunSuspended(runSnapshot)", "A suspended run is still treated as an active run");
 matches(ipc, /invoke<ScanYouTubeSourceResponse>\("scan_youtube_source"/, "Source scan IPC is not typed");
 matches(ipc, /invoke<StartYouTubeDownloadResponse>\("start_youtube_download"/, "Download start IPC is not typed");
 matches(ipc, /invoke<GetYouTubeHelperStatusResponse>\("get_youtube_helper_status"/, "Helper status IPC is not typed");
@@ -360,7 +370,7 @@ assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are sti
 
 assert.equal(
   packageJson.scripts["verify:youtube-ui"],
-  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status && npm run verify:youtube-start-flow && npm run verify:youtube-playback",
+  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status && npm run verify:youtube-start-flow && npm run verify:youtube-playback && npm run verify:youtube-resume",
   "Desktop YouTube UI verifier is not wired"
 );
 includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");

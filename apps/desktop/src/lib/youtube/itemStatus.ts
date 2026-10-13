@@ -1,4 +1,4 @@
-import type { YouTubeItemPhase, YouTubeItemState } from "./types";
+import type { YouTubeItemPhase, YouTubeItemState, YouTubeResumableRun } from "./types";
 
 /** Where a result row sits relative to a download run. */
 export type YouTubeRowRunContext = "idle" | "active" | "terminal";
@@ -118,4 +118,77 @@ export function youtubeItemStatusText(
       return null;
     default: return null;
   }
+}
+
+/** Live byte progress of a run in a resumed attempt, when the backend has reported any. */
+export type ResumeProgress = YouTubeByteProgress | null;
+
+/** The Continue button applies while the run waits for a decision, never while it runs. */
+export function canContinueResumable(run: YouTubeResumableRun): boolean {
+  return run.state === "needs_user" || run.state === "auto_pending";
+}
+
+/**
+ * One status line per run:
+ * - waiting for the automatic resume: "Interrupted — resuming automatically…"
+ * - waiting for the user: "Paused — <reason>"
+ * - resumed attempt: "Resuming from 120.0 MB" before yt-dlp reports, then "Resuming — 130.5 / 1.2 GB"
+ */
+export function resumableStatusText(run: YouTubeResumableRun, progress: ResumeProgress): string {
+  switch (run.state) {
+    case "auto_pending":
+      return "Interrupted — resuming automatically…";
+    case "needs_user": {
+      const reason = run.reason?.trim();
+      return reason ? `Paused — ${reason}` : "Paused — press Continue to pick up where it stopped.";
+    }
+    case "resuming": {
+      const bytes = formatYouTubeBytes(progress);
+      if (bytes) return `Resuming — ${bytes}`;
+      const kept = formatYouTubeBytes({ bytesCompleted: run.preservedBytes, bytesTotal: null });
+      return kept ? `Resuming from ${kept}` : "Resuming…";
+    }
+  }
+}
+
+/** Fraction `0..1` for the progress bar of a resumed attempt, or null when unknown. */
+export function resumeFraction(progress: ResumeProgress): number | null {
+  if (!progress || progress.bytesCompleted === null) return null;
+  if (progress.bytesTotal === null || progress.bytesTotal <= 0) return null;
+  return Math.max(0, Math.min(1, progress.bytesCompleted / progress.bytesTotal));
+}
+
+/**
+ * Text for the polite live region. It changes only when a run's state or
+ * reason changes, never on byte ticks, so screen readers are not flooded.
+ */
+export function resumeAnnouncement(runs: readonly YouTubeResumableRun[]): string {
+  if (runs.length === 0) return "";
+  return runs
+    .map((run) => `${run.title}: ${resumableStatusText(run, null)}`)
+    .join(" ");
+}
+
+/** Runs that need a decision first, then those resuming, newest change last within each. */
+export function orderResumable(runs: readonly YouTubeResumableRun[]): YouTubeResumableRun[] {
+  const rank = (run: YouTubeResumableRun): number =>
+    run.state === "needs_user" ? 0 : run.state === "auto_pending" ? 1 : 2;
+  return [...runs].sort((left, right) => rank(left) - rank(right) || left.updatedAt - right.updatedAt);
+}
+
+/** True when two lists describe the same thing to the user, so a refresh need not re-render. */
+export function sameResumableRuns(
+  left: readonly YouTubeResumableRun[],
+  right: readonly YouTubeResumableRun[]
+): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((run, index) => {
+    const other = right[index];
+    return other !== undefined
+      && run.runId === other.runId
+      && run.state === other.state
+      && run.reason === other.reason
+      && run.preservedBytes === other.preservedBytes
+      && run.updatedAt === other.updatedAt;
+  });
 }
