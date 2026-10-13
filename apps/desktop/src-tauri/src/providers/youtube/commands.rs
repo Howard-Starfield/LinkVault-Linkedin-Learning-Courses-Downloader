@@ -7,7 +7,7 @@ use crate::cache::{get_setting, open_runtime, upsert_setting_json};
 use crate::providers::youtube::error::{YouTubeError, YouTubeInternalError};
 use crate::providers::youtube::executor::{YouTubeExecutorContext, YouTubeExecutorItemContext};
 use crate::providers::youtube::helper::helper_kind;
-use crate::providers::youtube::live::{YouTubeLiveHandle, YoutubeDurableRequest};
+use crate::providers::youtube::live::{DiscoveryGuard, YouTubeLiveHandle, YoutubeDurableRequest};
 use crate::providers::youtube::manifest_contract::{
     artifact_fingerprint, select_transcript, validate_helper_lock_digest, ArtifactFingerprintInput,
     ManifestContractError, SelectedTranscript, FORMAT_POLICY_VERSION,
@@ -22,7 +22,9 @@ use crate::providers::youtube::models::{
     YouTubeHistoryEntry, YouTubeStartReceipt, YouTubeStartReceiptState, YouTubeTranscriptOccurrence,
 };
 use crate::shell::open_folder_in_explorer;
-use crate::providers::youtube::scan::{revalidate_selected_source, scan_source, YouTubeScanPlan};
+use crate::providers::youtube::scan::{
+    revalidate_selected_source, scan_source, selected_items_from_plan, YouTubeScanPlan,
+};
 use crate::providers::youtube::scan::PlannedYouTubeItem;
 use crate::providers::youtube::transcript_inspection::{
     inspect_transcripts, into_plan_inspection, stored_inspection, TranscriptInspectionResult,
@@ -419,6 +421,38 @@ pub async fn start_youtube_download(
     .await
 }
 
+/// Re-runs discovery for the selected source on a launch.
+type SourceRevalidator<'a> = &'a dyn Fn(
+    &YouTubeScanPlan,
+    &[String],
+    &DiscoveryOperation,
+) -> Result<Vec<PlannedYouTubeItem>, YouTubeInternalError>;
+
+/// Resolves the items a download starts from.  A plan scanned within
+/// `START_REVALIDATION_FRESH_FOR` is trusted: its own items are used and no
+/// discovery process or discovery slot is needed.  An older plan is re-scanned
+/// first (holding the discovery slot until the guard is dropped), so a video
+/// that changed or disappeared still fails the start with a visible error.
+fn selected_items_for_start<'a>(
+    live: &'a YouTubeLiveHandle,
+    plan: &YouTubeScanPlan,
+    selected_occurrence_ids: &[String],
+    now: Instant,
+    revalidate: SourceRevalidator<'_>,
+) -> Result<(Vec<PlannedYouTubeItem>, Option<DiscoveryGuard<'a>>), YouTubeError> {
+    if plan.is_fresh_for_start(now) {
+        let items =
+            selected_items_from_plan(plan, selected_occurrence_ids).map_err(YouTubeError::from)?;
+        return Ok((items, None));
+    }
+    let guard = live
+        .begin_discovery(opaque_id("revalidation"))
+        .map_err(YouTubeError::from)?;
+    let items = revalidate(plan, selected_occurrence_ids, &guard.operation)
+        .map_err(YouTubeError::from)?;
+    Ok((items, Some(guard)))
+}
+
 fn start_youtube_download_blocking(
     live: &YouTubeLiveHandle,
     state: &YouTubePlanStore,
@@ -470,15 +504,13 @@ fn start_youtube_download_blocking(
     {
         return Err(YouTubeError::from(YouTubeInternalError::ScanPlanStale));
     }
-    let revalidation = live
-        .begin_discovery(opaque_id("revalidation"))
-        .map_err(YouTubeError::from)?;
-    let current_selected_items = revalidate_selected_source(
+    let (current_selected_items, revalidation) = selected_items_for_start(
+        live,
         &plan,
         &request.selected_occurrence_ids,
-        &revalidation.operation,
-    )
-    .map_err(YouTubeError::from)?;
+        Instant::now(),
+        &revalidate_selected_source,
+    )?;
     let _output_root = validate_output_root(PathBuf::from(&request.output_dir).as_path())?;
     let helper = helper_identity(helper_kind()).map_err(|error| {
         helper_start_error(error, crate::app::media_toolchain::managed_install_present)
@@ -1479,6 +1511,169 @@ mod tests {
             assert_eq!(response.occurrences.len(), 2);
             assert_eq!(response.occurrences[0].tracks.len(), 1);
             assert!(response.occurrences[1].tracks.is_empty());
+        }
+    }
+
+    mod start_revalidation {
+        use super::*;
+        use crate::providers::youtube::scan::{
+            parse_scan_plan, validate_url, START_REVALIDATION_FRESH_FOR,
+        };
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        const PLAYLIST: &str = r#"{"id":"PL_12345","title":"List","entries":[{"id":"abc123_XY","title":"A","availability":"public"},{"id":"def456_ZZ","title":"B","availability":"public"}]}"#;
+
+        fn plan() -> YouTubeScanPlan {
+            parse_scan_plan(
+                validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap(),
+                PLAYLIST,
+            )
+            .unwrap()
+        }
+
+        fn selection(plan: &YouTubeScanPlan) -> Vec<String> {
+            // Reverse order: the start keeps the request's order.
+            plan.items
+                .iter()
+                .rev()
+                .map(|item| item.public.occurrence_id.clone())
+                .collect()
+        }
+
+        #[test]
+        fn a_plan_scanned_just_under_ten_minutes_ago_starts_without_discovery() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            // The slot being busy must not matter: no discovery is needed.
+            let _busy = live
+                .begin_discovery("busy-operation-11".to_string())
+                .unwrap();
+            let launches = Cell::new(0);
+            let now = plan.scanned_at + START_REVALIDATION_FRESH_FOR - Duration::from_secs(1);
+            let (items, guard) = selected_items_for_start(
+                &live,
+                &plan,
+                &selection(&plan),
+                now,
+                &|_, _, _| {
+                    launches.set(launches.get() + 1);
+                    Err(YouTubeInternalError::Helper("must not launch".to_string()))
+                },
+            )
+            .unwrap();
+            assert_eq!(launches.get(), 0);
+            assert!(guard.is_none());
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.public.video_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["def456_ZZ", "abc123_XY"]
+            );
+        }
+
+        #[test]
+        fn a_plan_scanned_ten_minutes_ago_or_more_still_revalidates() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            let launches = Cell::new(0);
+            let now = plan.scanned_at + START_REVALIDATION_FRESH_FOR;
+            let (items, guard) = selected_items_for_start(
+                &live,
+                &plan,
+                &selection(&plan),
+                now,
+                &|plan, selected, _| {
+                    launches.set(launches.get() + 1);
+                    Ok(selected
+                        .iter()
+                        .filter_map(|id| {
+                            plan.items
+                                .iter()
+                                .find(|item| &item.public.occurrence_id == id)
+                                .cloned()
+                        })
+                        .collect())
+                },
+            )
+            .unwrap();
+            assert_eq!(launches.get(), 1);
+            assert_eq!(items.len(), 2);
+            // The revalidation holds the discovery slot until the guard drops.
+            assert!(guard.is_some());
+            assert_eq!(
+                live.begin_discovery("other-operation-12".to_string())
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string(),
+                crate::app::managed_process::TransientRuntimeError::Busy.to_string()
+            );
+            drop(guard);
+            assert!(live
+                .begin_discovery("other-operation-13".to_string())
+                .is_ok());
+        }
+
+        #[test]
+        fn a_stale_plan_whose_video_changed_fails_the_start_visibly() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            let now = plan.scanned_at + START_REVALIDATION_FRESH_FOR + Duration::from_secs(1);
+            let error = selected_items_for_start(
+                &live,
+                &plan,
+                &selection(&plan),
+                now,
+                &|_, _, _| Err(YouTubeInternalError::ScanPlanStale),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(error.code, "SCAN_PLAN_STALE");
+            // The failed start releases the slot.
+            assert!(live
+                .begin_discovery("other-operation-14".to_string())
+                .is_ok());
+        }
+
+        #[test]
+        fn a_stale_plan_still_needs_the_discovery_slot() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            let _busy = live
+                .begin_discovery("busy-operation-15".to_string())
+                .unwrap();
+            let now = plan.scanned_at + START_REVALIDATION_FRESH_FOR;
+            let error = selected_items_for_start(
+                &live,
+                &plan,
+                &selection(&plan),
+                now,
+                &|_, _, _| Ok(Vec::new()),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(error.code, "RUNTIME_BUSY");
+        }
+
+        #[test]
+        fn the_fresh_path_keeps_the_selection_rules() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            let now = plan.scanned_at;
+            let launcher = |_: &YouTubeScanPlan, _: &[String], _: &DiscoveryOperation| {
+                Err(YouTubeInternalError::Helper("must not launch".to_string()))
+            };
+            let first = plan.items[0].public.occurrence_id.clone();
+            let code = |ids: Vec<String>| {
+                selected_items_for_start(&live, &plan, &ids, now, &launcher)
+                    .map(|_| ())
+                    .unwrap_err()
+                    .code
+            };
+            assert_eq!(code(Vec::new()), "EMPTY_SELECTION");
+            assert_eq!(code(vec![first.clone(), first]), "DUPLICATE_OCCURRENCE");
+            assert_eq!(code(vec!["nope".to_string()]), "UNKNOWN_OCCURRENCE");
         }
     }
 }

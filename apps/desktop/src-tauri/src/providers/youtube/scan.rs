@@ -17,6 +17,9 @@ use url::Url;
 pub const MAX_SOURCE_URL_BYTES: usize = 4096;
 pub const MAX_SCAN_ENTRIES: usize = 500;
 pub const PLAN_TTL: Duration = Duration::from_secs(30 * 60);
+/// A plan scanned less than this long ago is trusted as-is when a download
+/// starts; older plans are re-scanned first.  Shorter than [`PLAN_TTL`].
+pub const START_REVALIDATION_FRESH_FOR: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug)]
 pub struct PlannedYouTubeItem {
@@ -30,7 +33,17 @@ pub struct YouTubeScanPlan {
     pub response: ScanYouTubeSourceResponse,
     pub items: Vec<PlannedYouTubeItem>,
     pub source_snapshot_digest: String,
+    /// When discovery produced this plan.
+    pub scanned_at: Instant,
     pub expires_at: Instant,
+}
+
+impl YouTubeScanPlan {
+    /// Whether the scan is recent enough to start a download without
+    /// re-running discovery.  `now` is injected so the window is testable.
+    pub fn is_fresh_for_start(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.scanned_at) < START_REVALIDATION_FRESH_FOR
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +79,34 @@ pub fn revalidate_selected_source(
     let stdout = discovery_stdout(&source, operation)?;
     let current = parse_scan_plan(source, &stdout)?;
     revalidate_selected_items(plan, &current, selected_occurrence_ids)
+}
+
+/// Selects occurrences from the plan itself, applying the same selection rules
+/// as [`revalidate_selected_source`] but trusting the scan's own metadata.
+pub fn selected_items_from_plan(
+    plan: &YouTubeScanPlan,
+    selected_occurrence_ids: &[String],
+) -> Result<Vec<PlannedYouTubeItem>, YouTubeInternalError> {
+    if selected_occurrence_ids.is_empty() {
+        return Err(YouTubeInternalError::EmptySelection);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(selected_occurrence_ids.len());
+    let mut selected = Vec::with_capacity(selected_occurrence_ids.len());
+    for occurrence_id in selected_occurrence_ids {
+        if !seen.insert(occurrence_id) {
+            return Err(YouTubeInternalError::DuplicateOccurrence);
+        }
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.public.occurrence_id == occurrence_id.as_str())
+            .ok_or(YouTubeInternalError::UnknownOccurrence)?;
+        if matches!(&item.public.availability, YouTubeAvailability::Unavailable) {
+            return Err(YouTubeInternalError::ScanPlanStale);
+        }
+        selected.push(item.clone());
+    }
+    Ok(selected)
 }
 
 fn discovery_stdout(
@@ -356,11 +397,13 @@ pub(crate) fn parse_scan_plan(
         items: items.iter().map(|item| item.public.clone()).collect(),
     };
     let _ = root;
+    let scanned_at = Instant::now();
     Ok(YouTubeScanPlan {
         response,
         items,
         source_snapshot_digest,
-        expires_at: Instant::now() + PLAN_TTL,
+        scanned_at,
+        expires_at: scanned_at + PLAN_TTL,
     })
 }
 
