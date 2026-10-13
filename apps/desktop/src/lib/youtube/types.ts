@@ -119,7 +119,10 @@ export interface ScanYouTubeSourceResponse {
   sourceId: string;
   canonicalUrl: string;
   playlistId: string | null;
+  /** More entries exist than the scan keeps (500). */
   truncated: boolean;
+  /** The playlist's total size when YouTube reports it. */
+  totalCount: number | null;
   items: YouTubeScanItem[];
 }
 

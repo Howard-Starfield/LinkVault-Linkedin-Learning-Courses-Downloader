@@ -394,9 +394,12 @@ pub(crate) fn parse_scan_plan(
         canonical_url: source.canonical_url,
         playlist_id: source.playlist_id,
         truncated,
+        total_count: match source.kind {
+            YouTubePlaylistMode::Playlist => root.get("playlist_count").and_then(|count| count.as_u64()),
+            YouTubePlaylistMode::Video => None,
+        },
         items: items.iter().map(|item| item.public.clone()).collect(),
     };
-    let _ = root;
     let scanned_at = Instant::now();
     Ok(YouTubeScanPlan {
         response,
@@ -844,5 +847,40 @@ mod tests {
         let plan = parse_scan_plan(source, &payload).unwrap();
         assert_eq!(plan.items.len(), 1);
         assert!(plan.items[0].transcript_inspection.is_none());
+    }
+
+    fn playlist_payload(entries: usize, playlist_count: Option<u64>) -> String {
+        let entries = (1..=entries)
+            .map(|index| format!(r#"{{"id":"v{index:05}","title":"Video {index}","availability":"public"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let count = playlist_count.map_or(String::new(), |count| format!(r#""playlist_count":{count},"#));
+        format!(r#"{{"id":"PL_12345","title":"Big list",{count}"entries":[{entries}]}}"#)
+    }
+
+    #[test]
+    fn a_playlist_past_the_scan_limit_is_marked_truncated_with_its_total() {
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        // The scan asks yt-dlp for one entry past the limit, so 501 comes back.
+        let plan = parse_scan_plan(source, &playlist_payload(MAX_SCAN_ENTRIES + 1, Some(1234))).unwrap();
+        assert_eq!(plan.response.items.len(), MAX_SCAN_ENTRIES);
+        assert!(plan.response.truncated);
+        assert_eq!(plan.response.total_count, Some(1234));
+        let json = serde_json::to_value(&plan.response).unwrap();
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["totalCount"], 1234);
+    }
+
+    #[test]
+    fn a_playlist_at_the_scan_limit_is_not_truncated_and_a_missing_total_is_null() {
+        let source = validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap();
+        let plan = parse_scan_plan(source, &playlist_payload(MAX_SCAN_ENTRIES, None)).unwrap();
+        assert_eq!(plan.response.items.len(), MAX_SCAN_ENTRIES);
+        assert!(!plan.response.truncated);
+        assert_eq!(plan.response.total_count, None);
+        assert!(serde_json::to_value(&plan.response).unwrap()["totalCount"].is_null());
+        let video = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let video_plan = parse_scan_plan(video, VIDEO_WITH_CAPTIONS).unwrap();
+        assert_eq!(video_plan.response.total_count, None);
     }
 }

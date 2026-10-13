@@ -64,9 +64,12 @@ import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutput
 import {
   BusyRetryCancelled,
   WAITING_FOR_LOOKUP_MESSAGE,
+  batchingNotice,
   describeBusyFailure,
   isRowDownloadDisabled,
+  playlistTruncationNote,
   retryWhileBusy,
+  splitIntoRuns,
   supersededClickMessage,
   type InspectionOutcome
 } from "../../lib/youtube/startFlow";
@@ -648,6 +651,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     }),
     [videos, runItems]
   );
+  const scanNotes = useMemo(
+    () => scanPlans.flatMap((plan) => playlistTruncationNote(plan) ?? []),
+    [scanPlans]
+  );
   const queueCounts = useMemo(() => {
     const counts = { queue: 0, active: 0, completed: 0, failed: 0 };
     for (const entry of videosWithSection) {
@@ -1169,11 +1176,19 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     // A repeat click while a start is in flight is ignored: its button already shows the loading
     // state, and a second call would supersede the first one's inspection and drop that click.
     if (startingGroupRef.current) return;
-    const groups = groupsForVideos(targets);
-    if (groups.length === 0) {
+    const planGroups = groupsForVideos(targets);
+    if (planGroups.length === 0) {
       toast.error("Choose at least one public occurrence");
       return;
     }
+    // One run takes at most 100 videos: a larger selection queues as batches, one after another.
+    const groups = splitIntoRuns(planGroups);
+    const batching = batchingNotice(
+      planGroups.reduce((total, group) => total + group.occurrenceIds.length, 0),
+      planGroups.length,
+      groups.length
+    );
+    if (batching) toast.message(batching.title, { description: batching.description });
     const firstGroup = groups[0];
     if (!firstGroup) return;
     downloadQueueRef.current = groups.slice(1);
@@ -1449,6 +1464,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           {runFailureNotice ? (
             <p className="youtube-run-error" role="alert">{runFailureNotice}</p>
           ) : null}
+          {scanNotes.map((note) => (
+            <p key={note} className="youtube-scan-note" role="status">{note}</p>
+          ))}
           <div className="queue-section-tabs youtube-queue-section-tabs" role="group" aria-label="YouTube download queue sections">
             <YouTubeQueueSectionTab
               section="queue"

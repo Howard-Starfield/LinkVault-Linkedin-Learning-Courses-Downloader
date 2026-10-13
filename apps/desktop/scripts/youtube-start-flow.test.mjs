@@ -3,6 +3,10 @@ import test from "node:test";
 import {
   BUSY_RETRY_DELAYS_MS,
   BusyRetryCancelled,
+  MAX_SELECTED_PER_RUN,
+  batchingNotice,
+  playlistTruncationNote,
+  splitIntoRuns,
   describeBusyFailure,
   isRowDownloadDisabled,
   isRuntimeBusyError,
@@ -171,4 +175,60 @@ test("a row's Download is disabled while any start is in flight, and otherwise o
   assert.equal(isRowDownloadDisabled({ ...base, available: false }), true);
   assert.equal(isRowDownloadDisabled({ ...base, activeRun: true }), true);
   assert.equal(isRowDownloadDisabled({ ...base, helperReady: false }), true);
+});
+
+const ids = (count, prefix = "occ") => Array.from({ length: count }, (_, index) => `${prefix}-${index}`);
+
+test("a complete scan has no truncation note", () => {
+  assert.equal(playlistTruncationNote({ truncated: false, totalCount: 40, items: ids(40) }), null);
+  assert.equal(playlistTruncationNote({ truncated: false, totalCount: null, items: ids(500) }), null);
+});
+
+test("a truncated playlist says how many are shown, with the total when it is known", () => {
+  assert.equal(
+    playlistTruncationNote({ truncated: true, totalCount: 1234, items: ids(500) }),
+    "Showing the first 500 of 1,234 videos in this playlist."
+  );
+  assert.equal(
+    playlistTruncationNote({ truncated: true, totalCount: null, items: ids(500) }),
+    "Showing the first 500 videos of this playlist."
+  );
+});
+
+test("a reported total that is not larger than what is shown is not claimed", () => {
+  assert.equal(
+    playlistTruncationNote({ truncated: true, totalCount: 500, items: ids(500) }),
+    "Showing the first 500 videos of this playlist."
+  );
+});
+
+test("selections within the per-run cap are left alone", () => {
+  assert.equal(MAX_SELECTED_PER_RUN, 100);
+  const groups = [{ scanPlanId: "a", occurrenceIds: ids(100) }, { scanPlanId: "b", occurrenceIds: ids(3, "b") }];
+  assert.deepEqual(splitIntoRuns(groups), groups);
+  assert.deepEqual(splitIntoRuns([]), []);
+});
+
+test("a larger selection queues as batches of at most the cap, in order, without losing or repeating a video", () => {
+  const all = ids(250);
+  const runs = splitIntoRuns([{ scanPlanId: "plan", occurrenceIds: all }]);
+  assert.deepEqual(runs.map((run) => run.occurrenceIds.length), [100, 100, 50]);
+  assert.ok(runs.every((run) => run.scanPlanId === "plan"));
+  assert.deepEqual(runs.flatMap((run) => run.occurrenceIds), all);
+  assert.equal(all.length, 250, "the input is not mutated");
+});
+
+test("batches are made per plan so a run never mixes scan plans", () => {
+  const runs = splitIntoRuns([
+    { scanPlanId: "a", occurrenceIds: ids(101, "a") },
+    { scanPlanId: "b", occurrenceIds: ids(2, "b") }
+  ]);
+  assert.deepEqual(runs.map((run) => [run.scanPlanId, run.occurrenceIds.length]), [["a", 100], ["a", 1], ["b", 2]]);
+});
+
+test("the user is told only when a selection was split into batches", () => {
+  assert.equal(batchingNotice(100, 1, 1), null);
+  const notice = batchingNotice(250, 1, 3);
+  assert.equal(notice?.title, "Downloading in batches");
+  assert.match(notice?.description ?? "", /250 videos run as 3 batches of up to 100/);
 });

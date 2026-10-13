@@ -1717,6 +1717,14 @@ textarea {
  opacity: 0.58;
 }
 
+.youtube-scan-note {
+ margin: 8px 0 0;
+ color: var(--text-soft);
+ font-size: 12px;
+ line-height: 16px;
+ overflow-wrap: anywhere;
+}
+
 .youtube-scanning {
  margin: 8px 0 0;
  color: var(--text-soft);

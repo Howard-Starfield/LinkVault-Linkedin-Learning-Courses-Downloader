@@ -371,6 +371,7 @@ function scanPreviewSource(request: ScanYouTubeSourceRequest): ScanYouTubeSource
       : `https://www.youtube.com/watch?v=${encodeURIComponent(sourceId)}`,
     playlistId: playlist ? parsed.playlistId : null,
     truncated: false,
+    totalCount: null,
     items
   };
   writePreviewScan(response);
@@ -450,6 +451,7 @@ function buildUiMockScan(): ScanYouTubeSourceResponse {
     canonicalUrl: `https://www.youtube.com/playlist?list=${sourceId}`,
     playlistId: sourceId,
     truncated: false,
+    totalCount: null,
     items
   };
 }

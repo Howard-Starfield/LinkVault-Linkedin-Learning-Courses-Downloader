@@ -7,6 +7,58 @@ export const RUNTIME_BUSY_CODE = "RUNTIME_BUSY";
  */
 export const BUSY_RETRY_DELAYS_MS: readonly number[] = [200, 400, 800, 1200, 1600, 2000, 2000, 2000];
 
+/** Most occurrences one run accepts; the backend refuses more (MAX_SELECTED_ITEMS). */
+export const MAX_SELECTED_PER_RUN = 100;
+
+const COUNT_FORMAT = new Intl.NumberFormat("en-US");
+
+/**
+ * The note for a scan that kept only the first entries of a larger playlist, or null when the
+ * scan is complete.  Uses the playlist's total when YouTube reported one.
+ */
+export function playlistTruncationNote(plan: {
+  truncated: boolean;
+  totalCount: number | null;
+  items: readonly unknown[];
+}): string | null {
+  if (!plan.truncated) return null;
+  const shown = COUNT_FORMAT.format(plan.items.length);
+  if (plan.totalCount !== null && plan.totalCount > plan.items.length) {
+    return `Showing the first ${shown} of ${COUNT_FORMAT.format(plan.totalCount)} videos in this playlist.`;
+  }
+  return `Showing the first ${shown} videos of this playlist.`;
+}
+
+/**
+ * Splits download groups so no run exceeds the per-run selection cap; the groups then run one
+ * after another through the existing queue.  Groups within the cap come back unchanged.
+ */
+export function splitIntoRuns<Group extends { occurrenceIds: readonly string[] }>(
+  groups: readonly Group[],
+  limit: number = MAX_SELECTED_PER_RUN
+): Group[] {
+  const runs: Group[] = [];
+  for (const group of groups) {
+    for (let start = 0; start < group.occurrenceIds.length; start += limit) {
+      runs.push({ ...group, occurrenceIds: group.occurrenceIds.slice(start, start + limit) });
+    }
+  }
+  return runs;
+}
+
+/** Tells the user that a large selection runs as several batches, or null when it is a single run per group. */
+export function batchingNotice(
+  videoCount: number,
+  groupCount: number,
+  runCount: number
+): { title: string; description: string } | null {
+  if (runCount <= groupCount) return null;
+  return {
+    title: "Downloading in batches",
+    description: `${COUNT_FORMAT.format(videoCount)} videos run as ${runCount} batches of up to ${MAX_SELECTED_PER_RUN}, one after another.`
+  };
+}
+
 /** Shown while a Download waits for the lookup that currently owns the slot. */
 export const WAITING_FOR_LOOKUP_MESSAGE = "Waiting for the current lookup…";
 

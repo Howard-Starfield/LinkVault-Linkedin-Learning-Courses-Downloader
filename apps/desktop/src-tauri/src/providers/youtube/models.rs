@@ -79,7 +79,10 @@ pub struct ScanYouTubeSourceResponse {
     pub source_id: String,
     pub canonical_url: String,
     pub playlist_id: Option<String>,
+    /// More entries exist than the scan keeps (`MAX_SCAN_ENTRIES`).
     pub truncated: bool,
+    /// The playlist's total size when yt-dlp reports it (`playlist_count`).
+    pub total_count: Option<u64>,
     pub items: Vec<YouTubeScanItem>,
 }
 

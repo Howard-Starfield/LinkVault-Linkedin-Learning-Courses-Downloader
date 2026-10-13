@@ -286,6 +286,14 @@ matches(view, /const clickStillWanted = \(\) => helperViewMountedRef\.current &&
 matches(view, /isCurrent: clickStillWanted/, "The start retry does not stop when the view unmounts or the click is superseded");
 matches(view, /const isCurrent = \(\) => helperViewMountedRef\.current\s*&& requestGeneration === transcriptInspectionGenerationRef\.current/, "The inspection retry does not stop when the view unmounts");
 matches(view, /error instanceof BusyRetryCancelled/, "A cancelled start wait is not handled");
+// Large playlists: the scan's truncation is shown, and a selection over the per-run cap queues as batches.
+matches(view, /playlistTruncationNote\(plan\)/, "A truncated playlist scan is not noted in the view");
+matches(view, /className="youtube-scan-note" role="status"/, "The truncation note is not rendered as a status");
+matches(view, /splitIntoRuns\(planGroups\)/, "Download all does not split a selection over the per-run cap");
+matches(view, /batchingNotice\(/, "A split selection is not announced");
+matches(types, /totalCount: number \| null;/, "The scan response type omits the playlist total");
+matches(startFlow, /MAX_SELECTED_PER_RUN = 100/, "The per-run cap does not match the backend limit");
+includes(styles, ".youtube-scan-note", "The truncation note has no style");
 matches(view, /WAITING_FOR_LOOKUP_MESSAGE/, "The wait for the current lookup is not shown");
 matches(view, /inspection\.kind === "superseded"[^]*?toast\.message\(/, "A superseded Download click gives no feedback");
 matches(view, /if \(!resolvedOutputDir\) \{\s*toast\.message\(/, "A Download click without a folder gives no feedback");
