@@ -8,6 +8,7 @@ use std::{fs, path::Path};
 use rusqlite::{params, OptionalExtension};
 use tauri::http::{Request, Response, StatusCode};
 
+use crate::app::safe_output_filesystem::open_verified_file;
 use crate::app::media_range::{
     is_symlink_or_reparse, mime_for_path, serve_file, text_response, ResolvedFile, ServeOptions,
 };
@@ -73,8 +74,12 @@ fn resolve_media(db_path: &Path, request: &Request<Vec<u8>>) -> Result<ResolvedM
     if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_file() || metadata.len() == 0 {
         return Err(MediaError::NotFound);
     }
+    // Open once without following links and serve from that handle, so a
+    // swap after the checks above cannot redirect the read.
+    let file = open_verified_file(&canonical_path, metadata.len(), &canonical_root)
+        .map_err(|_| MediaError::NotFound)?;
     Ok(ResolvedMedia {
-        path: canonical_path,
+        file,
         len: metadata.len(),
         mime_type: mime_for_path(&artifact_path),
     })
@@ -259,7 +264,7 @@ mod tests {
         let (_directory, _db_path, video_path) = harness();
         fs::write(&video_path, vec![7_u8; 32]).unwrap();
         let media = ResolvedMedia {
-            path: video_path,
+            file: fs::File::open(&video_path).unwrap(),
             len: 32,
             mime_type: "video/mp4",
         };

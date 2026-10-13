@@ -419,6 +419,7 @@ fn subtitles_prefer_the_transcript_and_fall_back_to_raw_vtt() {
     let files = locate(&fixture).unwrap();
     let generated = String::from_utf8(subtitles_body(&files).unwrap()).unwrap();
     assert!(generated.contains("hello"));
+    drop(files);
 
     // Corrupt the JSON (same length keeps the manifest size valid).
     let json_path = fixture.item_dir.join("video.en.transcript.json");
@@ -693,6 +694,48 @@ fn saving_progress_requires_an_existing_run_and_occurrence() {
         .unwrap();
     assert_eq!(rows, 0, "rejected saves write nothing");
     writer.shutdown().unwrap();
+}
+
+#[test]
+fn a_junction_on_an_ancestor_of_the_output_root_is_rejected() {
+    let fixture = published_fixture();
+    // The stored root is link\out, where link is a junction to the real parent.
+    let link = fixture.dir.path().join("link");
+    if !crate::app::test_support::link_dir(&link, fixture.dir.path()) {
+        eprintln!("skipping: this environment cannot create directory links");
+        return;
+    }
+    let through_ancestor = link.join("out");
+    assert!(through_ancestor
+        .join(fixture.item_dir.file_name().unwrap())
+        .is_dir());
+    assert_eq!(
+        locate_item_files(through_ancestor.to_str().unwrap(), &fixture.item).unwrap_err(),
+        Unavailable::RootMissing
+    );
+}
+
+#[test]
+fn a_recurring_caption_later_in_the_video_is_kept() {
+    let body = vtt_text(&transcript(&[
+        (0, 1_000, "Hello"),
+        (5_000, 6_000, "Something else"),
+        (10_000, 11_000, "Hello"),
+    ]));
+    assert_eq!(body.matches("Hello").count(), 2);
+}
+
+#[test]
+fn contiguous_identical_cues_still_merge_for_automatic_captions_only() {
+    let cues = [(0, 1_000, "Hello"), (1_050, 2_000, "Hello")];
+    let automatic = vtt_text(&transcript(&cues));
+    assert_eq!(automatic.matches("Hello").count(), 1);
+    assert!(automatic.contains("00:00:00.000 --> 00:00:02.000"));
+
+    let mut uploader = transcript(&cues);
+    uploader.source = YouTubeTranscriptSource::Uploader;
+    let kept = vtt_text(&uploader);
+    assert_eq!(kept.matches("Hello").count(), 2);
 }
 
 mod protocol {

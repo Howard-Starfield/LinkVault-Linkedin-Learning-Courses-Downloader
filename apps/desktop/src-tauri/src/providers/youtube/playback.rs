@@ -8,9 +8,9 @@
 //! never paths, and nothing is discovered by scanning folders.
 
 use std::{
-    fs::{self, File},
-    io::Read,
-    path::{Path, PathBuf},
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -19,8 +19,10 @@ use tauri::State;
 use crate::app::database_diagnostics::DatabaseProvider;
 use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriteError, DatabaseWriter};
 use crate::app::managed_process::TransientWorkItem;
-use crate::app::media_range::is_symlink_or_reparse;
-use crate::app::safe_output_filesystem::validate_output_component;
+use crate::app::safe_output_filesystem::{
+    validate_output_component, validate_output_root_for_read, verify_open_file,
+    ExistingOutputDirectoryLease, SafeOutputError,
+};
 use crate::providers::youtube::commands::YouTubeState;
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::executor::{published_item_name, MAX_MANIFEST_BYTES};
@@ -32,6 +34,7 @@ use crate::providers::youtube::manifest_contract::{
 use crate::providers::youtube::models::{
     GetYouTubePlaybackProgressRequest, ListYouTubeRunVideosRequest,
     SaveYouTubePlaybackProgressRequest, YouTubePlaybackProgress, YouTubeRunVideo,
+    YouTubeTranscriptSource,
 };
 use crate::providers::youtube::transcript_normalizer::{
     NormalizedTranscript, MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES,
@@ -138,10 +141,11 @@ impl Unavailable {
 }
 
 /// A file proven to be a regular, non-link, non-empty child of the item folder
-/// whose size matches its manifest entry.
-#[derive(Debug, Clone)]
+/// whose size matches its manifest entry. It carries the open, verified
+/// handle: bytes are only ever read from `file`, never from a path again.
+#[derive(Debug)]
 pub(super) struct VerifiedFile {
-    pub path: PathBuf,
+    pub file: File,
     pub len: u64,
     pub name: String,
 }
@@ -208,47 +212,28 @@ impl RunPlayback {
 
 /// Resolve one item's playable files from the run's output root.
 ///
-/// Containment rules: the item folder must be a direct child of the canonical
-/// output root; every artifact a direct child of the canonical item folder; no
-/// symlink or reparse point at any of those levels; each file non-empty with
-/// exactly the size the manifest recorded. The content hash is deliberately not
-/// recomputed here (it runs once per Range request); the executor verified it
-/// when the folder was published.
+/// The output root goes through the same admission checks as a download (no
+/// reparse point on any ancestor, identity leases); the item folder is leased
+/// without following links; every artifact is opened once, no-follow, through
+/// that lease and verified on the handle (regular file, exact manifest size,
+/// real location inside the canonical root). The content hash is deliberately
+/// not recomputed here (it would run once per Range request); the executor
+/// verified it when the folder was published.
 pub(super) fn locate_item_files(
     output_root: &str,
     item: &TransientWorkItem,
 ) -> Result<ItemFiles, Unavailable> {
-    let root = Path::new(output_root);
-    if !root.is_absolute() {
-        return Err(Unavailable::RootMissing);
-    }
-    let root_metadata = fs::symlink_metadata(root).map_err(|_| Unavailable::RootMissing)?;
-    if is_symlink_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir() {
-        return Err(Unavailable::RootMissing);
-    }
-    let canonical_root = root.canonicalize().map_err(|_| Unavailable::RootMissing)?;
-
-    let item_name = published_item_name(root, item.ordinal, &item.title, &item.video_id)
+    let root = validate_output_root_for_read(Path::new(output_root))
+        .map_err(|_| Unavailable::RootMissing)?;
+    let item_name = published_item_name(root.path(), item.ordinal, &item.title, &item.video_id)
         .map_err(|_| Unavailable::FolderMissing)?;
-    let item_dir = root.join(&item_name);
-    let dir_metadata = match fs::symlink_metadata(&item_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Unavailable::FolderMissing)
-        }
+    let lease = match root.existing_item_lease(&item_name) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return Err(Unavailable::FolderMissing),
         Err(_) => return Err(Unavailable::Unsafe),
     };
-    if is_symlink_or_reparse(&dir_metadata) || !dir_metadata.file_type().is_dir() {
-        return Err(Unavailable::Unsafe);
-    }
-    let canonical_dir = item_dir
-        .canonicalize()
-        .map_err(|_| Unavailable::FolderMissing)?;
-    if canonical_dir.parent() != Some(canonical_root.as_path()) {
-        return Err(Unavailable::Unsafe);
-    }
 
-    let manifest = read_manifest(&canonical_dir, item)?;
+    let manifest = read_manifest(&lease, item)?;
 
     let mut files = ItemFiles::default();
     for artifact in &manifest.artifacts {
@@ -261,7 +246,7 @@ pub(super) fn locate_item_files(
         if slot.is_some() {
             continue;
         }
-        match verify_artifact(&canonical_dir, artifact) {
+        match verify_artifact(&lease, root.canonical_path(), artifact) {
             Ok(file) => *slot = Some(file),
             // Captions are optional: a bad caption file only drops captions.
             Err(error) if matches!(artifact.kind, ManifestArtifactKind::Media) => {
@@ -276,27 +261,30 @@ pub(super) fn locate_item_files(
     Ok(files)
 }
 
+fn is_not_found(error: &SafeOutputError) -> bool {
+    matches!(error, SafeOutputError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn read_manifest(
-    canonical_dir: &Path,
+    lease: &ExistingOutputDirectoryLease,
     item: &TransientWorkItem,
 ) -> Result<YouTubeArtifactManifest, Unavailable> {
-    let path = canonical_dir.join("manifest.json");
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Unavailable::ManifestMissing)
-        }
-        Err(_) => return Err(Unavailable::ManifestInvalid),
+    let mut file = match lease.open_leaf("manifest.json") {
+        Ok(file) => file,
+        Err(error) if is_not_found(&error) => return Err(Unavailable::ManifestMissing),
+        Err(_) => return Err(Unavailable::Unsafe),
     };
-    if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_file() {
-        return Err(Unavailable::Unsafe);
-    }
-    if metadata.len() == 0 || metadata.len() > MAX_MANIFEST_BYTES {
+    let len = file
+        .metadata()
+        .map_err(|_| Unavailable::ManifestInvalid)?
+        .len();
+    if len == 0 || len > MAX_MANIFEST_BYTES {
         return Err(Unavailable::ManifestInvalid);
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(&path)
-        .and_then(|file| file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes))
+    let mut bytes = Vec::with_capacity(len as usize);
+    (&mut file)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| Unavailable::ManifestInvalid)?;
     if bytes.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(Unavailable::ManifestInvalid);
@@ -321,30 +309,24 @@ fn read_manifest(
 }
 
 fn verify_artifact(
-    canonical_dir: &Path,
+    lease: &ExistingOutputDirectoryLease,
+    canonical_root: &Path,
     artifact: &ManifestArtifact,
 ) -> Result<VerifiedFile, Unavailable> {
-    let path = canonical_dir.join(&artifact.relative_path);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Unavailable::FileMissing)
-        }
+    let file = match lease.open_leaf(&artifact.relative_path) {
+        Ok(file) => file,
+        Err(error) if is_not_found(&error) => return Err(Unavailable::FileMissing),
         Err(_) => return Err(Unavailable::Unsafe),
     };
-    if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_file() {
-        return Err(Unavailable::Unsafe);
-    }
-    if metadata.len() == 0 || metadata.len() != artifact.size_bytes {
+    let len = file.metadata().map_err(|_| Unavailable::Unsafe)?.len();
+    if len == 0 || len != artifact.size_bytes {
         return Err(Unavailable::FileChanged);
     }
-    let canonical = path.canonicalize().map_err(|_| Unavailable::FileMissing)?;
-    if canonical.parent() != Some(canonical_dir) {
-        return Err(Unavailable::Unsafe);
-    }
+    verify_open_file(&file, artifact.size_bytes, canonical_root)
+        .map_err(|_| Unavailable::Unsafe)?;
     Ok(VerifiedFile {
-        path: canonical,
-        len: metadata.len(),
+        file,
+        len,
         name: artifact.relative_path.clone(),
     })
 }
@@ -384,14 +366,14 @@ pub(super) fn subtitles_body(files: &ItemFiles) -> Option<Vec<u8>> {
     if vtt.len > MAX_SUBTITLE_BYTES as u64 {
         return None;
     }
-    let bytes = read_bounded(&vtt.path, vtt.len, MAX_SUBTITLE_BYTES as u64)?;
+    let bytes = read_bounded(&vtt.file, vtt.len, MAX_SUBTITLE_BYTES as u64)?;
     std::str::from_utf8(&bytes).ok()?;
     Some(bytes)
 }
 
 fn generated_subtitles(json: &VerifiedFile) -> Option<Vec<u8>> {
     let bytes = read_bounded(
-        &json.path,
+        &json.file,
         json.len,
         MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES as u64,
     )?;
@@ -403,16 +385,19 @@ fn generated_subtitles(json: &VerifiedFile) -> Option<Vec<u8>> {
     webvtt_from_transcript(&transcript, MAX_SUBTITLE_BYTES)
 }
 
-fn read_bounded(path: &Path, expected_len: u64, max: u64) -> Option<Vec<u8>> {
+fn read_bounded(mut file: &File, expected_len: u64, max: u64) -> Option<Vec<u8>> {
     if expected_len > max {
         return None;
     }
+    // The handle is shared by reference; always read from the start.
+    file.seek(SeekFrom::Start(0)).ok()?;
     let mut bytes = Vec::with_capacity(expected_len as usize);
-    File::open(path)
-        .and_then(|file| file.take(max + 1).read_to_end(&mut bytes))
-        .ok()?;
+    file.take(max + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= max).then_some(bytes)
 }
+
+/// Largest gap between two cues still treated as one rolling caption.
+const ROLLING_CONTIGUITY_MS: u64 = 100;
 
 struct DisplayCue {
     start_ms: u64,
@@ -432,8 +417,10 @@ pub(super) fn webvtt_from_transcript(
     transcript: &NormalizedTranscript,
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
+    let rolling = matches!(transcript.source, YouTubeTranscriptSource::Automatic);
     let mut cues: Vec<DisplayCue> = Vec::new();
     let mut previous_lines: Vec<String> = Vec::new();
+    let mut previous_end_ms: u64 = 0;
     for cue in &transcript.cues {
         let lines: Vec<String> = cue
             .text
@@ -450,12 +437,22 @@ pub(super) fn webvtt_from_transcript(
         if lines.is_empty() {
             continue;
         }
-        let overlap = (0..=previous_lines.len().min(lines.len()))
+        // Rolling auto-captions repeat the previous cue only when the two cues
+        // are back to back. Uploader captions, and a line that merely recurs
+        // later in the video, are never removed.
+        let contiguous = cue.start_ms <= previous_end_ms.saturating_add(ROLLING_CONTIGUITY_MS);
+        let max_overlap = if rolling && contiguous {
+            previous_lines.len().min(lines.len())
+        } else {
+            0
+        };
+        let overlap = (0..=max_overlap)
             .rev()
             .find(|count| previous_lines[previous_lines.len() - count..] == lines[..*count])
             .unwrap_or(0);
         let fresh: Vec<String> = lines[overlap..].to_vec();
         previous_lines = lines;
+        previous_end_ms = cue.end_ms;
         if fresh.is_empty() {
             if let Some(last) = cues.last_mut() {
                 if cue.start_ms <= last.end_ms.saturating_add(1_000) {

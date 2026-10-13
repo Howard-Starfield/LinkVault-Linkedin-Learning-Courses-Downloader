@@ -304,6 +304,11 @@ impl ValidatedOutputRoot {
         &self.path
     }
 
+    /// The canonical form of the admitted root, for containment checks.
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
     /// Maximum UTF-16 units available to one direct child while retaining the
     /// conservative cross-helper path ceiling used by publication.
     pub fn direct_child_name_budget(&self) -> usize {
@@ -2281,6 +2286,20 @@ pub fn direct_child_name_budget_for(root: &Path) -> usize {
 }
 
 pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutputError> {
+    validate_output_root_inner(path, true)
+}
+
+/// Same admission checks as [`validate_output_root`] (absolute path, no
+/// reparse point on any ancestor, directory identity leases) without the
+/// write probe, for read-only consumers such as in-app playback.
+pub fn validate_output_root_for_read(path: &Path) -> Result<ValidatedOutputRoot, SafeOutputError> {
+    validate_output_root_inner(path, false)
+}
+
+fn validate_output_root_inner(
+    path: &Path,
+    probe_writable: bool,
+) -> Result<ValidatedOutputRoot, SafeOutputError> {
     if !path.is_absolute() {
         return Err(SafeOutputError::NotAbsolute);
     }
@@ -2307,9 +2326,90 @@ pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutp
         canonical_path,
         leases: Arc::new(leases),
     };
-    probe_writable_dir(root.path())?;
+    if probe_writable {
+        probe_writable_dir(root.path())?;
+    }
     root.revalidate()?;
     Ok(root)
+}
+
+/// Open `path` once without following a link and prove the handle is the
+/// file that was validated: a regular, non-reparse file of exactly
+/// `expected_len` bytes, whose identity matches a second no-follow open of
+/// the path and whose real location is inside `canonical_root`. Callers read
+/// from the returned handle only, never from the path again.
+pub fn open_verified_file(
+    path: &Path,
+    expected_len: u64,
+    canonical_root: &Path,
+) -> Result<File, SafeOutputError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str()))
+    else {
+        return Err(SafeOutputError::InvalidChildName);
+    };
+    let file = open_regular_leaf(parent, name, false)?;
+    verify_open_file(&file, expected_len, canonical_root)?;
+    let observer = open_regular_leaf(parent, name, false)?;
+    if stable_identity(&file)? != stable_identity(&observer)? {
+        return Err(SafeOutputError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(file)
+}
+
+/// Checks an already-open handle: regular file, not a reparse point, exact
+/// size, non-empty, and located inside `canonical_root` (where the platform
+/// can report the handle's real path).
+pub fn verify_open_file(
+    file: &File,
+    expected_len: u64,
+    canonical_root: &Path,
+) -> Result<(), SafeOutputError> {
+    let metadata = file.metadata()?;
+    if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(SafeOutputError::UnsafeDescendant {
+            path: canonical_root.to_path_buf(),
+        });
+    }
+    if metadata.len() == 0 || metadata.len() != expected_len {
+        return Err(SafeOutputError::IdentityChanged {
+            path: canonical_root.to_path_buf(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let real = handle_final_path(file)?;
+        if !real.starts_with(canonical_root) {
+            return Err(SafeOutputError::EscapedRoot);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn handle_final_path(file: &File) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buffer = vec![0_u16; 1024];
+    loop {
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle().cast(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                0,
+            )
+        } as usize;
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written < buffer.len() {
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written])));
+        }
+        buffer.resize(written + 1, 0);
+    }
 }
 
 pub fn validate_output_component(name: &str) -> Result<(), SafeOutputError> {

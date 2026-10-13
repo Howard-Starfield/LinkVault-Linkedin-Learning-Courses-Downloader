@@ -6,9 +6,9 @@
 //! never looks at databases, manifests, or provider-specific path rules.
 
 use std::{
-    fs,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use tauri::http::{
@@ -23,10 +23,13 @@ use tauri::http::{
 /// for the rest, so open-ended ranges never load a whole video into memory.
 pub const MAX_MEDIA_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 
-/// A file the provider has already validated (inside its root, not a link,
-/// non-empty). `len` is the length the provider measured.
+/// A file the provider has already validated and opened (inside its root, not
+/// a link, non-empty), for example with `open_verified_file`. Bytes are served
+/// from this handle; the path is never opened again, so a swap after
+/// validation cannot redirect the read. `len` is the length the provider
+/// measured on the handle.
 pub struct ResolvedFile {
-    pub path: PathBuf,
+    pub file: File,
     pub len: u64,
     pub mime_type: &'static str,
 }
@@ -106,7 +109,7 @@ fn serve_file_span(
     whole_file: bool,
     options: ServeOptions,
 ) -> Response<Vec<u8>> {
-    match read_file_range(&file.path, start, end) {
+    match read_file_range(&file.file, start, end) {
         Ok(bytes) if whole_file => media_response(
             StatusCode::OK,
             bytes,
@@ -182,10 +185,9 @@ fn parse_byte_range(header: Option<&HeaderValue>, total: u64) -> ByteRange {
     ByteRange::Partial { start, end }
 }
 
-fn read_file_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>, ()> {
+fn read_file_range(mut file: &File, start: u64, end: u64) -> Result<Vec<u8>, ()> {
     let len = end.saturating_sub(start).saturating_add(1);
     let len_usize = usize::try_from(len).map_err(|_| ())?;
-    let mut file = fs::File::open(path).map_err(|_| ())?;
     file.seek(SeekFrom::Start(start)).map_err(|_| ())?;
     let mut buf = vec![0_u8; len_usize];
     file.read_exact(&mut buf).map_err(|_| ())?;
@@ -277,6 +279,7 @@ pub fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::safe_output_filesystem::open_verified_file;
 
     const OPTIONS: ServeOptions = ServeOptions {
         internal_error_body: b"test failure",
@@ -288,7 +291,7 @@ mod tests {
         let path = directory.path().join("clip.mp4");
         fs::write(&path, bytes).unwrap();
         let file = ResolvedFile {
-            path,
+            file: File::open(&path).unwrap(),
             len: bytes.len() as u64,
             mime_type: "video/mp4",
         };
@@ -384,12 +387,90 @@ mod tests {
     }
 
     #[test]
-    fn vanished_file_reports_the_provider_error_body() {
-        let (_dir, file) = file_with(b"0123456789");
-        fs::remove_file(&file.path).unwrap();
+    fn bytes_come_from_the_open_handle_not_the_path() {
+        // Replace whatever is at the path after the handle was opened: the
+        // response must still carry the original bytes.
+        let (dir, file) = file_with(b"0123456789");
+        let path = dir.path().join("clip.mp4");
+        let moved = dir.path().join("moved.mp4");
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"SWAPPED!!!").unwrap();
+        let response = serve_file(&request(None), file, OPTIONS);
+        assert_eq!(response.body().as_slice(), b"0123456789");
+    }
+
+    #[test]
+    fn truncated_file_reports_the_provider_error_body() {
+        let (dir, file) = file_with(b"0123456789");
+        let other = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("clip.mp4"))
+            .unwrap();
+        other.set_len(2).unwrap();
         let response = serve_file(&request(None), file, OPTIONS);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(response.body().as_slice(), b"test failure");
+    }
+
+    fn canonical(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn verified_open_accepts_a_regular_file_of_the_expected_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.mp4");
+        fs::write(&path, b"12345678").unwrap();
+        let root = canonical(&dir);
+        let file = open_verified_file(&root.join("a.mp4"), 8, &root).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn verified_open_rejects_a_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("secret.mp4");
+        fs::write(&outside, b"12345678").unwrap();
+        let root = canonical(&dir);
+        let link = root.join("link.mp4");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &link).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        if !linked {
+            eprintln!("skipping: this environment cannot create file symlinks");
+            return;
+        }
+        assert!(open_verified_file(&link, 8, &root).is_err());
+    }
+
+    #[test]
+    fn verified_open_rejects_a_size_change_and_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.mp4"), b"123456789").unwrap();
+        fs::write(dir.path().join("empty.mp4"), b"").unwrap();
+        let root = canonical(&dir);
+        assert!(open_verified_file(&root.join("a.mp4"), 8, &root).is_err());
+        assert!(open_verified_file(&root.join("empty.mp4"), 0, &root).is_err());
+    }
+
+    #[test]
+    fn verified_open_rejects_a_file_reached_through_a_directory_link() {
+        // A directory (junction on Windows) inside the root points outside it:
+        // the path looks contained, but the handle's real location is not.
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(&dir);
+        let inside = root.join("root");
+        let outside = root.join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("a.mp4"), b"12345678").unwrap();
+        if !crate::app::test_support::link_dir(&inside.join("linked"), &outside) {
+            eprintln!("skipping: this environment cannot create directory links");
+            return;
+        }
+        let through_link = inside.join("linked").join("a.mp4");
+        assert!(open_verified_file(&through_link, 8, &inside).is_err());
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub fn handle_request(db_path: &Path, request: &Request<Vec<u8>>) -> Response<Ve
             serve_file(
                 request,
                 ResolvedFile {
-                    path: media.path,
+                    file: media.file,
                     len: media.len,
                     mime_type,
                 },
