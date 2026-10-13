@@ -8,6 +8,7 @@
 
 mod control;
 pub use control::*;
+mod stdout_lines;
 
 #[cfg(windows)]
 use crate::app::safe_output_filesystem::{
@@ -85,6 +86,10 @@ impl ManagedProcessContext<'_> {
         }
     }
 }
+
+/// Receives each complete stdout line (terminator removed) on the calling
+/// thread while the helper is still running.
+type StdoutLineObserver<'a> = &'a mut dyn FnMut(&str);
 
 #[derive(Clone, Debug)]
 pub struct ManagedProcessSpec {
@@ -323,8 +328,33 @@ pub fn helper_identity(kind: HelperKind) -> Result<HelperIdentity, ManagedProces
 }
 
 pub fn run(
+    spec: ManagedProcessSpec,
+    context: ManagedProcessContext<'_>,
+) -> Result<ManagedProcessOutput, ManagedProcessError> {
+    run_observed(spec, context, None)
+}
+
+/// Like [`run`], but also hands every complete stdout line to `on_line` while
+/// the helper runs, so a caller can report live progress.
+///
+/// Lines are delivered in order on the calling thread, at most one supervisor
+/// poll interval after the helper wrote them. Delivery is best effort and
+/// bounded: lines longer than 4 KiB are dropped, and if the caller falls far
+/// behind the newest lines are dropped rather than buffered. The captured
+/// [`ManagedProcessOutput::stdout`] and its size limit are unchanged, and lines
+/// keep flowing after that limit is reached.
+pub fn run_with_stdout_lines(
+    spec: ManagedProcessSpec,
+    context: ManagedProcessContext<'_>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<ManagedProcessOutput, ManagedProcessError> {
+    run_observed(spec, context, Some(on_line))
+}
+
+fn run_observed(
     mut spec: ManagedProcessSpec,
     context: ManagedProcessContext<'_>,
+    observer: Option<StdoutLineObserver<'_>>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     ensure_execution_hardened()?;
     let kind = spec.helper;
@@ -338,6 +368,7 @@ pub fn run(
         spec,
         Some(context),
         TestFaultSelection::None,
+        observer,
     )
 }
 
@@ -376,7 +407,31 @@ pub fn run_test(
             "creation cleanup test faults require run_test_in_parent".to_string(),
         ));
     }
-    run_resolved(test_spec.executable, &[], test_spec.spec, context, fault)
+    run_resolved(
+        test_spec.executable,
+        &[],
+        test_spec.spec,
+        context,
+        fault,
+        None,
+    )
+}
+
+/// Test twin of [`run_with_stdout_lines`] for a fixture executable.
+#[cfg(feature = "youtube-process-test")]
+pub fn run_test_with_stdout_lines(
+    test_spec: TestManagedProcessSpec,
+    context: Option<ManagedProcessContext<'_>>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<ManagedProcessOutput, ManagedProcessError> {
+    run_resolved(
+        test_spec.executable,
+        &[],
+        test_spec.spec,
+        context,
+        TestFaultSelection::None,
+        Some(on_line),
+    )
 }
 
 #[cfg(feature = "youtube-process-test")]
@@ -416,6 +471,7 @@ pub fn run_test_in_parent(
             capability,
             context,
             fault,
+            None,
         )
     }
     #[cfg(not(windows))]
@@ -468,16 +524,19 @@ fn run_resolved(
     spec: ManagedProcessSpec,
     context: Option<ManagedProcessContext<'_>>,
     fault: TestFaultSelection,
+    observer: Option<StdoutLineObserver<'_>>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     #[cfg(windows)]
     {
         let capability = HelperTempCapability::create()
             .map_err(|error| map_helper_temp_error(error, context.as_ref()))?;
-        run_with_capability(executable, verified, spec, capability, context, fault)
+        run_with_capability(
+            executable, verified, spec, capability, context, fault, observer,
+        )
     }
     #[cfg(not(windows))]
     {
-        let _ = (executable, verified, spec, context, fault);
+        let _ = (executable, verified, spec, context, fault, observer);
         Err(ManagedProcessError::UnsupportedPlatform)
     }
 }
@@ -490,6 +549,7 @@ fn run_with_capability(
     capability: HelperTempCapability,
     context: Option<ManagedProcessContext<'_>>,
     fault: TestFaultSelection,
+    observer: Option<StdoutLineObserver<'_>>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
     #[cfg(feature = "youtube-process-test")]
     let mut capability = capability;
@@ -509,6 +569,7 @@ fn run_with_capability(
         control,
         discovery_cancel.as_deref(),
         fault,
+        observer,
     );
     if context.is_none() {
         // The optional context is restricted to the test-only process seam;
@@ -1098,7 +1159,17 @@ fn digest_reader(file: &mut File) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn read_bounded<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+fn read_bounded<R: Read>(reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    read_bounded_with(reader, limit, &mut |_| {})
+}
+
+/// [`read_bounded`] that also shows every chunk it reads, including those past
+/// `limit`, to `on_chunk` before the cap is applied.
+fn read_bounded_with<R: Read>(
+    mut reader: R,
+    limit: usize,
+    on_chunk: &mut dyn FnMut(&[u8]),
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 16 * 1024];
     let mut truncated = false;
@@ -1107,6 +1178,7 @@ fn read_bounded<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8
         if read == 0 {
             break;
         }
+        on_chunk(&buffer[..read]);
         if bytes.len() < limit {
             let keep = (limit - bytes.len()).min(read);
             bytes.extend_from_slice(&buffer[..keep]);
