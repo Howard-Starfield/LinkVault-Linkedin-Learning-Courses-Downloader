@@ -339,7 +339,7 @@ pub(crate) fn parse_scan_plan(
         // playlist entries carry no caption data and stay lazily inspected.
         scanned_tracks.push(match source.kind {
             YouTubePlaylistMode::Video => {
-                tracks_from_scan_metadata(&occurrence_id, &entry, stdout.len())
+                tracks_from_scan_metadata(&occurrence_id, &entry)
             }
             YouTubePlaylistMode::Playlist => None,
         });
@@ -797,5 +797,52 @@ mod tests {
         )
         .unwrap();
         assert!(plan.items.iter().all(|item| item.transcript_inspection.is_none()));
+    }
+
+    #[test]
+    fn video_scan_over_the_inspection_output_limit_still_stores_its_tracks() {
+        use crate::providers::youtube::helper::MAX_RECORD_STDOUT_BYTES;
+        use crate::providers::youtube::transcript_inspection::parse_transcript_tracks;
+        // A multi-hour stream VOD: the `formats` array alone is megabytes, while the
+        // caption fields stay small.  The scan accepts up to 32 MiB of output.
+        let filler = "x".repeat(80);
+        let formats = (0..60_000)
+            .map(|index| {
+                format!(r#"{{"format_id":"f{index}","url":"https://rr.example/videoplayback?{filler}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(
+            r#"{{"id":"abc123_XY","title":"Long stream","availability":"public","formats":[{formats}],"subtitles":{{"en":[{{"ext":"vtt","name":"English"}}]}},"automatic_captions":{{"de":[{{"ext":"vtt"}}]}}}}"#
+        );
+        assert!(payload.len() > MAX_RECORD_STDOUT_BYTES);
+        assert!(payload.len() < MAX_DISCOVERY_STDOUT_BYTES);
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, &payload).unwrap();
+        let stored = plan.items[0]
+            .transcript_inspection
+            .as_ref()
+            .expect("a large scan whose captions are small must still store its tracks");
+        assert_eq!(stored.tracks.len(), 2);
+        // The same tracks a field-selected dedicated run would report.
+        let captions_only = r#"{"subtitles": {"en": [{"ext": "vtt", "name": "English"}]}, "automatic_captions": {"de": [{"ext": "vtt"}]}}"#;
+        assert_eq!(
+            stored.tracks,
+            parse_transcript_tracks(&plan.items[0].public.occurrence_id, captions_only).unwrap()
+        );
+    }
+
+    #[test]
+    fn video_scan_with_an_oversized_caption_subset_leaves_inspection_to_the_fallback() {
+        use crate::providers::youtube::helper::MAX_RECORD_STDOUT_BYTES;
+        // The refusal applies to the caption fields themselves, not the whole output.
+        let bulk = "x".repeat(MAX_RECORD_STDOUT_BYTES + 1);
+        let payload = format!(
+            r#"{{"id":"abc123_XY","title":"Video","availability":"public","subtitles":{{"en":[{{"ext":"vtt","url":"{bulk}"}}]}}}}"#
+        );
+        let source = validate_url("https://www.youtube.com/watch?v=abc123_XY", None).unwrap();
+        let plan = parse_scan_plan(source, &payload).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert!(plan.items[0].transcript_inspection.is_none());
     }
 }

@@ -1,7 +1,8 @@
 //! Bounded transcript metadata inspection for one YouTube occurrence.
 //!
-//! The helper returns provider metadata that may contain signed subtitle
-//! URLs.  This module intentionally projects that response to language,
+//! The helper is asked for the two caption fields only (never the whole info
+//! dict, whose `formats` grow with duration), and returns provider metadata
+//! that may contain signed subtitle URLs.  This module intentionally projects that response to language,
 //! source, display metadata, and extension names only.  URLs, format IDs,
 //! and every other provider-private field remain outside the plan and IPC
 //! contracts.
@@ -21,7 +22,12 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 
 /// Maximum number of language tracks retained for one occurrence.
-pub const MAX_TRANSCRIPT_TRACKS: usize = 256;
+///
+/// YouTube offers about 160 automatic languages and a talk can add 100+
+/// uploader ones, so the combined count (before same-language tracks merge)
+/// can pass the former 256.  512 leaves roughly 2x headroom while staying
+/// bounded: 512 tracks of at most 32 short format names is a few hundred KiB.
+pub const MAX_TRANSCRIPT_TRACKS: usize = 512;
 /// Maximum number of extension names retained for one language/source track.
 pub const MAX_TRANSCRIPT_FORMATS_PER_TRACK: usize = 32;
 /// Maximum bytes accepted for one normalized language tag.
@@ -107,21 +113,28 @@ fn ensure_inspection_output(
     Ok(())
 }
 
+/// yt-dlp field selection: print just the caption fields as one JSON object.
+/// `--print` implies simulate and quiet; errors still reach stderr and a
+/// non-zero exit.  The parser reads only these two fields.
+const INSPECTION_PRINT_TEMPLATE: &str = "%(.{subtitles,automatic_captions})j";
+
 fn inspection_args(item: &PlannedYouTubeItem) -> Vec<String> {
     vec![
         "--ignore-config".to_string(),
         "--no-plugin-dirs".to_string(),
         "--no-update".to_string(),
         "--no-warnings".to_string(),
-        "--dump-single-json".to_string(),
         "--skip-download".to_string(),
         "--no-playlist".to_string(),
+        "--print".to_string(),
+        INSPECTION_PRINT_TEMPLATE.to_string(),
         item.source_url.clone(),
     ]
 }
 
-/// Parse one complete `--dump-single-json --skip-download --no-playlist`
-/// result.  The parser accepts no JSON lines after the root object and does
+/// Parse one complete inspection result: the field-selected object printed by
+/// [`inspection_args`], or any larger yt-dlp info dict that carries the same
+/// two fields.  The parser accepts no JSON lines after the root object and does
 /// not retain any signed subtitle URL.
 pub(crate) fn parse_transcript_tracks(
     occurrence_id: &str,
@@ -160,14 +173,14 @@ pub(crate) fn tracks_from_metadata(
     append_source_tracks(
         occurrence_id,
         object,
-        "subtitles",
+        CAPTION_FIELDS[0],
         YouTubeTranscriptSource::Uploader,
         &mut tracks,
     )?;
     append_source_tracks(
         occurrence_id,
         object,
-        "automatic_captions",
+        CAPTION_FIELDS[1],
         YouTubeTranscriptSource::Automatic,
         &mut tracks,
     )?;
@@ -192,23 +205,35 @@ fn ensure_occurrence_identity(occurrence_id: &str) -> Result<(), YouTubeInternal
 
 /// Derive an occurrence's tracks from the metadata object of a scan.
 ///
-/// Only a video-mode scan (`--dump-single-json --no-playlist`) yields the full
-/// metadata a dedicated inspection run would see; flat playlist entries carry
-/// no caption data, so the caller must not use this for them.  Returns `None`
-/// whenever a dedicated run could not have produced the same tracks (output
-/// beyond the inspection safety limit, or malformed caption metadata), which
+/// Only a video-mode scan (`--dump-single-json --no-playlist`) carries the
+/// caption fields; flat playlist entries carry none, so the caller must not use
+/// this for them.  The scan output as a whole may be far larger than an
+/// inspection result (`formats` grows with duration), and that is irrelevant
+/// here: a dedicated run prints only the caption fields, so the same
+/// inspection limit applies to the serialized caption fields alone.  Returns
+/// `None` when those exceed it or the caption metadata is malformed, which
 /// leaves the occurrence to the lazy per-item inspection fallback and its
 /// original error reporting.
 pub(crate) fn tracks_from_scan_metadata(
     occurrence_id: &str,
     metadata: &Value,
-    scan_stdout_bytes: usize,
 ) -> Option<Vec<YouTubeTranscriptTrack>> {
-    if scan_stdout_bytes > MAX_RECORD_STDOUT_BYTES {
+    let object = metadata.as_object()?;
+    let mut caption_bytes = 0usize;
+    for field in CAPTION_FIELDS {
+        if let Some(value) = object.get(field) {
+            caption_bytes = caption_bytes
+                .saturating_add(serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len()));
+        }
+    }
+    if caption_bytes > MAX_RECORD_STDOUT_BYTES {
         return None;
     }
     tracks_from_metadata(occurrence_id, metadata).ok()
 }
+
+/// The only metadata fields transcript inspection reads.
+const CAPTION_FIELDS: [&str; 2] = ["subtitles", "automatic_captions"];
 
 /// Answer an inspection from the plan's stored data when it is bound to this
 /// exact snapshot and item metadata, so no helper process is needed.
@@ -618,9 +643,124 @@ mod tests {
             Some(item.source_url.as_str())
         );
         assert!(!args.iter().any(|arg| arg.contains("url")));
-        assert!(args.contains(&"--dump-single-json".to_string()));
+        // Field selection: only the caption fields are requested, never the whole
+        // info dict (formats, fragments, thumbnails...).
+        assert!(!args.contains(&"--dump-single-json".to_string()));
+        assert!(args.contains(&"--skip-download".to_string()));
+        let print = args.iter().position(|arg| arg == "--print").unwrap();
+        assert_eq!(args[print + 1], "%(.{subtitles,automatic_captions})j");
+        assert_eq!(args[print + 1], INSPECTION_PRINT_TEMPLATE);
         assert!(!args
             .iter()
             .any(|arg| arg == "--write-auto-subs" || arg == "--write-subs"));
+    }
+
+    /// Output captured from yt-dlp 2026.08.19 with the exact field-selection template, trimmed
+    /// to a few languages and with signed URLs shortened.  Python-style separators and the
+    /// trailing newline are as printed.
+    const FIELD_SELECTED_SAMPLE: &str = r#"{"subtitles": {"en": [{"ext": "json3", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv1", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv2", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv3", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "ttml", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srt", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}], "de-DE": [{"ext": "json3", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv1", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv2", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv3", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "ttml", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srt", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "German (Germany)", "impersonate": true, "__yt_dlp_client": "visionos"}]}, "automatic_captions": {"en": [{"url": "https://manifest.googlevideo.com/api/manifest/hl...", "ext": "vtt", "protocol": "m3u8_native", "__yt_dlp_client": "visionos"}, {"ext": "json3", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv1", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv2", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srv3", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "ttml", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "srt", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}, {"ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=dQw4w9Wg...", "name": "English", "impersonate": true, "__yt_dlp_client": "visionos"}]}}
+"#;
+
+    #[test]
+    fn parser_accepts_the_field_selected_output_and_matches_the_full_dump_shape() {
+        let selected = parse_transcript_tracks(OCCURRENCE, FIELD_SELECTED_SAMPLE).unwrap();
+        assert!(selected.iter().any(|track| track.language_tag == "en"
+            && track.source == YouTubeTranscriptSource::Uploader));
+        assert!(selected
+            .iter()
+            .any(|track| track.source == YouTubeTranscriptSource::Automatic));
+        assert!(selected.iter().all(|track| !track.formats.is_empty()));
+        // A full dump-single-json result carries the same two fields among many others.
+        let value: Value = serde_json::from_str(FIELD_SELECTED_SAMPLE).unwrap();
+        let mut full = serde_json::Map::new();
+        full.insert("id".to_string(), Value::from("dQw4w9WgXcQ"));
+        full.insert("formats".to_string(), serde_json::json!([{"format_id": "18"}]));
+        full.extend(value.as_object().unwrap().clone());
+        let full = serde_json::to_string(&Value::Object(full)).unwrap();
+        assert_eq!(parse_transcript_tracks(OCCURRENCE, &full).unwrap(), selected);
+    }
+
+    #[test]
+    fn a_video_with_many_uploader_and_automatic_languages_does_not_hit_the_track_limit() {
+        // YouTube offers ~160 automatic languages; a talk can add 100+ uploader ones.
+        let languages = |prefix: &str, count: usize| {
+            (0..count)
+                .map(|index| format!(r#""{prefix}{index:03}":[{{"ext":"vtt"}}]"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let payload = format!(
+            r#"{{"subtitles":{{{}}},"automatic_captions":{{{}}}}}"#,
+            languages("u", 120),
+            languages("a", 170)
+        );
+        let tracks = parse_transcript_tracks(OCCURRENCE, &payload).unwrap();
+        assert_eq!(tracks.len(), 290);
+        let too_many = format!(
+            r#"{{"automatic_captions":{{{}}}}}"#,
+            languages("a", MAX_TRANSCRIPT_TRACKS + 1)
+        );
+        assert!(parse_transcript_tracks(OCCURRENCE, &too_many).is_err());
+    }
+
+    /// Live reproduction through the real managed supervisor and the installed
+    /// helper pack.  Run with `LINKVAULT_DATA_DIR` pointing at the data folder
+    /// that holds `media-toolchain` (for example `%TEMP%\lv-e2e`):
+    /// `cargo test --lib live_inspection_sizes -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires an installed media toolchain and network access"]
+    fn live_inspection_sizes() {
+        use crate::app::managed_process::DiscoveryOperation;
+        use crate::providers::youtube::models::{ScanYouTubeSourceRequest, YouTubePlaylistMode};
+        use crate::providers::youtube::scan::scan_source;
+        let urls = std::env::var("LV_LIVE_URLS")
+            .unwrap_or_else(|_| {
+                "https://www.youtube.com/watch?v=jNQXAC9IVRw,https://www.youtube.com/watch?v=wbPMGczOVbk"
+                    .to_string()
+            });
+        for url in urls.split(',') {
+            let operation = DiscoveryOperation::new();
+            let plan = scan_source(
+                &ScanYouTubeSourceRequest {
+                    client_operation_id: "live-inspection-sizes".to_string(),
+                    url: url.to_string(),
+                    playlist_mode: Some(YouTubePlaylistMode::Video),
+                },
+                &operation,
+            )
+            .expect("scan");
+            let item = plan.items[0].clone();
+            eprintln!(
+                "{url}: scan stored tracks = {:?}",
+                item.transcript_inspection.as_ref().map(|stored| stored.tracks.len())
+            );
+            // The old dedicated run: the whole info dict.
+            let mut full_args = inspection_args(&item);
+            let print = full_args.iter().position(|arg| arg == "--print").unwrap();
+            full_args.splice(print..print + 2, ["--dump-single-json".to_string()]);
+            let output = run(
+                invocation(full_args, MAX_RECORD_STDOUT_BYTES),
+                ManagedProcessContext::Discovery(&operation),
+            )
+            .expect("full dump run");
+            eprintln!(
+                "{url}: full dump stdout.len={} truncated={} status={:?}",
+                output.stdout.len(),
+                output.stdout_truncated,
+                output.status
+            );
+            let check = ensure_inspection_output(&operation, &output);
+            eprintln!("{url}: ensure_inspection_output = {check:?}");
+            if check.is_ok() {
+                let tracks = parse_transcript_tracks(&item.public.occurrence_id, &output.stdout);
+                eprintln!("{url}: parse (full dump) = {:?}", tracks.as_ref().map(Vec::len));
+            }
+            // The field-selected dedicated run.
+            let inspected = inspect_transcripts(&item, &operation).expect("field-selected inspection");
+            eprintln!("{url}: field-selected tracks = {}", inspected.tracks.len());
+            if let Some(stored) = item.transcript_inspection.as_ref() {
+                assert_eq!(stored.tracks, inspected.tracks, "scan-derived tracks differ");
+            }
+        }
     }
 }
