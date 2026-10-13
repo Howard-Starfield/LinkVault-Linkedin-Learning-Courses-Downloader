@@ -566,10 +566,12 @@ fn run_with_capability(
         verified,
         spec,
         &capability,
-        control,
-        discovery_cancel.as_deref(),
+        windows_supervisor::SupervisorHooks {
+            control,
+            discovery_cancel: discovery_cancel.as_deref(),
+            observer,
+        },
         fault,
-        observer,
     );
     if context.is_none() {
         // The optional context is restricted to the test-only process seam;

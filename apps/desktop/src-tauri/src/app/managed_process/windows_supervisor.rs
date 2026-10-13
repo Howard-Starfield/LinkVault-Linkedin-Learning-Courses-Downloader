@@ -154,16 +154,27 @@ struct ReaderTask {
     thread: JoinHandle<()>,
 }
 
+/// What the caller supplies for the wait loop to service: cancellation sources
+/// and an optional live stdout observer.
+pub(super) struct SupervisorHooks<'a, 'o> {
+    pub(super) control: Option<&'a TransientRunControl>,
+    pub(super) discovery_cancel: Option<&'a AtomicBool>,
+    pub(super) observer: Option<StdoutLineObserver<'o>>,
+}
+
 pub(super) fn run(
     executable: PathBuf,
     verified: &[&VerifiedExecutable],
     spec: ManagedProcessSpec,
     capability: &HelperTempCapability,
-    control: Option<&TransientRunControl>,
-    discovery_cancel: Option<&AtomicBool>,
+    hooks: SupervisorHooks<'_, '_>,
     fault: TestFaultSelection,
-    mut observer: Option<StdoutLineObserver<'_>>,
 ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+    let SupervisorHooks {
+        control,
+        discovery_cancel,
+        mut observer,
+    } = hooks;
     ensure_absolute_executable(&executable)?;
     let job = create_kill_on_close_job()?;
     let pipes = create_child_pipes()?;
