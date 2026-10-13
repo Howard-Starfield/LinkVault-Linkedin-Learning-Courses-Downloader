@@ -11,7 +11,15 @@ use thiserror::Error;
 
 pub const NORMALIZED_TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
 pub const TRANSCRIPT_PROVIDER: &str = "youtube";
-pub const MAX_VTT_BYTES: usize = 16 * 1024 * 1024;
+/// Largest raw VTT accepted.  Twelve hours of word-timed rolling auto-captions
+/// is roughly 8-10 MB and dense speech can pass 16 MiB; 64 MiB leaves ample room
+/// while the whole file is still read into memory once.
+pub const MAX_VTT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest normalized transcript JSON written or reused.  Enforced by
+/// [`normalize_vtt_json`], which both the fresh write and the reuse check call,
+/// so what is written fresh can always be reused.  Equal to the VTT cap: the
+/// JSON drops the markup but adds a few dozen bytes per cue.
+pub const MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptMetadata {
@@ -46,6 +54,8 @@ pub struct NormalizedTranscript {
 pub enum TranscriptNormalizationError {
     #[error("raw VTT is too large: {size_bytes} bytes exceeds {max_bytes} bytes")]
     InputTooLarge { size_bytes: usize, max_bytes: usize },
+    #[error("normalized transcript is too large: {size_bytes} bytes exceeds {max_bytes} bytes")]
+    OutputTooLarge { size_bytes: usize, max_bytes: usize },
     #[error("raw VTT is not valid UTF-8")]
     InvalidUtf8,
     #[error("raw VTT is missing the WEBVTT header")]
@@ -102,10 +112,27 @@ pub fn normalize_vtt_json(
     raw_vtt: &[u8],
     metadata: TranscriptMetadata,
 ) -> Result<Vec<u8>, TranscriptNormalizationError> {
+    normalize_vtt_json_within(raw_vtt, metadata, MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES)
+}
+
+fn normalize_vtt_json_within(
+    raw_vtt: &[u8],
+    metadata: TranscriptMetadata,
+    max_json_bytes: usize,
+) -> Result<Vec<u8>, TranscriptNormalizationError> {
     let normalized = normalize_vtt(raw_vtt, metadata)?;
-    serde_json::to_vec(&normalized).map_err(|error| TranscriptNormalizationError::Serialization {
-        message: error.to_string(),
-    })
+    let json = serde_json::to_vec(&normalized).map_err(|error| {
+        TranscriptNormalizationError::Serialization {
+            message: error.to_string(),
+        }
+    })?;
+    if json.len() > max_json_bytes {
+        return Err(TranscriptNormalizationError::OutputTooLarge {
+            size_bytes: json.len(),
+            max_bytes: max_json_bytes,
+        });
+    }
+    Ok(json)
 }
 
 fn validate_metadata(metadata: &TranscriptMetadata) -> Result<(), TranscriptNormalizationError> {
@@ -396,19 +423,19 @@ fn normalize_cue_text(line: &str) -> String {
     decode_entities(&text)
 }
 
+const MAX_ENTITY_BYTES: usize = 32;
+
 fn decode_entities(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut remainder = value;
     while let Some(ampersand_index) = remainder.find('&') {
         output.push_str(&remainder[..ampersand_index]);
         let after_ampersand = &remainder[ampersand_index + 1..];
-        let Some(semicolon_index) = after_ampersand.find(';') else {
-            output.push_str(&remainder[ampersand_index..]);
-            break;
-        };
-        let entity = &after_ampersand[..semicolon_index];
-        if entity.len() <= 32 {
-            if let Some(decoded) = decode_entity(entity) {
+        // An entity is at most 32 bytes, so look for its terminator only that far:
+        // an unbounded search made a long run of '&' quadratic in the line length.
+        let window = &after_ampersand.as_bytes()[..after_ampersand.len().min(MAX_ENTITY_BYTES + 1)];
+        if let Some(semicolon_index) = window.iter().position(|byte| *byte == b';') {
+            if let Some(decoded) = decode_entity(&after_ampersand[..semicolon_index]) {
                 output.push_str(&decoded);
                 remainder = &after_ampersand[semicolon_index + 1..];
                 continue;
@@ -697,5 +724,108 @@ mod tests {
         assert!(json.contains("\"schemaVersion\":1"));
         assert!(json.contains("\"provider\":\"youtube\""));
         assert!(json.contains("\"startMs\":0"));
+    }
+
+    /// Twelve hours of YouTube-style rolling auto-captions: every 0.5 s a cue
+    /// that repeats the previous line, holds a whitespace-only line, and adds a
+    /// word-timed line, i.e. about 430k lines and about 10 MB.
+    fn rolling_auto_caption_vtt(hours: u64) -> String {
+        const WORDS: [&str; 8] = ["so", "today", "we", "are", "going", "to", "talk", "about"];
+        let cue_count = hours * 3600 * 2;
+        let mut vtt = String::with_capacity(cue_count as usize * 130);
+        vtt.push_str("WEBVTT\nKind: captions\nLanguage: en\n\n");
+        let stamp = |ms: u64| {
+            format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1_000 % 60,
+                ms % 1_000
+            )
+        };
+        for cue in 0..cue_count {
+            let start = cue * 500;
+            let previous = WORDS[(cue as usize) % WORDS.len()];
+            let word = WORDS[(cue as usize + 1) % WORDS.len()];
+            vtt.push_str(&format!(
+                "{} --> {} align:start position:0%\n{previous} {previous}\n \n{word}<{}><c> {word}</c><{}><c> &gt;&gt; {previous}</c>\n\n",
+                stamp(start),
+                stamp(start + 500),
+                stamp(start + 150),
+                stamp(start + 300)
+            ));
+        }
+        vtt
+    }
+
+    #[test]
+    fn twelve_hours_of_rolling_auto_captions_normalize_within_the_caps_and_in_linear_time() {
+        let vtt = rolling_auto_caption_vtt(12);
+        assert!(vtt.len() > 8_000_000, "fixture is {} bytes", vtt.len());
+        assert!(vtt.len() < MAX_VTT_BYTES);
+        let line_count = vtt.lines().count();
+        assert!(line_count > 400_000, "fixture has {line_count} lines");
+
+        let started = std::time::Instant::now();
+        let json = normalize_vtt_json(vtt.as_bytes(), metadata()).expect("12 h must normalize");
+        let elapsed = started.elapsed();
+        eprintln!("12h fixture: {} bytes, {line_count} lines, json {} bytes, {elapsed:?}", vtt.len(), json.len());
+        assert!(json.len() <= MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES);
+        let normalized: NormalizedTranscript = serde_json::from_slice(&json).unwrap();
+        assert_eq!(normalized.cues.len(), 12 * 3600 * 2);
+        assert_eq!(normalized.cues[0].text, "so so\n\ntoday today >> so");
+        assert_eq!(normalized.cues.last().unwrap().end_ms, 12 * 3_600_000);
+        // Unoptimized test builds do this in a few seconds; a quadratic pass would not finish.
+        assert!(elapsed < std::time::Duration::from_secs(60), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_huge_run_of_ampersands_in_one_cue_line_is_linear() {
+        // 4 MiB of '&' followed by one distant ';' made the entity scan quadratic: every
+        // '&' searched to the end of the line for its terminator.
+        let run = format!("{};", "&".repeat(4 * 1024 * 1024));
+        let raw = format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{run}\n");
+        let started = std::time::Instant::now();
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).unwrap();
+        assert_eq!(normalized.cues[0].text, run);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Entities still decode next to the run.
+        let mixed = format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{}&amp;&{}&lt;\n", "&".repeat(40), "x".repeat(40));
+        let normalized = normalize_vtt(mixed.as_bytes(), metadata()).unwrap();
+        assert_eq!(
+            normalized.cues[0].text,
+            format!("{}&&{}<", "&".repeat(40), "x".repeat(40))
+        );
+    }
+
+    #[test]
+    fn an_entity_is_decoded_only_within_its_32_byte_limit() {
+        let at_limit = format!("#x{}41", "0".repeat(28));
+        let over_limit = format!("#x{}41", "0".repeat(29));
+        assert_eq!(at_limit.len(), 32);
+        let raw = format!("WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+&{at_limit}; &{over_limit}; &#x41;
+");
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).unwrap();
+        assert_eq!(normalized.cues[0].text, format!("A &{over_limit}; A"));
+    }
+
+    #[test]
+    fn normalized_json_over_its_cap_is_refused_with_a_dedicated_error() {
+        let raw = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello world\n";
+        let json = normalize_vtt_json(raw.as_bytes(), metadata()).unwrap();
+        assert_eq!(
+            normalize_vtt_json_within(raw.as_bytes(), metadata(), json.len()).unwrap(),
+            json
+        );
+        assert_eq!(
+            normalize_vtt_json_within(raw.as_bytes(), metadata(), json.len() - 1),
+            Err(TranscriptNormalizationError::OutputTooLarge {
+                size_bytes: json.len(),
+                max_bytes: json.len() - 1,
+            })
+        );
     }
 }

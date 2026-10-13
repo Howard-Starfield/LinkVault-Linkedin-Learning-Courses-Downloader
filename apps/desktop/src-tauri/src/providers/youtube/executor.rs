@@ -27,7 +27,8 @@ use crate::providers::youtube::models::{
     StartYouTubeDownloadRequest, YouTubeDownloadMode, YouTubeTranscriptSource,
 };
 use crate::providers::youtube::transcript_normalizer::{
-    normalize_vtt_json, TranscriptMetadata, TranscriptNormalizationError, MAX_VTT_BYTES,
+    normalize_vtt_json, TranscriptMetadata, TranscriptNormalizationError,
+    MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES, MAX_VTT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,7 +39,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES: u64 = 32 * 1024 * 1024;
 /// Longest transcript failure reason carried into a user-visible warning.
 const MAX_WARNING_REASON_CHARS: usize = 240;
 
@@ -1637,7 +1637,7 @@ fn validate_existing_transcript_pair(
     let normalized_bytes = read_bounded_file(
         &mut normalized,
         json_name,
-        MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES,
+        MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES as u64,
     )?;
     let expected = normalize_vtt_json(
         &raw_vtt,
