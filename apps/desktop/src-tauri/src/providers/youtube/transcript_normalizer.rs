@@ -94,6 +94,7 @@ pub fn normalize_vtt(
         std::str::from_utf8(raw_vtt).map_err(|_| TranscriptNormalizationError::InvalidUtf8)?;
     let normalized_lines = normalize_line_endings(source);
     let cues = parse_vtt(&normalized_lines)?;
+    drop(normalized_lines);
 
     Ok(NormalizedTranscript {
         schema_version: NORMALIZED_TRANSCRIPT_SCHEMA_VERSION,
@@ -121,18 +122,64 @@ fn normalize_vtt_json_within(
     max_json_bytes: usize,
 ) -> Result<Vec<u8>, TranscriptNormalizationError> {
     let normalized = normalize_vtt(raw_vtt, metadata)?;
-    let json = serde_json::to_vec(&normalized).map_err(|error| {
-        TranscriptNormalizationError::Serialization {
-            message: error.to_string(),
-        }
-    })?;
-    if json.len() > max_json_bytes {
-        return Err(TranscriptNormalizationError::OutputTooLarge {
-            size_bytes: json.len(),
+    // Serialize into a writer that refuses to grow past the cap, so a transcript whose
+    // escapes expand it (a control character becomes a 6-byte \u00XX) fails as soon as it
+    // crosses the cap instead of after the whole JSON was built.
+    let mut writer = BoundedJsonWriter::new(max_json_bytes);
+    match serde_json::to_writer(&mut writer, &normalized) {
+        Ok(()) => Ok(writer.into_bytes()),
+        Err(_) if writer.refused_at.is_some() => Err(TranscriptNormalizationError::OutputTooLarge {
+            size_bytes: writer.refused_at.unwrap_or(max_json_bytes),
             max_bytes: max_json_bytes,
-        });
+        }),
+        Err(error) => Err(TranscriptNormalizationError::Serialization {
+            message: error.to_string(),
+        }),
     }
-    Ok(json)
+}
+
+/// A `Vec<u8>` sink that errors on the write that would take it past `max` bytes and never
+/// reserves more than `max`, so its memory stays within the cap.
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    max: usize,
+    /// Total size the refused write would have reached.
+    refused_at: Option<usize>,
+}
+
+impl BoundedJsonWriter {
+    fn new(max: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max,
+            refused_at: None,
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let needed = self.bytes.len().saturating_add(data.len());
+        if needed > self.max {
+            self.refused_at = Some(needed);
+            return Err(std::io::Error::other("normalized transcript exceeds its size cap"));
+        }
+        if needed > self.bytes.capacity() {
+            // Grow geometrically, but never beyond the cap.
+            let target = needed.max(self.bytes.capacity().saturating_mul(2)).min(self.max);
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn validate_metadata(metadata: &TranscriptMetadata) -> Result<(), TranscriptNormalizationError> {
@@ -157,7 +204,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn normalize_line_endings(source: &str) -> String {
+/// Returns the source untouched when it has no carriage return (YouTube's VTT), so a large
+/// transcript is not copied; otherwise a copy with `\r\n` and lone `\r` turned into `\n`.
+fn normalize_line_endings(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains('\r') {
+        return std::borrow::Cow::Borrowed(source);
+    }
     let mut normalized = String::with_capacity(source.len());
     let mut characters = source.chars().peekable();
     while let Some(character) = characters.next() {
@@ -170,7 +222,7 @@ fn normalize_line_endings(source: &str) -> String {
             normalized.push(character);
         }
     }
-    normalized
+    std::borrow::Cow::Owned(normalized)
 }
 
 fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalizationError> {
@@ -827,5 +879,60 @@ mod tests {
                 max_bytes: json.len() - 1,
             })
         );
+    }
+
+    #[test]
+    fn the_json_writer_never_holds_more_than_its_cap() {
+        use std::io::Write;
+        let max = 1000;
+        let mut writer = BoundedJsonWriter::new(max);
+        let mut written = 0;
+        let refused = loop {
+            match writer.write(&[b'x'; 37]) {
+                Ok(count) => written += count,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(refused.to_string(), "normalized transcript exceeds its size cap");
+        assert!(written <= max && writer.bytes.len() == written);
+        assert!(writer.bytes.capacity() <= max, "capacity {} passed the cap", writer.bytes.capacity());
+        assert_eq!(writer.refused_at, Some(written + 37));
+        // A single write that alone exceeds the cap is refused before anything is reserved.
+        let mut fresh = BoundedJsonWriter::new(max);
+        assert!(fresh.write(&vec![b'y'; max + 1]).is_err());
+        assert_eq!(fresh.bytes.capacity(), 0);
+    }
+
+    #[test]
+    fn control_characters_that_expand_past_the_cap_fail_as_soon_as_they_cross_it() {
+        // Each "&#1;" is one control character that JSON escapes as the 6 bytes \u0001.
+        let text = "&#1;".repeat(20_000);
+        let raw = format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{text}\n");
+        let full = normalize_vtt_json(raw.as_bytes(), metadata()).unwrap();
+        assert!(full.len() > 6 * 20_000);
+        let cap = 10_000;
+        match normalize_vtt_json_within(raw.as_bytes(), metadata(), cap) {
+            Err(TranscriptNormalizationError::OutputTooLarge { size_bytes, max_bytes }) => {
+                assert_eq!(max_bytes, cap);
+                // Refused at the first write past the cap, long before the ~130 KB the
+                // whole document needs.
+                assert!(size_bytes > cap && size_bytes <= cap + 64, "refused at {size_bytes}");
+            }
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+        // At exactly the needed size it still succeeds.
+        assert_eq!(
+            normalize_vtt_json_within(raw.as_bytes(), metadata(), full.len()).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn line_endings_are_only_copied_when_they_need_rewriting() {
+        assert!(matches!(
+            normalize_line_endings("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(normalize_line_endings("a\r\nb\rc\n"), "a\nb\nc\n");
     }
 }
