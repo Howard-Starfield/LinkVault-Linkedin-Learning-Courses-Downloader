@@ -52,12 +52,24 @@ fn download_timeout(source_duration_seconds: Option<u64>) -> Duration {
     requested.clamp(MIN_DOWNLOAD_TIMEOUT, MAX_DOWNLOAD_TIMEOUT)
 }
 
-pub fn media_probe_invocation(args: Vec<String>) -> ManagedProcessSpec {
+/// The FFmpeg media check (`-c copy -f null`) reads the whole file, so its
+/// time grows with the file: the 5-minute base plus one minute per 2 GiB,
+/// capped at six hours.  A 12-hour download is 22-43 GB and gets 15-27 minutes.
+pub fn media_probe_timeout(file_size_bytes: u64) -> Duration {
+    const BYTES_PER_EXTRA_MINUTE: u128 = 2 * 1024 * 1024 * 1024;
+    const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+    let extra_seconds = u128::from(file_size_bytes) * 60 / BYTES_PER_EXTRA_MINUTE;
+    let extra = Duration::from_secs(u64::try_from(extra_seconds).unwrap_or(u64::MAX));
+    HELPER_TIMEOUT.saturating_add(extra).min(MAX_PROBE_TIMEOUT)
+}
+
+/// `file_size_bytes` is the size of the verified media artifact being probed.
+pub fn media_probe_invocation(args: Vec<String>, file_size_bytes: u64) -> ManagedProcessSpec {
     ManagedProcessSpec::youtube_ffmpeg(
         args.into_iter().map(OsString::from).collect(),
         MAX_FFPROBE_STDOUT_BYTES,
         MAX_RETAINED_STDERR_BYTES,
-        HELPER_TIMEOUT,
+        media_probe_timeout(file_size_bytes),
     )
 }
 
@@ -78,6 +90,35 @@ pub fn output_error(output: &ManagedProcessOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_probe_timeout_scales_with_the_file_and_stays_bounded() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(media_probe_timeout(0), HELPER_TIMEOUT);
+        // One minute per 2 GiB, proportionally.
+        assert_eq!(media_probe_timeout(GIB), HELPER_TIMEOUT + Duration::from_secs(30));
+        assert_eq!(media_probe_timeout(2 * GIB), HELPER_TIMEOUT + Duration::from_secs(60));
+        // A 12-hour file.
+        assert_eq!(
+            media_probe_timeout(43 * GIB),
+            HELPER_TIMEOUT + Duration::from_secs(21 * 60 + 30)
+        );
+        // Capped at six hours: the cap is reached at 710 GiB and never exceeded.
+        let cap = Duration::from_secs(6 * 60 * 60);
+        assert_eq!(media_probe_timeout(710 * GIB), cap);
+        assert_eq!(media_probe_timeout(709 * GIB) < cap, true);
+        assert_eq!(media_probe_timeout(10_000 * GIB), cap);
+        assert_eq!(media_probe_timeout(u64::MAX), cap);
+        // Never below the old fixed timeout, and non-decreasing.
+        assert!(media_probe_timeout(1) >= HELPER_TIMEOUT);
+        assert!(media_probe_timeout(5 * GIB) <= media_probe_timeout(6 * GIB));
+    }
+
+    #[test]
+    fn discovery_and_inspection_keep_the_fixed_five_minute_timeout() {
+        let spec = invocation(vec!["--version".to_string()], 1024);
+        assert_eq!(spec.timeout, HELPER_TIMEOUT);
+    }
 
     #[test]
     fn download_timeout_scales_for_long_form_media_and_stays_bounded() {

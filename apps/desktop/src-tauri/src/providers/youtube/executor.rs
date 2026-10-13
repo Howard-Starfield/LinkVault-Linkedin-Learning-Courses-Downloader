@@ -1190,10 +1190,10 @@ fn verify_media_with_ffprobe(
     let input_path = media_path.to_string_lossy().into_owned();
     let output = runner
         .run(
-            media_probe_invocation(ffmpeg_copy_probe_args(
-                &input_path,
-                MediaMode::VideoAndAudio,
-            )),
+            media_probe_invocation(
+                ffmpeg_copy_probe_args(&input_path, MediaMode::VideoAndAudio),
+                media[0].size_bytes,
+            ),
             control,
         )
         .map_err(FfprobeVerificationError::ManagedProcess)?;
@@ -1253,10 +1253,10 @@ fn verify_existing_media_with_ffprobe(
     let input_path = media_path.to_string_lossy().into_owned();
     let output = runner
         .run(
-            media_probe_invocation(ffmpeg_copy_probe_args(
-                &input_path,
-                MediaMode::VideoAndAudio,
-            )),
+            media_probe_invocation(
+                ffmpeg_copy_probe_args(&input_path, MediaMode::VideoAndAudio),
+                media[0].size_bytes,
+            ),
             control,
         )
         .map_err(FfprobeVerificationError::ManagedProcess)?;
