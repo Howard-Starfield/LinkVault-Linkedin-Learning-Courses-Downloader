@@ -68,8 +68,11 @@ fn claims() -> &'static Mutex<HashSet<String>> {
 #[derive(Debug)]
 pub struct StagingClaim {
     key: String,
+    /// `.lv` guard handle and the lock file, in drop order: lock first.
     #[cfg(windows)]
     _lock: Option<File>,
+    #[cfg(windows)]
+    _parent_guard: Option<File>,
 }
 
 impl Drop for StagingClaim {
@@ -95,6 +98,69 @@ fn is_claimed(root: &ValidatedOutputRoot, name: &str) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .contains(&claim_key(root, name))
+}
+
+/// Open `<parent>/<name>.lock` exclusively and delete it when closed, but only
+/// after proving the opened file really lives in `expected_parent`. If the
+/// directory was swapped for a link between the check and the open, the file
+/// is not followed into place: the mismatch is an error and nothing outside
+/// the root is left armed for deletion by us.
+#[cfg(windows)]
+pub(super) fn open_verified_lock(
+    parent: &Path,
+    expected_parent: &Path,
+    name: &str,
+) -> Result<File, SafeOutputError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    };
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let path = parent.join(format!("{name}.lock"));
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .access_mode(FILE_GENERIC_WRITE | DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+                SafeOutputError::StagingBusy { path: path.clone() }
+            } else {
+                SafeOutputError::Io(error)
+            }
+        })?;
+    let metadata = file.metadata()?;
+    if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(SafeOutputError::UnsafeDescendant { path });
+    }
+    let actual = handle_final_path(&file)?;
+    let in_place = actual
+        .parent()
+        .is_some_and(|actual_parent| same_path(actual_parent, expected_parent));
+    if !in_place {
+        // Only a file we just created (empty) may be removed again.
+        if metadata.len() == 0 {
+            let _ = mark_delete_by_handle_once(&file);
+        }
+        return Err(SafeOutputError::IdentityChanged { path });
+    }
+    // Deleted when the last handle (this one) closes, including on a crash.
+    mark_delete_by_handle_once(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn same_path(left: &Path, right: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        let text = path.to_string_lossy().to_lowercase();
+        text.strip_prefix(r"\?\")
+            .unwrap_or(&text)
+            .trim_end_matches(char::from(92))
+            .to_string()
+    }
+    normalized(left) == normalized(right)
 }
 
 /// Deterministic staging directory name for one work item.
@@ -162,10 +228,14 @@ impl ValidatedOutputRoot {
             key,
             #[cfg(windows)]
             _lock: None,
+            #[cfg(windows)]
+            _parent_guard: None,
         };
         #[cfg(windows)]
         {
-            claim._lock = Some(self.open_staging_lock(name)?);
+            let (guard, lock) = self.open_staging_lock(name)?;
+            claim._parent_guard = Some(guard);
+            claim._lock = Some(lock);
         }
         #[cfg(not(windows))]
         let _ = &mut claim;
@@ -173,42 +243,22 @@ impl ValidatedOutputRoot {
     }
 
     #[cfg(windows)]
-    fn open_staging_lock(&self, name: &str) -> Result<File, SafeOutputError> {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
-        };
-        const ERROR_SHARING_VIOLATION: i32 = 32;
+    fn open_staging_lock(&self, name: &str) -> Result<(File, File), SafeOutputError> {
         let parent = self.path.join(STAGING_DIR_NAME);
         match fs::create_dir(&parent) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let metadata = fs::symlink_metadata(&parent)?;
-        if is_untrusted_directory(&metadata) {
+        // Hold `.lv` open (no-follow, rename/delete denied) for as long as the
+        // claim lives, then prove the handle is the real directory.
+        let guard = open_directory_guard(&parent, false, false)?;
+        if is_untrusted_directory(&guard.metadata()?) {
             return Err(SafeOutputError::UntrustedDirectory { path: parent });
         }
-        let path = parent.join(format!("{name}.lock"));
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .access_mode(FILE_GENERIC_WRITE | DELETE)
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)
-            .map_err(|error| {
-                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-                    SafeOutputError::StagingBusy { path: path.clone() }
-                } else {
-                    SafeOutputError::Io(error)
-                }
-            })?;
-        let opened = file.metadata()?;
-        if is_reparse_point(&opened) || !opened.file_type().is_file() {
-            return Err(SafeOutputError::UnsafeDescendant { path });
-        }
-        Ok(file)
+        let expected = self.canonical_path.join(STAGING_DIR_NAME);
+        let lock = open_verified_lock(&parent, &expected, name)?;
+        Ok((guard, lock))
     }
 
     /// Lease the deterministic staging directory for one work item,
@@ -707,6 +757,40 @@ mod tests {
         assert_eq!(fs::read(target.join("important.txt")).unwrap(), b"keep");
         drop(staging);
         fs::remove_dir(&link).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_opened_through_a_swapped_directory_is_refused_and_not_left_outside() {
+        let (temp, root) = root();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let real = root.path().join(STAGING_DIR_NAME);
+        fs::create_dir_all(&real).unwrap();
+        let swapped = root.path().join("swapped-lv");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&swapped)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "mklink /J failed");
+
+        // `swapped` plays the `.lv` that was replaced after the check.
+        let expected = real.canonicalize().unwrap();
+        let error = open_verified_lock(&swapped, &expected, "y-test").unwrap_err();
+        assert!(matches!(error, SafeOutputError::IdentityChanged { .. }), "{error}");
+        assert!(
+            !outside.join("y-test.lock").exists(),
+            "nothing may be left behind outside the root"
+        );
+        fs::remove_dir(&swapped).unwrap();
+
+        // The honest path still works and the lock disappears on close.
+        let lock = open_verified_lock(&real, &expected, "y-ok").unwrap();
+        assert!(real.join("y-ok.lock").exists());
+        drop(lock);
+        assert!(!real.join("y-ok.lock").exists());
     }
 
     #[test]

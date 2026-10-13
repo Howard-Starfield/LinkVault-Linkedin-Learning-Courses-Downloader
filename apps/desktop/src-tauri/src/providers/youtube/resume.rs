@@ -712,3 +712,6 @@ pub fn sweep_orphans(runtime: &WorkflowRuntime, extra_roots: &[String]) -> usize
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod live_e2e;
