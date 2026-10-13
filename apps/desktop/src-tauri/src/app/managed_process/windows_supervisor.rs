@@ -199,6 +199,14 @@ pub(super) fn run(
     capability
         .revalidate()
         .map_err(super::helper_temp_from_safe)?;
+    // The single content pass per helper file: hash the pinned handles before
+    // anything is created, so corrupt bytes never reach CreateProcessW (which
+    // would otherwise report them as a start error, not an integrity failure).
+    for verified in verified {
+        verified.verify_contents()?;
+    }
+    #[cfg(test)]
+    super::launch_probe::record_creation();
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -268,7 +276,7 @@ pub(super) fn run(
         ));
     }
     for verified in verified {
-        if let Err(error) = verified.revalidate() {
+        if let Err(error) = verified.check_identity() {
             terminate_suspended_child(&job, &process);
             return Err(error);
         }

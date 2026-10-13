@@ -190,7 +190,7 @@ pub fn lock_test_executable(
         .len();
     let verified =
         open_pinned_executable(executable, expected_digest, expected_digest, expected_size)?;
-    verified.revalidate()?;
+    verified.verify_contents()?;
     Ok(TestVerifiedExecutable {
         _verified: verified,
     })
@@ -236,8 +236,9 @@ pub struct HelperIdentity {
 ///
 /// Opening it checks the file's type, size, and PE header and records the
 /// approved SHA-256 it must have, but does not read its contents.  The
-/// contents are hashed by [`VerifiedExecutable::revalidate`], which each
-/// launch (and `helper_identity`) calls exactly once on this same handle.
+/// contents are hashed by [`VerifiedExecutable::verify_contents`], which each
+/// launch (before the process is created) and `helper_identity` call exactly
+/// once on this same handle.
 pub(super) struct VerifiedExecutable {
     path: PathBuf,
     _file: File,
@@ -254,19 +255,12 @@ pub(super) struct VerifiedExecutable {
 impl VerifiedExecutable {
     /// Re-checks the pinned handle's type, size, and file identity and hashes
     /// its contents once against the approved digest.  This is the only content
-    /// pass a launch makes per helper file, run immediately before the helper
-    /// executes (the process is still suspended) on the exact handle that is
-    /// held open against writes.
-    pub(super) fn revalidate(&self) -> Result<(), ManagedProcessError> {
-        let metadata = self
-            ._file
-            .metadata()
-            .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
-        if metadata_is_reparse(&metadata) || !metadata.is_file() || metadata.len() != self.size {
-            return Err(ManagedProcessError::Integrity(
-                "verified helper identity changed before launch".to_string(),
-            ));
-        }
+    /// pass a launch makes per helper file.  It runs on the exact handle that
+    /// is held open against writes, after the temp workspace is validated and
+    /// BEFORE any process is created, so corrupt bytes are never handed to
+    /// `CreateProcessW`.
+    pub(super) fn verify_contents(&self) -> Result<(), ManagedProcessError> {
+        self.check_identity()?;
         let mut recheck = self
             ._file
             .try_clone()
@@ -276,6 +270,23 @@ impl VerifiedExecutable {
         if digest != self.digest {
             return Err(ManagedProcessError::Integrity(
                 "helper digest does not match the approved helper lock".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cheap re-check, without reading contents, that the pinned handle still
+    /// names the same regular file of the same size.  A launch repeats it after
+    /// the process is assigned to its job, as the write-denying handle makes a
+    /// content change impossible once `verify_contents` has passed.
+    pub(super) fn check_identity(&self) -> Result<(), ManagedProcessError> {
+        let metadata = self
+            ._file
+            .metadata()
+            .map_err(|error| ManagedProcessError::Integrity(error.to_string()))?;
+        if metadata_is_reparse(&metadata) || !metadata.is_file() || metadata.len() != self.size {
+            return Err(ManagedProcessError::Integrity(
+                "verified helper identity changed before launch".to_string(),
             ));
         }
         #[cfg(windows)]
@@ -342,7 +353,7 @@ pub fn helper_identity(kind: HelperKind) -> Result<HelperIdentity, ManagedProces
 
 fn identity_of(helpers: &VerifiedHelperSet) -> Result<HelperIdentity, ManagedProcessError> {
     for executable in helpers.identities() {
-        executable.revalidate()?;
+        executable.verify_contents()?;
     }
     Ok(HelperIdentity {
         digest: helpers.lock_digest().to_string(),
@@ -381,7 +392,7 @@ fn run_observed(
     ensure_execution_hardened()?;
     let kind = spec.helper;
     // Resolving pins the helper files but does not read them: the supervisor
-    // hashes each pinned handle once, right before the process is resumed.
+    // hashes each pinned handle once, right before it creates the process.
     let verified = resolve_helpers(kind)?;
     verified.apply_controlled_args(kind, &mut spec);
     let executable = verified.executable(kind).path.clone();
@@ -775,7 +786,7 @@ impl TransientCleanupVerifier for HelperTempCleanupVerifier {
 
 /// Locates the helper set and pins each file (see [`VerifiedExecutable`]).
 /// Content hashing is deliberately left to the caller's single
-/// [`VerifiedExecutable::revalidate`] pass.
+/// [`VerifiedExecutable::verify_contents`] pass.
 fn resolve_helpers(kind: HelperKind) -> Result<VerifiedHelperSet, ManagedProcessError> {
     if !matches!(kind, HelperKind::YouTubeYtDlp | HelperKind::YouTubeFfmpeg) {
         return Err(ManagedProcessError::Integrity(
@@ -865,7 +876,7 @@ fn resolve_from_media_toolchain() -> Result<Option<VerifiedHelperSet>, ManagedPr
 /// it is a SHA-256 over a length-prefixed, domain-separated encoding of the
 /// install version and each component's verified SHA-256 and size.
 pub(crate) fn media_toolchain_lock_digest(
-    paths: &crate::app::media_toolchain::VerifiedToolchainPaths,
+    paths: &crate::app::media_toolchain::ActiveToolchainPaths,
 ) -> String {
     fn field(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_le_bytes());
@@ -1037,7 +1048,7 @@ fn canonical_json(value: &Value) -> Option<Vec<u8>> {
 /// Opens a helper with a write-denying handle and checks what can be checked
 /// without reading it: regular non-reparse file, approved size, stable path,
 /// x86_64 PE header, and file identity.  The content hash is checked by
-/// [`VerifiedExecutable::revalidate`].
+/// [`VerifiedExecutable::verify_contents`].
 fn open_pinned_executable(
     path: PathBuf,
     expected_digest: &str,
@@ -1178,6 +1189,32 @@ thread_local! {
     static CONTENT_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Test-only record of when the supervisor reaches CreateProcessW, so tests can
+// prove helper contents are hashed before any process exists.
+#[cfg(all(test, windows))]
+mod launch_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CREATIONS: Cell<usize> = const { Cell::new(0) };
+        static HASH_PASSES_AT_CREATION: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_creation() {
+        CREATIONS.with(|count| count.set(count.get() + 1));
+        HASH_PASSES_AT_CREATION
+            .with(|passes| passes.set(super::CONTENT_HASH_PASSES.with(Cell::get)));
+    }
+
+    pub(super) fn creations() -> usize {
+        CREATIONS.with(Cell::get)
+    }
+
+    pub(super) fn hash_passes_at_last_creation() -> usize {
+        HASH_PASSES_AT_CREATION.with(Cell::get)
+    }
+}
+
 fn digest_reader(file: &mut File) -> std::io::Result<String> {
     #[cfg(test)]
     CONTENT_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
@@ -1230,7 +1267,7 @@ fn read_bounded_with<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::{canonical_json, media_toolchain_lock_digest, parse_locked_helpers};
-    use crate::app::media_toolchain::VerifiedToolchainPaths;
+    use crate::app::media_toolchain::ActiveToolchainPaths;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
@@ -1243,8 +1280,8 @@ mod tests {
             .starts_with("helper integrity validation failed"));
     }
 
-    fn toolchain_paths() -> VerifiedToolchainPaths {
-        VerifiedToolchainPaths {
+    fn toolchain_paths() -> ActiveToolchainPaths {
+        ActiveToolchainPaths {
             root: PathBuf::from("toolchain"),
             version: "2026.10.1".to_string(),
             yt_dlp: PathBuf::from("toolchain/yt-dlp.exe"),
@@ -1453,7 +1490,7 @@ mod tests {
         use super::super::{
             identity_of, open_pinned_executable, run_with_capability, ManagedProcessError,
             ManagedProcessSpec, TestFaultSelection, VerifiedExecutable, VerifiedHelperSet,
-            CONTENT_HASH_PASSES,
+            launch_probe, CONTENT_HASH_PASSES,
         };
         use crate::app::safe_output_filesystem::HelperTempCapability;
         use sha2::{Digest, Sha256};
@@ -1581,23 +1618,38 @@ mod tests {
         }
 
         #[test]
-        fn a_launch_reads_each_helper_file_exactly_once() {
+        fn a_launch_reads_each_helper_file_exactly_once_before_the_process_is_created() {
             let temp = tempfile::tempdir().unwrap();
             let set = helper_set(temp.path(), None);
             let before = passes();
+            let creations_before = launch_probe::creations();
             launch(&set).unwrap();
             assert_eq!(passes() - before, 3);
+            assert_eq!(launch_probe::creations() - creations_before, 1);
+            // All three hashes had already happened when the process was created.
+            assert_eq!(launch_probe::hash_passes_at_last_creation() - before, 3);
         }
 
         #[test]
-        fn a_launch_refuses_a_helper_that_does_not_match_its_approved_digest() {
+        fn a_launch_refuses_a_corrupted_helper_before_any_process_is_created() {
             for corrupt in ["yt-dlp", "deno", "ffmpeg"] {
                 let temp = tempfile::tempdir().unwrap();
                 let set = helper_set(temp.path(), Some(corrupt));
+                let before = passes();
+                let creations_before = launch_probe::creations();
+                // An integrity failure, not a start error from handing corrupt
+                // bytes to CreateProcessW...
                 assert!(
                     matches!(launch(&set), Err(ManagedProcessError::Integrity(_))),
-                    "{corrupt} was corrupted but the launch went ahead"
+                    "{corrupt} was corrupted but the launch did not fail as an integrity error"
                 );
+                // ...and the child never existed, so it cannot have run.
+                assert_eq!(
+                    launch_probe::creations(),
+                    creations_before,
+                    "{corrupt} was corrupted but a process was created"
+                );
+                assert!(passes() - before <= 3, "at most one pass per helper file");
             }
         }
     }

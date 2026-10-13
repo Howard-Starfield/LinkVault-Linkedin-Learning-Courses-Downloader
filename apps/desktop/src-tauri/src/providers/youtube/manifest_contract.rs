@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn media_toolchain_helper_digest_is_accepted_by_the_start_path_fingerprint() {
-        let paths = crate::app::media_toolchain::VerifiedToolchainPaths {
+        let paths = crate::app::media_toolchain::ActiveToolchainPaths {
             root: std::path::PathBuf::from("toolchain"),
             version: "2026.10.1".to_string(),
             yt_dlp: std::path::PathBuf::from("toolchain/yt-dlp.exe"),

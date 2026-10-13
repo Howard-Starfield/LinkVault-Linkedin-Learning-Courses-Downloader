@@ -133,7 +133,7 @@ pub struct MediaToolchainStatus {
 /// verification.  Whether file contents were also hashed depends on the
 /// resolver that produced it (`status` hashes, `active_component_paths` does not).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedToolchainPaths {
+pub struct ActiveToolchainPaths {
     pub root: PathBuf,
     pub version: String,
     pub yt_dlp: PathBuf,
@@ -1225,11 +1225,11 @@ fn build_verified_paths(
     version_root: PathBuf,
     version: String,
     platform: &MediaToolchainPlatformManifest,
-) -> ToolchainResult<VerifiedToolchainPaths> {
+) -> ToolchainResult<ActiveToolchainPaths> {
     let yt_dlp = artifact_for(platform, MediaToolchainComponentKind::YtDlp)?;
     let ffmpeg = artifact_for(platform, MediaToolchainComponentKind::Ffmpeg)?;
     let deno = artifact_for(platform, MediaToolchainComponentKind::Deno)?;
-    Ok(VerifiedToolchainPaths {
+    Ok(ActiveToolchainPaths {
         yt_dlp: safe_join(&version_root, &yt_dlp.path)?,
         ffmpeg: safe_join(&version_root, &ffmpeg.path)?,
         deno: safe_join(&version_root, &deno.path)?,
@@ -1246,14 +1246,14 @@ fn build_verified_paths(
 
 fn read_verified_active(
     layout: &MediaToolchainLayout,
-) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, VerifiedToolchainPaths)>> {
+) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, ActiveToolchainPaths)>> {
     read_active(layout, true)
 }
 
 fn read_active(
     layout: &MediaToolchainLayout,
     hash_contents: bool,
-) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, VerifiedToolchainPaths)>> {
+) -> ToolchainResult<Option<(String, MediaToolchainPlatformManifest, ActiveToolchainPaths)>> {
     let state = read_install_state(layout)?;
     let Some(active_version) = state.active_version.clone() else {
         return Ok(None);
@@ -1408,7 +1408,7 @@ fn managed_install_present_in(layout: &MediaToolchainLayout) -> bool {
 /// The launcher pins each file with an open handle and hashes that handle once,
 /// right before it executes, so hashing the same bytes here would only repeat
 /// ~230 MB of reads.  Use [`status`] for a full content check.
-pub fn active_component_paths() -> ToolchainResult<Option<VerifiedToolchainPaths>> {
+pub fn active_component_paths() -> ToolchainResult<Option<ActiveToolchainPaths>> {
     let layout = MediaToolchainLayout::resolve()?;
     Ok(read_active(&layout, false)?.map(|(_, _, paths)| paths))
 }
