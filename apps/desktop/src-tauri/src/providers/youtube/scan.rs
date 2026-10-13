@@ -39,6 +39,16 @@ pub struct YouTubeScanPlan {
 }
 
 impl YouTubeScanPlan {
+    /// Keeps the plan in the cache until `now + PLAN_TTL`.  Expiry only bounds
+    /// cache lifetime: freshness of the data is decided by `scanned_at`
+    /// (`is_fresh_for_start`), so a plan kept alive this way is re-scanned at
+    /// start once it is old.
+    pub fn extend_expiry(&mut self, now: Instant) {
+        self.expires_at = now + PLAN_TTL;
+        self.response.expires_at =
+            (Utc::now() + ChronoDuration::seconds(PLAN_TTL.as_secs() as i64)).to_rfc3339();
+    }
+
     /// Whether the scan is recent enough to start a download without
     /// re-running discovery.  `now` is injected so the window is testable.
     pub fn is_fresh_for_start(&self, now: Instant) -> bool {
@@ -395,7 +405,9 @@ pub(crate) fn parse_scan_plan(
         playlist_id: source.playlist_id,
         truncated,
         total_count: match source.kind {
-            YouTubePlaylistMode::Playlist => root.get("playlist_count").and_then(|count| count.as_u64()),
+            YouTubePlaylistMode::Playlist => root
+                .get("playlist_count")
+                .and_then(serde_json::Value::as_u64),
             YouTubePlaylistMode::Video => None,
         },
         items: items.iter().map(|item| item.public.clone()).collect(),

@@ -64,32 +64,80 @@ pub struct YouTubePlanStore {
 
 const MAX_SCAN_PLANS: usize = 8;
 
+/// Answers whether a run is still active; the plan cache does not own run state.
+type RunActive<'a> = &'a dyn Fn(&str) -> bool;
+
 #[derive(Default)]
 struct PlanCache {
     plans: HashMap<String, YouTubeScanPlan>,
     order: VecDeque<String>,
+    /// Plans in use by a run (plan id -> run id).  A pinned plan neither expires
+    /// nor is evicted while its run is active, because a large selection runs
+    /// as several batches that start long after the 30-minute scan TTL.
+    pins: HashMap<String, String>,
 }
 
 impl PlanCache {
-    fn insert(&mut self, plan: YouTubeScanPlan) {
+    /// Marks `scan_plan_id` as in use by `run_id` until that run ends.
+    fn pin(&mut self, scan_plan_id: &str, run_id: &str) {
+        if self.plans.contains_key(scan_plan_id) {
+            self.pins
+                .insert(scan_plan_id.to_string(), run_id.to_string());
+        }
+    }
+
+    /// Keeps the plans of active runs alive and releases those of runs that
+    /// ended.  Both get a fresh expiry from `now`: an active run's plan must
+    /// not lapse mid-run, and a finished run's plan starts a new TTL so the
+    /// next batch can use it.  (Run end is observed lazily, at the next access.)
+    fn settle_pins(&mut self, now: Instant, run_active: RunActive<'_>) {
+        let mut released = Vec::new();
+        for (plan_id, run_id) in &self.pins {
+            if let Some(plan) = self.plans.get_mut(plan_id) {
+                plan.extend_expiry(now);
+            }
+            if !run_active(run_id) {
+                released.push(plan_id.clone());
+            }
+        }
+        for plan_id in released {
+            self.pins.remove(&plan_id);
+        }
+    }
+
+    fn insert(&mut self, plan: YouTubeScanPlan, now: Instant, run_active: RunActive<'_>) {
+        self.settle_pins(now, run_active);
         let key = plan.response.scan_plan_id.clone();
         if self.plans.contains_key(&key) {
             self.order.retain(|entry| entry != &key);
         }
         while self.plans.len() >= MAX_SCAN_PLANS {
-            let Some(evicted) = self.order.pop_front() else {
+            // Evict the oldest plan that no active run is using.
+            let Some(position) = self
+                .order
+                .iter()
+                .position(|candidate| !self.pins.contains_key(candidate))
+            else {
                 break;
             };
-            self.plans.remove(&evicted);
+            if let Some(evicted) = self.order.remove(position) {
+                self.plans.remove(&evicted);
+            }
         }
         self.order.push_back(key.clone());
         self.plans.insert(key, plan);
     }
 
-    fn get(&mut self, scan_plan_id: &str) -> Option<YouTubeScanPlan> {
-        let now = Instant::now();
+    fn get(
+        &mut self,
+        scan_plan_id: &str,
+        now: Instant,
+        run_active: RunActive<'_>,
+    ) -> Option<YouTubeScanPlan> {
+        self.settle_pins(now, run_active);
         self.plans.retain(|_, plan| plan.expires_at > now);
         self.order.retain(|key| self.plans.contains_key(key));
+        self.pins.retain(|plan_id, _| self.plans.contains_key(plan_id));
         self.plans.get(scan_plan_id).cloned()
     }
 
@@ -276,7 +324,7 @@ fn scan_youtube_source_blocking(
         .plans
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(plan);
+        .insert(plan, Instant::now(), &|run_id| live.has_active_run(run_id));
     Ok(response)
 }
 
@@ -323,7 +371,7 @@ fn inspect_youtube_transcripts_with(
     launch: InspectionLauncher<'_>,
 ) -> Result<InspectYouTubeTranscriptsResponse, YouTubeError> {
     validate_operation_id(&request.client_operation_id)?;
-    let plan = get_plan(state, &request.scan_plan_id)?;
+    let plan = get_plan(state, live, &request.scan_plan_id)?;
     let mut seen = std::collections::HashSet::new();
     let mut targets: Vec<(&PlannedYouTubeItem, Option<TranscriptInspectionResult>)> = Vec::new();
     for occurrence_id in &request.occurrence_ids {
@@ -476,7 +524,7 @@ fn start_youtube_download_blocking(
     }
     live.ensure_submission_capacity(&request.client_submission_id)
         .map_err(YouTubeError::from)?;
-    let plan = get_plan(state, &request.scan_plan_id)?;
+    let plan = get_plan(state, live, &request.scan_plan_id)?;
     if plan.expires_at <= Instant::now() {
         return Err(YouTubeError::from(YouTubeInternalError::PlanExpired));
     }
@@ -610,6 +658,12 @@ fn start_youtube_download_blocking(
     })?;
     // The run is attached: the live handle now refuses new discovery on its own.
     drop(revalidation);
+    // Keep the plan alive for the run's whole life so later batches can still use it.
+    state
+        .plans
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pin(&request.scan_plan_id, &run_id);
     let receipt = YouTubeStartReceipt {
         client_submission_id: request.client_submission_id.clone(),
         run_id: run_id.clone(),
@@ -803,14 +857,27 @@ pub struct CancelYouTubeDiscoveryRequest {
     pub client_operation_id: String,
 }
 
-fn get_plan(state: &YouTubePlanStore, scan_plan_id: &str) -> Result<YouTubeScanPlan, YouTubeError> {
+fn get_plan(
+    state: &YouTubePlanStore,
+    live: &YouTubeLiveHandle,
+    scan_plan_id: &str,
+) -> Result<YouTubeScanPlan, YouTubeError> {
+    get_plan_at(state, live, scan_plan_id, Instant::now())
+}
+
+fn get_plan_at(
+    state: &YouTubePlanStore,
+    live: &YouTubeLiveHandle,
+    scan_plan_id: &str,
+    now: Instant,
+) -> Result<YouTubeScanPlan, YouTubeError> {
     let plan = state
         .plans
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(scan_plan_id)
+        .get(scan_plan_id, now, &|run_id| live.has_active_run(run_id))
         .ok_or_else(|| YouTubeError::from(YouTubeInternalError::PlanNotFound))?;
-    if plan.expires_at <= Instant::now() {
+    if plan.expires_at <= now {
         return Err(YouTubeError::from(YouTubeInternalError::PlanExpired));
     }
     Ok(plan)
@@ -1332,7 +1399,7 @@ mod tests {
         fn store_with(url: &str, payload: &str) -> (YouTubePlanStore, YouTubeScanPlan) {
             let plan = parse_scan_plan(validate_url(url, None).unwrap(), payload).unwrap();
             let store = YouTubePlanStore::default();
-            store.plans.lock().unwrap().insert(plan.clone());
+            store.plans.lock().unwrap().insert(plan.clone(), Instant::now(), &|_| false);
             (store, plan)
         }
 
@@ -1744,6 +1811,139 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
             assert_eq!(unavailable.code, "SCAN_PLAN_STALE");
+        }
+    }
+
+    mod plan_pinning {
+        use super::*;
+        use crate::providers::youtube::scan::{parse_scan_plan, validate_url, PLAN_TTL};
+        use std::time::Duration;
+
+        const PLAYLIST: &str = r#"{"id":"PL_12345","title":"List","entries":[{"id":"abc123_XY","title":"A","availability":"public"}]}"#;
+        const MIN: Duration = Duration::from_secs(60);
+
+        fn plan() -> YouTubeScanPlan {
+            parse_scan_plan(
+                validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap(),
+                PLAYLIST,
+            )
+            .unwrap()
+        }
+
+        fn insert(store: &YouTubePlanStore, live: &YouTubeLiveHandle, plan: &YouTubeScanPlan, now: Instant) {
+            store
+                .plans
+                .lock()
+                .unwrap()
+                .insert(plan.clone(), now, &|run| live.has_active_run(run));
+        }
+
+        fn start_run(live: &YouTubeLiveHandle, store: &YouTubePlanStore, plan: &YouTubeScanPlan, run: &str) {
+            live.attach_run(run.to_string(), format!("submission-{run}"), "fingerprint".to_string(), &[])
+                .unwrap();
+            store.plans.lock().unwrap().pin(&plan.response.scan_plan_id, run);
+        }
+
+        fn code(result: Result<YouTubeScanPlan, YouTubeError>) -> String {
+            result.map(|_| "ok".to_string()).unwrap_or_else(|error| error.code)
+        }
+
+        #[test]
+        fn an_unpinned_plan_expires_after_the_ttl_and_is_evicted_under_pressure() {
+            let store = YouTubePlanStore::default();
+            let live = YouTubeLiveHandle::default();
+            let first = plan();
+            let id = first.response.scan_plan_id.clone();
+            insert(&store, &live, &first, first.scanned_at);
+            assert_eq!(code(get_plan_at(&store, &live, &id, first.scanned_at + PLAN_TTL - MIN)), "ok");
+            assert_eq!(
+                code(get_plan_at(&store, &live, &id, first.scanned_at + PLAN_TTL + MIN)),
+                "SCAN_PLAN_NOT_FOUND"
+            );
+
+            let victim = plan();
+            let victim_id = victim.response.scan_plan_id.clone();
+            insert(&store, &live, &victim, victim.scanned_at);
+            for _ in 0..MAX_SCAN_PLANS {
+                let other = plan();
+                insert(&store, &live, &other, other.scanned_at);
+            }
+            assert_eq!(code(get_plan_at(&store, &live, &victim_id, victim.scanned_at)), "SCAN_PLAN_NOT_FOUND");
+        }
+
+        #[test]
+        fn a_plan_used_by_an_active_run_outlives_the_ttl_and_lru_pressure() {
+            let store = YouTubePlanStore::default();
+            let live = YouTubeLiveHandle::default();
+            let scanned = plan();
+            let id = scanned.response.scan_plan_id.clone();
+            insert(&store, &live, &scanned, scanned.scanned_at);
+            start_run(&live, &store, &scanned, "run-batch-1");
+
+            // Batch 1 runs for 45 minutes, longer than the 30-minute TTL.
+            let during = scanned.scanned_at + 45 * MIN;
+            assert_eq!(code(get_plan_at(&store, &live, &id, during)), "ok");
+
+            // Newer scans fill the cache well past its capacity; the pinned plan stays.
+            for _ in 0..(MAX_SCAN_PLANS * 2) {
+                let other = plan();
+                insert(&store, &live, &other, during);
+            }
+            assert_eq!(code(get_plan_at(&store, &live, &id, during + 10 * MIN)), "ok");
+            let held = store.plans.lock().unwrap().plans.len();
+            assert!(held <= MAX_SCAN_PLANS + 1, "cache grew to {held}");
+        }
+
+        #[test]
+        fn a_finished_runs_plan_gets_a_fresh_ttl_and_then_ages_out_normally() {
+            let store = YouTubePlanStore::default();
+            let live = YouTubeLiveHandle::default();
+            let scanned = plan();
+            let id = scanned.response.scan_plan_id.clone();
+            insert(&store, &live, &scanned, scanned.scanned_at);
+            start_run(&live, &store, &scanned, "run-batch-1");
+
+            // The run ends 45 minutes in; the plan had already outlived its original expiry.
+            live.clear_run("run-batch-1");
+            let ended = scanned.scanned_at + 45 * MIN;
+            assert_eq!(code(get_plan_at(&store, &live, &id, ended)), "ok");
+            assert!(store.plans.lock().unwrap().pins.is_empty(), "released once the run ended");
+            // The refreshed TTL counts from when the end was observed.
+            assert_eq!(code(get_plan_at(&store, &live, &id, ended + 29 * MIN)), "ok");
+            assert_eq!(
+                code(get_plan_at(&store, &live, &id, ended + 29 * MIN + PLAN_TTL + MIN)),
+                "SCAN_PLAN_NOT_FOUND"
+            );
+        }
+
+        #[test]
+        fn a_later_batch_can_start_more_than_thirty_minutes_after_the_scan() {
+            let store = YouTubePlanStore::default();
+            let live = YouTubeLiveHandle::default();
+            let scanned = plan();
+            let id = scanned.response.scan_plan_id.clone();
+            insert(&store, &live, &scanned, scanned.scanned_at);
+            start_run(&live, &store, &scanned, "run-batch-1");
+            live.clear_run("run-batch-1");
+
+            // Batch 2: inspected and started 50 minutes after the scan.
+            let now = scanned.scanned_at + 50 * MIN;
+            let plan = get_plan_at(&store, &live, &id, now).expect("the plan survived the first batch");
+            let revalidations = std::cell::Cell::new(0);
+            let (items, _guard) = selected_items_for_start(
+                &live,
+                &plan,
+                &[plan.items[0].public.occurrence_id.clone()],
+                now,
+                &|plan, selected, _| {
+                    revalidations.set(revalidations.get() + 1);
+                    selected_items_from_plan(plan, selected)
+                },
+            )
+            .unwrap();
+            // The old scan is re-validated through yt-dlp rather than trusted.
+            assert_eq!(revalidations.get(), 1);
+            assert_eq!(items.len(), 1);
         }
     }
 }

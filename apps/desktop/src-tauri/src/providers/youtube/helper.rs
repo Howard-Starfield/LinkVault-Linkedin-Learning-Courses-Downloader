@@ -54,7 +54,8 @@ fn download_timeout(source_duration_seconds: Option<u64>) -> Duration {
 
 /// The FFmpeg media check (`-c copy -f null`) reads the whole file, so its
 /// time grows with the file: the 5-minute base plus one minute per 2 GiB,
-/// capped at six hours.  A 12-hour download is 22-43 GB and gets 15-27 minutes.
+/// capped at six hours.  A 12-hour download of 22-43 GB (about 20-40 GiB) gets
+/// roughly 15-25 minutes.
 pub fn media_probe_timeout(file_size_bytes: u64) -> Duration {
     const BYTES_PER_EXTRA_MINUTE: u128 = 2 * 1024 * 1024 * 1024;
     const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
