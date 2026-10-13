@@ -228,6 +228,9 @@ impl From<String> for FfprobeVerificationError {
 enum ExistingOutputVerificationError {
     Message(String),
     Ffprobe(FfprobeVerificationError),
+    /// The folder is a valid video-only output but this request requires a
+    /// transcript. Carries guidance the user can act on.
+    TranscriptRequired(String),
 }
 
 impl From<String> for ExistingOutputVerificationError {
@@ -604,22 +607,30 @@ impl TransientExecutor for YouTubeExecutor {
             .map_err(safe_output_error)?;
         if let Some(artifact_kinds) = self.try_reuse_existing(item, &stem, control)? {
             report_stage(progress, item, TransientItemPhase::Completed, STAGE_DONE);
-            // A prior run may have kept the video without a transcript (the
-            // transcript was missing or could not be processed). Reuse stays
-            // exact, so it is reported rather than re-downloaded in a loop.
-            let transcript_absent = matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
-                && !artifact_kinds.iter().any(|kind| kind == "transcript_json");
-            let mut outcome = TransientExecutionOutcome::skipped_existing(artifact_kinds);
-            if transcript_absent {
-                outcome
-                    .warnings
-                    .push(TRANSCRIPT_MISSING_WARNING.to_string());
-                outcome = outcome.with_warning_message(
+            // A prior run may have kept the video without its transcript (it
+            // was missing or could not be processed). A published folder is
+            // read-only to the executor, so the transcript cannot be added in
+            // place and the video must not be downloaded again. Report the
+            // gap as a warning, not as "Already saved", and say how to retry.
+            let transcript_expected = matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
+                && self
+                    .item_selected_transcript(item)
+                    .is_ok_and(|selected| selected.is_some());
+            if transcript_expected && !artifact_kinds.iter().any(|kind| kind == "transcript_json") {
+                return Ok(TransientExecutionOutcome::warning(
                     TRANSCRIPT_MISSING_WARNING,
-                    "The video was already saved without a transcript, so it was reused as it is.",
-                );
+                    artifact_kinds,
+                )
+                .with_warning_message(
+                    TRANSCRIPT_MISSING_WARNING,
+                    format!(
+                        "This video was saved earlier without its transcript. To try the \
+                         transcript again, delete or move the folder \"{}\" and download it again.",
+                        self.output_root.path().join(&stem).display()
+                    ),
+                ));
             }
-            return Ok(outcome);
+            return Ok(TransientExecutionOutcome::skipped_existing(artifact_kinds));
         }
         let lease = self
             .output_root
@@ -704,8 +715,9 @@ impl TransientExecutor for YouTubeExecutor {
         if let Some(reading) = download_progress.flush(clock()) {
             report_download_progress(progress, item, download_phase, &reading);
         }
-        // Set when the video is kept but its transcript could not be processed.
-        let mut transcript_failure: Option<String> = None;
+        // Set when the video is kept but its transcript could not be processed:
+        // the transcript error code and its reason.
+        let mut transcript_failure: Option<(&'static str, String)> = None;
         if matches!(
             &self.mode,
             YouTubeDownloadMode::TranscriptOnly | YouTubeDownloadMode::VideoAndTranscript
@@ -742,18 +754,21 @@ impl TransientExecutor for YouTubeExecutor {
                         "yt-dlp completed without the requested transcript artifact",
                     ));
                 }
-                Err(message) => {
+                Err(error) => {
                     // The video is the expensive part and it downloaded; keep
-                    // it when the request may continue without a transcript.
-                    // Transcript-only runs, and runs that require a transcript,
-                    // still fail closed.
+                    // it when the request may continue without a transcript and
+                    // the transcript content itself is the problem. Transcript-
+                    // only runs, runs that require a transcript, and staging or
+                    // ambiguity failures still fail with their own code.
                     if matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
                         && self.continue_without_transcript
-                        && discard_transcript_artifacts(cleanup.lease()).is_ok()
+                        && error.keeps_video()
                     {
-                        transcript_failure = Some(message);
+                        discard_transcript_artifacts(cleanup.lease())
+                            .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
+                        transcript_failure = Some((error.code(), error.to_string()));
                     } else {
-                        return Err(transient_error("TRANSCRIPT_INVALID", message));
+                        return Err(transient_error(error.code(), error.to_string()));
                     }
                 }
             }
@@ -885,10 +900,10 @@ impl TransientExecutor for YouTubeExecutor {
         let _ = sync_directory_best_effort(self.output_root.path());
         let mut warnings = media_warnings;
         let mut warning_messages = Vec::new();
-        if let Some(reason) = &transcript_failure {
-            warnings.push(TRANSCRIPT_INVALID_WARNING.to_string());
+        if let Some((code, reason)) = &transcript_failure {
+            warnings.push((*code).to_string());
             warning_messages.push((
-                TRANSCRIPT_INVALID_WARNING.to_string(),
+                (*code).to_string(),
                 format!(
                     "Video saved; the transcript couldn't be processed: {}",
                     truncate_reason(reason)
@@ -914,7 +929,48 @@ impl TransientExecutor for YouTubeExecutor {
 }
 
 const TRANSCRIPT_MISSING_WARNING: &str = "TRANSCRIPT_MISSING";
-const TRANSCRIPT_INVALID_WARNING: &str = "TRANSCRIPT_INVALID";
+
+/// Why transcript post-processing failed, split by what the caller may do.
+#[derive(Debug)]
+enum TranscriptProcessError {
+    /// The transcript itself is unusable (malformed or empty VTT, normalization
+    /// failure, wrong language). The downloaded video is still good.
+    Content(String),
+    /// The helper emitted several tracks, so no single transcript can be trusted.
+    Ambiguous(String),
+    /// Staging I/O or validation failed. Never a reason to keep a result.
+    Staging(String),
+}
+
+impl TranscriptProcessError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Content(_) => "TRANSCRIPT_INVALID",
+            Self::Ambiguous(_) => "TRANSCRIPT_AMBIGUOUS",
+            Self::Staging(_) => "OUTPUT_VERIFY_FAILED",
+        }
+    }
+
+    fn keeps_video(&self) -> bool {
+        matches!(self, Self::Content(_))
+    }
+}
+
+impl std::fmt::Display for TranscriptProcessError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Content(message) | Self::Ambiguous(message) | Self::Staging(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl From<String> for TranscriptProcessError {
+    fn from(message: String) -> Self {
+        Self::Staging(message)
+    }
+}
 
 fn truncate_reason(reason: &str) -> String {
     let single_line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -990,11 +1046,10 @@ fn verify_existing_item(
     if artifacts.is_empty() {
         return Err("existing output has no artifacts".to_string().into());
     }
-    let artifact_set = validate_artifact_set(
-        &executor.mode,
-        executor.continue_without_transcript,
-        &artifacts,
-    )?;
+    // Structure is checked as if a transcript were optional; a request that
+    // requires one is enforced below, once the folder is proven valid, so the
+    // user gets guidance instead of a generic "not an exact match".
+    let artifact_set = validate_artifact_set(&executor.mode, true, &artifacts)?;
     if artifact_set.has_transcript {
         let selected = executor.item_selected_transcript(item)?.ok_or_else(|| {
             "existing output has a transcript without a selected track".to_string()
@@ -1061,6 +1116,19 @@ fn verify_existing_item(
     });
     verify_held_leaf_handles(&mut handles)?;
     lease.revalidate().map_err(|error| error.to_string())?;
+    if !artifact_set.has_transcript
+        && matches!(&executor.mode, YouTubeDownloadMode::VideoAndTranscript)
+        && !executor.continue_without_transcript
+    {
+        return Err(ExistingOutputVerificationError::TranscriptRequired(
+            format!(
+                "The video is already saved in \"{}\" without its transcript, and this download \
+             requires one. Delete or move that folder to download it again, or allow \
+             downloads to continue without a transcript.",
+                lease.path().display()
+            ),
+        ));
+    }
     let mut kinds = artifacts
         .into_iter()
         .map(|artifact| artifact.kind)
@@ -1293,7 +1361,7 @@ fn post_process_transcript(
     attempt: &OutputAttemptLease,
     item: &TransientWorkItem,
     selected: &SelectedTranscript,
-) -> Result<bool, String> {
+) -> Result<bool, TranscriptProcessError> {
     attempt
         .validate_contents()
         .map_err(|error| error.to_string())?;
@@ -1307,7 +1375,7 @@ fn post_process_transcript(
             .ok_or_else(|| "transcript artifact has a non-UTF-8 name".to_string())?;
         validate_output_component(&name).map_err(|error| error.to_string())?;
         if is_transient_artifact_name(&name) {
-            return Err(format!("staging contained an incomplete artifact: {name}"));
+            return Err(format!("staging contained an incomplete artifact: {name}").into());
         }
         if name
             .rsplit_once('.')
@@ -1321,24 +1389,35 @@ fn post_process_transcript(
     }
     if vtt_names.len() != 1 {
         vtt_names.sort();
-        return Err(format!(
+        return Err(TranscriptProcessError::Ambiguous(format!(
             "transcript helper emitted multiple VTT tracks: {}",
             vtt_names.join(", ")
-        ));
+        )));
     }
     let vtt_name = vtt_names
         .pop()
         .ok_or_else(|| "transcript VTT selection unexpectedly empty".to_string())?;
     if !transcript_filename_matches_language(&vtt_name, selected) {
-        return Err(format!(
+        return Err(TranscriptProcessError::Content(format!(
             "transcript VTT filename does not match selected language {}: {vtt_name}",
             selected.language_tag
-        ));
+        )));
     }
     let json_name = transcript_json_name(&vtt_name)?;
     let mut vtt = attempt
         .open_leaf(&vtt_name)
         .map_err(|error| error.to_string())?;
+    let vtt_len = vtt.metadata().map_err(|error| error.to_string())?.len();
+    if vtt_len == 0 {
+        return Err(TranscriptProcessError::Content(format!(
+            "transcript VTT is empty: {vtt_name}"
+        )));
+    }
+    if vtt_len > MAX_VTT_BYTES as u64 {
+        return Err(TranscriptProcessError::Content(format!(
+            "{vtt_name} exceeds the {MAX_VTT_BYTES}-byte safety limit"
+        )));
+    }
     let raw_vtt = read_bounded_file(&mut vtt, &vtt_name, MAX_VTT_BYTES as u64)?;
     let normalized = normalize_vtt_json(
         &raw_vtt,
@@ -1349,7 +1428,14 @@ fn post_process_transcript(
             source_track_key: selected.track_key.clone(),
         },
     )
-    .map_err(transcript_normalization_error)?;
+    .map_err(|error| match error {
+        // Our own metadata or serializer failing says nothing about the track.
+        TranscriptNormalizationError::EmptyMetadata { .. }
+        | TranscriptNormalizationError::Serialization { .. } => {
+            TranscriptProcessError::Staging(transcript_normalization_error(error))
+        }
+        error => TranscriptProcessError::Content(transcript_normalization_error(error)),
+    })?;
     let mut output = attempt
         .create_leaf(&json_name)
         .map_err(|error| error.to_string())?;
@@ -2171,6 +2257,9 @@ fn map_existing_output_verification_error(
         | ExistingOutputVerificationError::Message(message) => {
             existing_output_collision_error(message)
         }
+        ExistingOutputVerificationError::TranscriptRequired(message) => {
+            transient_error("EXISTING_OUTPUT_MISSING_TRANSCRIPT", message)
+        }
     }
 }
 
@@ -2674,7 +2763,10 @@ mod tests {
         fs::write(attempt.path().join(raw_name), VALID_VTT).unwrap();
 
         let error = post_process_transcript(&attempt, &item, &selected).unwrap_err();
-        assert!(error.contains("does not match selected language"));
+        assert!(error
+            .to_string()
+            .contains("does not match selected language"));
+        assert!(error.keeps_video());
         assert!(!attempt
             .path()
             .join(transcript_json_name(raw_name).unwrap())
@@ -2756,7 +2848,8 @@ mod tests {
         let raw_name = "001-Example-video-1.en-US.vtt";
         fs::write(attempt.path().join(raw_name), MALFORMED_VTT).unwrap();
         let error = post_process_transcript(&attempt, &item, &selected).unwrap_err();
-        assert!(error.contains("WEBVTT"));
+        assert!(error.to_string().contains("WEBVTT"));
+        assert_eq!(error.code(), "TRANSCRIPT_INVALID");
         assert!(!attempt
             .path()
             .join(transcript_json_name(raw_name).unwrap())
@@ -2805,6 +2898,8 @@ mod tests {
         vtt: &'static str,
         downloads: AtomicUsize,
         script: Vec<ScriptStep>,
+        /// Also write a second language track, as a misbehaving helper might.
+        second_vtt: bool,
     }
 
     impl FakeRunner {
@@ -2817,6 +2912,16 @@ mod tests {
                 vtt,
                 downloads: AtomicUsize::new(0),
                 script,
+                second_vtt: false,
+            })
+        }
+
+        fn with_second_vtt(vtt: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                vtt,
+                downloads: AtomicUsize::new(0),
+                script: Vec::new(),
+                second_vtt: true,
             })
         }
 
@@ -2839,6 +2944,9 @@ mod tests {
                 }
                 if args.iter().any(|argument| argument == "--write-subs") {
                     fs::write(staging.join("media.en-US.vtt"), self.vtt).unwrap();
+                    if self.second_vtt {
+                        fs::write(staging.join("media.fr-FR.vtt"), self.vtt).unwrap();
+                    }
                 }
                 for step in &self.script {
                     match step {
@@ -3019,16 +3127,170 @@ mod tests {
 
         let (second, _) = run_collecting(&executor, &item);
 
-        let outcome = second.expect("exact reuse of the kept video");
+        let outcome = second.expect("the kept video is reused, not failed");
+        // Not "Already saved": the transcript the user asked for is missing.
         assert_eq!(
             outcome.state,
-            crate::app::managed_process::TransientItemState::SkippedExisting
+            crate::app::managed_process::TransientItemState::CompletedWithWarnings
         );
         assert_eq!(outcome.warnings, vec!["TRANSCRIPT_MISSING".to_string()]);
+        let message = &outcome.warning_messages[0].1;
+        assert!(
+            message.contains("delete or move the folder"),
+            "the warning must say how to retry: {message}"
+        );
+        assert_eq!(outcome.published_artifact_kinds, vec!["media".to_string()]);
         assert_eq!(
             runner.downloads.load(Ordering::SeqCst),
             1,
             "the video must not be downloaded again"
+        );
+    }
+
+    #[test]
+    fn rerun_with_a_now_working_transcript_still_does_not_redownload_or_rewrite_the_folder() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            FakeRunner::new(MALFORMED_VTT),
+        );
+        run_collecting(&executor, &item).0.unwrap();
+        let before = published_files(temp.path());
+        // The same item again, with a helper that would now return a good VTT.
+        let fixed_runner = FakeRunner::new(VALID_VTT);
+        let (retry, retry_item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&fixed_runner),
+        );
+
+        let outcome = run_collecting(&retry, &retry_item).0.unwrap();
+
+        assert_eq!(fixed_runner.downloads.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.warnings, vec!["TRANSCRIPT_MISSING".to_string()]);
+        assert_eq!(published_files(temp.path()), before);
+    }
+
+    #[test]
+    fn required_transcript_rerun_of_a_video_only_folder_explains_how_to_continue() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (kept, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            FakeRunner::new(MALFORMED_VTT),
+        );
+        run_collecting(&kept, &item).0.unwrap();
+        let strict_runner = FakeRunner::new(VALID_VTT);
+        let (strict, strict_item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            false,
+            Arc::clone(&strict_runner),
+        );
+
+        let error = run_collecting(&strict, &strict_item)
+            .0
+            .expect_err("a required transcript cannot be satisfied by a video-only folder");
+
+        assert_eq!(error.code, "EXISTING_OUTPUT_MISSING_TRANSCRIPT");
+        assert!(
+            error.message.contains("Delete or move that folder"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("without a transcript"),
+            "{}",
+            error.message
+        );
+        assert_eq!(strict_runner.downloads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn empty_transcript_keeps_the_video_with_the_transcript_error_code() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            FakeRunner::new(""),
+        );
+
+        let outcome = run_collecting(&executor, &item).0.unwrap();
+
+        assert_eq!(outcome.warnings, vec!["TRANSCRIPT_INVALID".to_string()]);
+        assert!(outcome.warning_messages[0].1.contains("empty"));
+        assert_eq!(outcome.published_artifact_kinds, vec!["media".to_string()]);
+    }
+
+    #[test]
+    fn multiple_transcript_tracks_fail_with_their_own_code_instead_of_keeping_the_video() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            FakeRunner::with_second_vtt(VALID_VTT),
+        );
+
+        let error = run_collecting(&executor, &item)
+            .0
+            .expect_err("an ambiguous transcript is not a content failure");
+
+        assert_eq!(error.code, "TRANSCRIPT_AMBIGUOUS");
+        assert!(published_files(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn only_transcript_content_failures_keep_the_video() {
+        assert!(TranscriptProcessError::Content("bad".to_string()).keeps_video());
+        assert!(!TranscriptProcessError::Ambiguous("two".to_string()).keeps_video());
+        assert!(!TranscriptProcessError::Staging("io".to_string()).keeps_video());
+        assert_eq!(
+            TranscriptProcessError::Staging("io".to_string()).code(),
+            "OUTPUT_VERIFY_FAILED"
+        );
+    }
+
+    #[test]
+    fn truncate_reason_leaves_short_reasons_and_collapses_whitespace() {
+        assert_eq!(
+            truncate_reason("bad   header\n at line 3"),
+            "bad header at line 3"
+        );
+        let exactly = "a".repeat(MAX_WARNING_REASON_CHARS);
+        assert_eq!(truncate_reason(&exactly), exactly);
+    }
+
+    #[test]
+    fn truncate_reason_cuts_long_multibyte_text_on_character_boundaries() {
+        // 3-byte, 4-byte and combining characters: a byte-based cut would panic
+        // or split a character.
+        for unit in ["字幕", "🎬", "e\u{301}"] {
+            let reason = unit.repeat(MAX_WARNING_REASON_CHARS + 5);
+            let shortened = truncate_reason(&reason);
+            assert!(shortened.ends_with('…'));
+            assert_eq!(shortened.chars().count(), MAX_WARNING_REASON_CHARS + 1);
+            assert!(reason.starts_with(shortened.trim_end_matches('…')));
+        }
+    }
+
+    #[test]
+    fn truncate_reason_cuts_one_character_over_the_limit() {
+        let reason = "字".repeat(MAX_WARNING_REASON_CHARS + 1);
+        let shortened = truncate_reason(&reason);
+        assert_eq!(shortened.chars().count(), MAX_WARNING_REASON_CHARS + 1);
+        assert_eq!(
+            shortened.trim_end_matches('…').chars().count(),
+            MAX_WARNING_REASON_CHARS
         );
     }
 
