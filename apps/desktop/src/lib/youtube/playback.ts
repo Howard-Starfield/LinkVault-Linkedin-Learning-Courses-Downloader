@@ -36,29 +36,40 @@ export function isSavableSample(sample: PlaybackSample): boolean {
 export function createProgressThrottle(intervalMs: number = PROGRESS_SAVE_INTERVAL_MS) {
   let lastSavedAt = Number.NEGATIVE_INFINITY;
   let lastAttemptAt = Number.NEGATIVE_INFINITY;
-  let lastSaved: PlaybackSample | null = null;
+  let lastRequested: PlaybackSample | null = null;
+  let lastRequestFailed = false;
   return {
     shouldSave(sample: PlaybackSample, nowMs: number, force: boolean): boolean {
       if (!isSavableSample(sample)) return false;
       if (force) {
+        // Skip only a repeat of the last value that was *requested* (queued,
+        // in flight, or done). Comparing with the last committed value would
+        // drop a pause at 10 while a save of 20 is still pending, and 20
+        // would win.
         return !(
-          lastSaved !== null &&
-          lastSaved.occurrenceId === sample.occurrenceId &&
-          Math.abs(lastSaved.positionSeconds - sample.positionSeconds) < FORCED_SAVE_MIN_DELTA_SECONDS
+          lastRequested !== null &&
+          !lastRequestFailed &&
+          lastRequested.occurrenceId === sample.occurrenceId &&
+          Math.abs(lastRequested.positionSeconds - sample.positionSeconds) < FORCED_SAVE_MIN_DELTA_SECONDS
         );
       }
       // A failed attempt waits one interval before the next tick retries, so
       // a persistent failure is not hammered four times a second.
       return nowMs - lastSavedAt >= intervalMs && nowMs - lastAttemptAt >= intervalMs;
     },
-    /** Call when a save is sent. Does not count as saved until `markSaved`. */
-    markAttempted(nowMs: number): void {
+    /** Call when a save is queued. Does not count as saved until `markSaved`. */
+    markAttempted(sample: PlaybackSample, nowMs: number): void {
       lastAttemptAt = nowMs;
+      lastRequested = sample;
+      lastRequestFailed = false;
     },
-    /** Call only after the save succeeded; a failed save stays dirty. */
-    markSaved(sample: PlaybackSample, nowMs: number): void {
+    /** Call only after the save succeeded. */
+    markSaved(nowMs: number): void {
       lastSavedAt = nowMs;
-      lastSaved = sample;
+    },
+    /** Call when a save failed: its value stays dirty and is retried. */
+    markFailed(sample: PlaybackSample): void {
+      if (lastRequested === sample) lastRequestFailed = true;
     }
   };
 }
@@ -175,12 +186,15 @@ export function createProgressSaver(options: {
     request(sample: PlaybackSample, force: boolean): Promise<void> {
       const now = clock();
       if (!throttle.shouldSave(sample, now, force)) return options.runner.drain();
-      throttle.markAttempted(now);
+      throttle.markAttempted(sample, now);
       return options.runner
         .run(() => options.save(sample))
         .then(
-          () => throttle.markSaved(sample, now),
-          (error: unknown) => options.onError?.(error)
+          () => throttle.markSaved(now),
+          (error: unknown) => {
+            throttle.markFailed(sample);
+            options.onError?.(error);
+          }
         )
         .then(() => options.runner.drain());
     }
@@ -188,19 +202,22 @@ export function createProgressSaver(options: {
 }
 
 /**
- * Lets an async continuation (for example "advance after the ended save")
- * check that nothing changed in between: `cancel` is called when the video
- * changes or the player unmounts, and every earlier capture then reports false.
+ * Decides whether "the video ended" may still advance to the next one once
+ * the ended-save has finished. Every earlier pending advance is invalidated by
+ * `invalidate`, which the player calls on play, seeking, source change,
+ * close and unmount; the advance also requires the media to still be ended.
  */
-export function createNavigationGuard() {
+export function createEndedAdvance(options: { onAdvance: () => void }) {
   let generation = 0;
   return {
-    capture(): () => boolean {
-      const captured = generation;
-      return () => generation === captured;
-    },
-    cancel(): void {
+    invalidate(): void {
       generation += 1;
+    },
+    afterSave(save: Promise<unknown>, isStillEnded: () => boolean): Promise<void> {
+      const captured = generation;
+      return save.then(() => {
+        if (generation === captured && isStillEnded()) options.onAdvance();
+      });
     }
   };
 }

@@ -2319,7 +2319,7 @@ fn validate_output_root_inner(
         });
     }
     reject_reparse_components(path)?;
-    let leases = guard_root_chain(path)?;
+    let leases = guard_root_chain(path, probe_writable)?;
     let canonical_path = path.canonicalize()?;
     let root = ValidatedOutputRoot {
         path: path.to_path_buf(),
@@ -2343,8 +2343,10 @@ pub fn open_verified_file(
     expected_len: u64,
     canonical_root: &Path,
 ) -> Result<File, SafeOutputError> {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str()))
-    else {
+    let (Some(parent), Some(name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) else {
         return Err(SafeOutputError::InvalidChildName);
     };
     let file = open_regular_leaf(parent, name, false)?;
@@ -2406,7 +2408,9 @@ fn handle_final_path(file: &File) -> std::io::Result<PathBuf> {
             return Err(std::io::Error::last_os_error());
         }
         if written < buffer.len() {
-            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written])));
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer[..written],
+            )));
         }
         buffer.resize(written + 1, 0);
     }
@@ -2434,7 +2438,10 @@ fn validate_component(name: &str) -> Result<(), SafeOutputError> {
     validate_output_component(name)
 }
 
-fn guard_root_chain(path: &Path) -> Result<Vec<DirectoryLease>, SafeOutputError> {
+/// `writable` is false for read-only consumers (playback): every guard, the
+/// selected root included, is then opened without write-class access, so a
+/// root whose ACL grants only read still validates.
+fn guard_root_chain(path: &Path, writable: bool) -> Result<Vec<DirectoryLease>, SafeOutputError> {
     let mut paths = path
         .ancestors()
         .filter(|ancestor| ancestor.is_absolute())
@@ -2445,12 +2452,12 @@ fn guard_root_chain(path: &Path) -> Result<Vec<DirectoryLease>, SafeOutputError>
     let mut leases = Vec::with_capacity(path_count);
     for (index, current) in paths.into_iter().enumerate() {
         let is_selected_root = index + 1 == path_count;
-        let handle = open_directory_guard(&current, false, is_selected_root).map_err(|error| {
-            SafeOutputError::NotWritable {
+        let handle = open_directory_guard(&current, false, is_selected_root && writable).map_err(
+            |error| SafeOutputError::NotWritable {
                 path: current.clone(),
                 message: error.to_string(),
-            }
-        })?;
+            },
+        )?;
         let metadata = handle.metadata()?;
         if is_untrusted_directory(&metadata) {
             return Err(SafeOutputError::UntrustedDirectory { path: current });
@@ -2491,6 +2498,28 @@ fn revalidate_directory_lease(lease: &DirectoryLease) -> Result<(), SafeOutputEr
     Ok(())
 }
 
+#[cfg(windows)]
+const FILE_ADD_SUBDIRECTORY_ACCESS: u32 = 0x0004;
+#[cfg(windows)]
+const FILE_DELETE_CHILD_ACCESS: u32 = 0x0040;
+
+/// Access mask requested for a directory guard. Read-only guards (no delete,
+/// no add-child) request only list/read-attributes access.
+#[cfg(windows)]
+fn directory_guard_access(delete_access: bool, add_child_access: bool) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    };
+    FILE_LIST_DIRECTORY
+        | FILE_READ_ATTRIBUTES
+        | if delete_access { DELETE } else { 0 }
+        | if add_child_access {
+            FILE_ADD_SUBDIRECTORY_ACCESS | FILE_DELETE_CHILD_ACCESS
+        } else {
+            0
+        }
+}
+
 fn open_directory_guard(
     path: &Path,
     delete_access: bool,
@@ -2502,22 +2531,11 @@ fn open_directory_guard(
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
         };
-        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
-        const FILE_DELETE_CHILD: u32 = 0x0040;
         options
-            .access_mode(
-                FILE_LIST_DIRECTORY
-                    | FILE_READ_ATTRIBUTES
-                    | if delete_access { DELETE } else { 0 }
-                    | if add_child_access {
-                        FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
-                    } else {
-                        0
-                    },
-            )
+            .access_mode(directory_guard_access(delete_access, add_child_access))
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -2987,6 +3005,35 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn read_only_directory_guards_request_no_write_access() {
+        let write_bits = FILE_ADD_SUBDIRECTORY_ACCESS | FILE_DELETE_CHILD_ACCESS;
+        assert_eq!(directory_guard_access(false, false) & write_bits, 0);
+        assert_eq!(
+            directory_guard_access(false, false) & 0x0001_0000,
+            0,
+            "no DELETE"
+        );
+        assert_eq!(
+            directory_guard_access(false, true) & write_bits,
+            write_bits,
+            "the writable root guard still requests add-child access"
+        );
+    }
+
+    #[test]
+    fn read_validation_admits_a_root_without_probing_or_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = validate_output_root_for_read(temp.path()).unwrap();
+        assert!(root.canonical_path().is_dir());
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            0,
+            "read validation must leave no probe file behind"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 

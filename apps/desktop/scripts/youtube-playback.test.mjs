@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   PROGRESS_SAVE_INTERVAL_MS,
   adjacentPlayableVideo,
-  createNavigationGuard,
+  createEndedAdvance,
   createProgressSaver,
   createProgressThrottle,
   createSerialRunner,
@@ -41,7 +41,8 @@ test("playing saves at most once per interval", () => {
   const throttle = createProgressThrottle();
   assert.equal(PROGRESS_SAVE_INTERVAL_MS, 5000);
   assert.equal(throttle.shouldSave(sample(1), 1_000, false), true);
-  throttle.markSaved(sample(1), 1_000);
+  throttle.markAttempted(sample(1), 1_000);
+  throttle.markSaved(1_000);
   assert.equal(throttle.shouldSave(sample(2), 2_000, false), false);
   assert.equal(throttle.shouldSave(sample(5), 5_999, false), false);
   assert.equal(throttle.shouldSave(sample(6), 6_000, false), true);
@@ -56,7 +57,8 @@ test("a sample that was never sent does not start the interval", () => {
 
 test("forced saves bypass the interval but skip an unchanged position", () => {
   const throttle = createProgressThrottle();
-  throttle.markSaved(sample(10), 1_000);
+  throttle.markAttempted(sample(10), 1_000);
+  throttle.markSaved(1_000);
   assert.equal(throttle.shouldSave(sample(10.2), 1_100, true), false);
   assert.equal(throttle.shouldSave(sample(12), 1_100, true), true);
   assert.equal(throttle.shouldSave(sample(10.1, "occ-2"), 1_100, true), true);
@@ -230,16 +232,60 @@ test("a failed periodic save is not retried before the interval", async () => {
   assert.deepEqual(calls, [1, 7]);
 });
 
-test("a navigation guard blocks a stale continuation after the video changed", async () => {
-  const guard = createNavigationGuard();
-  const stillCurrent = guard.capture();
-  let advanced = false;
-  const pending = Promise.resolve().then(() => {
-    if (stillCurrent()) advanced = true;
+test("a pause back at a committed value is not skipped while a different save is pending", async () => {
+  const runner = createSerialRunner();
+  const saved = [];
+  const resolvers = [];
+  const saver = createProgressSaver({
+    runner,
+    now: () => 1_000,
+    save: (sample) => {
+      saved.push(sample.positionSeconds);
+      return new Promise((resolve) => resolvers.push(resolve));
+    }
   });
-  // The user jumped from A to C (or the player closed) before the save finished.
-  guard.cancel();
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1) {
+      resolvers.splice(0).forEach((resolve) => resolve());
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  const first = saver.request(sampleAt(10), true);
+  await flush();
+  await first; // 10 is committed
+  const second = saver.request(sampleAt(20), true); // 20 is now pending
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const third = saver.request(sampleAt(10), true); // seek back to 10 and pause
+  await flush();
+  await Promise.all([second, third]);
+  assert.deepEqual(saved, [10, 20, 10], "the last write must be the pause at 10");
+});
+
+test("ended advance is invalidated by play, seeking, or a changed ended state", async () => {
+  let advances = 0;
+  const advance = createEndedAdvance({ onAdvance: () => { advances += 1; } });
+
+  // Normal case: still ended once the save finishes.
+  await advance.afterSave(Promise.resolve(), () => true);
+  assert.equal(advances, 1);
+
+  // The user restarts the same video before the save finishes.
+  let finish;
+  const pending = advance.afterSave(new Promise((resolve) => { finish = resolve; }), () => true);
+  advance.invalidate(); // "play" or "seeking" fired
+  finish();
   await pending;
-  assert.equal(advanced, false);
-  assert.equal(guard.capture()(), true);
+  assert.equal(advances, 1);
+
+  // No longer at the end (for example it was paused earlier in the video).
+  await advance.afterSave(Promise.resolve(), () => false);
+  assert.equal(advances, 1);
+
+  // Unmount / source change invalidates too, and later ends work again.
+  const stale = advance.afterSave(Promise.resolve(), () => true);
+  advance.invalidate();
+  await stale;
+  assert.equal(advances, 1);
+  await advance.afterSave(Promise.resolve(), () => true);
+  assert.equal(advances, 2);
 });

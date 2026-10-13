@@ -3,7 +3,7 @@ import { Captions, CaptionsOff, Pause, Play, SkipBack, SkipForward, Volume2, Vol
 import { saveYouTubePlaybackProgress } from "../../lib/youtube/ipc";
 import {
   adjacentPlayableVideo,
-  createNavigationGuard,
+  createEndedAdvance,
   createProgressSaver,
   createSerialRunner,
   formatPlaybackClock,
@@ -222,9 +222,12 @@ function PlayerPane({
       return () => undefined;
     }
     let lastSample: PlaybackSample | null = null;
-    // Cancelled when this video is left, so a pending "ended" save cannot
-    // advance after the user jumped elsewhere or the player closed.
-    const navigation = createNavigationGuard();
+    // A pending "ended" save may only advance if nothing happened since:
+    // play, seeking, leaving the video and closing all invalidate it.
+    const ended = createEndedAdvance({ onAdvance: () => onNextRef.current?.() });
+    // Set by the close flush: after the final save is queued, no periodic,
+    // pause-event or unmount save may follow it.
+    let frozen = false;
     const saver = createProgressSaver({
       runner,
       now: () => performance.now(),
@@ -242,7 +245,7 @@ function PlayerPane({
 
     function persist(force: boolean): Promise<void> {
       const sample = lastSample;
-      if (!sample) return runner.drain();
+      if (!sample || frozen) return runner.drain();
       const position = Math.min(sample.positionSeconds, sample.durationSeconds);
       onRecord(sample.occurrenceId, {
         positionSeconds: position,
@@ -313,10 +316,7 @@ function PlayerPane({
       if (!(target instanceof HTMLVideoElement) || !primed) return;
       syncClock(target, true);
       sampleFrom(target);
-      const stillCurrent = navigation.capture();
-      void persist(true).then(() => {
-        if (stillCurrent()) onNextRef.current?.();
-      });
+      void ended.afterSave(persist(true), () => target.ended && !frozen);
     }
 
     function onLoadedMetadata(event: Event) {
@@ -324,13 +324,25 @@ function PlayerPane({
       if (target instanceof HTMLVideoElement) applyResumeAndPlay(target);
     }
 
+    function invalidateAdvance() {
+      ended.invalidate();
+    }
+
     registerFlush(() => {
+      // Close: stop playback first so the position cannot move, queue exactly
+      // one final save, then freeze so nothing queues after it.
+      ended.invalidate();
+      media.pause();
       if (media.readyState >= HTMLMediaElement.HAVE_METADATA && primed) sampleFrom(media);
-      return persist(true);
+      const final = persist(true);
+      frozen = true;
+      return final;
     });
 
     media.addEventListener("timeupdate", onTimeUpdate);
     media.addEventListener("play", onTimeUpdate);
+    media.addEventListener("play", invalidateAdvance);
+    media.addEventListener("seeking", invalidateAdvance);
     media.addEventListener("pause", onPause);
     media.addEventListener("ended", onEndedMedia);
     media.addEventListener("loadedmetadata", onLoadedMetadata);
@@ -341,11 +353,13 @@ function PlayerPane({
     return () => {
       media.removeEventListener("timeupdate", onTimeUpdate);
       media.removeEventListener("play", onTimeUpdate);
+      media.removeEventListener("play", invalidateAdvance);
+      media.removeEventListener("seeking", invalidateAdvance);
       media.removeEventListener("pause", onPause);
       media.removeEventListener("ended", onEndedMedia);
       media.removeEventListener("loadedmetadata", onLoadedMetadata);
       media.removeEventListener("volumechange", onTimeUpdate);
-      navigation.cancel();
+      ended.invalidate();
       // Leaving the video (next/previous, close, navigating away) saves the
       // last position once; an unchanged position is skipped by the throttle.
       void persist(true);
