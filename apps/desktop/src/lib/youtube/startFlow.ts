@@ -17,16 +17,19 @@ const COUNT_FORMAT = new Intl.NumberFormat("en-US");
  * scan is complete.  Uses the playlist's total when YouTube reported one.
  */
 export function playlistTruncationNote(plan: {
+  title: string;
   truncated: boolean;
   totalCount: number | null;
   items: readonly unknown[];
 }): string | null {
   if (!plan.truncated) return null;
   const shown = COUNT_FORMAT.format(plan.items.length);
+  const title = plan.title.trim();
+  const place = title ? `the playlist "${title}"` : "this playlist";
   if (plan.totalCount !== null && plan.totalCount > plan.items.length) {
-    return `Showing the first ${shown} of ${COUNT_FORMAT.format(plan.totalCount)} videos in this playlist.`;
+    return `Showing the first ${shown} of ${COUNT_FORMAT.format(plan.totalCount)} videos in ${place}.`;
   }
-  return `Showing the first ${shown} videos of this playlist.`;
+  return `Showing the first ${shown} videos of ${place}.`;
 }
 
 /**
@@ -44,6 +47,112 @@ export function splitIntoRuns<Group extends { occurrenceIds: readonly string[] }
     }
   }
   return runs;
+}
+
+export type BatchStartResult =
+  | { started: true; runId: string }
+  /** `reason` is a short human reason, or null when the start already explained itself. */
+  | { started: false; reason: string | null };
+
+export interface BatchContext {
+  /** 1-based number of the batch being started. */
+  batchNumber: number;
+  totalBatches: number;
+}
+
+export interface BatchSequencerPorts<Group> {
+  start(group: Group, context: BatchContext): Promise<BatchStartResult>;
+  /** Tells the user that the remaining batches were not started. */
+  notify(notice: { title: string; description: string }): void;
+}
+
+export interface BatchSequencer<Group> {
+  /** Starts the first batch and queues the rest.  Ignored while a start is in flight. */
+  begin(groups: readonly Group[]): Promise<void>;
+  /** The run `runId` reached a terminal state; starts the next batch if this sequencer awaits that run. */
+  onRunTerminal(runId: string): Promise<void>;
+  /** Drops every batch not yet started (cancel, helper reinstall, a rescan). */
+  clear(): void;
+  isStarting(): boolean;
+  pendingVideos(): number;
+}
+
+/**
+ * Runs download batches one after another.  Each batch's start is injected, so the sequencing is
+ * independent of the view: the next batch starts only after the run it awaits ends, a failed start
+ * stops the sequence and says how many videos were left, `clear` empties the queue at any time, and
+ * a run can never advance the queue twice.
+ */
+export function createBatchSequencer<Group extends { occurrenceIds: readonly string[] }>(
+  ports: BatchSequencerPorts<Group>
+): BatchSequencer<Group> {
+  let pending: Group[] = [];
+  let totalBatches = 0;
+  let batchNumber = 0;
+  let starting = false;
+  /** The run whose end starts the next batch. */
+  let awaitedRunId: string | null = null;
+  /** Bumped by `clear` and `begin` so an in-flight start cannot revive a cleared queue. */
+  let epoch = 0;
+
+  const pendingVideos = () => pending.reduce((total, group) => total + group.occurrenceIds.length, 0);
+
+  async function launch(group: Group): Promise<void> {
+    starting = true;
+    awaitedRunId = null;
+    batchNumber += 1;
+    const launchEpoch = epoch;
+    const number = batchNumber;
+    let result: BatchStartResult;
+    try {
+      result = await ports.start(group, { batchNumber: number, totalBatches });
+    } catch (error: unknown) {
+      result = { started: false, reason: error instanceof Error ? error.message : null };
+    } finally {
+      starting = false;
+    }
+    if (launchEpoch !== epoch) return;
+    if (result.started) {
+      awaitedRunId = result.runId;
+      return;
+    }
+    const remaining = pendingVideos();
+    pending = [];
+    if (remaining > 0) {
+      const why = result.reason ? `: ${result.reason}` : "";
+      ports.notify({
+        title: "Remaining batches not started",
+        description: `Batch ${number} of ${totalBatches} couldn't start${why}. ${COUNT_FORMAT.format(remaining)} videos were not queued.`
+      });
+    }
+  }
+
+  return {
+    async begin(groups) {
+      if (starting) return;
+      const [first, ...rest] = groups;
+      if (!first) return;
+      epoch += 1;
+      pending = rest;
+      totalBatches = groups.length;
+      batchNumber = 0;
+      await launch(first);
+    },
+    async onRunTerminal(runId) {
+      if (starting || awaitedRunId === null || awaitedRunId !== runId) return;
+      awaitedRunId = null;
+      const next = pending.shift();
+      if (next === undefined) return;
+      await launch(next);
+    },
+    clear() {
+      epoch += 1;
+      pending = [];
+      awaitedRunId = null;
+    },
+    isStarting: () => starting,
+    pendingVideos
+  };
 }
 
 /** Tells the user that a large selection runs as several batches, or null when it is a single run per group. */

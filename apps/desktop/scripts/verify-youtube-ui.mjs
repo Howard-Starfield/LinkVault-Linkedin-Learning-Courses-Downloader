@@ -276,8 +276,14 @@ matches(view, /requestGeneration === transcriptInspectionGenerationRef\.current/
 matches(view, /if \(!isCurrent\(\)\) return \{ kind: "superseded" \}/, "A superseded transcript inspection is not reported to the caller");
 // A Download click is never dropped silently: repeats are ignored while the row shows loading,
 // a busy lookup is waited for, and every non-starting outcome tells the user.
-matches(view, /async function startDownloads\([^)]*\): Promise<void> \{\s*[^]*?if \(startingGroupRef\.current\) return;[^]*?downloadQueueRef\.current = groups\.slice\(1\)/, "A repeat click can still reach the queue reset while a start is in flight");
-matches(view, /async function handleDownloadOne\([^)]*\): Promise<void> \{\s*if \(startingGroupRef\.current\) return;\s*downloadQueueRef\.current = \[\];/, "A repeat row click can clear the queue of the start already in flight");
+matches(view, /async function startDownloads\([^)]*\): Promise<void> \{\s*[^]*?if \(batches\.isStarting\(\)\) return;[^]*?await batches\.begin\(groups\)/, "A repeat click can still reach the batch queue while a start is in flight");
+matches(view, /async function handleDownloadOne\([^)]*\): Promise<void> \{\s*if \(batches\.isStarting\(\)\) return;\s*batches\.clear\(\);/, "A repeat row click can clear the queue of the start already in flight");
+assert.doesNotMatch(view, /downloadQueueRef/, "Batch sequencing must live in the tested sequencer, not in a view ref");
+matches(view, /createBatchSequencer<DownloadGroup>\(/, "The view does not use the batch sequencer");
+matches(view, /batches\.onRunTerminal\(runSnapshot\.runId\)/, "A finished run does not start the next batch");
+matches(view, /\[runSnapshot, isStarting, batches\]/, "A run that ended during its own start would strand the queue");
+matches(view, /handleCancel\(\)[^]*?batches\.clear\(\)/, "Cancel does not drop the batches that were not started");
+matches(view, /captionsNoticeShownRef/, "The no-captions notice can repeat for every batch");
 matches(view, /loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/, "Row Download buttons do not show a per-row loading state");
 assert.equal((view.match(/loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/g) ?? []).length, 2, "Both the single-result and the inline Download buttons need the loading state");
 matches(view, /retryWhileBusy\(\s*\(\) => inspectYouTubeTranscripts\(/, "Transcript inspection does not wait for a busy discovery slot");
@@ -288,7 +294,9 @@ matches(view, /const isCurrent = \(\) => helperViewMountedRef\.current\s*&& requ
 matches(view, /error instanceof BusyRetryCancelled/, "A cancelled start wait is not handled");
 // Large playlists: the scan's truncation is shown, and a selection over the per-run cap queues as batches.
 matches(view, /playlistTruncationNote\(plan\)/, "A truncated playlist scan is not noted in the view");
-matches(view, /className="youtube-scan-note" role="status"/, "The truncation note is not rendered as a status");
+matches(view, /className="youtube-scan-notes" role="status" aria-live="polite"/, "The truncation notes are not in one persistent status region");
+matches(view, /<p key=\{note\.key\} className="youtube-scan-note">/, "The truncation notes are not keyed by scan plan");
+matches(view, /key: plan\.scanPlanId/, "The truncation notes are not keyed by scan plan id");
 matches(view, /splitIntoRuns\(planGroups\)/, "Download all does not split a selection over the per-run cap");
 matches(view, /batchingNotice\(/, "A split selection is not announced");
 matches(types, /totalCount: number \| null;/, "The scan response type omits the playlist total");
