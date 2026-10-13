@@ -106,7 +106,7 @@ mod tests {
         // Capped at six hours: the cap is reached at 710 GiB and never exceeded.
         let cap = Duration::from_secs(6 * 60 * 60);
         assert_eq!(media_probe_timeout(710 * GIB), cap);
-        assert_eq!(media_probe_timeout(709 * GIB) < cap, true);
+        assert!(media_probe_timeout(709 * GIB) < cap);
         assert_eq!(media_probe_timeout(10_000 * GIB), cap);
         assert_eq!(media_probe_timeout(u64::MAX), cap);
         // Never below the old fixed timeout, and non-decreasing.
