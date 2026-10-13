@@ -210,7 +210,7 @@ fn ensure_occurrence_identity(occurrence_id: &str) -> Result<(), YouTubeInternal
 /// this for them.  The scan output as a whole may be far larger than an
 /// inspection result (`formats` grows with duration), and that is irrelevant
 /// here: a dedicated run prints only the caption fields, so the same
-/// inspection limit applies to the serialized caption fields alone.  Returns
+/// inspection limit applies to the size those fields would print.  Returns
 /// `None` when those exceed it or the caption metadata is malformed, which
 /// leaves the occurrence to the lazy per-item inspection fallback and its
 /// original error reporting.
@@ -219,17 +219,104 @@ pub(crate) fn tracks_from_scan_metadata(
     metadata: &Value,
 ) -> Option<Vec<YouTubeTranscriptTrack>> {
     let object = metadata.as_object()?;
-    let mut caption_bytes = 0usize;
-    for field in CAPTION_FIELDS {
-        if let Some(value) = object.get(field) {
-            caption_bytes = caption_bytes
-                .saturating_add(serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len()));
-        }
-    }
-    if caption_bytes > MAX_RECORD_STDOUT_BYTES {
+    if yt_dlp_printed_len(object) > MAX_RECORD_STDOUT_BYTES {
         return None;
     }
     tracks_from_metadata(occurrence_id, metadata).ok()
+}
+
+/// Bytes a field-selected run would print for these captions: the two fields as one JSON
+/// object in Python's `json.dumps` style (`", "` and `": "` separators, every non-ASCII
+/// character escaped) plus the newline `--print` appends.  Measuring the printed form, which is
+/// larger than compact JSON, keeps the scan-side limit from being laxer than the inspection run's.
+fn yt_dlp_printed_len(object: &Map<String, Value>) -> usize {
+    #[derive(serde::Serialize)]
+    struct PrintedFields<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subtitles: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        automatic_captions: Option<&'a Value>,
+    }
+    let fields = PrintedFields {
+        subtitles: object.get(CAPTION_FIELDS[0]),
+        automatic_captions: object.get(CAPTION_FIELDS[1]),
+    };
+    let mut serializer =
+        serde_json::Serializer::with_formatter(ByteCounter(0), PythonJsonFormat);
+    match serde::Serialize::serialize(&fields, &mut serializer) {
+        Ok(()) => serializer.into_inner().0.saturating_add(1),
+        Err(_) => usize::MAX,
+    }
+}
+
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(data.len());
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Python's default `json.dumps` layout (`ensure_ascii=True`), which yt-dlp's `j` conversion uses.
+struct PythonJsonFormat;
+
+impl serde_json::ser::Formatter for PythonJsonFormat {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+
+    fn write_string_fragment<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        fragment: &str,
+    ) -> std::io::Result<()> {
+        if fragment.is_ascii() {
+            return writer.write_all(fragment.as_bytes());
+        }
+        let mut units = [0u16; 2];
+        for character in fragment.chars() {
+            if character.is_ascii() {
+                writer.write_all(&[character as u8])?;
+            } else {
+                for unit in character.encode_utf16(&mut units) {
+                    write!(writer, "\\u{unit:04x}")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The only metadata fields transcript inspection reads.
@@ -762,5 +849,55 @@ mod tests {
                 assert_eq!(stored.tracks, inspected.tracks, "scan-derived tracks differ");
             }
         }
+    }
+
+    #[test]
+    fn printed_length_matches_what_yt_dlp_really_prints() {
+        // The sample is real `--print` output (Python-style separators plus the newline).
+        let value: Value = serde_json::from_str(FIELD_SELECTED_SAMPLE).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(yt_dlp_printed_len(object), FIELD_SELECTED_SAMPLE.len());
+        // Compact JSON is shorter, so measuring it would have been the laxer limit.
+        assert!(serde_json::to_vec(&value).unwrap().len() + 1 < FIELD_SELECTED_SAMPLE.len());
+    }
+
+    #[test]
+    fn printed_length_escapes_non_ascii_like_python() {
+        let value: Value =
+            serde_json::from_str(r#"{"subtitles":{"é":[{"name":"日本語 😀"}]},"other":1}"#).unwrap();
+        // Python escapes every non-ASCII character, as a surrogate pair beyond the BMP.
+        let expected = r#"{"subtitles": {""#.len() // up to the key
+            + 6 // the key: one BMP character, written as a 6-byte \uXXXX escape
+            + r#"": [{"name": ""#.len()
+            + 3 * 6 // three BMP characters
+            + 1 // the ASCII space
+            + 12 // one astral character: a surrogate pair, two escapes
+            + r#""}]}}"#.len()
+            + 1; // the newline --print appends
+        assert_eq!(yt_dlp_printed_len(value.as_object().unwrap()), expected);
+        // Only the caption fields count.
+        assert_eq!(yt_dlp_printed_len(&Map::new()), "{}".len() + 1);
+    }
+
+    #[test]
+    fn scan_tracks_are_refused_by_printed_size_not_compact_size() {
+        // One track whose format carries a long array: "0," is 2 bytes compact but "0, " is 3
+        // printed, so the two sizes straddle the 4 MiB inspection limit.
+        let captions = |zeros: usize| {
+            let filler = vec!["0"; zeros].join(",");
+            serde_json::from_str::<Value>(&format!(
+                r#"{{"subtitles":{{"en":[{{"ext":"vtt","x":[{filler}]}}]}}}}"#
+            ))
+            .unwrap()
+        };
+        let straddling = captions(1_600_000);
+        let compact = serde_json::to_vec(&straddling).unwrap().len();
+        let printed = yt_dlp_printed_len(straddling.as_object().unwrap());
+        assert!(compact < MAX_RECORD_STDOUT_BYTES && printed > MAX_RECORD_STDOUT_BYTES);
+        assert!(tracks_from_scan_metadata(OCCURRENCE, &straddling).is_none());
+        // Comfortably inside the limit in both forms: tracks are stored.
+        let small = captions(1_000_000);
+        assert!(yt_dlp_printed_len(small.as_object().unwrap()) < MAX_RECORD_STDOUT_BYTES);
+        assert_eq!(tracks_from_scan_metadata(OCCURRENCE, &small).unwrap().len(), 1);
     }
 }
