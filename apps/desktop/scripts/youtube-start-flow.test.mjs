@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   BUSY_RETRY_DELAYS_MS,
+  BusyRetryCancelled,
   describeBusyFailure,
   isRowDownloadDisabled,
   isRuntimeBusyError,
@@ -97,10 +98,51 @@ test("a click that was superseded stops waiting", async () => {
         throw busy();
       },
       { sleep, isCurrent: () => current }
-    )
+    ),
+    (error) => error instanceof BusyRetryCancelled
   );
   assert.equal(calls, 1);
   assert.deepEqual(slept, []);
+});
+
+test("work that stops being wanted during a pause is not run again", async () => {
+  let calls = 0;
+  let current = true;
+  let waiting = 0;
+  await assert.rejects(
+    retryWhileBusy(
+      async () => {
+        calls += 1;
+        throw busy();
+      },
+      {
+        // The view unmounts (or the scan is replaced) while the pause is running.
+        sleep: async () => { current = false; },
+        isCurrent: () => current,
+        onWaiting: () => { waiting += 1; }
+      }
+    ),
+    (error) => error instanceof BusyRetryCancelled
+  );
+  assert.equal(calls, 1, "no attempt follows the cancelled pause");
+  assert.equal(waiting, 1);
+});
+
+test("work that is already unwanted is never started", async () => {
+  let calls = 0;
+  await assert.rejects(
+    retryWhileBusy(async () => { calls += 1; return "started"; }, { isCurrent: () => false }),
+    (error) => error instanceof BusyRetryCancelled
+  );
+  assert.equal(calls, 0);
+});
+
+test("cancellation does not mask other failures while the work is still wanted", async () => {
+  const failure = { code: "SCAN_PLAN_STALE", message: "stale" };
+  await assert.rejects(
+    retryWhileBusy(async () => { throw failure; }, { isCurrent: () => true }),
+    (error) => error === failure
+  );
 });
 
 test("custom pauses bound the retries", async () => {

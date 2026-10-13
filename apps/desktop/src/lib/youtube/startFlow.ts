@@ -35,10 +35,22 @@ export interface BusyRetryOptions {
   /** Pauses between attempts; one retry per entry. */
   delaysMs?: readonly number[];
   sleep?: (milliseconds: number) => Promise<void>;
-  /** Return false to stop retrying, e.g. once the click that started the work is superseded. */
+  /**
+   * Return false once the work is no longer wanted (the view unmounted, or the click that started
+   * it was superseded).  It is checked before every attempt, including the first and the one that
+   * follows each pause, so a cancelled wait never starts the operation.
+   */
   isCurrent?: () => boolean;
   /** Called once, before the first pause. */
   onWaiting?: () => void;
+}
+
+/** Thrown by {@link retryWhileBusy} when `isCurrent` turned false; the operation was not (re)run. */
+export class BusyRetryCancelled extends Error {
+  constructor() {
+    super("The wait for the current lookup was cancelled.");
+    this.name = "BusyRetryCancelled";
+  }
 }
 
 function defaultSleep(milliseconds: number): Promise<void> {
@@ -50,7 +62,9 @@ function defaultSleep(milliseconds: number): Promise<void> {
 /**
  * Runs `operation`, and while it fails with RUNTIME_BUSY waits and tries again
  * a bounded number of times.  Any other failure, and the last busy failure
- * once the pauses are used up, is thrown to the caller unchanged.
+ * once the pauses are used up, is thrown to the caller unchanged.  If
+ * `isCurrent` turns false the wait ends with {@link BusyRetryCancelled} and the
+ * operation is not run again.
  */
 export async function retryWhileBusy<T>(
   operation: () => Promise<T>,
@@ -61,11 +75,13 @@ export async function retryWhileBusy<T>(
   const isCurrent = options.isCurrent ?? (() => true);
   let announced = false;
   for (let attempt = 0; ; attempt += 1) {
+    if (!isCurrent()) throw new BusyRetryCancelled();
     try {
       return await operation();
     } catch (error: unknown) {
       const delay = delays[attempt];
-      if (delay === undefined || !isRuntimeBusyError(error) || !isCurrent()) throw error;
+      if (delay === undefined || !isRuntimeBusyError(error)) throw error;
+      if (!isCurrent()) throw new BusyRetryCancelled();
       if (!announced) {
         announced = true;
         options.onWaiting?.();

@@ -62,6 +62,7 @@ import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtu
 import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
 import {
+  BusyRetryCancelled,
   WAITING_FOR_LOOKUP_MESSAGE,
   describeBusyFailure,
   isRowDownloadDisabled,
@@ -1017,7 +1018,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     }
     const requestGeneration = transcriptInspectionGenerationRef.current + 1;
     transcriptInspectionGenerationRef.current = requestGeneration;
-    const isCurrent = () => requestGeneration === transcriptInspectionGenerationRef.current;
+    // Stop waiting, and never launch another attempt, once the view is gone or a newer request or scan replaced this one.
+    const isCurrent = () => helperViewMountedRef.current
+      && requestGeneration === transcriptInspectionGenerationRef.current;
     try {
       const response = await retryWhileBusy(
         () => inspectYouTubeTranscripts({
@@ -1087,6 +1090,9 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     startingGroupRef.current = true;
     setIsStarting(true);
     setStartingOccurrenceIds(new Set(group.occurrenceIds));
+    // A click belongs to the scan it was made on: a rescan or reset, or leaving the view, cancels it.
+    const clickScanGeneration = scanGenerationRef.current;
+    const clickStillWanted = () => helperViewMountedRef.current && scanGenerationRef.current === clickScanGeneration;
     try {
       const resolvedOutputDir = outputDir.trim() || await pickOutputDirectory();
       if (!resolvedOutputDir) {
@@ -1096,8 +1102,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       if (downloadMode !== "video_only") {
         const inspection = await requestTranscriptInspection(group.scanPlanId, group.occurrenceIds);
         if (inspection.kind === "superseded") {
-          const notice = supersededClickMessage();
-          toast.message(notice.title, { description: notice.description });
+          if (helperViewMountedRef.current) {
+            const notice = supersededClickMessage();
+            toast.message(notice.title, { description: notice.description });
+          }
           return false;
         }
         // A failed inspection has already told the user why.
@@ -1125,7 +1133,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           allowAutomaticCaptions: true,
           continueWithoutTranscript: true
         }),
-        { onWaiting: () => setWaitingForLookup(true) }
+        { isCurrent: clickStillWanted, onWaiting: () => setWaitingForLookup(true) }
       );
       latestRunIdRef.current = response.receipt.runId;
       latestRevisionRef.current = 0;
@@ -1136,6 +1144,14 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       applyRunSnapshot(snapshot, true);
       return true;
     } catch (error) {
+      if (error instanceof BusyRetryCancelled) {
+        // Nothing was started: say so unless the view is already gone.
+        if (helperViewMountedRef.current) {
+          const notice = supersededClickMessage();
+          toast.message(notice.title, { description: notice.description });
+        }
+        return false;
+      }
       toast.error("YouTube download could not start", {
         description: describeBusyFailure(error) ?? formatYouTubeInvokeError(error)
       });

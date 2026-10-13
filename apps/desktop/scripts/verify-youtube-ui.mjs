@@ -282,6 +282,10 @@ matches(view, /loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)
 assert.equal((view.match(/loading=\{startingOccurrenceIds\.has\(video\.item\.occurrenceId\)\}/g) ?? []).length, 2, "Both the single-result and the inline Download buttons need the loading state");
 matches(view, /retryWhileBusy\(\s*\(\) => inspectYouTubeTranscripts\(/, "Transcript inspection does not wait for a busy discovery slot");
 matches(view, /retryWhileBusy\(\s*\(\) => startYouTubeDownload\(/, "Start does not wait for a busy discovery slot");
+matches(view, /const clickStillWanted = \(\) => helperViewMountedRef\.current && scanGenerationRef\.current === clickScanGeneration;/, "A Download click is not tied to the view and scan it was made on");
+matches(view, /isCurrent: clickStillWanted/, "The start retry does not stop when the view unmounts or the click is superseded");
+matches(view, /const isCurrent = \(\) => helperViewMountedRef\.current\s*&& requestGeneration === transcriptInspectionGenerationRef\.current/, "The inspection retry does not stop when the view unmounts");
+matches(view, /error instanceof BusyRetryCancelled/, "A cancelled start wait is not handled");
 matches(view, /WAITING_FOR_LOOKUP_MESSAGE/, "The wait for the current lookup is not shown");
 matches(view, /inspection\.kind === "superseded"[^]*?toast\.message\(/, "A superseded Download click gives no feedback");
 matches(view, /if \(!resolvedOutputDir\) \{\s*toast\.message\(/, "A Download click without a folder gives no feedback");
