@@ -191,14 +191,10 @@ fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalization
         let (start_ms, end_ms) = parse_timing_line(timing_line)?;
         index = timing_index + 1;
         let text_start = index;
-        while index < lines.len() && !lines[index].trim().is_empty() {
+        while index < lines.len() && !ends_cue_text(&lines, index) {
             index += 1;
         }
-        let text = lines[text_start..index]
-            .iter()
-            .map(|line| normalize_cue_text(line))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = join_cue_text(&lines[text_start..index]);
         cues.push(TranscriptCue {
             start_ms,
             end_ms,
@@ -207,6 +203,51 @@ fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalization
     }
 
     Ok(cues)
+}
+
+/// Per the WebVTT spec only a truly empty line ends cue text. YouTube
+/// auto-captions put whitespace-only lines inside cues, so those stay part of
+/// the text unless the next line starts a new cue (a timing line, or a cue
+/// identifier followed by a timing line).
+fn ends_cue_text(lines: &[&str], index: usize) -> bool {
+    let line = lines[index];
+    if line.is_empty() {
+        return true;
+    }
+    if !line.trim().is_empty() {
+        return false;
+    }
+    match lines.get(index + 1) {
+        Some(next) if next.contains("-->") => true,
+        Some(next) if !next.trim().is_empty() => lines
+            .get(index + 2)
+            .is_some_and(|after| after.contains("-->")),
+        _ => false,
+    }
+}
+
+/// Normalizes each cue text line and joins them, dropping blank lines at
+/// either end (whitespace-only lines normalize to empty text).
+fn join_cue_text(cue_lines: &[&str]) -> String {
+    let normalized: Vec<String> = cue_lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                normalize_cue_text(line)
+            }
+        })
+        .collect();
+    let is_blank = |line: &String| line.trim().is_empty();
+    let Some(first) = normalized.iter().position(|line| !is_blank(line)) else {
+        return String::new();
+    };
+    let last = normalized
+        .iter()
+        .rposition(|line| !is_blank(line))
+        .unwrap_or(first);
+    normalized[first..=last].join("\n")
 }
 
 fn is_webvtt_header(line: &str) -> bool {
@@ -538,6 +579,87 @@ mod tests {
             normalize_vtt(overflow.as_bytes(), metadata()),
             Err(TranscriptNormalizationError::TimestampOverflow { .. })
         ));
+    }
+
+    #[test]
+    fn parses_youtube_auto_caption_cues_with_whitespace_only_lines() {
+        let raw = concat!(
+            "WEBVTT\n",
+            "Kind: captions\n",
+            "Language: en\n",
+            "\n",
+            "00:00:00.160 --> 00:00:02.230 align:start position:0%\n",
+            " \n",
+            "You<00:00:00.240><c> are</c><00:00:00.320><c> sitting</c><00:00:00.600><c> in</c><00:00:00.680><c> a</c><00:00:00.720><c> meeting</c>\n",
+            "\n",
+            "00:00:02.230 --> 00:00:02.240 align:start position:0%\n",
+            "You are sitting in a meeting\n",
+            " \n",
+            "\n",
+            "00:00:02.240 --> 00:00:04.990 align:start position:0%\n",
+            "You are sitting in a meeting\n",
+            "and<00:00:02.560><c> someone</c><00:00:02.880><c> says</c>\n",
+        );
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).expect("auto captions parse");
+        assert_eq!(normalized.cues.len(), 3);
+        assert_eq!(
+            (normalized.cues[0].start_ms, normalized.cues[0].end_ms),
+            (160, 2_230)
+        );
+        assert_eq!(normalized.cues[0].text, "You are sitting in a meeting");
+        assert_eq!(
+            (normalized.cues[1].start_ms, normalized.cues[1].end_ms),
+            (2_230, 2_240)
+        );
+        assert_eq!(normalized.cues[1].text, "You are sitting in a meeting");
+        assert_eq!(
+            (normalized.cues[2].start_ms, normalized.cues[2].end_ms),
+            (2_240, 4_990)
+        );
+        assert_eq!(
+            normalized.cues[2].text,
+            "You are sitting in a meeting\nand someone says"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_line_before_next_cue_terminates_the_cue() {
+        let raw = concat!(
+            "WEBVTT\n\n",
+            "00:00:00.000 --> 00:00:01.000\n",
+            "first\n",
+            " \n",
+            "00:00:01.000 --> 00:00:02.000\n",
+            "second\n",
+            "\t\n",
+            "cue-3\n",
+            "00:00:02.000 --> 00:00:03.000\n",
+            "third\n",
+        );
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).expect("fixture should parse");
+        let cues: Vec<_> = normalized
+            .cues
+            .iter()
+            .map(|cue| (cue.start_ms, cue.end_ms, cue.text.as_str()))
+            .collect();
+        assert_eq!(
+            cues,
+            vec![
+                (0, 1_000, "first"),
+                (1_000, 2_000, "second"),
+                (2_000, 3_000, "third"),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_cues_whose_text_is_only_whitespace_with_empty_text() {
+        let raw =
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n \n\n00:00:01.000 --> 00:00:02.000\nx\n";
+        let normalized = normalize_vtt(raw.as_bytes(), metadata()).expect("fixture should parse");
+        assert_eq!(normalized.cues.len(), 2);
+        assert_eq!(normalized.cues[0].text, "");
+        assert_eq!(normalized.cues[1].text, "x");
     }
 
     #[test]
