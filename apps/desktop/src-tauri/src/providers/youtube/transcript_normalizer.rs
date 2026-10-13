@@ -208,7 +208,7 @@ fn parse_vtt(source: &str) -> Result<Vec<TranscriptCue>, TranscriptNormalization
 /// Per the WebVTT spec only a truly empty line ends cue text. YouTube
 /// auto-captions put whitespace-only lines inside cues, so those stay part of
 /// the text unless the next line starts a new cue (a timing line, or a cue
-/// identifier followed by a timing line).
+/// identifier followed by a timing line) or a NOTE, STYLE or REGION block.
 fn ends_cue_text(lines: &[&str], index: usize) -> bool {
     let line = lines[index];
     if line.is_empty() {
@@ -218,7 +218,7 @@ fn ends_cue_text(lines: &[&str], index: usize) -> bool {
         return false;
     }
     match lines.get(index + 1) {
-        Some(next) if next.contains("-->") => true,
+        Some(next) if next.contains("-->") || is_ignored_block_start(next) => true,
         Some(next) if !next.trim().is_empty() => lines
             .get(index + 2)
             .is_some_and(|after| after.contains("-->")),
@@ -650,6 +650,31 @@ mod tests {
                 (2_000, 3_000, "third"),
             ]
         );
+    }
+
+    #[test]
+    fn whitespace_only_line_before_note_style_or_region_block_terminates_the_cue() {
+        for block in [
+            "NOTE a comment\nspanning two lines",
+            "STYLE\n::cue { color: red }",
+            "REGION\nid:fred",
+        ] {
+            let raw = format!(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nfirst\n \n{block}\n\n00:00:01.000 --> 00:00:02.000\nsecond\n"
+            );
+            let normalized =
+                normalize_vtt(raw.as_bytes(), metadata()).expect("fixture should parse");
+            let cues: Vec<_> = normalized
+                .cues
+                .iter()
+                .map(|cue| (cue.start_ms, cue.end_ms, cue.text.as_str()))
+                .collect();
+            assert_eq!(
+                cues,
+                vec![(0, 1_000, "first"), (1_000, 2_000, "second")],
+                "block leaked into the cue: {block}"
+            );
+        }
     }
 
     #[test]
