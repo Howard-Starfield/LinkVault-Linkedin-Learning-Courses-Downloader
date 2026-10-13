@@ -2693,7 +2693,7 @@ export default function App() {
           ) : activeView === "youtube" ? (
             <YouTubeView />
           ) : activeView === "youtube-history" ? (
-            <YouTubeView mode="history" />
+            <YouTubeView mode="history" onPlayerOpenChange={setLinkedinCinema} />
           ) : activeView === "newspaper-download" ? (
             <NewspaperView
               onRequestQueueProcess={(options) => ensureNewspaperQueueProcessing(options ?? null, true)}

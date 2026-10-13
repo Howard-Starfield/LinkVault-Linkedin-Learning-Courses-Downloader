@@ -53,11 +53,14 @@ import {
   type YouTubeError,
   type YouTubeHistoryEntry,
   type YouTubeItemState,
+  type YouTubePlayerSession,
   type YouTubePlaylistMode,
   type YouTubeRunSnapshot,
   type YouTubeScanItem,
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
+import { YouTubeHistoryRow } from "./YouTubeHistoryRow";
+import { YouTubePlayerPane } from "./YouTubePlayerPane";
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
 import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
@@ -327,7 +330,14 @@ function formatYouTubeWarning(value: unknown): string {
   }
 }
 
-export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "history" }) {
+export function YouTubeView({
+  mode = "downloads",
+  onPlayerOpenChange
+}: {
+  mode?: "downloads" | "history";
+  /** Reports whether the in-app player is open so the shell can enter cinema mode. */
+  onPlayerOpenChange?: (open: boolean) => void;
+}) {
   const nativeRuntime = isTauriRuntime();
   const [helperStatus, setHelperStatus] = useState<HelperStatus>(nativeRuntime ? "pending" : "ready");
   const [helperError, setHelperError] = useState<YouTubeError | null>(null);
@@ -449,6 +459,8 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const [historyEntries, setHistoryEntries] = useState<YouTubeHistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(mode === "history");
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [player, setPlayer] = useState<YouTubePlayerSession | null>(null);
+  const [playerClosedCount, setPlayerClosedCount] = useState(0);
   const sourceInputRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptInspectionGenerationRef = useRef(0);
   const latestRunIdRef = useRef<string | null>(null);
@@ -535,6 +547,16 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       disposed = true;
     };
   }, [nativeRuntime]);
+
+  useEffect(() => {
+    onPlayerOpenChange?.(player !== null);
+  }, [onPlayerOpenChange, player]);
+
+  useEffect(() => {
+    return () => {
+      onPlayerOpenChange?.(false);
+    };
+  }, [onPlayerOpenChange]);
 
   useEffect(() => {
     if (mode !== "history") return;
@@ -1333,7 +1355,25 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
 
   if (mode === "history") {
     return (
+      <>
+      {player ? (
+        <div
+          className="lv-workspace youtube-history-workspace youtube-player-workspace"
+          data-player-open="true"
+        >
+          <YouTubePlayerPane
+            session={player}
+            onClose={() => {
+              setPlayer(null);
+              setPlayerClosedCount((count) => count + 1);
+            }}
+          />
+        </div>
+      ) : null}
       <YouTubeHistoryPage
+        hidden={player !== null}
+        playerClosedCount={playerClosedCount}
+        onPlay={setPlayer}
         entries={historyEntries}
         loading={historyLoading}
         error={historyError}
@@ -1349,6 +1389,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           }
         }}
       />
+      </>
     );
   }
 
@@ -1693,15 +1734,24 @@ function YouTubeHistoryPage({
   entries,
   loading,
   error,
-  onOpenFolder
+  hidden,
+  playerClosedCount,
+  onOpenFolder,
+  onPlay
 }: {
+  hidden: boolean;
   entries: YouTubeHistoryEntry[];
   loading: boolean;
   error: string | null;
+  playerClosedCount: number;
   onOpenFolder: (entry: YouTubeHistoryEntry) => void | Promise<void>;
+  onPlay: (session: YouTubePlayerSession) => void;
 }) {
   return (
-    <div className="lv-workspace download-history-workspace youtube-history-workspace">
+    <div
+      className="lv-workspace download-history-workspace youtube-history-workspace"
+      style={hidden ? { display: "none" } : undefined}
+    >
       <div className="download-history-header youtube-history-header">
         <p className="download-history-count">
           {loading
@@ -1727,28 +1777,14 @@ function YouTubeHistoryPage({
               `${entry.videoCount} video${entry.videoCount === 1 ? "" : "s"}`
             ].join(" · ");
             return (
-              <li key={entry.runId} className="download-history-row youtube-history-row">
-                <div className="download-history-copy">
-                  <strong>{entry.title}</strong>
-                  <span>{meta}</span>
-                  {entry.errorMessage ? (
-                    <span className="youtube-result-warning">{entry.errorMessage}</span>
-                  ) : null}
-                </div>
-                <div className="download-history-overlay">
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="ghost"
-                    className="download-history-file-action youtube-file-action"
-                    onClick={() => void onOpenFolder(entry)}
-                    aria-label={`Open folder for ${entry.title}`}
-                  >
-                    <FolderOpen aria-hidden="true" />
-                    Open Folder
-                  </Button>
-                </div>
-              </li>
+              <YouTubeHistoryRow
+                key={entry.runId}
+                entry={entry}
+                meta={meta}
+                refreshKey={playerClosedCount}
+                onOpenFolder={onOpenFolder}
+                onPlay={onPlay}
+              />
             );
           })}
         </ol>

@@ -2,16 +2,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   CancelYouTubeRunRequest,
+  GetYouTubePlaybackProgressRequest,
   GetYouTubeDownloadStateRequest,
   GetYouTubeHelperStatusResponse,
   MediaToolchainStatus,
   InspectYouTubeTranscriptsRequest,
   InspectYouTubeTranscriptsResponse,
   ListYouTubeHistoryRequest,
+  ListYouTubeRunVideosRequest,
   MutateYouTubeRunRequest,
   OpenYouTubeDownloadFolderRequest,
   OpenYouTubeDownloadFolderResponse,
   SavedYouTubePreferences,
+  SaveYouTubePlaybackProgressRequest,
   ScanYouTubeSourceRequest,
   ScanYouTubeSourceResponse,
   StartYouTubeDownloadRequest,
@@ -19,8 +22,10 @@ import type {
   YouTubeDownloadMode,
   YouTubeHistoryEntry,
   YouTubeItemState,
+  YouTubePlaybackProgress,
   YouTubeProgressEvent,
   YouTubeProgressItem,
+  YouTubeRunVideo,
   YouTubeRunSnapshot,
   YouTubeScanItem,
   YouTubeError,
@@ -244,6 +249,39 @@ export async function listYouTubeHistory(
     return invoke<YouTubeHistoryEntry[]>("list_youtube_history", { request });
   }
   return [];
+}
+
+/** Videos of a finished run with opaque playback URLs; missing files come back unavailable, not as errors. */
+export async function listYouTubeRunVideos(
+  request: ListYouTubeRunVideosRequest
+): Promise<YouTubeRunVideo[]> {
+  if (isTauriRuntime()) {
+    return invoke<YouTubeRunVideo[]>("list_youtube_run_videos", { request });
+  }
+  return [];
+}
+
+export async function getYouTubePlaybackProgress(
+  request: GetYouTubePlaybackProgressRequest
+): Promise<YouTubePlaybackProgress | null> {
+  if (isTauriRuntime()) {
+    return invoke<YouTubePlaybackProgress | null>("get_youtube_playback_progress", { request });
+  }
+  return null;
+}
+
+export async function saveYouTubePlaybackProgress(
+  request: SaveYouTubePlaybackProgressRequest
+): Promise<YouTubePlaybackProgress> {
+  if (isTauriRuntime()) {
+    return invoke<YouTubePlaybackProgress>("save_youtube_playback_progress", { request });
+  }
+  // Browser preview has no database; echo the sample so callers behave the same.
+  return {
+    positionSeconds: request.positionSeconds,
+    durationSeconds: request.durationSeconds,
+    completed: false
+  };
 }
 
 export async function startYouTubeUiMock(): Promise<StartYouTubeDownloadResponse> {

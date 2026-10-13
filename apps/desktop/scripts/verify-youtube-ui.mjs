@@ -43,7 +43,7 @@ includes(app, "Downloaded history", "YouTube nav is missing Downloaded history c
 includes(app, 'activeView === "youtube" ? (', "YouTube route is not mounted in the main view switch");
 includes(app, 'activeView === "youtube-history" ? (', "YouTube history route is not mounted in the main view switch");
 includes(app, "<YouTubeView />", "YouTube route does not render YouTubeView");
-includes(app, '<YouTubeView mode="history" />', "YouTube history route does not render history mode");
+includes(app, '<YouTubeView mode="history" onPlayerOpenChange={setLinkedinCinema} />', "YouTube history route does not render history mode with the cinema hook");
 includes(app, "isYouTubeExpanded", "YouTube nav expand/collapse state is missing");
 includes(styles, '.lv-content[data-active-view="youtube-history"]', "YouTube history content scroll rule is missing");
 
@@ -58,6 +58,9 @@ for (const command of [
   '"resume_youtube_download"',
   '"open_youtube_download_folder"',
   '"list_youtube_history"',
+  '"list_youtube_run_videos"',
+  '"get_youtube_playback_progress"',
+  '"save_youtube_playback_progress"',
   '"get_youtube_helper_status"',
   '"get_youtube_preferences"',
   '"save_youtube_preferences"'
@@ -72,10 +75,13 @@ matches(ipc, /invoke<YouTubeRunSnapshot>\("pause_youtube_download"/, "Pause IPC 
 matches(ipc, /invoke<YouTubeRunSnapshot>\("resume_youtube_download"/, "Resume IPC is not typed");
 matches(ipc, /invoke<YouTubeHistoryEntry\[\]>\("list_youtube_history"/, "History list IPC is not typed");
 matches(ipc, /export async function listYouTubeHistory/, "listYouTubeHistory adapter is missing");
+matches(ipc, /invoke<YouTubeRunVideo\[\]>\("list_youtube_run_videos"/, "Run video list IPC is not typed");
+matches(ipc, /invoke<YouTubePlaybackProgress \| null>\("get_youtube_playback_progress"/, "Playback progress get IPC is not typed");
+matches(ipc, /invoke<YouTubePlaybackProgress>\("save_youtube_playback_progress"/, "Playback progress save IPC is not typed");
 matches(ipc, /return \{ status: "ready", code: null, message: "" \}/, "Browser preview does not remain helper-ready");
 matches(ipc, /listen<YouTubeProgressEvent>\(/, "Run-change listener is not typed");
 matches(view, /subscribeYouTubeRunChanged/, "YouTube view does not subscribe to run events");
-matches(view, /export function YouTubeView\(\{ mode = "downloads" \}/, "YouTubeView does not accept downloads/history mode");
+matches(view, /export function YouTubeView\(\{\s*mode = "downloads",\s*onPlayerOpenChange\s*\}/, "YouTubeView does not accept downloads/history mode and the player cinema hook");
 matches(view, /mode === "history"/, "YouTube history mode mount is missing");
 matches(view, /listYouTubeHistory/, "YouTube history mode does not load durable history");
 matches(view, /Paste a URL to scan/, "Empty queue copy is missing");
@@ -132,6 +138,12 @@ for (const type of [
   "OpenYouTubeDownloadFolderResponse",
   "YouTubeHistoryEntry",
   "ListYouTubeHistoryRequest",
+  "ListYouTubeRunVideosRequest",
+  "YouTubeRunVideo",
+  "YouTubePlaybackProgress",
+  "SaveYouTubePlaybackProgressRequest",
+  "GetYouTubePlaybackProgressRequest",
+  "YouTubePlayerSession",
   "GetYouTubeHelperStatusResponse",
   "SavedYouTubePreferences",
   "YouTubeScanItem",
@@ -348,7 +360,7 @@ assert.doesNotMatch(styles, /\.youtube-search-hint/, "Search hint styles are sti
 
 assert.equal(
   packageJson.scripts["verify:youtube-ui"],
-  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status && npm run verify:youtube-start-flow",
+  "node ./scripts/verify-youtube-ui.mjs && npm run verify:youtube-helper-recovery && npm run verify:youtube-helper-lock && npm run verify:youtube-item-status && npm run verify:youtube-start-flow && npm run verify:youtube-playback",
   "Desktop YouTube UI verifier is not wired"
 );
 includes(view, "Download YouTube helpers to repair.", "Failed items with reinstall-class errors must point at the helper repair action");

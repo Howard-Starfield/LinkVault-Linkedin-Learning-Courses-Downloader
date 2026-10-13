@@ -293,3 +293,52 @@ export function isYouTubeRunTerminal(state: YouTubeRunState | null | undefined):
     || state === "failed"
     || state === "cancelled";
 }
+
+export interface ListYouTubeRunVideosRequest {
+  runId: string;
+}
+
+/**
+ * One video of a finished run, as the in-app player needs it.
+ * `mediaUrl` / `subtitlesUrl` are opaque `youtube-media` URLs (ids only).
+ * An unavailable video has no URLs and says why in `unavailableReason`.
+ */
+export interface YouTubeRunVideo {
+  occurrenceId: string;
+  ordinal: number;
+  title: string;
+  videoId: string;
+  mediaUrl: string | null;
+  subtitlesUrl: string | null;
+  available: boolean;
+  unavailableReason: string | null;
+  positionSeconds: number | null;
+  durationSeconds: number | null;
+  completed: boolean;
+}
+
+export interface GetYouTubePlaybackProgressRequest {
+  runId: string;
+  occurrenceId: string;
+}
+
+export interface SaveYouTubePlaybackProgressRequest {
+  runId: string;
+  occurrenceId: string;
+  positionSeconds: number;
+  durationSeconds: number;
+}
+
+export interface YouTubePlaybackProgress {
+  positionSeconds: number;
+  durationSeconds: number;
+  completed: boolean;
+}
+
+/** What the history page hands the player: one run and the video to start on. */
+export interface YouTubePlayerSession {
+  runId: string;
+  title: string;
+  videos: YouTubeRunVideo[];
+  startOccurrenceId: string;
+}
