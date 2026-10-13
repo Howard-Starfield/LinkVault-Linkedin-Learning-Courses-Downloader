@@ -1367,7 +1367,7 @@ fn apply_executor_outcome(
             step_id.to_string(),
             reason,
             outcome.pause_code.clone(),
-            0,
+            outcome.pause_revision,
             now,
         )? {
             return Ok(false);
@@ -2461,5 +2461,47 @@ mod tests {
             .is_none());
         let coursera = runtime.get_run("coursera-queued-1".to_string()).unwrap().unwrap();
         assert_eq!(coursera.state, RunState::Queued);
+    }
+
+    struct PauseRetryWithRevision;
+
+    impl StepExecutor for PauseRetryWithRevision {
+        fn workflow_type(&self) -> &'static str {
+            "youtube_download"
+        }
+
+        fn execute(&self, _run: &RunRecord, _step: &StepRecord) -> ExecutorOutcome {
+            // The provider's own pause write failed; the runtime applies it.
+            let mut outcome =
+                ExecutorOutcome::paused_for_user("dropped".to_string(), Some("HELPER_FAILED".to_string()));
+            outcome.pause_revision = 4321;
+            outcome
+        }
+    }
+
+    #[test]
+    fn the_runtimes_retry_of_a_pause_keeps_the_providers_last_revision() {
+        use crate::workflow::domain::resume::ResumeTrigger;
+        let (_dir, runtime) = runtime();
+        runtime.register_executor(Arc::new(PauseRetryWithRevision));
+        runtime
+            .submit_youtube_download(
+                "yt-rev-retry".to_string(),
+                "vid".to_string(),
+                "{}".to_string(),
+                ".".to_string(),
+                100,
+            )
+            .unwrap();
+        runtime.drain_type("youtube_download").unwrap();
+
+        let record = runtime
+            .get_resume("yt-rev-retry".to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.last_revision, 4321, "a retry must not lower the revision to 0");
+        assert!(runtime
+            .begin_resume("yt-rev-retry".to_string(), ResumeTrigger::Manual, 200)
+            .unwrap());
     }
 }

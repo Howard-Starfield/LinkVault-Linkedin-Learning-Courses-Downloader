@@ -106,6 +106,27 @@ pub fn stale_part_leaves(names: &[String], chosen_format_ids: &[String]) -> Vec<
 /// when yt-dlp reports its choice, read on resume to pin the same selection,
 /// and removed before the item is verified and published.
 pub const FORMAT_MARKER: &str = "media.lvformat";
+/// Marker holding the reason a transcript was discarded while the video was
+/// kept, so finalization after a resume keeps the same warning without
+/// fetching the transcript again.
+pub const TRANSCRIPT_MARKER: &str = "media.lvtranscript";
+/// Marker holding the code of the last verification failure of a finished
+/// download, to stop Continue from repeating the same failing check forever.
+pub const VERIFY_MARKER: &str = "media.lvverify";
+
+/// Resume bookkeeping that is never an artifact.
+pub fn is_bookkeeping_leaf(name: &str) -> bool {
+    matches!(name, FORMAT_MARKER | TRANSCRIPT_MARKER | VERIFY_MARKER)
+}
+
+/// A downloaded media stream or merged media file (not a subtitle or marker).
+pub fn is_media_leaf(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("media.")
+        && lower
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| MEDIA_EXTENSIONS.contains(&extension))
+}
 
 /// True when any file is an unfinished download (`.part`, fragments, `.ytdl`).
 /// A directory with none holds only complete files, whose bytes cannot be
@@ -161,6 +182,8 @@ pub fn ffmpeg_stderr_proves_invalid(stderr: &str) -> bool {
         "could not find codec parameters",
         "ebml header parsing failed",
         "partial file",
+        // The stream map names a stream the file does not have (no audio).
+        "matches no streams",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))

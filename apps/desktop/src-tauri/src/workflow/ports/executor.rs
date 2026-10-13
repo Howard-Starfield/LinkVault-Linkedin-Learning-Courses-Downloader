@@ -18,6 +18,9 @@ pub struct ExecutorOutcome {
     /// Pause the run for the user instead of failing it (resumed attempts).
     pub pause_for_user: bool,
     pub pause_code: Option<String>,
+    /// Last live revision published before the pause, so the durable write
+    /// (or its retry by the runtime) never lowers it.
+    pub pause_revision: u64,
     pub error_message: Option<String>,
     pub payload_json: String,
 }
@@ -31,6 +34,7 @@ impl ExecutorOutcome {
             retryable: false,
             pause_for_user: false,
             pause_code: None,
+            pause_revision: 0,
             error_message: None,
             payload_json,
         }
@@ -44,6 +48,7 @@ impl ExecutorOutcome {
             retryable: false,
             pause_for_user: false,
             pause_code: None,
+            pause_revision: 0,
             error_message: Some(message),
             payload_json: "{}".to_string(),
         }
@@ -57,6 +62,7 @@ impl ExecutorOutcome {
             retryable: true,
             pause_for_user: false,
             pause_code: None,
+            pause_revision: 0,
             error_message: Some(message),
             payload_json: "{}".to_string(),
         }
@@ -70,6 +76,7 @@ impl ExecutorOutcome {
             retryable: false,
             pause_for_user: false,
             pause_code: None,
+            pause_revision: 0,
             error_message: Some(message),
             payload_json: "{}".to_string(),
         }
@@ -85,6 +92,7 @@ impl ExecutorOutcome {
             retryable: false,
             pause_for_user: true,
             pause_code: code,
+            pause_revision: 0,
             error_message: Some(message),
             payload_json: "{}".to_string(),
         }

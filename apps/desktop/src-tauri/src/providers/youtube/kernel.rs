@@ -332,7 +332,11 @@ impl YoutubeDownloadExecutor {
         if let Some(notify) = &self.notify_resume_changed {
             notify();
         }
-        ExecutorOutcome::paused_for_user(reason, Some(error.code.clone()))
+        let mut outcome = ExecutorOutcome::paused_for_user(reason, Some(error.code.clone()));
+        // If the runtime has to apply the pause itself, it must record the real
+        // revision, not zero.
+        outcome.pause_revision = revision;
+        outcome
     }
 
     fn end_cancelled(

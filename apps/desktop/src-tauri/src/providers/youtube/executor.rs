@@ -15,7 +15,8 @@ use crate::providers::youtube::resume::{
     classify_helper_failure, ffmpeg_stderr_proves_invalid, has_complete_merged_media,
     has_incomplete_partials, incomplete_leaves, keep_staging_after, pause_reason,
     pinned_format_unavailable,
-    stale_part_leaves, FailureKind, FORMAT_MARKER,
+    is_bookkeeping_leaf, is_media_leaf, stale_part_leaves, FailureKind, FORMAT_MARKER,
+    TRANSCRIPT_MARKER, VERIFY_MARKER,
 };
 use crate::app::safe_output_filesystem::resume::{resumable_staging_name, StagingDisposition};
 use crate::providers::youtube::error::YouTubeError;
@@ -766,8 +767,10 @@ impl YouTubeExecutor {
         let skip_helper = pinned.is_some()
             && !matches!(&self.mode, YouTubeDownloadMode::TranscriptOnly)
             && {
-                let transcript_needed =
-                    self.item_selected_transcript(item).ok().flatten().is_some();
+                // A VTT is only required when the run cannot go on without a
+                // transcript; an optional one may have been discarded already.
+                let transcript_needed = !self.continue_without_transcript
+                    && self.item_selected_transcript(item).ok().flatten().is_some();
                 cleanup
                     .lease()
                     .leaf_names()
@@ -896,6 +899,16 @@ impl YouTubeExecutor {
                     STAGE_NORMALIZING,
                 );
             }
+            // A transcript already discarded as unusable stays discarded: the
+            // video is finalized with the same warning, nothing is fetched.
+            let recorded_failure = (matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
+                && self.continue_without_transcript
+                && selected.is_some())
+            .then(|| read_text_marker(cleanup.lease(), TRANSCRIPT_MARKER, 600))
+            .flatten();
+            if let Some(reason) = recorded_failure {
+                transcript_failure = Some(("TRANSCRIPT_INVALID", reason));
+            } else {
             match selected
                 .as_ref()
                 .map(|selected| post_process_transcript(cleanup.lease(), item, selected))
@@ -930,10 +943,13 @@ impl YouTubeExecutor {
                         discard_transcript_artifacts(cleanup.lease())
                             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
                         transcript_failure = Some((error.code(), error.to_string()));
+                        let reason: String = error.to_string().chars().take(500).collect();
+                        let _ = write_text_marker(cleanup.lease(), TRANSCRIPT_MARKER, &reason);
                     } else {
                         return Err(transient_error(error.code(), error.to_string()));
                     }
                 }
+            }
             }
         }
         report_stage(
@@ -981,9 +997,9 @@ impl YouTubeExecutor {
                     if !readable {
                         return Err(transient_error("MEDIA_VERIFY_FAILED", message));
                     }
-                    for name in &media_names {
-                        let _ = cleanup.lease().remove_leaf(name);
-                    }
+                    // Media and the recorded format selection both go: a format
+                    // without the required streams must not be pinned again.
+                    let _ = discard_finished_download(cleanup.lease());
                     return Err(transient_error("MEDIA_CORRUPT", message));
                 }
                 // An I/O or process failure proves nothing about the file:
@@ -1085,7 +1101,7 @@ impl YouTubeExecutor {
         drop(held_leaf_handles);
         // Kept through verification so a crash there still resumes with the
         // media; it must not be published.
-        remove_format_marker(cleanup.lease())
+        remove_bookkeeping(cleanup.lease())
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         let destination = self
             .output_root
@@ -1203,6 +1219,15 @@ impl TransientExecutor for YouTubeExecutor {
             &mut cleanup,
             preserved_bytes,
         );
+        let result = match result {
+            Err(error)
+                if resumable
+                    && matches!(error.code.as_str(), "MEDIA_VERIFY_FAILED" | "OUTPUT_VERIFY_FAILED") =>
+            {
+                Err(note_verification_failure(cleanup.lease(), error))
+            }
+            other => other,
+        };
         if let Err(error) = &result {
             // A cancelled or non-transport failure removes its partial files; a
             // transport failure keeps them so the next attempt resumes from the
@@ -1662,7 +1687,7 @@ fn verify_artifacts(
             .ok_or_else(|| format!("staging contained an unnamed artifact: {}", path.display()))?;
         validate_output_component(name).map_err(|error| error.to_string())?;
         // Resume bookkeeping, not an artifact; removed just before publication.
-        if name == FORMAT_MARKER {
+        if is_bookkeeping_leaf(name) {
             continue;
         }
         if name == "manifest.json" {
@@ -2649,30 +2674,63 @@ fn helper_failure(stderr: &str, summary: &str) -> TransientError {
 /// The format selection recorded in a reused staging directory, if it is
 /// present and plain enough to hand back to yt-dlp.
 fn read_format_marker(lease: &OutputAttemptLease) -> Option<String> {
-    let mut file = lease.open_leaf(FORMAT_MARKER).ok()?;
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut std::io::Read::take(&mut file, 256), &mut text).ok()?;
-    let selection = text.trim().to_string();
+    let selection = read_text_marker(lease, FORMAT_MARKER, 256)?;
     parse_pinned_formats(&selection).map(|_| selection)
 }
 
-fn write_format_marker(lease: &OutputAttemptLease, selection: &str) -> Result<(), String> {
-    let _ = lease.remove_leaf(FORMAT_MARKER);
-    let mut file = lease
-        .create_leaf(FORMAT_MARKER)
-        .map_err(|error| error.to_string())?;
-    file.write_all(selection.as_bytes())
+fn read_text_marker(lease: &OutputAttemptLease, name: &str, max_bytes: u64) -> Option<String> {
+    let mut file = lease.open_leaf(name).ok()?;
+    let mut text = String::new();
+    Read::read_to_string(&mut Read::take(&mut file, max_bytes), &mut text).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn write_text_marker(lease: &OutputAttemptLease, name: &str, text: &str) -> Result<(), String> {
+    let _ = lease.remove_leaf(name);
+    let mut file = lease.create_leaf(name).map_err(|error| error.to_string())?;
+    file.write_all(text.as_bytes())
         .map_err(|error| error.to_string())
 }
 
-fn remove_format_marker(lease: &OutputAttemptLease) -> Result<(), String> {
-    let names = lease.leaf_names().map_err(|error| error.to_string())?;
-    if names.iter().any(|name| name == FORMAT_MARKER) {
-        lease
-            .remove_leaf(FORMAT_MARKER)
-            .map_err(|error| error.to_string())?;
+fn write_format_marker(lease: &OutputAttemptLease, selection: &str) -> Result<(), String> {
+    write_text_marker(lease, FORMAT_MARKER, selection)
+}
+
+/// Remove every bookkeeping marker; none of them is ever published.
+fn remove_bookkeeping(lease: &OutputAttemptLease) -> Result<(), String> {
+    for name in lease.leaf_names().map_err(|error| error.to_string())? {
+        if is_bookkeeping_leaf(&name) {
+            lease.remove_leaf(&name).map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
+}
+
+/// Throw away a finished download (media and the markers that describe it) so
+/// the next attempt fetches it again with the normal format selection. Subtitles stay.
+fn discard_finished_download(lease: &OutputAttemptLease) -> Result<(), String> {
+    for name in lease.leaf_names().map_err(|error| error.to_string())? {
+        if is_media_leaf(&name) || is_bookkeeping_leaf(&name) {
+            lease.remove_leaf(&name).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Remember which check failed on a finished download. The same failure twice
+/// in a row means retrying the check cannot help, so the download is discarded
+/// and fetched again instead of looping.
+fn note_verification_failure(lease: &OutputAttemptLease, error: TransientError) -> TransientError {
+    if read_text_marker(lease, VERIFY_MARKER, 64).as_deref() == Some(error.code.as_str()) {
+        let _ = discard_finished_download(lease);
+        return transient_error(
+            "MEDIA_CORRUPT",
+            "Verification failed twice in a row, so the download was removed and will be fetched again.",
+        );
+    }
+    let _ = write_text_marker(lease, VERIFY_MARKER, &error.code);
+    error
 }
 
 /// Delete files derived from the media (normalized transcripts, manifest) so a
@@ -4021,7 +4079,11 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(!files.contains(&"media.mp4".to_string()), "{files:?}");
-        assert!(files.contains(&FORMAT_MARKER.to_string()), "{files:?}");
+        assert!(
+            !files.contains(&FORMAT_MARKER.to_string()),
+            "media and its pin go together: {files:?}"
+        );
+        assert!(files.contains(&"media.en-US.vtt".to_string()), "subtitles stay: {files:?}");
         run_collecting(&executor, &item).0.expect("downloads again");
     }
 
@@ -4172,6 +4234,108 @@ mod tests {
             .resumable_staging_lease(&item.occurrence_id, &item.artifact_fingerprint)
             .unwrap();
         assert_eq!(run_collecting(&executor, &item).0.unwrap_err().code, "STAGING_BUSY");
+    }
+
+    #[test]
+    fn an_optional_transcript_discarded_earlier_does_not_force_yt_dlp_again() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            MALFORMED_VTT,
+            vec![ScriptStep::Line("LVFORMATID 18".to_string())],
+        );
+        runner.probe_failure.store(1, Ordering::SeqCst);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(error.code, "MEDIA_VERIFY_FAILED");
+
+        // Offline Continue: the malformed VTT was discarded, yet nothing is
+        // fetched and the warning survives.
+        runner.download_unreachable.store(true, Ordering::SeqCst);
+        let outcome = run_collecting(&executor, &item).0.expect("finalized offline");
+
+        assert_eq!(runner.seen_args.lock().unwrap().len(), 1);
+        assert_eq!(outcome.warnings, vec!["TRANSCRIPT_INVALID".to_string()]);
+        let published = published_files(temp.path());
+        assert!(published.contains(&"media.mp4".to_string()), "{published:?}");
+        assert!(
+            !published.iter().any(|name| is_bookkeeping_leaf(name)),
+            "no marker may be published: {published:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_required_stream_is_structural_so_the_media_and_its_pin_are_dropped() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            VALID_VTT,
+            vec![ScriptStep::Line("LVFORMATID 137".to_string())],
+        );
+        runner.probe_failure.store(2, Ordering::SeqCst);
+        *runner.probe_stderr.lock().unwrap() =
+            "Stream map '0:a:0' matches no streams.".to_string();
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+
+        assert_eq!(error.code, "MEDIA_CORRUPT");
+        let kept = staging_dirs(temp.path());
+        let files = fs::read_dir(temp.path().join(".lv").join(&kept[0]))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!files.contains(&"media.mp4".to_string()), "{files:?}");
+        assert!(
+            !files.contains(&FORMAT_MARKER.to_string()),
+            "the format without the stream must not be pinned again: {files:?}"
+        );
+        // The next Continue downloads again with the normal selection.
+        run_collecting(&executor, &item).0.expect("re-downloaded");
+        let seen = runner.seen_args.lock().unwrap().clone();
+        assert!(format_of(&seen[1]).unwrap().starts_with("bestvideo"));
+    }
+
+    #[test]
+    fn the_same_verification_failure_twice_in_a_row_discards_the_download_instead_of_looping() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            VALID_VTT,
+            vec![ScriptStep::Line("LVFORMATID 18".to_string())],
+        );
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        runner.probe_failure.store(1, Ordering::SeqCst);
+        assert_eq!(
+            run_collecting(&executor, &item).0.unwrap_err().code,
+            "MEDIA_VERIFY_FAILED"
+        );
+        // Continue: finished download, no yt-dlp, the same check fails again.
+        runner.probe_failure.store(1, Ordering::SeqCst);
+        let second = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(second.code, "MEDIA_CORRUPT", "{second:?}");
+        assert!(second.message.contains("twice"));
+        assert_eq!(runner.seen_args.lock().unwrap().len(), 1);
+
+        // The next Continue fetches it again and publishes.
+        run_collecting(&executor, &item).0.expect("fetched again");
+        assert_eq!(runner.seen_args.lock().unwrap().len(), 2);
+        assert!(staging_dirs(temp.path()).is_empty());
     }
 
     #[test]
