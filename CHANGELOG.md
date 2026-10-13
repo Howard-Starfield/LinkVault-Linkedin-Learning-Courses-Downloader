@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.29 - 2026-10-13
+
+- **YouTube downloads work after installing the helpers (#45).** Installed helpers now get a valid lock digest, so starts no longer fail with `MANIFEST_CONTRACT_INVALID: helperLockDigest must be a lowercase SHA-256 digest`. The post-download media check runs with FFmpeg alone and accepts valid MP4/MKV output.
+- **Helper setup and repair.** A startup check marks YouTube when helpers need setup, helper status matches the start-path check, and Download YouTube helpers repairs a corrupted or half-written install of the same version.
+- **Honest progress and errors.** Rows show each stage (downloading, checking media, saving) with live percent and size, queued items say Queued, and failures show their reason inline instead of sitting at 0%.
+- **Captions never cost you the video.** YouTube auto-captions parse correctly; if a transcript still can't be processed, the video is kept and the row explains why.
+- **Faster paste to download.** The scan result supplies caption languages, recent scans skip a second lookup, and helpers are hashed once per launch: one yt-dlp launch from paste to start instead of four. Download clicks are never dropped while a lookup finishes.
+- **Long videos and big playlists.** The media check scales with file size, transcripts up to 64 MiB are accepted, playlists show when they are cut at 500 videos, and Download all queues more than 100 videos in batches.
+
 ## 0.2.28 - 2026-10-03
 
 - **Smoother scrolling and interactions.** LinkedIn history queries use indexed, bounded reads; idle queues stop recurring bootstrap work. Newspaper reading-progress and queue mutations run away from the UI thread.
