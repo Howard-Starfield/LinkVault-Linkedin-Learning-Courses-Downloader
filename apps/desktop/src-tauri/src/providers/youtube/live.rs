@@ -192,6 +192,17 @@ impl YouTubeLiveHandle {
         Ok(())
     }
 
+    /// Takes the single discovery slot (scan, transcript inspection, or a
+    /// download's source check).
+    ///
+    /// Discovery and a download are mutually exclusive: this refuses with
+    /// `Busy` while another discovery or an active run exists.  Starting a
+    /// download therefore takes this slot itself and keeps it until its run is
+    /// attached, which refuses any discovery that begins afterwards, so no
+    /// download starts while a discovery process runs and vice versa.  Callers
+    /// treat `Busy` (RUNTIME_BUSY) as "wait and retry".  `attach_run` does not
+    /// itself check the slot because queued runs are also attached from the
+    /// workflow drain.
     pub fn begin_discovery(
         &self,
         operation_id: String,

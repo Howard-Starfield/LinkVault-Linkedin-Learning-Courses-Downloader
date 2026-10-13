@@ -1,6 +1,6 @@
 use crate::app::managed_process::{
-    helper_identity, DiscoveryOperation, HelperIdentity, ManagedProcessError, TransientRunSnapshot, TransientWorkItem,
-    MAX_SELECTED_ITEMS,
+    helper_identity, DiscoveryOperation, HelperIdentity, ManagedProcessError,
+    TransientRunSnapshot, TransientWorkItem, MAX_SELECTED_ITEMS,
 };
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::cache::{get_setting, open_runtime, upsert_setting_json};
@@ -23,9 +23,9 @@ use crate::providers::youtube::models::{
 };
 use crate::shell::open_folder_in_explorer;
 use crate::providers::youtube::scan::{
-    revalidate_selected_source, scan_source, selected_items_from_plan, YouTubeScanPlan,
+    revalidate_selected_source, scan_source, selected_items_from_plan, PlannedYouTubeItem,
+    YouTubeScanPlan,
 };
-use crate::providers::youtube::scan::PlannedYouTubeItem;
 use crate::providers::youtube::transcript_inspection::{
     inspect_transcripts, into_plan_inspection, stored_inspection, TranscriptInspectionResult,
 };
@@ -428,29 +428,33 @@ type SourceRevalidator<'a> = &'a dyn Fn(
     &DiscoveryOperation,
 ) -> Result<Vec<PlannedYouTubeItem>, YouTubeInternalError>;
 
-/// Resolves the items a download starts from.  A plan scanned within
-/// `START_REVALIDATION_FRESH_FOR` is trusted: its own items are used and no
-/// discovery process or discovery slot is needed.  An older plan is re-scanned
-/// first (holding the discovery slot until the guard is dropped), so a video
-/// that changed or disappeared still fails the start with a visible error.
+/// Resolves the items a download starts from, holding the discovery slot.
+///
+/// Every start takes the slot (RUNTIME_BUSY if a scan, inspection or another
+/// start owns it) and the caller keeps the returned guard until the run is
+/// attached, so a download can never begin while a discovery process is
+/// running and no discovery can begin between this check and the attach.  A
+/// plan scanned within `START_REVALIDATION_FRESH_FOR` is then trusted: its own
+/// items are used and no discovery process is launched.  An older plan is
+/// re-scanned first, so a video that changed or disappeared still fails the
+/// start with a visible error.
 fn selected_items_for_start<'a>(
     live: &'a YouTubeLiveHandle,
     plan: &YouTubeScanPlan,
     selected_occurrence_ids: &[String],
     now: Instant,
     revalidate: SourceRevalidator<'_>,
-) -> Result<(Vec<PlannedYouTubeItem>, Option<DiscoveryGuard<'a>>), YouTubeError> {
-    if plan.is_fresh_for_start(now) {
-        let items =
-            selected_items_from_plan(plan, selected_occurrence_ids).map_err(YouTubeError::from)?;
-        return Ok((items, None));
-    }
+) -> Result<(Vec<PlannedYouTubeItem>, DiscoveryGuard<'a>), YouTubeError> {
     let guard = live
         .begin_discovery(opaque_id("revalidation"))
         .map_err(YouTubeError::from)?;
-    let items = revalidate(plan, selected_occurrence_ids, &guard.operation)
-        .map_err(YouTubeError::from)?;
-    Ok((items, Some(guard)))
+    let items = if plan.is_fresh_for_start(now) {
+        selected_items_from_plan(plan, selected_occurrence_ids)
+    } else {
+        revalidate(plan, selected_occurrence_ids, &guard.operation)
+    }
+    .map_err(YouTubeError::from)?;
+    Ok((items, guard))
 }
 
 fn start_youtube_download_blocking(
@@ -566,7 +570,6 @@ fn start_youtube_download_blocking(
             })
             .collect(),
     };
-    drop(revalidation);
     let durable = YoutubeDurableRequest {
         schema_version: 1,
         start: request.clone(),
@@ -605,6 +608,8 @@ fn start_youtube_download_blocking(
             }
         }
     })?;
+    // The run is attached: the live handle now refuses new discovery on its own.
+    drop(revalidation);
     let receipt = YouTubeStartReceipt {
         client_submission_id: request.client_submission_id.clone(),
         run_id: run_id.clone(),
@@ -1542,13 +1547,9 @@ mod tests {
         }
 
         #[test]
-        fn a_plan_scanned_just_under_ten_minutes_ago_starts_without_discovery() {
+        fn a_plan_scanned_just_under_ten_minutes_ago_starts_without_launching_discovery() {
             let plan = plan();
             let live = YouTubeLiveHandle::default();
-            // The slot being busy must not matter: no discovery is needed.
-            let _busy = live
-                .begin_discovery("busy-operation-11".to_string())
-                .unwrap();
             let launches = Cell::new(0);
             let now = plan.scanned_at + START_REVALIDATION_FRESH_FOR - Duration::from_secs(1);
             let (items, guard) = selected_items_for_start(
@@ -1563,7 +1564,6 @@ mod tests {
             )
             .unwrap();
             assert_eq!(launches.get(), 0);
-            assert!(guard.is_none());
             assert_eq!(
                 items
                     .iter()
@@ -1571,6 +1571,60 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["def456_ZZ", "abc123_XY"]
             );
+            // The slot stays held until the run is attached, so no discovery
+            // can begin in between.
+            assert_eq!(
+                live.begin_discovery("other-operation-11".to_string())
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string(),
+                crate::app::managed_process::TransientRuntimeError::Busy.to_string()
+            );
+            drop(guard);
+        }
+
+        #[test]
+        fn a_fresh_start_while_a_discovery_is_running_is_busy_then_succeeds_once_it_ends() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            let now = plan.scanned_at;
+            let launcher = |_: &YouTubeScanPlan, _: &[String], _: &DiscoveryOperation| {
+                Err(YouTubeInternalError::Helper("must not launch".to_string()))
+            };
+            let busy = live
+                .begin_discovery("busy-operation-11".to_string())
+                .unwrap();
+            let error = selected_items_for_start(&live, &plan, &selection(&plan), now, &launcher)
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(error.code, "RUNTIME_BUSY");
+            drop(busy);
+            let (items, _guard) =
+                selected_items_for_start(&live, &plan, &selection(&plan), now, &launcher).unwrap();
+            assert_eq!(items.len(), 2);
+        }
+
+        #[test]
+        fn a_fresh_start_is_refused_while_a_download_is_active() {
+            let plan = plan();
+            let live = YouTubeLiveHandle::default();
+            live.attach_run(
+                "run-active-01".to_string(),
+                "submission-active-01".to_string(),
+                "fingerprint".to_string(),
+                &[],
+            )
+            .unwrap();
+            let error = selected_items_for_start(
+                &live,
+                &plan,
+                &selection(&plan),
+                plan.scanned_at,
+                &|_, _, _| Ok(Vec::new()),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(error.code, "RUNTIME_BUSY");
         }
 
         #[test]
@@ -1601,7 +1655,6 @@ mod tests {
             assert_eq!(launches.get(), 1);
             assert_eq!(items.len(), 2);
             // The revalidation holds the discovery slot until the guard drops.
-            assert!(guard.is_some());
             assert_eq!(
                 live.begin_discovery("other-operation-12".to_string())
                     .map(|_| ())
@@ -1674,6 +1727,23 @@ mod tests {
             assert_eq!(code(Vec::new()), "EMPTY_SELECTION");
             assert_eq!(code(vec![first.clone(), first]), "DUPLICATE_OCCURRENCE");
             assert_eq!(code(vec!["nope".to_string()]), "UNKNOWN_OCCURRENCE");
+
+            // A scanned-unavailable occurrence cannot be started from the plan either.
+            let private = parse_scan_plan(
+                validate_url("https://www.youtube.com/playlist?list=PL_12345", None).unwrap(),
+                r#"{"id":"PL_12345","entries":[{"id":"abc123_XY","title":"A","availability":"private"}]}"#,
+            )
+            .unwrap();
+            let unavailable = selected_items_for_start(
+                &live,
+                &private,
+                &[private.items[0].public.occurrence_id.clone()],
+                private.scanned_at,
+                &launcher,
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(unavailable.code, "SCAN_PLAN_STALE");
         }
     }
 }
