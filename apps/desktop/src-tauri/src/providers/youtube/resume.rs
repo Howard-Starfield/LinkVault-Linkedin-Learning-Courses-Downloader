@@ -753,4 +753,5 @@ pub fn sweep_orphans_at(
 mod tests;
 
 #[cfg(test)]
+#[path = "resume/live_e2e/tests.rs"]
 mod live_e2e;
