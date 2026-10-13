@@ -1694,18 +1694,12 @@ textarea {
  overflow-wrap: anywhere;
 }
 
-.youtube-result-copy > .youtube-result-status.youtube-result-stage,
-.youtube-result-progress .youtube-result-stage {
- display: inline-flex;
- min-width: 0;
- align-items: center;
- gap: 6px;
-}
-
 .youtube-result-spinner {
+ display: inline-block;
  width: 12px;
  height: 12px;
- flex: 0 0 auto;
+ margin-right: 6px;
+ vertical-align: -2px;
 }
 
 .youtube-run-error {

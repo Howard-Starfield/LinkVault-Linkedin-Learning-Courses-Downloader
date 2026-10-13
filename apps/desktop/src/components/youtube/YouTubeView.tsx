@@ -58,7 +58,7 @@ import {
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
-import { youtubeItemStatusText, youtubeProgressText, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
+import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
 
 type HelperStatus = "pending" | "ready" | "failed";
@@ -1422,6 +1422,7 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                   && !runSnapshot.runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX)
                   ? runSnapshot.progress
                   : null;
+                const progressDetail = percent !== null ? youtubeProgressDetail(percent, runBytes) : "";
                 const duration = formatDuration(video.item.durationSeconds);
                 const plan = scanPlans.find((candidate) => candidate.scanPlanId === video.scanPlanId);
                 const kind = plan?.kind === "playlist" ? "playlist" : "video";
@@ -1440,13 +1441,14 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                           <Progress value={percent} />
                           <span className="youtube-result-stage">
                             {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
-                            {youtubeProgressText(status, percent, runBytes)}
+                            <span aria-live="polite">{status}</span>
+                            {progressDetail ? <span>{` · ${progressDetail}`}</span> : null}
                           </span>
                         </div>
                       ) : status ? (
                         <span className="youtube-result-status youtube-result-stage">
                           {state === "running" ? <LoaderCircle aria-hidden="true" className="lv-button-spinner youtube-result-spinner" /> : null}
-                          {status}
+                          <span aria-live="polite">{status}</span>
                         </span>
                       ) : null}
                       {warningTexts.map((text) => <span key={text} className="youtube-result-warning">{text}</span>)}

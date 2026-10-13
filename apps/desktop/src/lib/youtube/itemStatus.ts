@@ -66,17 +66,26 @@ export function formatYouTubeBytes(progress: YouTubeByteProgress | null): string
   ].join(NBSP);
 }
 
+/**
+ * Percent and, when known, bytes: "42% · 18.3 / 43.6 MB". Kept apart from the
+ * stage label so only the label sits in a live region and screen readers are
+ * not told about every progress tick.
+ */
+export function youtubeProgressDetail(percent: number, bytes: YouTubeByteProgress | null): string {
+  const parts: string[] = [];
+  if (percent > 0) parts.push(`${Math.round(percent)}%`);
+  const byteText = formatYouTubeBytes(bytes);
+  if (byteText) parts.push(byteText);
+  return parts.join(" · ");
+}
+
 /** Stage text plus percent and, when known, bytes: "Downloading video… · 42% · 18.3 / 43.6 MB". */
 export function youtubeProgressText(
   status: string | null,
   percent: number,
   bytes: YouTubeByteProgress | null
 ): string {
-  const parts = [status ?? ""];
-  if (percent > 0) parts.push(`${Math.round(percent)}%`);
-  const byteText = formatYouTubeBytes(bytes);
-  if (byteText) parts.push(byteText);
-  return parts.filter((part) => part !== "").join(" · ");
+  return [status ?? "", youtubeProgressDetail(percent, bytes)].filter((part) => part !== "").join(" · ");
 }
 
 /**

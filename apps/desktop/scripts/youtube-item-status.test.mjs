@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   formatYouTubeBytes,
   youtubeItemStatusText,
+  youtubeProgressDetail,
   youtubeProgressText,
   youtubeStageLabel
 } from "../src/lib/youtube/itemStatus.ts";
@@ -100,6 +101,16 @@ test("a downloading row combines stage, percent and bytes", () => {
     youtubeProgressText("Downloading video…", 42.4, { bytesCompleted: 18_300_000, bytesTotal: null }),
     `Downloading video… · 42% · 18.3${nb}MB`
   );
+});
+
+test("the progress detail leaves the stage label out so only the label is announced", () => {
+  const nb = "\u00A0";
+  assert.equal(
+    youtubeProgressDetail(42, { bytesCompleted: 18_300_000, bytesTotal: 43_600_000 }),
+    `42% · 18.3${nb}/${nb}43.6${nb}MB`
+  );
+  assert.equal(youtubeProgressDetail(0, null), "");
+  assert.equal(youtubeProgressDetail(100, null), "100%");
 });
 
 test("rows without bytes or percent keep the existing text", () => {
