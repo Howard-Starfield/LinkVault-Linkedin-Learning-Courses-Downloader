@@ -614,41 +614,43 @@ impl YouTubeLiveHandle {
     /// The check and the change happen under the active lock that `cancel`
     /// also takes, so they cannot interleave.
     pub fn suspend_run(&self, run_id: &str, error: Option<TransientError>) -> SuspendOutcome {
-        let (snapshot, control) = {
-            let mut active = self
-                .active
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(current) = active.as_mut() else {
-                return SuspendOutcome::NotOwner;
-            };
-            if current.run_id != run_id {
-                return SuspendOutcome::NotOwner;
-            }
-            if current.control.is_cancelled() {
-                return SuspendOutcome::Cancelled;
-            }
-            current.snapshot.revision += 1;
-            current.snapshot.state = TransientRunState::Paused;
-            current.snapshot.error = error;
-            for entry in &mut current.snapshot.items {
-                if entry.state == TransientItemState::Running {
-                    entry.state = TransientItemState::Pending;
-                    entry.phase = TransientItemPhase::Waiting;
-                }
-            }
-            let snapshot = current.snapshot.clone();
-            let control = Arc::clone(&current.control);
-            *active = None;
-            (snapshot, control)
+        // Check, change, release the slot and publish all under the active
+        // lock, which `cancel` also takes: a cancel is either seen here or
+        // happens after the paused snapshot is out; it can never be
+        // overwritten by a paused snapshot captured earlier.
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(current) = active.as_mut() else {
+            return SuspendOutcome::NotOwner;
         };
-        let _ = control.retry_cleanup_verifiers();
+        if current.run_id != run_id {
+            return SuspendOutcome::NotOwner;
+        }
+        if current.control.is_cancelled() {
+            return SuspendOutcome::Cancelled;
+        }
+        current.snapshot.revision += 1;
+        current.snapshot.state = TransientRunState::Paused;
+        current.snapshot.error = error;
+        for entry in &mut current.snapshot.items {
+            if entry.state == TransientItemState::Running {
+                entry.state = TransientItemState::Pending;
+                entry.phase = TransientItemPhase::Waiting;
+            }
+        }
+        let snapshot = current.snapshot.clone();
+        let control = Arc::clone(&current.control);
+        *active = None;
         *self
             .most_recent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
         self.emit(&snapshot);
-        SuspendOutcome::Suspended(snapshot)
+        drop(active);
+        let _ = control.retry_cleanup_verifiers();
+        SuspendOutcome::Suspended(Box::new(snapshot))
     }
 
     fn clear_discovery(&self, operation_id: &str) {
@@ -872,6 +874,44 @@ mod tests {
         assert!(
             fresh.revision_of("run-continue") > paused_at,
             "the UI discards events whose revision does not exceed the last one it saw"
+        );
+    }
+
+    #[test]
+    fn a_cancel_racing_the_paused_publish_cannot_be_overwritten_by_it() {
+        let (live, _item) = live_with_run("run-race");
+        let live = Arc::new(live);
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&events);
+        let sink_live = Arc::clone(&live);
+        live.set_test_sink(Arc::new(move |snapshot| {
+            if snapshot.state != TransientRunState::Paused {
+                return;
+            }
+            sink_events.lock().unwrap().push("paused-publish-start");
+            let racer_live = Arc::clone(&sink_live);
+            let racer_events = Arc::clone(&sink_events);
+            std::thread::spawn(move || {
+                // The user's Cancel arrives while the paused snapshot is
+                // being published.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let _ = racer_live.cancel("run-race");
+                racer_events.lock().unwrap().push("cancel-returned");
+            });
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            sink_events.lock().unwrap().push("paused-publish-end");
+        }));
+
+        assert!(matches!(
+            live.suspend_run("run-race", None),
+            SuspendOutcome::Suspended(_)
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        assert_eq!(
+            events.lock().unwrap().clone(),
+            vec!["paused-publish-start", "paused-publish-end", "cancel-returned"],
+            "cancel must be ordered after the paused publish, not interleaved with it"
         );
     }
 
@@ -1138,7 +1178,7 @@ mod tests {
 /// Result of [`YouTubeLiveHandle::suspend_run`].
 #[derive(Debug)]
 pub enum SuspendOutcome {
-    Suspended(TransientRunSnapshot),
+    Suspended(Box<TransientRunSnapshot>),
     /// The run was cancelled first; finish it as cancelled.
     Cancelled,
     /// The run does not own the active slot.

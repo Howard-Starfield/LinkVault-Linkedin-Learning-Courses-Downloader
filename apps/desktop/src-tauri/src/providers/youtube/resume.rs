@@ -117,6 +117,55 @@ pub fn has_incomplete_partials(names: &[String]) -> bool {
     })
 }
 
+/// A staging directory that already holds the finished, merged download: the
+/// format marker, a merged media file (no format id in its name), a transcript
+/// when one is expected, and nothing unfinished or half-merged. Such a
+/// directory needs verification and finalization, not yt-dlp.
+pub fn has_complete_merged_media(names: &[String], transcript_needed: bool) -> bool {
+    let merged = names.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.starts_with("media.")
+            && format_id_of_leaf(name).is_none()
+            && lower
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| MEDIA_EXTENSIONS.contains(&extension))
+    });
+    let any_stream_files = names.iter().any(|name| format_id_of_leaf(name).is_some());
+    let transcript = !transcript_needed
+        || names
+            .iter()
+            .any(|name| name.to_ascii_lowercase().ends_with(".vtt"));
+    names.iter().any(|name| name == FORMAT_MARKER)
+        && merged
+        && !any_stream_files
+        && !has_incomplete_partials(names)
+        && transcript
+}
+
+/// The unfinished-download files (`.part`, fragments, `.ytdl`).
+pub fn incomplete_leaves(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| has_incomplete_partials(std::slice::from_ref(name)))
+        .cloned()
+        .collect()
+}
+
+/// Positive evidence in FFmpeg's own diagnostics that the input is not valid
+/// media. A permission error, an I/O error or a failed spawn are not.
+pub fn ffmpeg_stderr_proves_invalid(stderr: &str) -> bool {
+    let lowered = stderr.to_lowercase();
+    [
+        "invalid data found when processing input",
+        "moov atom not found",
+        "could not find codec parameters",
+        "ebml header parsing failed",
+        "partial file",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 /// Whether yt-dlp refused a pinned `--format` because it no longer exists.
 pub fn pinned_format_unavailable(stderr: &str) -> bool {
     stderr.to_lowercase().contains("requested format is not available")
@@ -177,11 +226,15 @@ pub fn keep_staging_after(code: &str) -> bool {
     )
 }
 
-/// Failures after a complete download (the file could not be verified, the
-/// manifest could not be written). Even a fresh run pauses on these, with the
-/// download kept, so Continue only repeats the finish.
-pub fn keeps_finished_download(code: &str) -> bool {
-    matches!(code, "OUTPUT_VERIFY_FAILED" | "MEDIA_VERIFY_FAILED")
+/// Failures even a fresh run pauses on instead of failing: after a complete
+/// download (the file could not be verified, the manifest could not be
+/// written) so Continue only repeats the finish, and a staging directory that
+/// is briefly held by another attempt.
+pub fn pauses_even_when_fresh(code: &str) -> bool {
+    matches!(
+        code,
+        "OUTPUT_VERIFY_FAILED" | "MEDIA_VERIFY_FAILED" | "STAGING_BUSY"
+    )
 }
 
 /// The wording shown beside Continue for a failed attempt.

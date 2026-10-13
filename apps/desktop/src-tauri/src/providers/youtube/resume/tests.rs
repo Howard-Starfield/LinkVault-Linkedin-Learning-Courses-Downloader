@@ -963,3 +963,84 @@ fn only_incomplete_downloads_count_as_partials() {
     assert!(has_incomplete_partials(&names(&["media.f137.mp4.ytdl"])));
     assert!(!has_incomplete_partials(&names(&["media.mp4", "media.en.vtt"])));
 }
+
+// ---- finished downloads, FFmpeg evidence, admission lock -----------------------------
+
+#[test]
+fn only_a_merged_download_with_its_marker_skips_yt_dlp() {
+    let marker = "media.lvformat";
+    assert!(has_complete_merged_media(&names(&[marker, "media.webm"]), false));
+    assert!(has_complete_merged_media(
+        &names(&[marker, "media.mp4", "media.en.vtt"]),
+        true
+    ));
+    // The transcript is expected but was never downloaded.
+    assert!(!has_complete_merged_media(&names(&[marker, "media.mp4"]), true));
+    // No record of the format, unfinished parts, or an unmerged pair of streams.
+    assert!(!has_complete_merged_media(&names(&["media.mp4"]), false));
+    assert!(!has_complete_merged_media(
+        &names(&[marker, "media.mp4", "media.f140.m4a.part"]),
+        false
+    ));
+    assert!(!has_complete_merged_media(
+        &names(&[marker, "media.f137.mp4", "media.f140.m4a"]),
+        false
+    ));
+    assert_eq!(
+        incomplete_leaves(&names(&["media.mp4", "media.f1.mp4.part", "media.f1.mp4.ytdl"])),
+        names(&["media.f1.mp4.part", "media.f1.mp4.ytdl"])
+    );
+}
+
+#[test]
+fn only_ffmpegs_own_words_about_the_data_prove_corruption() {
+    for proof in [
+        "x.mp4: Invalid data found when processing input",
+        "[mov,mp4] moov atom not found",
+        "Could not find codec parameters for stream 0",
+        "EBML header parsing failed",
+    ] {
+        assert!(ffmpeg_stderr_proves_invalid(proof), "{proof}");
+    }
+    for nothing in [
+        "x.mp4: Permission denied",
+        "Input/output error",
+        "The process cannot access the file because it is being used by another process",
+        "",
+    ] {
+        assert!(!ffmpeg_stderr_proves_invalid(nothing), "{nothing}");
+    }
+}
+
+#[test]
+fn a_fresh_run_pauses_on_a_busy_staging_directory_instead_of_failing() {
+    assert!(pauses_even_when_fresh("STAGING_BUSY"));
+    assert!(pauses_even_when_fresh("MEDIA_VERIFY_FAILED"));
+    assert!(!pauses_even_when_fresh("MEDIA_CORRUPT"));
+    assert!(!pauses_even_when_fresh("HELPER_FAILED"));
+}
+
+#[test]
+fn the_cleanup_decision_runs_under_the_admission_lock() {
+    use crate::providers::youtube::kernel::ResumeLedger;
+    let (_dir, runtime) = runtime();
+    let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+    runtime.with_shared_staging("any-run", ".", &mut |_shared| {
+        let racing = runtime.clone();
+        let tx = admitted_tx.clone();
+        std::thread::spawn(move || {
+            // An admission of a run that uses the same staging.
+            racing.with_drain_lock(|| ());
+            let _ = tx.send(());
+        });
+        assert!(
+            admitted_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "admission must wait while cleanup decides and deletes"
+        );
+    });
+    admitted_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("admission proceeds once cleanup is done");
+}

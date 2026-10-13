@@ -7,7 +7,7 @@ use crate::app::managed_process::{
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::executor::SharedStaging;
 use crate::providers::youtube::resume::{
-    discard_run_staging, keeps_finished_download, pause_reason, ChangeNotifier,
+    discard_run_staging, pause_reason, pauses_even_when_fresh, ChangeNotifier,
 };
 use crate::providers::youtube::live::SuspendOutcome;
 use crate::providers::youtube::live::{
@@ -46,11 +46,39 @@ pub trait ResumeLedger: Send + Sync {
     /// `last_revision` is recorded so a re-attached run keeps counting up.
     /// Returns `false` when the run is no longer running (it is being
     /// cancelled), in which case nothing was committed.
-    fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, last_revision: u64) -> bool;
+    fn pause_for_user(
+        &self,
+        run_id: &str,
+        reason: &str,
+        code: &str,
+        last_revision: u64,
+    ) -> PauseCommit;
 
     /// Staging directory names that other unfinished runs under `root` still
     /// reference; they must survive this run's cleanup.
     fn shared_staging(&self, run_id: &str, root: &str) -> std::collections::HashSet<String>;
+
+    /// Run `decide` with the shared set while holding the lock that
+    /// serializes new admissions, so a cleanup that follows cannot race one.
+    fn with_shared_staging(
+        &self,
+        run_id: &str,
+        root: &str,
+        decide: &mut dyn FnMut(&std::collections::HashSet<String>),
+    ) {
+        decide(&self.shared_staging(run_id, root));
+    }
+}
+
+/// Result of committing a pause for the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseCommit {
+    Committed,
+    /// The run is no longer running: a cancel has the final say.
+    AlreadyCancelled,
+    /// The database refused the write. This says nothing about a cancel, so
+    /// nothing may be deleted because of it.
+    Failed(String),
 }
 
 impl ResumeLedger for WorkflowRuntime {
@@ -64,14 +92,36 @@ impl ResumeLedger for WorkflowRuntime {
             })
     }
 
-    fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, last_revision: u64) -> bool {
-        self.pause_running_for_user(
+    fn pause_for_user(
+        &self,
+        run_id: &str,
+        reason: &str,
+        code: &str,
+        last_revision: u64,
+    ) -> PauseCommit {
+        match self.pause_running_for_user(
             run_id.to_string(),
             reason.to_string(),
             code.to_string(),
             last_revision,
-        )
-        .unwrap_or(false)
+        ) {
+            Ok(true) => PauseCommit::Committed,
+            Ok(false) => PauseCommit::AlreadyCancelled,
+            Err(error) => PauseCommit::Failed(error.to_string()),
+        }
+    }
+
+    fn with_shared_staging(
+        &self,
+        run_id: &str,
+        root: &str,
+        decide: &mut dyn FnMut(&std::collections::HashSet<String>),
+    ) {
+        self.with_drain_lock(|| {
+            decide(&crate::providers::youtube::resume::staging_shared_with_others(
+                self, run_id, root,
+            ))
+        });
     }
 
     fn shared_staging(&self, run_id: &str, root: &str) -> std::collections::HashSet<String> {
@@ -137,8 +187,8 @@ impl StepExecutor for YoutubeDownloadExecutor {
                     let ledger = Arc::clone(ledger);
                     let run_id = run.id.clone();
                     let root = run.output_root.clone();
-                    executor.with_shared_staging(SharedStaging(Arc::new(move || {
-                        ledger.shared_staging(&run_id, &root)
+                    executor.with_shared_staging(SharedStaging(Arc::new(move |decide| {
+                        ledger.with_shared_staging(&run_id, &root, decide)
                     })))
                 }
                 None => executor,
@@ -152,12 +202,14 @@ impl StepExecutor for YoutubeDownloadExecutor {
         if !outcome.succeeded && !outcome.pause_for_user {
             // Cancelled or failed for good: nothing will resume from the
             // partial files, so remove them now.
-            let shared = self
-                .resume
-                .as_ref()
-                .map(|ledger| ledger.shared_staging(&run.id, &run.output_root))
-                .unwrap_or_default();
-            discard_run_staging(&staging_root, &request.work_items, &shared);
+            match &self.resume {
+                Some(ledger) => ledger.with_shared_staging(&run.id, &run.output_root, &mut |shared| {
+                    discard_run_staging(&staging_root, &request.work_items, shared)
+                }),
+                None => {
+                    discard_run_staging(&staging_root, &request.work_items, &Default::default())
+                }
+            }
         }
         outcome
     }
@@ -242,24 +294,30 @@ impl YoutubeDownloadExecutor {
         error: &TransientError,
     ) -> ExecutorOutcome {
         let reason = pause_reason(&error.code, &error.message);
-        let shown = TransientError {
+        let mut shown = TransientError {
             code: error.code.clone(),
             message: reason.clone(),
         };
         // Commit first, publish second: the panel must never show a pause the
         // database does not have yet.
         let revision = self.live.revision_of(run_id).saturating_add(1);
-        let committed = self.resume.as_ref().map_or(true, |ledger| {
+        let commit = self.resume.as_ref().map_or(PauseCommit::Committed, |ledger| {
             ledger.pause_for_user(run_id, &reason, &error.code, revision)
         });
         let cancelled = self
             .live
             .control_for(run_id)
             .is_some_and(|control| control.is_cancelled());
-        if !committed || cancelled {
+        if commit == PauseCommit::AlreadyCancelled || cancelled {
             // A cancel got there first (or in between): it wins, and the
             // outcome says so. Staging is cleaned up by the caller.
             return self.end_cancelled(run_id, snapshot, &reason);
+        }
+        // A database error is not a cancel: nothing is deleted. The live
+        // view pauses and says so; the staging stays and a restart reconciles
+        // the run as interrupted.
+        if let PauseCommit::Failed(problem) = &commit {
+            shown.message = format!("{reason} (the pause could not be saved: {problem})");
         }
         match self.live.suspend_run(run_id, Some(shown.clone())) {
             SuspendOutcome::Suspended(_) => {}
@@ -360,7 +418,7 @@ impl YoutubeDownloadExecutor {
                         let cancelled = matches!(outcome.state, TransientItemState::Cancelled);
                         if !cancelled && !control.is_cancelled() {
                             if let Some(error) = outcome.error.as_ref() {
-                                if resumed || keeps_finished_download(&error.code) {
+                                if resumed || pauses_even_when_fresh(&error.code) {
                                     return self.pause_for_user(run_id, &mut snapshot, error);
                                 }
                             }
@@ -385,7 +443,7 @@ impl YoutubeDownloadExecutor {
                     // A resumed attempt always pauses. A fresh one pauses only when
                     // the download itself is complete and verification or the
                     // manifest failed, so Continue re-runs just the finish.
-                    if !cancelled && (resumed || keeps_finished_download(&code)) {
+                    if !cancelled && (resumed || pauses_even_when_fresh(&code)) {
                         return self.pause_for_user(run_id, &mut snapshot, &error);
                     }
                     self.commit(run_id, &mut snapshot, |live| {
@@ -929,12 +987,12 @@ mod tests {
             Default::default()
         }
 
-        fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, _: u64) -> bool {
+        fn pause_for_user(&self, run_id: &str, reason: &str, code: &str, _: u64) -> PauseCommit {
             self.pauses
                 .lock()
                 .unwrap()
                 .push((run_id.to_string(), reason.to_string(), code.to_string()));
-            true
+            PauseCommit::Committed
         }
     }
 
@@ -1114,7 +1172,7 @@ mod tests {
             fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
                 Default::default()
             }
-            fn pause_for_user(&self, run_id: &str, _: &str, _: &str, _: u64) -> bool {
+            fn pause_for_user(&self, run_id: &str, _: &str, _: &str, _: u64) -> PauseCommit {
                 let already = self
                     .published
                     .lock()
@@ -1122,7 +1180,11 @@ mod tests {
                     .iter()
                     .any(|snapshot| snapshot.state == TransientRunState::Paused);
                 *self.saw_paused_published.lock().unwrap() = Some(already);
-                self.live.has_active_run(run_id)
+                if self.live.has_active_run(run_id) {
+                    PauseCommit::Committed
+                } else {
+                    PauseCommit::AlreadyCancelled
+                }
             }
         }
         let live = Arc::new(YouTubeLiveHandle::default());
@@ -1175,11 +1237,11 @@ mod tests {
             fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
                 Default::default()
             }
-            fn pause_for_user(&self, run_id: &str, _: &str, _: &str, _: u64) -> bool {
+            fn pause_for_user(&self, run_id: &str, _: &str, _: &str, _: u64) -> PauseCommit {
                 // The durable pause committed; the user's cancel arrives
                 // before the live view is suspended.
                 self.live.cancel(run_id).unwrap();
-                true
+                PauseCommit::Committed
             }
         }
         let live = Arc::new(YouTubeLiveHandle::default());
@@ -1231,8 +1293,8 @@ mod tests {
             fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
                 Default::default()
             }
-            fn pause_for_user(&self, _: &str, _: &str, _: &str, _: u64) -> bool {
-                false
+            fn pause_for_user(&self, _: &str, _: &str, _: &str, _: u64) -> PauseCommit {
+                PauseCommit::AlreadyCancelled
             }
         }
         let live = Arc::new(YouTubeLiveHandle::default());
@@ -1316,5 +1378,57 @@ mod tests {
             assert_eq!(ledger.pauses.lock().unwrap().len(), usize::from(pauses), "{code}");
             assert!(!live.has_active_run("yt-fresh"));
         }
+    }
+
+    #[test]
+    fn a_failing_pause_write_is_not_a_cancel_and_deletes_nothing() {
+        struct DatabaseFull;
+        impl ResumeLedger for DatabaseFull {
+            fn is_resumed_attempt(&self, _: &str) -> bool {
+                true
+            }
+            fn record_expected_bytes(&self, _: &str, _: &str, _: u64) {}
+            fn shared_staging(&self, _: &str, _: &str) -> std::collections::HashSet<String> {
+                Default::default()
+            }
+            fn pause_for_user(&self, _: &str, _: &str, _: &str, _: u64) -> PauseCommit {
+                PauseCommit::Failed("database or disk is full".to_string())
+            }
+        }
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-full".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: Some(Arc::new(DatabaseFull)),
+            notify_resume_changed: None,
+        };
+
+        let outcome = kernel.run_items_with(
+            "yt-full",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            true,
+        );
+
+        assert!(!outcome.cancelled, "a database error is not a cancel");
+        // `pause_for_user` keeps `execute` from discarding the staging.
+        assert!(outcome.pause_for_user);
+        let last = published.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.state, TransientRunState::Paused);
+        assert!(last
+            .error
+            .unwrap()
+            .message
+            .contains("database or disk is full"));
     }
 }

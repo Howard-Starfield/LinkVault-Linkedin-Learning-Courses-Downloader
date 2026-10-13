@@ -760,7 +760,10 @@ pub(super) fn cancel_youtube_download_blocking(
     // therefore either lands on a live control that is attached (and signals
     // it), or makes the durable run non-paused first so a later admission
     // refuses it; the executor can never start behind a cancel.
-    let (snapshot, unowned_paused) = runtime.with_drain_lock(|| {
+    // The reference check and the deletion of any staging nothing else needs
+    // also happen under this lock, so an admission of a run using the same
+    // directory waits for the cleanup instead of racing it.
+    let snapshot = runtime.with_drain_lock(|| {
         let durable = runtime
             .get_run(run_id.to_string())
             .map_err(|error| YouTubeError::new("CANCEL_FAILED", error.to_string()))?;
@@ -770,11 +773,19 @@ pub(super) fn cancel_youtube_download_blocking(
             .cloned();
         let snapshot = match live.cancel(run_id) {
             Ok(snapshot) => snapshot,
-            // A paused run waiting to be resumed has no live control.
+            // A paused run waiting to be resumed has no live control. Its
+            // snapshot continues the revisions the UI has already seen.
             Err(crate::app::managed_process::TransientRuntimeError::RunNotFound)
                 if paused.is_some() =>
             {
-                cancelled_snapshot_for(paused.as_ref())
+                let mut snapshot = cancelled_snapshot_for(paused.as_ref());
+                let stored = runtime
+                    .get_resume(run_id.to_string())
+                    .ok()
+                    .flatten()
+                    .map_or(0, |record| record.last_revision);
+                snapshot.revision = live.revision_of(run_id).max(stored) + 1;
+                snapshot
             }
             Err(error) => return Err(YouTubeError::from(error)),
         };
@@ -782,14 +793,14 @@ pub(super) fn cancel_youtube_download_blocking(
             .cancel_run(run_id.to_string(), chrono::Utc::now().timestamp())
             .map_err(|error| YouTubeError::new("CANCEL_FAILED", error.to_string()))?;
         // Only a run with no attached control has no executor to clean up.
-        let unowned = paused.filter(|_| !live.has_active_run(run_id));
-        Ok::<_, YouTubeError>((snapshot, unowned))
+        if let Some(run) = paused.filter(|_| !live.has_active_run(run_id)) {
+            let shared =
+                resume::staging_shared_with_others(runtime, run_id, &run.output_root);
+            resume::discard_paused_run_staging(&run, &shared);
+            live.publish_snapshot(snapshot.clone());
+        }
+        Ok::<_, YouTubeError>(snapshot)
     })?;
-    if let Some(run) = unowned_paused {
-        let shared = resume::staging_shared_with_others(runtime, run_id, &run.output_root);
-        resume::discard_paused_run_staging(&run, &shared);
-        live.publish_snapshot(snapshot.clone());
-    }
     Ok(snapshot)
 }
 
