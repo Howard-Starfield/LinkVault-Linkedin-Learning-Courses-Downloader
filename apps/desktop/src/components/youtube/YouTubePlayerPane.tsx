@@ -3,13 +3,15 @@ import { Captions, CaptionsOff, Pause, Play, SkipBack, SkipForward, Volume2, Vol
 import { saveYouTubePlaybackProgress } from "../../lib/youtube/ipc";
 import {
   adjacentPlayableVideo,
-  createProgressThrottle,
+  createNavigationGuard,
+  createProgressSaver,
   createSerialRunner,
   formatPlaybackClock,
   isPlaybackCompleted,
   progressOfVideo,
   resumePositionSeconds,
-  type PlaybackSample
+  type PlaybackSample,
+  type SerialRunner
 } from "../../lib/youtube/playback";
 import type { YouTubePlaybackProgress, YouTubePlayerSession, YouTubeRunVideo } from "../../lib/youtube/types";
 
@@ -62,6 +64,9 @@ export function YouTubePlayerPane({ session, onClose }: YouTubePlayerPaneProps) 
     closingRef.current = true;
     try {
       await flushRef.current?.();
+      // Always wait for every queued save, including those of earlier videos
+      // and saves already in flight, before the history reloads progress.
+      await runnerRef.current.drain();
     } finally {
       onClose();
     }
@@ -104,7 +109,13 @@ export function YouTubePlayerPane({ session, onClose }: YouTubePlayerPaneProps) 
       onRecord={recordProgress}
       onClose={() => void close()}
       onPrevious={previous ? () => setCurrentId(previous.occurrenceId) : null}
-      onNext={next ? () => setCurrentId(next.occurrenceId) : null}
+      onNext={
+        next
+          ? () => {
+              if (!closingRef.current) setCurrentId(next.occurrenceId);
+            }
+          : null
+      }
     />
   );
 }
@@ -116,7 +127,7 @@ type PlayerPaneProps = {
   resumeSeconds: number;
   captionsOn: boolean;
   onToggleCaptions: () => void;
-  runner: ReturnType<typeof createSerialRunner>;
+  runner: SerialRunner;
   registerFlush: (flush: (() => Promise<void>) | null) => void;
   onRecord: (occurrenceId: string, progress: YouTubePlaybackProgress) => void;
   onClose: () => void;
@@ -210,32 +221,35 @@ function PlayerPane({
     if (!media) {
       return () => undefined;
     }
-    const throttle = createProgressThrottle();
     let lastSample: PlaybackSample | null = null;
+    // Cancelled when this video is left, so a pending "ended" save cannot
+    // advance after the user jumped elsewhere or the player closed.
+    const navigation = createNavigationGuard();
+    const saver = createProgressSaver({
+      runner,
+      now: () => performance.now(),
+      save: (sample) =>
+        saveYouTubePlaybackProgress({
+          runId,
+          occurrenceId: sample.occurrenceId,
+          positionSeconds: Math.min(sample.positionSeconds, sample.durationSeconds),
+          durationSeconds: sample.durationSeconds
+        }),
+      onError: (error) => {
+        console.error("YouTube playback progress could not be saved", error);
+      }
+    });
 
     function persist(force: boolean): Promise<void> {
       const sample = lastSample;
-      if (!sample) return Promise.resolve();
-      const now = performance.now();
-      if (!throttle.shouldSave(sample, now, force)) return Promise.resolve();
-      throttle.markSaved(sample, now);
+      if (!sample) return runner.drain();
       const position = Math.min(sample.positionSeconds, sample.durationSeconds);
       onRecord(sample.occurrenceId, {
         positionSeconds: position,
         durationSeconds: sample.durationSeconds,
         completed: isPlaybackCompleted(position, sample.durationSeconds)
       });
-      return runner
-        .run(() =>
-          saveYouTubePlaybackProgress({
-            runId,
-            occurrenceId: sample.occurrenceId,
-            positionSeconds: position,
-            durationSeconds: sample.durationSeconds
-          })
-        )
-        .then(() => undefined)
-        .catch(() => undefined);
+      return saver.request(sample, force);
     }
 
     function sampleFrom(target: HTMLVideoElement) {
@@ -299,7 +313,10 @@ function PlayerPane({
       if (!(target instanceof HTMLVideoElement) || !primed) return;
       syncClock(target, true);
       sampleFrom(target);
-      void persist(true).then(() => onNextRef.current?.());
+      const stillCurrent = navigation.capture();
+      void persist(true).then(() => {
+        if (stillCurrent()) onNextRef.current?.();
+      });
     }
 
     function onLoadedMetadata(event: Event) {
@@ -328,6 +345,7 @@ function PlayerPane({
       media.removeEventListener("ended", onEndedMedia);
       media.removeEventListener("loadedmetadata", onLoadedMetadata);
       media.removeEventListener("volumechange", onTimeUpdate);
+      navigation.cancel();
       // Leaving the video (next/previous, close, navigating away) saves the
       // last position once; an unchanged position is skipped by the throttle.
       void persist(true);

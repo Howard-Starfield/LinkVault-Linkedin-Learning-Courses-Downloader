@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   PROGRESS_SAVE_INTERVAL_MS,
   adjacentPlayableVideo,
+  createNavigationGuard,
+  createProgressSaver,
   createProgressThrottle,
   createSerialRunner,
   describeVideoProgress,
@@ -136,4 +138,108 @@ test("completion matches the backend rule", () => {
   assert.equal(isPlaybackCompleted(3_590, 3_600), true);
   assert.equal(isPlaybackCompleted(Number.NaN, 100), false);
   assert.equal(isPlaybackCompleted(1, 0), false);
+});
+
+const sampleAt = (position, occurrenceId = "occ-1") => ({ occurrenceId, positionSeconds: position, durationSeconds: 100 });
+
+test("close waits for a pending save before it resolves", async () => {
+  const runner = createSerialRunner();
+  const resolvers = [];
+  const saver = createProgressSaver({
+    runner,
+    now: () => 1_000,
+    save: () => new Promise((resolve) => resolvers.push(resolve))
+  });
+  const first = saver.request(sampleAt(10), true);
+  let closed = false;
+  const close = saver.request(sampleAt(10), true).then(() => {
+    closed = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(closed, false, "close must not resolve while a save is still in flight");
+  while (!closed) {
+    resolvers.splice(0).forEach((resolve) => resolve());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await Promise.all([first, close]);
+});
+
+test("an unchanged forced save still waits for the queue to drain", async () => {
+  const runner = createSerialRunner();
+  const saver = createProgressSaver({ runner, now: () => 1_000, save: async () => undefined });
+  await saver.request(sampleAt(10), true);
+  let release;
+  const slow = runner.run(() => new Promise((resolve) => {
+    release = resolve;
+  }));
+  let closed = false;
+  // Position unchanged and already saved: nothing to send, yet it must wait.
+  const close = saver.request(sampleAt(10), true).then(() => {
+    closed = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(closed, false);
+  release();
+  await slow;
+  await close;
+  assert.equal(closed, true);
+});
+
+test("a failed save stays dirty and is retried by the next forced save", async () => {
+  const runner = createSerialRunner();
+  const calls = [];
+  const errors = [];
+  let fail = true;
+  const saver = createProgressSaver({
+    runner,
+    now: () => 1_000,
+    onError: (error) => errors.push(error),
+    save: async (sample) => {
+      calls.push(sample.positionSeconds);
+      if (fail) throw new Error("ipc down");
+    }
+  });
+  await saver.request(sampleAt(10), false);
+  assert.equal(errors.length, 1);
+  fail = false;
+  await saver.request(sampleAt(10), true);
+  assert.deepEqual(calls, [10, 10]);
+  // Now it succeeded, so an unchanged forced save is skipped.
+  await saver.request(sampleAt(10), true);
+  assert.deepEqual(calls, [10, 10]);
+});
+
+test("a failed periodic save is not retried before the interval", async () => {
+  let now = 1_000;
+  const calls = [];
+  const saver = createProgressSaver({
+    runner: createSerialRunner(),
+    now: () => now,
+    onError: () => undefined,
+    save: async (sample) => {
+      calls.push(sample.positionSeconds);
+      throw new Error("down");
+    }
+  });
+  await saver.request(sampleAt(1), false);
+  now = 2_000;
+  await saver.request(sampleAt(2), false);
+  assert.deepEqual(calls, [1]);
+  now = 6_100;
+  await saver.request(sampleAt(7), false);
+  assert.deepEqual(calls, [1, 7]);
+});
+
+test("a navigation guard blocks a stale continuation after the video changed", async () => {
+  const guard = createNavigationGuard();
+  const stillCurrent = guard.capture();
+  let advanced = false;
+  const pending = Promise.resolve().then(() => {
+    if (stillCurrent()) advanced = true;
+  });
+  // The user jumped from A to C (or the player closed) before the save finished.
+  guard.cancel();
+  await pending;
+  assert.equal(advanced, false);
+  assert.equal(guard.capture()(), true);
 });

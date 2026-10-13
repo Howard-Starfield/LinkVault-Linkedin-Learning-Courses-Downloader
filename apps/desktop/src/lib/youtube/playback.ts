@@ -29,11 +29,13 @@ export function isSavableSample(sample: PlaybackSample): boolean {
  * While playing, a sample is saved at most every `intervalMs`. Forced samples
  * (pause, ended, switching video, closing) bypass the interval but are still
  * dropped when nothing moved since the last save, so closing right after a
- * pause does not write twice. The caller calls `markSaved` for every sample it
- * actually sends, so a sample the throttle declined never starts the interval.
+ * pause does not write twice. `markSaved` is called only after a write
+ * succeeded, so a failed save stays dirty and the next save or the close
+ * retries it.
  */
 export function createProgressThrottle(intervalMs: number = PROGRESS_SAVE_INTERVAL_MS) {
   let lastSavedAt = Number.NEGATIVE_INFINITY;
+  let lastAttemptAt = Number.NEGATIVE_INFINITY;
   let lastSaved: PlaybackSample | null = null;
   return {
     shouldSave(sample: PlaybackSample, nowMs: number, force: boolean): boolean {
@@ -45,8 +47,15 @@ export function createProgressThrottle(intervalMs: number = PROGRESS_SAVE_INTERV
           Math.abs(lastSaved.positionSeconds - sample.positionSeconds) < FORCED_SAVE_MIN_DELTA_SECONDS
         );
       }
-      return nowMs - lastSavedAt >= intervalMs;
+      // A failed attempt waits one interval before the next tick retries, so
+      // a persistent failure is not hammered four times a second.
+      return nowMs - lastSavedAt >= intervalMs && nowMs - lastAttemptAt >= intervalMs;
     },
+    /** Call when a save is sent. Does not count as saved until `markSaved`. */
+    markAttempted(nowMs: number): void {
+      lastAttemptAt = nowMs;
+    },
+    /** Call only after the save succeeded; a failed save stays dirty. */
     markSaved(sample: PlaybackSample, nowMs: number): void {
       lastSavedAt = nowMs;
       lastSaved = sample;
@@ -130,10 +139,68 @@ export function describeVideoProgress(video: YouTubeRunVideo): string | null {
 export function createSerialRunner() {
   let tail: Promise<unknown> = Promise.resolve();
   return {
+    /** Resolves once every save queued so far has finished (successfully or not). */
+    drain(): Promise<void> {
+      return tail.then(() => undefined);
+    },
     run<T>(task: () => Promise<T>): Promise<T> {
       const result = tail.then(task, task);
       tail = result.catch(() => undefined);
       return result;
+    }
+  };
+}
+
+export type SerialRunner = ReturnType<typeof createSerialRunner>;
+
+/**
+ * Throttled, ordered, retrying progress saves for one video.
+ *
+ * - `request` saves when the throttle allows (or `force`) and always resolves
+ *   only after the shared queue has drained, so a close can await it and the
+ *   history reload never sees stale progress, even when nothing new was sent.
+ * - A save counts as done only after it succeeded; on failure the error is
+ *   reported and the position stays dirty for the next save or the close.
+ */
+export function createProgressSaver(options: {
+  runner: SerialRunner;
+  save: (sample: PlaybackSample) => Promise<unknown>;
+  now?: () => number;
+  intervalMs?: number;
+  onError?: (error: unknown) => void;
+}) {
+  const throttle = createProgressThrottle(options.intervalMs);
+  const clock = options.now ?? (() => Date.now());
+  return {
+    request(sample: PlaybackSample, force: boolean): Promise<void> {
+      const now = clock();
+      if (!throttle.shouldSave(sample, now, force)) return options.runner.drain();
+      throttle.markAttempted(now);
+      return options.runner
+        .run(() => options.save(sample))
+        .then(
+          () => throttle.markSaved(sample, now),
+          (error: unknown) => options.onError?.(error)
+        )
+        .then(() => options.runner.drain());
+    }
+  };
+}
+
+/**
+ * Lets an async continuation (for example "advance after the ended save")
+ * check that nothing changed in between: `cancel` is called when the video
+ * changes or the player unmounts, and every earlier capture then reports false.
+ */
+export function createNavigationGuard() {
+  let generation = 0;
+  return {
+    capture(): () => boolean {
+      const captured = generation;
+      return () => generation === captured;
+    },
+    cancel(): void {
+      generation += 1;
     }
   };
 }
