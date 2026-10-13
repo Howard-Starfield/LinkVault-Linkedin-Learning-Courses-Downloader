@@ -231,11 +231,17 @@ function pickPreferredLanguage(
 ): string | null {
   if (options.length === 0 || (options.length === 1 && options[0]?.tag === "")) return null;
   if (current && options.some((option) => option.tag === current)) return current;
-  const english = options.find((option) => {
+  const english = options.filter((option) => {
     const tag = option.tag.toLowerCase();
     return tag === "en" || tag.startsWith("en-") || tag.startsWith("en_");
   });
-  return english?.tag ?? options[0]?.tag ?? null;
+  // Prefer uploader English, then YouTube's untranslated "-orig" track:
+  // automatic "en" on an English video is a machine translation that YouTube
+  // rate-limits (HTTP 429) far more often than the original track.
+  const preferred = english.find((option) => !option.label.toLowerCase().includes("automatic") && !option.tag.toLowerCase().endsWith("-orig"))
+    ?? english.find((option) => option.tag.toLowerCase().endsWith("-orig"))
+    ?? english[0];
+  return preferred?.tag ?? options[0]?.tag ?? null;
 }
 
 function helperStatusFailure(error: unknown): YouTubeError {
