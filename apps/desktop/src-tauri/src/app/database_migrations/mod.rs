@@ -7,12 +7,14 @@ pub(crate) mod linkedin_path_library_v8;
 mod linkedin_query_indexes;
 mod newspaper_clipping_drafts;
 mod workflow_v7;
+mod youtube_playback_progress_v11;
 
 pub fn migrate(connection: &Connection) -> Result<()> {
     newspaper_clipping_drafts::install_and_verify(connection)?;
     workflow_v7::install_and_verify(connection)?;
     linkedin_path_library_v8::install_and_verify(connection)?;
-    linkedin_course_placement_v9::install_and_verify(connection)
+    linkedin_course_placement_v9::install_and_verify(connection)?;
+    youtube_playback_progress_v11::install_and_verify(connection)
 }
 
 /// Query indexes are installed after `migrate`, not inside it.

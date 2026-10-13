@@ -307,7 +307,7 @@ impl ValidatedOutputRoot {
     /// Maximum UTF-16 units available to one direct child while retaining the
     /// conservative cross-helper path ceiling used by publication.
     pub fn direct_child_name_budget(&self) -> usize {
-        MAX_SUPPORTED_PATH_UTF16.saturating_sub(path_utf16_len(&self.path).saturating_add(1))
+        direct_child_name_budget_for(&self.path)
     }
 
     fn root_lease(&self) -> Result<&DirectoryLease, SafeOutputError> {
@@ -2272,6 +2272,12 @@ impl ExistingOutputDirectoryLease {
         self.revalidate()?;
         Ok(file)
     }
+}
+
+/// [`ValidatedOutputRoot::direct_child_name_budget`] for a root that is only
+/// being read (no admission, no write probe). Uses the path as stored.
+pub fn direct_child_name_budget_for(root: &Path) -> usize {
+    MAX_SUPPORTED_PATH_UTF16.saturating_sub(path_utf16_len(root).saturating_add(1))
 }
 
 pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutputError> {

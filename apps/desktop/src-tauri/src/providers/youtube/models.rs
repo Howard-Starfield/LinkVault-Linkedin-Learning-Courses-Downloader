@@ -252,3 +252,54 @@ pub struct ListYouTubeHistoryRequest {
 }
 
 pub type GetYouTubeDownloadStateResponse = Option<TransientRunSnapshot>;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListYouTubeRunVideosRequest {
+    pub run_id: String,
+}
+
+/// One work item of a finished run, with what the in-app player needs.
+///
+/// `media_url` / `subtitles_url` are opaque `youtube-media` URLs (ids only,
+/// never paths). `available` is false when the files are missing, moved, or
+/// changed; `unavailable_reason` then explains why in plain language.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct YouTubeRunVideo {
+    pub occurrence_id: String,
+    pub ordinal: u32,
+    pub title: String,
+    pub video_id: String,
+    pub media_url: Option<String>,
+    pub subtitles_url: Option<String>,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub position_seconds: Option<f64>,
+    pub duration_seconds: Option<f64>,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GetYouTubePlaybackProgressRequest {
+    pub run_id: String,
+    pub occurrence_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveYouTubePlaybackProgressRequest {
+    pub run_id: String,
+    pub occurrence_id: String,
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct YouTubePlaybackProgress {
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+    pub completed: bool,
+}

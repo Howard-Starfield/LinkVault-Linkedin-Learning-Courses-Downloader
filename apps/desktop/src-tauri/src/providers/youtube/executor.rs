@@ -4,7 +4,7 @@ use crate::app::managed_process::{
     TransientItemPhase, TransientProgressUpdate, TransientRunControl, TransientWorkItem,
 };
 use crate::app::safe_output_filesystem::{
-    validate_output_component, ExistingOutputDirectoryLease, OutputAttemptLease, SafeOutputError,
+    direct_child_name_budget_for, validate_output_component, ExistingOutputDirectoryLease, OutputAttemptLease, SafeOutputError,
     ValidatedOutputRoot,
 };
 use crate::providers::youtube::download_progress::{
@@ -38,7 +38,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 /// Longest transcript failure reason carried into a user-visible warning.
 const MAX_WARNING_REASON_CHARS: usize = 240;
 
@@ -1997,6 +1997,23 @@ fn safe_stem_for_root(
         title,
         video_id,
         output_root.direct_child_name_budget(),
+    )
+}
+
+/// Final item directory name the executor publishes under, computed from the
+/// stored output root without admitting (or writing to) it. Playback uses this
+/// to find an item folder from durable run state instead of scanning.
+pub(super) fn published_item_name(
+    root_path: &Path,
+    ordinal: u32,
+    title: &str,
+    video_id: &str,
+) -> Result<String, SafeOutputError> {
+    safe_stem_with_budget(
+        ordinal,
+        title,
+        video_id,
+        direct_child_name_budget_for(root_path),
     )
 }
 

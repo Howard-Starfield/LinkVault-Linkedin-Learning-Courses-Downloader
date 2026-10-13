@@ -51,6 +51,10 @@ impl YouTubeState {
         Self { db_path }
     }
 
+    pub(super) fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     fn connection(&self) -> Result<Connection, YouTubeError> {
         open_runtime(&self.db_path)
             .map_err(|error| YouTubeError::new("PREFERENCES_UNAVAILABLE", error.to_string()))
