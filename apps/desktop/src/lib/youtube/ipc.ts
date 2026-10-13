@@ -33,7 +33,13 @@ const PREVIEW_SCANS_KEY = "linkvault.youtube.preview.scans";
 const PREVIEW_RUN_KEY = "linkvault.youtube.preview.run";
 const PREVIEW_EVENT_NAME = "linkvault://youtube-run-changed";
 export const YOUTUBE_UI_MOCK_RUN_PREFIX = "youtube-ui-mock-";
-let previewRunIdPrefix = "preview-run-";
+export const YOUTUBE_PREVIEW_RUN_PREFIX = "preview-run-";
+let previewRunIdPrefix = YOUTUBE_PREVIEW_RUN_PREFIX;
+
+/** Browser-only runs (UI mock or preview) store item counts, not bytes, in the byte fields. */
+export function isYouTubeSimulatedRun(runId: string): boolean {
+  return runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX) || runId.startsWith(YOUTUBE_PREVIEW_RUN_PREFIX);
+}
 const previewTimers = new Set<number>();
 const previewRunModes = new Map<string, YouTubeDownloadMode>();
 
@@ -258,7 +264,7 @@ export async function startYouTubeUiMock(): Promise<StartYouTubeDownloadResponse
       continueWithoutTranscript: true
     });
   } finally {
-    previewRunIdPrefix = "preview-run-";
+    previewRunIdPrefix = YOUTUBE_PREVIEW_RUN_PREFIX;
   }
 }
 

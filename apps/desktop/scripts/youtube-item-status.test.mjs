@@ -7,6 +7,7 @@ import {
   youtubeProgressText,
   youtubeStageLabel
 } from "../src/lib/youtube/itemStatus.ts";
+import { isYouTubeSimulatedRun } from "../src/lib/youtube/ipc.ts";
 
 test("a pending item is Queued while the run is active and Not started once it ended", () => {
   assert.equal(youtubeItemStatusText("pending", "waiting", true, "active"), "Queued");
@@ -121,4 +122,39 @@ test("rows without bytes or percent keep the existing text", () => {
     "Downloading video…"
   );
   assert.equal(youtubeProgressText(null, 0, null), "");
+});
+
+test("a value that rounds up to 1000 is promoted to the next unit", () => {
+  const nb = "\u00A0";
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 999_950, bytesTotal: null }), `1.0${nb}MB`);
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 999_949, bytesTotal: null }), `999.9${nb}KB`);
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 999.6, bytesTotal: null }), `1.0${nb}KB`);
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 500_000, bytesTotal: 999_950 }),
+    ["0.5", "/", `1.0${nb}MB`].join(nb)
+  );
+  assert.equal(formatYouTubeBytes({ bytesCompleted: 999_950_000, bytesTotal: null }), `1.0${nb}GB`);
+});
+
+test("a tiny completed amount against a huge total keeps its own unit instead of 0.0", () => {
+  const nb = "\u00A0";
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 20_000, bytesTotal: 3_000_000_000 }),
+    [`20.0${nb}KB`, "/", `3.0${nb}GB`].join(nb)
+  );
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 1_024, bytesTotal: 3_000_000_000 }),
+    [`1.0${nb}KB`, "/", `3.0${nb}GB`].join(nb)
+  );
+  // 0.1 GB is visible in the total's unit, so it stays there.
+  assert.equal(
+    formatYouTubeBytes({ bytesCompleted: 100_000_000, bytesTotal: 3_000_000_000 }),
+    ["0.1", "/", `3.0${nb}GB`].join(nb)
+  );
+});
+
+test("browser-only runs are recognised so their item counts are not shown as bytes", () => {
+  assert.equal(isYouTubeSimulatedRun("preview-run-1760000000000"), true);
+  assert.equal(isYouTubeSimulatedRun("youtube-ui-mock-1760000000000"), true);
+  assert.equal(isYouTubeSimulatedRun("yt-5f2c1a"), false);
 });

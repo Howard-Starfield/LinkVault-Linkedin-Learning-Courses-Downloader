@@ -34,7 +34,8 @@ import {
   subscribeYouTubeRunChanged,
   youtubeErrorFromUnknown,
   isYouTubeRunSnapshot,
-  YOUTUBE_UI_MOCK_RUN_PREFIX
+  YOUTUBE_UI_MOCK_RUN_PREFIX,
+  isYouTubeSimulatedRun
 } from "../../lib/youtube/ipc";
 import {
   detectYouTubeLinks,
@@ -1416,10 +1417,10 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
                   ? formatYouTubeFailure(outcome.error)
                   : null;
                 const percent = itemProgressPercent(video.item.occurrenceId, state, runSnapshot, currentProgress);
-                // Byte counts describe the item that is downloading now; the UI mock reuses the fields for item counts.
+                // Byte counts describe the item that is downloading now; browser-only runs reuse the fields for item counts.
                 const runBytes = state === "running"
                   && runSnapshot?.item?.occurrenceId === video.item.occurrenceId
-                  && !runSnapshot.runId.startsWith(YOUTUBE_UI_MOCK_RUN_PREFIX)
+                  && !isYouTubeSimulatedRun(runSnapshot.runId)
                   ? runSnapshot.progress
                   : null;
                 const progressDetail = percent !== null ? youtubeProgressDetail(percent, runBytes) : "";
