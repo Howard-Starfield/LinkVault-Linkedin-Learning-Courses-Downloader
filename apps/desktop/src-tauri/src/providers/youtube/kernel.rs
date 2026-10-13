@@ -1,10 +1,12 @@
 //! Durable-kernel adapter around the provider-owned YouTube item executor.
 
-use crate::app::managed_process::{TransientError, TransientExecutor, TransientItemState};
+use crate::app::managed_process::{
+    TransientError, TransientExecutor, TransientItemState, TransientRunControl,
+};
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::live::{
-    apply_item_outcome, apply_item_progress, executor_from_request, finish_snapshot,
-    YouTubeLiveHandle, YoutubeDurableRequest,
+    apply_item_failure, apply_item_outcome, apply_item_progress, executor_from_request,
+    finish_snapshot, YouTubeLiveHandle, YoutubeDurableRequest,
 };
 use crate::workflow::domain::types::{RunRecord, StepRecord};
 use crate::workflow::ports::executor::{ExecutorOutcome, StepExecutor};
@@ -31,20 +33,62 @@ impl StepExecutor for YoutubeDownloadExecutor {
         };
         let request = match serde_json::from_str::<YoutubeDurableRequest>(&run.request_json) {
             Ok(request) => request,
-            Err(error) => return ExecutorOutcome::failed(error.to_string()),
+            Err(error) => {
+                return self.fail_before_start(&run.id, "REQUEST_INVALID", error.to_string())
+            }
         };
         let output_root = match validate_output_root(PathBuf::from(&run.output_root).as_path()) {
             Ok(root) => root,
-            Err(error) => return ExecutorOutcome::failed(error.to_string()),
+            Err(error) => {
+                return self.fail_before_start(&run.id, "OUTPUT_ROOT_INVALID", error.to_string())
+            }
         };
         let executor = match executor_from_request(output_root, &request) {
             Ok(executor) => executor,
-            Err(error) => return ExecutorOutcome::failed(error.to_string()),
+            Err(error) => return self.fail_before_start(&run.id, &error.code, error.message),
         };
-        let mut snapshot = match self.live.snapshot(Some(&run.id)) {
+        self.run_items(&run.id, &request, &control, executor.as_ref())
+    }
+}
+
+impl YoutubeDownloadExecutor {
+    /// Fail the run before any item started.
+    ///
+    /// The live slot is only released by a terminal publish, so a bare
+    /// `ExecutorOutcome::failed` would leave the run "active" and make every
+    /// later start fail with `RunAlreadyActive`.
+    fn fail_before_start(&self, run_id: &str, code: &str, message: String) -> ExecutorOutcome {
+        let error = TransientError {
+            code: code.to_string(),
+            message,
+        };
+        let failure = format!("{}: {}", error.code, error.message);
+        let mut snapshot = match self.live.snapshot(Some(run_id)) {
             Ok(Some(snapshot)) => snapshot,
             _ => crate::providers::youtube::live::initial_snapshot(
-                run.id.clone(),
+                run_id.to_string(),
+                String::new(),
+                String::new(),
+                &[],
+            ),
+        };
+        finish_snapshot(&mut snapshot, false, Some(error));
+        self.live.publish_snapshot(snapshot);
+        ExecutorOutcome::failed(failure)
+    }
+
+    /// Drive every work item through `executor`, publishing snapshots as it goes.
+    fn run_items(
+        &self,
+        run_id: &str,
+        request: &YoutubeDurableRequest,
+        control: &TransientRunControl,
+        executor: &dyn TransientExecutor,
+    ) -> ExecutorOutcome {
+        let mut snapshot = match self.live.snapshot(Some(run_id)) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => crate::providers::youtube::live::initial_snapshot(
+                run_id.to_string(),
                 request.client_submission_id.clone(),
                 request.plan_fingerprint.clone(),
                 &request.work_items,
@@ -70,18 +114,17 @@ impl StepExecutor for YoutubeDownloadExecutor {
             let live = Arc::clone(&self.live);
             let mut item_snapshot = snapshot.clone();
             let work_item = item.clone();
-            let outcome =
-                TransientExecutor::execute(executor.as_ref(), item, &control, &mut |update| {
-                    apply_item_progress(
-                        &mut item_snapshot,
-                        &work_item,
-                        update.phase,
-                        update.bytes_completed,
-                        update.bytes_total,
-                        update.fraction,
-                    );
-                    live.publish_snapshot(item_snapshot.clone());
-                });
+            let outcome = TransientExecutor::execute(executor, item, control, &mut |update| {
+                apply_item_progress(
+                    &mut item_snapshot,
+                    &work_item,
+                    update.phase,
+                    update.bytes_completed,
+                    update.bytes_total,
+                    update.fraction,
+                );
+                live.publish_snapshot(item_snapshot.clone());
+            });
             snapshot = item_snapshot;
 
             match outcome {
@@ -111,14 +154,16 @@ impl StepExecutor for YoutubeDownloadExecutor {
                     }
                 }
                 Err(TransientError { code, message }) => {
-                    finish_snapshot(
-                        &mut snapshot,
-                        control.is_cancelled(),
-                        Some(TransientError {
-                            code: code.clone(),
-                            message: message.clone(),
-                        }),
-                    );
+                    let error = TransientError {
+                        code: code.clone(),
+                        message: message.clone(),
+                    };
+                    // A cancelled run marks in-flight items Cancelled in
+                    // `finish_snapshot`; only a real failure fails the item.
+                    if !control.is_cancelled() {
+                        apply_item_failure(&mut snapshot, item, &error);
+                    }
+                    finish_snapshot(&mut snapshot, control.is_cancelled(), Some(error));
                     self.live.publish_snapshot(snapshot);
                     if control.is_cancelled() {
                         return ExecutorOutcome::cancelled(message);
@@ -145,9 +190,208 @@ impl StepExecutor for YoutubeDownloadExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::managed_process::{
+        TransientExecutionOutcome, TransientItemPhase, TransientProgressUpdate,
+        TransientRunSnapshot, TransientRunState, TransientWorkItem,
+    };
+    use crate::providers::youtube::models::{StartYouTubeDownloadRequest, YouTubeDownloadMode};
     use crate::workflow::domain::state::{RunState, StepState};
     use crate::workflow::domain::types::{StepType, WorkflowType};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn work_item(ordinal: u32) -> TransientWorkItem {
+        TransientWorkItem {
+            occurrence_id: format!("occ-{ordinal}"),
+            artifact_fingerprint: format!("af-{ordinal}"),
+            video_id: format!("vid-{ordinal}"),
+            ordinal,
+            title: format!("Video {ordinal}"),
+            source_url: format!("https://www.youtube.com/watch?v=vid-{ordinal}"),
+        }
+    }
+
+    fn durable_request(items: Vec<TransientWorkItem>) -> YoutubeDurableRequest {
+        YoutubeDurableRequest {
+            schema_version: 1,
+            start: StartYouTubeDownloadRequest {
+                client_submission_id: "sub-kernel".to_string(),
+                scan_plan_id: "plan-kernel".to_string(),
+                selected_occurrence_ids: items.iter().map(|i| i.occurrence_id.clone()).collect(),
+                output_dir: ".".to_string(),
+                mode: YouTubeDownloadMode::VideoAndTranscript,
+                max_height: None,
+                preferred_language: None,
+                fallback_languages: Vec::new(),
+                allow_automatic_captions: false,
+                continue_without_transcript: false,
+            },
+            work_items: items,
+            context: Default::default(),
+            plan_fingerprint: "plan-fp".to_string(),
+            client_submission_id: "sub-kernel".to_string(),
+        }
+    }
+
+    fn run_record(id: &str, request_json: String) -> RunRecord {
+        RunRecord {
+            id: id.to_string(),
+            workflow_type: WorkflowType::youtube_download(),
+            provider: "youtube".to_string(),
+            state: RunState::Running,
+            legacy_origin: None,
+            legacy_id: None,
+            request_json,
+            output_root: ".".to_string(),
+            error_message: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        }
+    }
+
+    fn step_record(run_id: &str) -> StepRecord {
+        StepRecord {
+            id: format!("{run_id}-step"),
+            run_id: run_id.to_string(),
+            step_key: "video".to_string(),
+            step_type: StepType::youtube_execute(),
+            state: StepState::Running,
+            attempt: 1,
+            error_message: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn capture_sink(live: &YouTubeLiveHandle) -> Arc<Mutex<Vec<TransientRunSnapshot>>> {
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let sink_target = Arc::clone(&published);
+        live.set_test_sink(Arc::new(move |snapshot| {
+            if let Ok(mut guard) = sink_target.lock() {
+                guard.push(snapshot.clone());
+            }
+        }));
+        published
+    }
+
+    /// Fake item executor: completes the first item, then fails the others.
+    struct ScriptedExecutor;
+
+    impl TransientExecutor for ScriptedExecutor {
+        fn execute(
+            &self,
+            item: &TransientWorkItem,
+            _control: &TransientRunControl,
+            progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            progress(TransientProgressUpdate {
+                occurrence_id: item.occurrence_id.clone(),
+                phase: TransientItemPhase::Media,
+                bytes_completed: None,
+                bytes_total: None,
+                fraction: Some(0.0),
+            });
+            if item.ordinal == 1 {
+                return Ok(TransientExecutionOutcome::completed(vec![
+                    "video".to_string()
+                ]));
+            }
+            Err(TransientError {
+                code: "TRANSCRIPT_INVALID".to_string(),
+                message: "caption file was malformed".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn executor_error_marks_the_running_item_failed_in_the_terminal_snapshot() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1), work_item(2), work_item(3)];
+        let control = live
+            .attach_run(
+                "yt-err-run".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+        };
+
+        let outcome = kernel.run_items(
+            "yt-err-run",
+            &durable_request(items),
+            &control,
+            &ScriptedExecutor,
+        );
+
+        assert!(!outcome.succeeded);
+        let last = published
+            .lock()
+            .expect("published lock")
+            .last()
+            .cloned()
+            .expect("terminal snapshot published");
+        assert_eq!(last.state, TransientRunState::Failed);
+        assert_eq!(last.items[0].state, TransientItemState::Completed);
+        let failed = &last.items[1];
+        assert_eq!(failed.state, TransientItemState::Failed);
+        assert_eq!(failed.phase, TransientItemPhase::Failed);
+        let error = failed.error.as_ref().expect("item carries the error");
+        assert_eq!(error.code, "TRANSCRIPT_INVALID");
+        assert_eq!(error.message, "caption file was malformed");
+        assert_eq!(last.items[2].state, TransientItemState::Pending);
+        assert_eq!(last.counts.completed, 1);
+        assert_eq!(last.counts.failed, 1);
+        assert_eq!(
+            last.error.as_ref().map(|e| e.code.as_str()),
+            Some("TRANSCRIPT_INVALID")
+        );
+    }
+
+    #[test]
+    fn pre_loop_failure_publishes_terminal_snapshot_and_frees_the_active_slot() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1)];
+        live.attach_run(
+            "yt-preloop-run".to_string(),
+            "sub-kernel".to_string(),
+            "plan-fp".to_string(),
+            &items,
+        )
+        .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+        };
+        let run = run_record("yt-preloop-run", "{not valid json".to_string());
+
+        let outcome = kernel.execute(&run, &step_record(&run.id));
+
+        assert!(!outcome.succeeded);
+        let last = published
+            .lock()
+            .expect("published lock")
+            .last()
+            .cloned()
+            .expect("terminal snapshot published");
+        assert_eq!(last.state, TransientRunState::Failed);
+        assert!(last.error.is_some(), "run-level error must be recorded");
+        assert!(
+            !live.has_active_run("yt-preloop-run"),
+            "terminal publish must release the active slot"
+        );
+        live.attach_run(
+            "yt-next-run".to_string(),
+            "sub-next".to_string(),
+            "plan-fp".to_string(),
+            &items,
+        )
+        .expect("a later start must not be refused with RunAlreadyActive");
+    }
 
     #[test]
     fn execute_without_live_control_fails_closed_without_publish() {

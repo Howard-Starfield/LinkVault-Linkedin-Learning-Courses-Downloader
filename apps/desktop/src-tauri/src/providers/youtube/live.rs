@@ -767,6 +767,50 @@ pub fn apply_item_outcome(
         entry.error = outcome.error.clone();
         entry.published_artifact_kinds = outcome.published_artifact_kinds.clone();
     }
+    recount_items(snapshot);
+    snapshot.item = Some(TransientCurrentItem {
+        occurrence_id: item.occurrence_id.clone(),
+        artifact_fingerprint: item.artifact_fingerprint.clone(),
+        video_id: item.video_id.clone(),
+        ordinal: item.ordinal,
+        title: item.title.clone(),
+        state: outcome.state.clone(),
+        phase: outcome.phase.clone(),
+    });
+}
+
+/// Mark `item` failed with `error` when the item executor returned `Err`.
+///
+/// Items that never started stay `Pending`; the run-level terminal state is set
+/// separately by `finish_snapshot`.
+pub fn apply_item_failure(
+    snapshot: &mut TransientRunSnapshot,
+    item: &TransientWorkItem,
+    error: &TransientError,
+) {
+    snapshot.revision += 1;
+    if let Some(entry) = snapshot
+        .items
+        .iter_mut()
+        .find(|entry| entry.occurrence_id == item.occurrence_id)
+    {
+        entry.state = TransientItemState::Failed;
+        entry.phase = TransientItemPhase::Failed;
+        entry.error = Some(error.clone());
+    }
+    recount_items(snapshot);
+    snapshot.item = Some(TransientCurrentItem {
+        occurrence_id: item.occurrence_id.clone(),
+        artifact_fingerprint: item.artifact_fingerprint.clone(),
+        video_id: item.video_id.clone(),
+        ordinal: item.ordinal,
+        title: item.title.clone(),
+        state: TransientItemState::Failed,
+        phase: TransientItemPhase::Failed,
+    });
+}
+
+fn recount_items(snapshot: &mut TransientRunSnapshot) {
     snapshot.counts.completed = snapshot
         .items
         .iter()
@@ -797,15 +841,6 @@ pub fn apply_item_outcome(
         .iter()
         .filter(|entry| entry.state == TransientItemState::Cancelled)
         .count() as u32;
-    snapshot.item = Some(TransientCurrentItem {
-        occurrence_id: item.occurrence_id.clone(),
-        artifact_fingerprint: item.artifact_fingerprint.clone(),
-        video_id: item.video_id.clone(),
-        ordinal: item.ordinal,
-        title: item.title.clone(),
-        state: outcome.state.clone(),
-        phase: outcome.phase.clone(),
-    });
 }
 
 pub fn finish_snapshot(
