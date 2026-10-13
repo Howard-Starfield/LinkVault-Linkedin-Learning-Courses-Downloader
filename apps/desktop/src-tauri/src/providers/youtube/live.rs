@@ -586,6 +586,55 @@ mod tests {
         assert_eq!(run.state, crate::workflow::domain::state::RunState::Queued);
     }
 
+    fn one_item() -> Vec<TransientWorkItem> {
+        vec![TransientWorkItem {
+            occurrence_id: "occ-1".to_string(),
+            artifact_fingerprint: "af-1".to_string(),
+            video_id: "vid-1".to_string(),
+            ordinal: 1,
+            title: "t".to_string(),
+            source_url: "https://www.youtube.com/watch?v=vid-1".to_string(),
+        }]
+    }
+
+    #[test]
+    fn item_outcome_warning_carries_its_human_message_when_one_is_given() {
+        use crate::app::managed_process::TransientExecutionOutcome;
+        let items = one_item();
+        let mut snapshot = initial_snapshot(
+            "run-w".to_string(),
+            "sub-w".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        let outcome = TransientExecutionOutcome::warning("TRANSCRIPT_INVALID", Vec::new())
+            .with_warning_message("TRANSCRIPT_INVALID", "Video saved; the transcript is bad");
+
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+
+        let warning = &snapshot.items[0].warnings[0];
+        assert_eq!(warning.code, "TRANSCRIPT_INVALID");
+        assert_eq!(warning.message, "Video saved; the transcript is bad");
+        assert_eq!(snapshot.counts.completed_with_warnings, 1);
+    }
+
+    #[test]
+    fn item_outcome_warning_without_a_message_falls_back_to_its_code() {
+        use crate::app::managed_process::TransientExecutionOutcome;
+        let items = one_item();
+        let mut snapshot = initial_snapshot(
+            "run-w".to_string(),
+            "sub-w".to_string(),
+            "fp".to_string(),
+            &items,
+        );
+        let outcome = TransientExecutionOutcome::warning("TRANSCRIPT_MISSING", Vec::new());
+
+        apply_item_outcome(&mut snapshot, &items[0], &outcome);
+
+        assert_eq!(snapshot.items[0].warnings[0].message, "TRANSCRIPT_MISSING");
+    }
+
     #[test]
     fn submit_failure_clears_live_and_leaves_no_active_slot() {
         use crate::app::database::initialize_database;
@@ -761,7 +810,11 @@ pub fn apply_item_outcome(
             .map(|code| crate::app::managed_process::TransientWarning {
                 occurrence_id: Some(item.occurrence_id.clone()),
                 code: code.clone(),
-                message: code.clone(),
+                message: outcome
+                    .warning_messages
+                    .iter()
+                    .find(|(candidate, _)| candidate == code)
+                    .map_or_else(|| code.clone(), |(_, message)| message.clone()),
             })
             .collect();
         entry.error = outcome.error.clone();

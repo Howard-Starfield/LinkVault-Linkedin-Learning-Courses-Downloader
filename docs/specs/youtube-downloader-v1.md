@@ -765,7 +765,7 @@ failed
 cancelled
 ```
 
-Item states are `pending`, `running`, `completed`, `completed_with_warnings`, `failed`, `cancelled`, `skipped` and `skipped_existing`. Item phases are `waiting`, `transcript`, `media`, `merging`, `normalizing_transcript`, `verifying`, `completed`, `warning`, `failed` and `cancelled`.
+Item states are `pending`, `running`, `completed`, `completed_with_warnings`, `failed`, `cancelled`, `skipped` and `skipped_existing`. Item phases are `waiting`, `transcript`, `media`, `merging`, `normalizing_transcript`, `verifying`, `finalizing`, `completed`, `warning`, `failed` and `cancelled`.
 
 Every accepted mutation increments a strictly increasing `revision`. The runtime emits `linkvault://youtube-run-changed` after committing the new in-memory snapshot. Non-terminal byte progress is throttled to at most four events per second; state changes, warnings and terminal events emit immediately. React subscribes before requesting state, ignores a different run or a revision not greater than its last applied revision, and then reconciles the greater snapshot/event. On mount, route remount, invoke-response loss or a revision gap it calls `get_youtube_download_state` with `runId: null` to discover the active or most-recent run; it never owns a polling or processing loop.
 
@@ -797,6 +797,7 @@ type YouTubeItemPhase =
   | "merging"
   | "normalizing_transcript"
   | "verifying"
+  | "finalizing"
   | "completed"
   | "warning"
   | "failed"
@@ -806,6 +807,7 @@ type YouTubeWarningCode =
   | "PLAYLIST_TRUNCATED"
   | "TRANSCRIPT_FALLBACK_USED"
   | "TRANSCRIPT_MISSING"
+  | "TRANSCRIPT_INVALID"
   | "ITEM_UNAVAILABLE"
   | "METADATA_DRIFT"
   | "PLAYBACK_COMPATIBILITY_WARNING"

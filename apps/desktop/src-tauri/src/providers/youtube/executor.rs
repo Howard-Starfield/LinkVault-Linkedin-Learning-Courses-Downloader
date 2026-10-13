@@ -1,7 +1,7 @@
 use crate::app::managed_process::{
-    run, ManagedProcessContext, ManagedProcessError, TransientError, TransientExecutionOutcome,
-    TransientExecutor, TransientItemPhase, TransientProgressUpdate, TransientRunControl,
-    TransientWorkItem,
+    run, ManagedProcessContext, ManagedProcessError, ManagedProcessOutput, ManagedProcessSpec,
+    TransientError, TransientExecutionOutcome, TransientExecutor, TransientItemPhase,
+    TransientProgressUpdate, TransientRunControl, TransientWorkItem,
 };
 use crate::app::safe_output_filesystem::{
     validate_output_component, ExistingOutputDirectoryLease, OutputAttemptLease, SafeOutputError,
@@ -35,6 +35,58 @@ use std::sync::Arc;
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NORMALIZED_TRANSCRIPT_JSON_BYTES: u64 = 32 * 1024 * 1024;
+/// Longest transcript failure reason carried into a user-visible warning.
+const MAX_WARNING_REASON_CHARS: usize = 240;
+
+/// Coarse per-item progress fractions. Downloading owns `0.0..STAGE_NORMALIZING`;
+/// the live byte-progress follow-up fills that range in, so later stages start
+/// at or above it and stay monotonic.
+const STAGE_START: f64 = 0.0;
+const STAGE_NORMALIZING: f64 = 0.8;
+const STAGE_VERIFYING: f64 = 0.85;
+const STAGE_FINALIZING: f64 = 0.95;
+const STAGE_DONE: f64 = 1.0;
+
+/// Process launch seam. Production always goes through the managed-process
+/// port (identity-verified helpers in a kill-on-close job); tests substitute a
+/// fake so stage and publication logic run without the real helpers.
+trait ProcessRunner: Send + Sync + std::fmt::Debug {
+    fn run(
+        &self,
+        spec: ManagedProcessSpec,
+        control: &TransientRunControl,
+    ) -> Result<ManagedProcessOutput, ManagedProcessError>;
+}
+
+#[derive(Debug)]
+struct ManagedProcessRunner;
+
+impl ProcessRunner for ManagedProcessRunner {
+    fn run(
+        &self,
+        spec: ManagedProcessSpec,
+        control: &TransientRunControl,
+    ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+        run(spec, ManagedProcessContext::Run(control))
+    }
+}
+
+/// Report a stage boundary. Bytes stay `None` here; the byte-progress task
+/// adds them to this same update shape.
+fn report_stage(
+    progress: &mut dyn FnMut(TransientProgressUpdate),
+    item: &TransientWorkItem,
+    phase: TransientItemPhase,
+    fraction: f64,
+) {
+    progress(TransientProgressUpdate {
+        occurrence_id: item.occurrence_id.clone(),
+        phase,
+        bytes_completed: None,
+        bytes_total: None,
+        fraction: Some(fraction),
+    });
+}
 
 #[derive(Clone, Debug)]
 pub struct YouTubeExecutor {
@@ -48,6 +100,7 @@ pub struct YouTubeExecutor {
     allow_automatic_captions: bool,
     continue_without_transcript: bool,
     context: Option<YouTubeExecutorContext>,
+    runner: Arc<dyn ProcessRunner>,
 }
 
 /// Immutable execution facts captured by the command layer after scan and
@@ -204,6 +257,29 @@ impl YouTubeExecutor {
             allow_automatic_captions: request.allow_automatic_captions,
             continue_without_transcript: request.continue_without_transcript,
             context: None,
+            runner: Arc::new(ManagedProcessRunner),
+        }))
+    }
+
+    /// Test constructor that substitutes the process launcher.
+    #[cfg(test)]
+    fn new_with_runner(
+        output_root: ValidatedOutputRoot,
+        request: &StartYouTubeDownloadRequest,
+        context: YouTubeExecutorContext,
+        runner: Arc<dyn ProcessRunner>,
+    ) -> Result<Arc<Self>, YouTubeError> {
+        validate_options(request)?;
+        Ok(Arc::new(Self {
+            output_root,
+            mode: request.mode.clone(),
+            max_height: request.max_height,
+            preferred_language: request.preferred_language.clone(),
+            fallback_languages: request.fallback_languages.clone(),
+            allow_automatic_captions: request.allow_automatic_captions,
+            continue_without_transcript: request.continue_without_transcript,
+            context: Some(context),
+            runner,
         }))
     }
 
@@ -228,6 +304,7 @@ impl YouTubeExecutor {
             allow_automatic_captions: request.allow_automatic_captions,
             continue_without_transcript: request.continue_without_transcript,
             context: Some(context),
+            runner: Arc::new(ManagedProcessRunner),
         }))
     }
 
@@ -444,7 +521,7 @@ impl YouTubeExecutor {
         else {
             return Ok(None);
         };
-        verify_existing_item(&lease, self, item, control)
+        verify_existing_item(&lease, self, item, control, self.runner.as_ref())
             .map(Some)
             .map_err(map_existing_output_verification_error)
     }
@@ -470,17 +547,29 @@ impl TransientExecutor for YouTubeExecutor {
                 message: "download was cancelled".to_string(),
             });
         }
+        // Mark the item running right away so a queued row never looks idle
+        // while the reuse check and staging setup run.
+        report_stage(progress, item, TransientItemPhase::Waiting, STAGE_START);
         let stem = safe_stem_for_root(&self.output_root, item.ordinal, &item.title, &item.video_id)
             .map_err(safe_output_error)?;
         if let Some(artifact_kinds) = self.try_reuse_existing(item, &stem, control)? {
-            progress(TransientProgressUpdate {
-                occurrence_id: item.occurrence_id.clone(),
-                phase: TransientItemPhase::Completed,
-                bytes_completed: None,
-                bytes_total: None,
-                fraction: Some(1.0),
-            });
-            return Ok(TransientExecutionOutcome::skipped_existing(artifact_kinds));
+            report_stage(progress, item, TransientItemPhase::Completed, STAGE_DONE);
+            // A prior run may have kept the video without a transcript (the
+            // transcript was missing or could not be processed). Reuse stays
+            // exact, so it is reported rather than re-downloaded in a loop.
+            let transcript_absent = matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
+                && !artifact_kinds.iter().any(|kind| kind == "transcript_json");
+            let mut outcome = TransientExecutionOutcome::skipped_existing(artifact_kinds);
+            if transcript_absent {
+                outcome
+                    .warnings
+                    .push(TRANSCRIPT_MISSING_WARNING.to_string());
+                outcome = outcome.with_warning_message(
+                    TRANSCRIPT_MISSING_WARNING,
+                    "The video was already saved without a transcript, so it was reused as it is.",
+                );
+            }
+            return Ok(outcome);
         }
         let lease = self
             .output_root
@@ -496,16 +585,15 @@ impl TransientExecutor for YouTubeExecutor {
         // download is in flight; the descriptive name belongs to the final
         // item directory, not the temporary media leaf.
         let output_template = staging.join("media.%(ext)s");
-        progress(TransientProgressUpdate {
-            occurrence_id: item.occurrence_id.clone(),
-            phase: match &self.mode {
+        report_stage(
+            progress,
+            item,
+            match &self.mode {
                 YouTubeDownloadMode::TranscriptOnly => TransientItemPhase::Transcript,
                 _ => TransientItemPhase::Media,
             },
-            bytes_completed: None,
-            bytes_total: None,
-            fraction: Some(0.0),
-        });
+            STAGE_START,
+        );
         cleanup
             .lease()
             .revalidate()
@@ -532,8 +620,10 @@ impl TransientExecutor for YouTubeExecutor {
                 source_duration_seconds,
             )
         };
-        let output =
-            run(helper_spec, ManagedProcessContext::Run(control)).map_err(|error| match error {
+        let output = self
+            .runner
+            .run(helper_spec, control)
+            .map_err(|error| match error {
                 ManagedProcessError::HelperTemp(reason) => {
                     transient_error("HELPER_TEMP_ROOT_INVALID", reason)
                 }
@@ -558,6 +648,8 @@ impl TransientExecutor for YouTubeExecutor {
         if control.is_cancelled() {
             return Err(transient_error("CANCELLED", "download was cancelled"));
         }
+        // Set when the video is kept but its transcript could not be processed.
+        let mut transcript_failure: Option<String> = None;
         if matches!(
             &self.mode,
             YouTubeDownloadMode::TranscriptOnly | YouTubeDownloadMode::VideoAndTranscript
@@ -565,6 +657,14 @@ impl TransientExecutor for YouTubeExecutor {
             let selected = self
                 .item_selected_transcript(item)
                 .map_err(|message| transient_error("TRANSCRIPT_POLICY_MISSING", message))?;
+            if selected.is_some() {
+                report_stage(
+                    progress,
+                    item,
+                    TransientItemPhase::NormalizingTranscript,
+                    STAGE_NORMALIZING,
+                );
+            }
             match selected
                 .as_ref()
                 .map(|selected| post_process_transcript(cleanup.lease(), item, selected))
@@ -587,10 +687,27 @@ impl TransientExecutor for YouTubeExecutor {
                     ));
                 }
                 Err(message) => {
-                    return Err(transient_error("TRANSCRIPT_INVALID", message));
+                    // The video is the expensive part and it downloaded; keep
+                    // it when the request may continue without a transcript.
+                    // Transcript-only runs, and runs that require a transcript,
+                    // still fail closed.
+                    if matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
+                        && self.continue_without_transcript
+                        && discard_transcript_artifacts(cleanup.lease()).is_ok()
+                    {
+                        transcript_failure = Some(message);
+                    } else {
+                        return Err(transient_error("TRANSCRIPT_INVALID", message));
+                    }
                 }
             }
         }
+        report_stage(
+            progress,
+            item,
+            TransientItemPhase::Verifying,
+            STAGE_VERIFYING,
+        );
         let (verified, initial_leaf_handles) = verify_artifacts(cleanup.lease(), false)
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         let artifact_set =
@@ -606,6 +723,7 @@ impl TransientExecutor for YouTubeExecutor {
                     .map_err(|message| transient_error("MEDIA_POLICY_MISSING", message))?,
                 &verified,
                 control,
+                self.runner.as_ref(),
             )
             .map_err(map_fresh_ffprobe_error)?
         } else {
@@ -665,6 +783,12 @@ impl TransientExecutor for YouTubeExecutor {
             .iter()
             .map(|artifact| artifact.kind.clone())
             .collect::<Vec<_>>();
+        report_stage(
+            progress,
+            item,
+            TransientItemPhase::Finalizing,
+            STAGE_FINALIZING,
+        );
         write_strict_manifest(cleanup.lease(), self, item, &verified)
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         let manifest_leaf = validate_strict_manifest_file(cleanup.lease(), self, item, &verified)
@@ -704,12 +828,22 @@ impl TransientExecutor for YouTubeExecutor {
         cleanup.disarm();
         let _ = sync_directory_best_effort(self.output_root.path());
         let mut warnings = media_warnings;
-        if transcript_missing {
-            warnings.push("TRANSCRIPT_MISSING".to_string());
+        let mut warning_messages = Vec::new();
+        if let Some(reason) = &transcript_failure {
+            warnings.push(TRANSCRIPT_INVALID_WARNING.to_string());
+            warning_messages.push((
+                TRANSCRIPT_INVALID_WARNING.to_string(),
+                format!(
+                    "Video saved; the transcript couldn't be processed: {}",
+                    truncate_reason(reason)
+                ),
+            ));
+        } else if transcript_missing {
+            warnings.push(TRANSCRIPT_MISSING_WARNING.to_string());
         }
         warnings.sort();
         warnings.dedup();
-        let outcome = if warnings.is_empty() {
+        let mut outcome = if warnings.is_empty() {
             TransientExecutionOutcome::completed(artifact_kinds)
         } else {
             let mut outcome =
@@ -717,15 +851,53 @@ impl TransientExecutor for YouTubeExecutor {
             outcome.warnings = warnings;
             outcome
         };
-        progress(TransientProgressUpdate {
-            occurrence_id: item.occurrence_id.clone(),
-            phase: TransientItemPhase::Completed,
-            bytes_completed: None,
-            bytes_total: None,
-            fraction: Some(1.0),
-        });
+        outcome.warning_messages = warning_messages;
+        report_stage(progress, item, TransientItemPhase::Completed, STAGE_DONE);
         Ok(outcome)
     }
+}
+
+const TRANSCRIPT_MISSING_WARNING: &str = "TRANSCRIPT_MISSING";
+const TRANSCRIPT_INVALID_WARNING: &str = "TRANSCRIPT_INVALID";
+
+fn truncate_reason(reason: &str) -> String {
+    let single_line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= MAX_WARNING_REASON_CHARS {
+        return single_line;
+    }
+    let mut shortened = single_line
+        .chars()
+        .take(MAX_WARNING_REASON_CHARS)
+        .collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
+/// Remove the raw VTT and any normalized transcript JSON from a staging
+/// attempt after transcript processing failed, so only the video is published.
+/// Contents are re-validated first: an unsafe staging directory is a real
+/// failure, not a transcript problem, and is reported to the caller.
+fn discard_transcript_artifacts(attempt: &OutputAttemptLease) -> Result<(), String> {
+    attempt
+        .validate_contents()
+        .map_err(|error| error.to_string())?;
+    let mut doomed = Vec::new();
+    for entry in fs::read_dir(attempt.path()).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "staging contained a non-UTF-8 name".to_string())?;
+        validate_output_component(&name).map_err(|error| error.to_string())?;
+        if is_vtt_name(&name) || name.to_ascii_lowercase().ends_with(".transcript.json") {
+            doomed.push(name);
+        }
+    }
+    for name in doomed {
+        fs::remove_file(attempt.path().join(&name)).map_err(|error| error.to_string())?;
+    }
+    attempt.revalidate().map_err(|error| error.to_string())
 }
 
 fn verify_existing_item(
@@ -733,6 +905,7 @@ fn verify_existing_item(
     executor: &YouTubeExecutor,
     item: &TransientWorkItem,
     control: &TransientRunControl,
+    runner: &dyn ProcessRunner,
 ) -> Result<Vec<String>, ExistingOutputVerificationError> {
     lease
         .validate_contents()
@@ -817,6 +990,7 @@ fn verify_existing_item(
                 .map_err(|message| message.to_string())?,
             &artifacts,
             control,
+            runner,
         )?;
     }
     let manifest_sha256 = hash_open_file(&mut manifest)?;
@@ -873,6 +1047,7 @@ fn verify_media_with_ffprobe(
     context: &YouTubeExecutorItemContext,
     artifacts: &[VerifiedArtifact],
     control: &TransientRunControl,
+    runner: &dyn ProcessRunner,
 ) -> Result<Vec<String>, FfprobeVerificationError> {
     let media = artifacts
         .iter()
@@ -886,14 +1061,15 @@ fn verify_media_with_ffprobe(
     attempt.revalidate().map_err(|error| error.to_string())?;
     let media_path = attempt.path().join(&media[0].name);
     let input_path = media_path.to_string_lossy().into_owned();
-    let output = run(
-        media_probe_invocation(ffmpeg_copy_probe_args(
-            &input_path,
-            MediaMode::VideoAndAudio,
-        )),
-        ManagedProcessContext::Run(control),
-    )
-    .map_err(FfprobeVerificationError::ManagedProcess)?;
+    let output = runner
+        .run(
+            media_probe_invocation(ffmpeg_copy_probe_args(
+                &input_path,
+                MediaMode::VideoAndAudio,
+            )),
+            control,
+        )
+        .map_err(FfprobeVerificationError::ManagedProcess)?;
     attempt.revalidate().map_err(|error| error.to_string())?;
     if output.cancelled || control.is_cancelled() {
         return Err("media verification was cancelled".to_string().into());
@@ -934,6 +1110,7 @@ fn verify_existing_media_with_ffprobe(
     context: &YouTubeExecutorItemContext,
     artifacts: &[VerifiedArtifact],
     control: &TransientRunControl,
+    runner: &dyn ProcessRunner,
 ) -> Result<(), FfprobeVerificationError> {
     let media = artifacts
         .iter()
@@ -947,14 +1124,15 @@ fn verify_existing_media_with_ffprobe(
     lease.revalidate().map_err(|error| error.to_string())?;
     let media_path = lease.path().join(&media[0].name);
     let input_path = media_path.to_string_lossy().into_owned();
-    let output = run(
-        media_probe_invocation(ffmpeg_copy_probe_args(
-            &input_path,
-            MediaMode::VideoAndAudio,
-        )),
-        ManagedProcessContext::Run(control),
-    )
-    .map_err(FfprobeVerificationError::ManagedProcess)?;
+    let output = runner
+        .run(
+            media_probe_invocation(ffmpeg_copy_probe_args(
+                &input_path,
+                MediaMode::VideoAndAudio,
+            )),
+            control,
+        )
+        .map_err(FfprobeVerificationError::ManagedProcess)?;
     lease.revalidate().map_err(|error| error.to_string())?;
     if output.cancelled || control.is_cancelled() {
         return Err("media reuse verification was cancelled".to_string().into());
@@ -2529,6 +2707,327 @@ mod tests {
             .exists());
         drop(executor);
         root.discard_attempt_lease(attempt).unwrap();
+    }
+
+    // ---- Execute-level tests with a fake process launcher -----------------
+
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Stands in for yt-dlp and FFmpeg: the download call writes the media
+    /// file and, when the request asks for subtitles, a VTT with the chosen
+    /// content into the staging directory; the probe call reports a clean copy.
+    #[derive(Debug)]
+    struct FakeRunner {
+        vtt: &'static str,
+        downloads: AtomicUsize,
+    }
+
+    impl FakeRunner {
+        fn new(vtt: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                vtt,
+                downloads: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    fn arg_after(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|argument| argument == flag)
+            .and_then(|index| args.get(index + 1).cloned())
+    }
+
+    impl ProcessRunner for FakeRunner {
+        fn run(
+            &self,
+            spec: ManagedProcessSpec,
+            _control: &TransientRunControl,
+        ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+            let args = spec
+                .args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let (stdout, stderr) = if args.iter().any(|argument| argument == "--ignore-config") {
+                self.downloads.fetch_add(1, Ordering::SeqCst);
+                let template = arg_after(&args, "--output").expect("download has --output");
+                let staging = Path::new(&template).parent().expect("template parent");
+                if !args.iter().any(|argument| argument == "--skip-download") {
+                    fs::write(staging.join("media.mp4"), b"media bytes").unwrap();
+                }
+                if args.iter().any(|argument| argument == "--write-subs") {
+                    fs::write(staging.join("media.en-US.vtt"), self.vtt).unwrap();
+                }
+                (String::new(), String::new())
+            } else {
+                let input = arg_after(&args, "-i").expect("probe has -i");
+                (
+                    "frame=10\nout_time_us=1000000\nprogress=end\n".to_string(),
+                    format!(
+                        "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '{input}':\n\
+                         Output #0, null, to 'pipe:':\n  \
+                         Stream #0:0: Video: h264, yuv420p\n  \
+                         Stream #0:1: Audio: aac, 48000 Hz\n"
+                    ),
+                )
+            };
+            Ok(ManagedProcessOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                timed_out: false,
+                cancelled: false,
+            })
+        }
+    }
+
+    fn item_for_mode(
+        mode: &YouTubeDownloadMode,
+        selected: Option<SelectedTranscript>,
+    ) -> (TransientWorkItem, YouTubeExecutorContext) {
+        let (mut item, mut context) = transcript_item(selected.clone());
+        item.artifact_fingerprint = artifact_fingerprint(&ArtifactFingerprintInput {
+            occurrence_id: item.occurrence_id.clone(),
+            video_id: item.video_id.clone(),
+            mode: mode.clone(),
+            format_policy_version: FORMAT_POLICY_VERSION,
+            max_height: None,
+            selected_transcript: selected,
+            helper_lock_digest: context.helper_lock_digest.clone(),
+        })
+        .unwrap();
+        context.items[0].source_duration_seconds = None;
+        (item, context)
+    }
+
+    fn executor_with_fake(
+        root: &ValidatedOutputRoot,
+        mode: YouTubeDownloadMode,
+        continue_without_transcript: bool,
+        runner: Arc<FakeRunner>,
+    ) -> (Arc<YouTubeExecutor>, TransientWorkItem) {
+        let (item, context) = item_for_mode(&mode, Some(selected_uploader()));
+        let mut request = transcript_request();
+        request.mode = mode;
+        request.continue_without_transcript = continue_without_transcript;
+        let executor =
+            YouTubeExecutor::new_with_runner(root.clone(), &request, context, runner).unwrap();
+        (executor, item)
+    }
+
+    fn run_collecting(
+        executor: &YouTubeExecutor,
+        item: &TransientWorkItem,
+    ) -> (
+        Result<TransientExecutionOutcome, TransientError>,
+        Vec<(TransientItemPhase, f64)>,
+    ) {
+        let mut stages = Vec::new();
+        let control = TransientRunControl::default();
+        let result = TransientExecutor::execute(executor, item, &control, &mut |update| {
+            stages.push((update.phase, update.fraction.unwrap_or(-1.0)));
+        });
+        (result, stages)
+    }
+
+    fn published_files(temp: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(temp).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for child in fs::read_dir(entry.path()).unwrap() {
+                names.push(child.unwrap().file_name().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn video_and_transcript_keeps_the_video_when_the_transcript_is_malformed() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(MALFORMED_VTT);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+
+        let (result, _) = run_collecting(&executor, &item);
+
+        let outcome = result.expect("the video must survive a bad transcript");
+        assert_eq!(
+            outcome.state,
+            crate::app::managed_process::TransientItemState::CompletedWithWarnings
+        );
+        assert_eq!(outcome.warnings, vec!["TRANSCRIPT_INVALID".to_string()]);
+        let message = &outcome
+            .warning_messages
+            .iter()
+            .find(|(code, _)| code == "TRANSCRIPT_INVALID")
+            .expect("the warning carries a human message")
+            .1;
+        assert!(
+            message.starts_with("Video saved; the transcript couldn't be processed: "),
+            "unexpected message: {message}"
+        );
+        assert!(message.contains("WEBVTT"), "reason missing: {message}");
+        assert_eq!(outcome.published_artifact_kinds, vec!["media".to_string()]);
+        let files = published_files(temp.path());
+        assert!(files.contains(&"media.mp4".to_string()), "{files:?}");
+        assert!(files.contains(&"manifest.json".to_string()), "{files:?}");
+        assert!(
+            !files
+                .iter()
+                .any(|name| name.ends_with(".vtt") || name.ends_with(".transcript.json")),
+            "transcript artifacts must not be published: {files:?}"
+        );
+    }
+
+    #[test]
+    fn rerun_reuses_a_video_that_was_kept_without_its_transcript() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(MALFORMED_VTT);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap();
+        assert_eq!(runner.downloads.load(Ordering::SeqCst), 1);
+
+        let (second, _) = run_collecting(&executor, &item);
+
+        let outcome = second.expect("exact reuse of the kept video");
+        assert_eq!(
+            outcome.state,
+            crate::app::managed_process::TransientItemState::SkippedExisting
+        );
+        assert_eq!(outcome.warnings, vec!["TRANSCRIPT_MISSING".to_string()]);
+        assert_eq!(
+            runner.downloads.load(Ordering::SeqCst),
+            1,
+            "the video must not be downloaded again"
+        );
+    }
+
+    #[test]
+    fn transcript_only_malformed_transcript_still_fails() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(MALFORMED_VTT);
+        let (executor, item) =
+            executor_with_fake(&root, YouTubeDownloadMode::TranscriptOnly, true, runner);
+
+        let (result, _) = run_collecting(&executor, &item);
+
+        let error = result.expect_err("transcript-only has nothing to keep");
+        assert_eq!(error.code, "TRANSCRIPT_INVALID");
+        assert!(published_files(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn required_transcript_still_fails_a_video_and_transcript_run() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(MALFORMED_VTT);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            false,
+            runner,
+        );
+
+        let (result, _) = run_collecting(&executor, &item);
+
+        assert_eq!(
+            result.expect_err("transcript is required").code,
+            "TRANSCRIPT_INVALID"
+        );
+        assert!(published_files(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn successful_video_and_transcript_run_reports_each_stage_in_order() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            FakeRunner::new(VALID_VTT),
+        );
+
+        let (result, stages) = run_collecting(&executor, &item);
+
+        let outcome = result.unwrap();
+        assert_eq!(
+            outcome.state,
+            crate::app::managed_process::TransientItemState::Completed
+        );
+        let phases = stages
+            .iter()
+            .map(|(phase, _)| phase.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                TransientItemPhase::Waiting,
+                TransientItemPhase::Media,
+                TransientItemPhase::NormalizingTranscript,
+                TransientItemPhase::Verifying,
+                TransientItemPhase::Finalizing,
+                TransientItemPhase::Completed,
+            ]
+        );
+        assert!(
+            stages.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "fractions must never go backwards: {stages:?}"
+        );
+        assert_eq!(stages.last().map(|stage| stage.1), Some(1.0));
+    }
+
+    #[test]
+    fn successful_transcript_only_run_reports_transcript_stages() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::TranscriptOnly,
+            false,
+            FakeRunner::new(VALID_VTT),
+        );
+
+        let (result, stages) = run_collecting(&executor, &item);
+
+        result.unwrap();
+        let phases = stages
+            .into_iter()
+            .map(|(phase, _)| phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                TransientItemPhase::Waiting,
+                TransientItemPhase::Transcript,
+                TransientItemPhase::NormalizingTranscript,
+                TransientItemPhase::Verifying,
+                TransientItemPhase::Finalizing,
+                TransientItemPhase::Completed,
+            ]
+        );
     }
 
     fn stage_reviewed_helpers_beside_current_exe() -> bool {
