@@ -16,7 +16,7 @@ use crate::providers::youtube::resume::{
     pinned_format_unavailable,
     stale_part_leaves, FailureKind, FORMAT_MARKER,
 };
-use crate::app::safe_output_filesystem::resume::StagingDisposition;
+use crate::app::safe_output_filesystem::resume::{resumable_staging_name, StagingDisposition};
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::helper::{
     download_invocation, invocation, media_probe_invocation, output_error, MAX_RECORD_STDOUT_BYTES,
@@ -148,6 +148,19 @@ pub struct YouTubeExecutor {
     runner: Arc<dyn ProcessRunner>,
     /// Time source for the progress throttle; tests substitute a fake.
     clock: fn() -> Instant,
+    /// Staging names another unfinished run still references, asked at the
+    /// moment of cleanup. A shared directory is never discarded.
+    shared_staging: Option<SharedStaging>,
+}
+
+/// Lazily answers "which staging directories do other unfinished runs use?".
+#[derive(Clone)]
+pub struct SharedStaging(pub Arc<dyn Fn() -> std::collections::HashSet<String> + Send + Sync>);
+
+impl std::fmt::Debug for SharedStaging {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedStaging")
+    }
 }
 
 /// Immutable execution facts captured by the command layer after scan and
@@ -321,6 +334,7 @@ impl YouTubeExecutor {
             context: None,
             runner: Arc::new(ManagedProcessRunner),
             clock: Instant::now,
+            shared_staging: None,
         }))
     }
 
@@ -344,6 +358,7 @@ impl YouTubeExecutor {
             context: Some(context),
             runner,
             clock: Instant::now,
+            shared_staging: None,
         }))
     }
 
@@ -370,6 +385,7 @@ impl YouTubeExecutor {
             context: Some(context),
             runner: Arc::new(ManagedProcessRunner),
             clock: Instant::now,
+            shared_staging: None,
         }))
     }
 
@@ -384,6 +400,14 @@ impl YouTubeExecutor {
 
     /// Helper arguments; `pinned_format` replaces the policy's format
     /// selector with the exact selection an interrupted attempt used.
+    /// The same executor, told how to ask which staging directories other
+    /// unfinished runs reference.
+    pub fn with_shared_staging(self: Arc<Self>, shared: SharedStaging) -> Arc<Self> {
+        let mut executor = (*self).clone();
+        executor.shared_staging = Some(shared);
+        Arc::new(executor)
+    }
+
     fn args_for_format(
         &self,
         item: &TransientWorkItem,
@@ -1107,8 +1131,17 @@ impl TransientExecutor for YouTubeExecutor {
         if let Err(error) = &result {
             // A cancelled or non-transport failure removes its partial files
             // (the cleanup guard discards on drop). A transport failure keeps
-            // them so the next attempt resumes from the same bytes.
-            if resumable && error.code != "CANCELLED" && keep_staging_after(&error.code) {
+            // them so the next attempt resumes from the same bytes. Either
+            // way a directory another unfinished run references is left alone.
+            let shared = self.shared_staging.as_ref().is_some_and(|ask| {
+                (ask.0)().contains(&resumable_staging_name(
+                    &item.occurrence_id,
+                    &item.artifact_fingerprint,
+                ))
+            });
+            if resumable
+                && (shared || (error.code != "CANCELLED" && keep_staging_after(&error.code)))
+            {
                 cleanup.keep_for_resume();
             }
         }
@@ -3211,6 +3244,8 @@ mod tests {
         reject_pinned: std::sync::atomic::AtomicBool,
         /// Make the next media check fail: 1 = timed out, 2 = unreadable file.
         probe_failure: std::sync::atomic::AtomicUsize,
+        /// Cancel the run while the next download is in flight.
+        cancel_download: std::sync::atomic::AtomicBool,
     }
 
     impl FakeRunner {
@@ -3230,6 +3265,7 @@ mod tests {
                 seen_args: std::sync::Mutex::new(Vec::new()),
                 reject_pinned: std::sync::atomic::AtomicBool::new(false),
                 probe_failure: std::sync::atomic::AtomicUsize::new(0),
+                cancel_download: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -3245,6 +3281,7 @@ mod tests {
                 seen_args: std::sync::Mutex::new(Vec::new()),
                 reject_pinned: std::sync::atomic::AtomicBool::new(false),
                 probe_failure: std::sync::atomic::AtomicUsize::new(0),
+                cancel_download: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -3377,9 +3414,12 @@ mod tests {
         fn run_streaming(
             &self,
             spec: ManagedProcessSpec,
-            _control: &TransientRunControl,
+            control: &TransientRunControl,
             on_line: &mut dyn FnMut(&str),
         ) -> Result<ManagedProcessOutput, ManagedProcessError> {
+            if self.cancel_download.swap(false, Ordering::SeqCst) {
+                control.request_cancel();
+            }
             self.execute(spec, on_line)
         }
     }
@@ -3846,6 +3886,54 @@ mod tests {
         assert!(!files.contains(&"media.mp4".to_string()), "{files:?}");
         assert!(files.contains(&FORMAT_MARKER.to_string()), "{files:?}");
         run_collecting(&executor, &item).0.expect("downloads again");
+    }
+
+    #[test]
+    fn cancelling_an_attempt_keeps_staging_that_a_paused_run_shares_and_removes_the_rest() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        for shared in [true, false] {
+            let runner = FakeRunner::new(VALID_VTT);
+            runner.cancel_download.store(true, Ordering::SeqCst);
+            *runner.fail_lines.lock().unwrap() = vec!["LVFORMATID 137".to_string()];
+            let (executor, item) = executor_with_fake(
+                &root,
+                YouTubeDownloadMode::VideoAndTranscript,
+                true,
+                Arc::clone(&runner),
+            );
+            let name = resumable_staging_name(&item.occurrence_id, &item.artifact_fingerprint);
+            let executor = executor.with_shared_staging(SharedStaging(Arc::new(move || {
+                if shared {
+                    std::collections::HashSet::from([name.clone()])
+                } else {
+                    std::collections::HashSet::new()
+                }
+            })));
+            // Partials left by a paused run that uses the same directory.
+            let held = root
+                .resumable_staging_lease(&item.occurrence_id, &item.artifact_fingerprint)
+                .unwrap();
+            fs::write(held.lease.path().join("media.f137.mp4.part"), b"paused run partial")
+                .unwrap();
+            fs::write(held.lease.path().join(FORMAT_MARKER), b"137").unwrap();
+            drop(held);
+
+            let error = run_collecting(&executor, &item).0.unwrap_err();
+
+            assert_eq!(error.code, "CANCELLED");
+            assert_eq!(
+                staging_dirs(temp.path()).len(),
+                usize::from(shared),
+                "shared={shared}: the directory survives only when another run needs it"
+            );
+            if !shared {
+                continue;
+            }
+            // Leave a clean slate for the next iteration.
+            root.discard_resumable_staging(&item.occurrence_id, &item.artifact_fingerprint)
+                .unwrap();
+        }
     }
 
     #[test]

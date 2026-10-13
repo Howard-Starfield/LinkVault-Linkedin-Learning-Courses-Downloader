@@ -247,3 +247,31 @@ fn a_first_attempt_size_note_is_not_a_resumed_attempt() {
     assert_eq!(row.expected_bytes, Some(5_000));
     assert!(begin(&connection, "run-d", ResumeTrigger::Auto, 11));
 }
+
+#[test]
+fn pausing_a_fresh_run_for_the_user_spends_no_automatic_budget() {
+    let (_dir, connection) = open();
+    submit(&connection, "run-fresh", 1);
+    let step = claim(&connection, 2).unwrap();
+
+    assert!(SqliteWorkflowRepository
+        .pause_after_failed_attempt(
+            &connection,
+            "run-fresh",
+            &step,
+            PauseNote {
+                reason: "could not verify",
+                reason_code: Some("MEDIA_VERIFY_FAILED"),
+                last_revision: 0,
+            },
+            3,
+        )
+        .unwrap());
+
+    let row = resume(&connection, "run-fresh");
+    assert_eq!(row.state, ResumeState::NeedsUser);
+    assert!(!row.auto_resume_used, "this was not an interruption");
+    assert!(!begin(&connection, "run-fresh", ResumeTrigger::Auto, 4));
+    assert!(begin(&connection, "run-fresh", ResumeTrigger::Manual, 5));
+    assert!(claim(&connection, 6).is_some(), "Continue runs one attempt");
+}

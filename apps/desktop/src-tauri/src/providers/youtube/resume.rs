@@ -177,6 +177,13 @@ pub fn keep_staging_after(code: &str) -> bool {
     )
 }
 
+/// Failures after a complete download (the file could not be verified, the
+/// manifest could not be written). Even a fresh run pauses on these, with the
+/// download kept, so Continue only repeats the finish.
+pub fn keeps_finished_download(code: &str) -> bool {
+    matches!(code, "OUTPUT_VERIFY_FAILED" | "MEDIA_VERIFY_FAILED")
+}
+
 /// The wording shown beside Continue for a failed attempt.
 pub fn pause_reason(code: &str, message: &str) -> String {
     match code {

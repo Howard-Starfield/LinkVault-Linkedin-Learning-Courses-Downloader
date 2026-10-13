@@ -400,7 +400,7 @@ impl SqliteWorkflowRepository {
         tx.execute(
             "INSERT INTO workflow_run_resume
                 (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at, generation, last_revision)
-             VALUES (?1, 'needs_user', 1, ?2, ?3, ?4, 1, ?5)
+             VALUES (?1, 'needs_user', 0, ?2, ?3, ?4, 1, ?5)
              ON CONFLICT(run_id) DO UPDATE SET
                 state = 'needs_user',
                 last_interruption_reason = excluded.last_interruption_reason,
