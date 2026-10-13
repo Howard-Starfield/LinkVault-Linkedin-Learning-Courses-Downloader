@@ -17,6 +17,7 @@ pub mod media_protocol;
 pub mod media_verifier;
 pub mod models;
 pub mod playback;
+pub(crate) mod resume;
 mod scan;
 pub(crate) mod transcript_inspection;
 pub mod transcript_normalizer;

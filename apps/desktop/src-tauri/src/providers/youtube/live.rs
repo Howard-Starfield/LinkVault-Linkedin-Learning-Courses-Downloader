@@ -565,6 +565,62 @@ impl YouTubeLiveHandle {
         self.emit(&snapshot);
     }
 
+    /// True while any run is attached or a discovery (scan, inspection or a
+    /// start's source check) holds the slot.
+    pub fn is_busy(&self) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+            || self
+                .discovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+    }
+
+    /// End the live view of a run whose attempt failed but which the user
+    /// can continue. The snapshot becomes `Paused` with `error` (items that
+    /// were running go back to pending, nothing is marked failed) and the
+    /// active slot is released, so the next run or an explicit Continue can
+    /// attach. Returns `None` when `run_id` does not own the slot.
+    pub fn suspend_run(
+        &self,
+        run_id: &str,
+        error: Option<TransientError>,
+    ) -> Option<TransientRunSnapshot> {
+        let (snapshot, control) = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = active.as_mut()?;
+            if current.run_id != run_id {
+                return None;
+            }
+            current.snapshot.revision += 1;
+            current.snapshot.state = TransientRunState::Paused;
+            current.snapshot.error = error;
+            for entry in &mut current.snapshot.items {
+                if entry.state == TransientItemState::Running {
+                    entry.state = TransientItemState::Pending;
+                    entry.phase = TransientItemPhase::Waiting;
+                }
+            }
+            let snapshot = current.snapshot.clone();
+            let control = Arc::clone(&current.control);
+            *active = None;
+            (snapshot, control)
+        };
+        let _ = control.retry_cleanup_verifiers();
+        *self
+            .most_recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
+        self.emit(&snapshot);
+        Some(snapshot)
+    }
+
     fn clear_discovery(&self, operation_id: &str) {
         let mut discovery = self
             .discovery

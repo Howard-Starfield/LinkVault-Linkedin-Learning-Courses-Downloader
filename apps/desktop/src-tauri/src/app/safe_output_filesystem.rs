@@ -19,6 +19,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub mod resume;
+
 const MAX_SUPPORTED_PATH_UTF16: usize = 240;
 const MAX_HELPER_STAGING_DIR_UTF16: usize = 192;
 const MAX_HELPER_TEMP_ROOT_UTF16: usize = MAX_SUPPORTED_PATH_UTF16 - 1 - "roaming-app-data".len();
@@ -67,6 +69,8 @@ pub enum SafeOutputError {
     OutputCollision { path: PathBuf },
     #[error("output path exceeds the supported length")]
     PathTooLong,
+    #[error("staging directory is already in use by another download: {path}")]
+    StagingBusy { path: PathBuf },
     #[error("helper temporary workspace validation failed: {reason}")]
     HelperTemp { reason: String },
     #[cfg(windows)]
@@ -230,6 +234,8 @@ pub struct OutputAttemptLease {
     ancestor_leases: Vec<DirectoryLease>,
     identity: StableIdentity,
     handle: File,
+    /// Exclusive use of a resumable staging directory; released on drop.
+    claim: Option<resume::StagingClaim>,
 }
 
 /// Identity-held cleanup state for a staging attempt that is being discarded.
@@ -241,6 +247,8 @@ pub struct OutputAttemptLease {
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct OutputAttemptCleanupRecovery {
+    /// Keeps a resumable staging directory claimed until cleanup finishes.
+    _claim: Option<resume::StagingClaim>,
     root: ValidatedOutputRoot,
     ancestor_leases: Vec<DirectoryLease>,
     attempt: CleanupTarget,
@@ -444,8 +452,20 @@ impl ValidatedOutputRoot {
             now_nanos(),
             NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
         );
-        validate_component(&attempt_name)?;
-        let names = [".lv", attempt_name.as_str()];
+        self.lease_staging_dir(&attempt_name, resume::LeaseMode::CreateNew)?
+            .ok_or(SafeOutputError::EscapedRoot)
+    }
+
+    /// Lease one directory under `<root>/.lv`, creating it or opening an
+    /// existing one. `OpenExisting` returns `None` when it does not exist.
+    /// Every step uses no-follow guards and records stable identities.
+    fn lease_staging_dir(
+        &self,
+        attempt_name: &str,
+        mode: resume::LeaseMode,
+    ) -> Result<Option<OutputAttemptLease>, SafeOutputError> {
+        validate_component(attempt_name)?;
+        let names = [".lv", attempt_name];
         self.revalidate()?;
         let mut current = self.path.clone();
         let mut ancestor_leases = Vec::with_capacity(names.len() - 1);
@@ -461,10 +481,26 @@ impl ValidatedOutputRoot {
                 return Err(SafeOutputError::PathTooLong);
             }
             let is_final = index + 1 == names.len();
-            match fs::create_dir(&current) {
-                Ok(()) => {}
-                Err(error) if !is_final && error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+            if is_final && mode == resume::LeaseMode::OpenExisting {
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if is_untrusted_directory(&metadata) {
+                            return Err(SafeOutputError::UnsafeDescendant { path: current });
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.revalidate()?;
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error)
+                        if !is_final && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             let handle = open_directory_guard(&current, is_final, false)?;
             let metadata = handle.metadata()?;
@@ -486,13 +522,14 @@ impl ValidatedOutputRoot {
         }
         let (handle, identity) = final_handle.ok_or(SafeOutputError::EscapedRoot)?;
         self.revalidate()?;
-        Ok(OutputAttemptLease {
+        Ok(Some(OutputAttemptLease {
             root: self.clone(),
             path: current,
             ancestor_leases,
             identity,
             handle,
-        })
+            claim: None,
+        }))
     }
 
     /// Verify and publish a leased attempt. Windows renames the held source
@@ -1288,8 +1325,10 @@ impl OutputAttemptCleanupRecovery {
             ancestor_leases,
             identity,
             handle,
+            claim,
         } = attempt;
         Self {
+            _claim: claim,
             root,
             ancestor_leases,
             attempt: CleanupTarget {

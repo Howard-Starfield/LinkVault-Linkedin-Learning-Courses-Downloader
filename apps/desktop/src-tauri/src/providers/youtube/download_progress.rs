@@ -124,6 +124,23 @@ pub fn parse_record(line: &str) -> Option<ProgressRecord> {
     Some(ProgressRecord::Formats(count.clamp(1, MAX_STREAMS)))
 }
 
+/// Format ids from a `LVFORMATS` record (`LVFORMATS 137, 140`), in order.
+/// Anything else, including a record with no usable ids, is `None`.
+pub fn parse_formats_line(line: &str) -> Option<Vec<String>> {
+    let rest = line.strip_prefix(FORMATS_PREFIX)?;
+    if !rest.is_empty() && !rest.starts_with(' ') {
+        return None;
+    }
+    let ids = rest
+        .split(',')
+        .map(str::trim)
+        .filter(|id| valid_format_id(id))
+        .take(MAX_STREAMS)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!ids.is_empty()).then_some(ids)
+}
+
 #[derive(Clone, Debug)]
 struct Stream {
     format_id: String,

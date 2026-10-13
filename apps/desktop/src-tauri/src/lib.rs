@@ -230,6 +230,8 @@ pub fn run() {
             youtube::commands::pause_youtube_download,
             youtube::commands::resume_youtube_download,
             youtube::commands::cancel_youtube_download,
+            youtube::commands::list_youtube_resumable_runs,
+            youtube::commands::continue_youtube_run,
             youtube::commands::open_youtube_download_folder,
             youtube::commands::list_youtube_history,
             youtube::playback::list_youtube_run_videos,
@@ -346,6 +348,7 @@ pub fn run() {
             workflow_runtime.register_executor(Arc::new(
                 youtube::kernel::YoutubeDownloadExecutor {
                     live: Arc::clone(&youtube_live),
+                    resume: Some(Arc::new(workflow_runtime.clone())),
                 },
             ));
             let linkedin_cancellation = Arc::new(AtomicBool::new(false));
@@ -417,7 +420,28 @@ pub fn run() {
             ));
             let runtime = app.state::<workflow::WorkflowRuntime>();
             runtime.register_supervisor_hook(Arc::new(newspaper::supervisor::NewspaperSupervisor::new(app.handle().clone())));
+            runtime.register_supervisor_hook(Arc::new(
+                youtube::resume::YoutubeResumeSupervisor::new(
+                    Arc::clone(&*app.state::<Arc<youtube::live::YouTubeLiveHandle>>()),
+                    Some({
+                        let handle = app.handle().clone();
+                        Arc::new(move || {
+                            let _ = tauri::Emitter::emit(
+                                &handle,
+                                youtube::resume::RESUME_EVENT_NAME,
+                                (),
+                            );
+                        })
+                    }),
+                ),
+            ));
             runtime.start_supervisor()?;
+            // Abandoned staging (no resumable run, older than 7 days) is
+            // removed off the async executor once reconcile has run.
+            let sweep_runtime = (*runtime).clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = youtube::resume::sweep_orphans(&sweep_runtime, &[]);
+            });
             newspaper::commands::schedule_page_dimension_backfill(app.handle());
             app.manage(app_updates::PendingUpdate::default());
             app.manage(CooperativeExit::default());

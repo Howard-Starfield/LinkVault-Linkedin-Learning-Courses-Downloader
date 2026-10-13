@@ -5,17 +5,55 @@ use crate::app::managed_process::{
     TransientRunSnapshot,
 };
 use crate::app::safe_output_filesystem::validate_output_root;
+use crate::providers::youtube::resume::{discard_run_staging, pause_reason};
 use crate::providers::youtube::live::{
     apply_item_failure, apply_item_outcome, executor_from_request, finish_snapshot,
     YouTubeLiveHandle, YoutubeDurableRequest,
 };
 use crate::workflow::domain::types::{RunRecord, StepRecord};
 use crate::workflow::ports::executor::{ExecutorOutcome, StepExecutor};
+use crate::workflow::WorkflowRuntime;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct YoutubeDownloadExecutor {
     pub live: Arc<YouTubeLiveHandle>,
+    /// Durable resume bookkeeping. `None` disables resume behaviour (tests).
+    pub resume: Option<Arc<dyn ResumeLedger>>,
+}
+
+/// What the kernel needs from the durable resume record, kept as a port so
+/// the item loop can be tested without a database.
+pub trait ResumeLedger: Send + Sync {
+    /// The run's current attempt was admitted by a resume (automatic or
+    /// Continue). Such an attempt pauses on failure instead of failing.
+    fn is_resumed_attempt(&self, run_id: &str) -> bool;
+
+    /// Remember the size of the item being downloaded for the disk check of a
+    /// later resume.
+    fn record_expected_bytes(&self, run_id: &str, item_key: &str, bytes: u64);
+}
+
+impl ResumeLedger for WorkflowRuntime {
+    fn is_resumed_attempt(&self, run_id: &str) -> bool {
+        self.get_resume(run_id.to_string())
+            .ok()
+            .flatten()
+            .is_some_and(|record| {
+                record.state == crate::workflow::domain::resume::ResumeState::Resuming
+                    && record.auto_resume_used
+            })
+    }
+
+    fn record_expected_bytes(&self, run_id: &str, item_key: &str, bytes: u64) {
+        let _ = WorkflowRuntime::record_expected_bytes(
+            self,
+            run_id.to_string(),
+            item_key.to_string(),
+            bytes,
+            chrono::Utc::now().timestamp(),
+        );
+    }
 }
 
 impl StepExecutor for YoutubeDownloadExecutor {
@@ -44,11 +82,23 @@ impl StepExecutor for YoutubeDownloadExecutor {
                 return self.fail_before_start(&run.id, "OUTPUT_ROOT_INVALID", error.to_string())
             }
         };
+        let staging_root = output_root.clone();
         let executor = match executor_from_request(output_root, &request) {
             Ok(executor) => executor,
             Err(error) => return self.fail_before_start(&run.id, &error.code, error.message),
         };
-        self.run_items(&run.id, &request, &control, executor.as_ref())
+        let resumed = self
+            .resume
+            .as_ref()
+            .is_some_and(|ledger| ledger.is_resumed_attempt(&run.id));
+        let outcome =
+            self.run_items_with(&run.id, &request, &control, executor.as_ref(), resumed);
+        if !outcome.succeeded && !outcome.pause_for_user {
+            // Cancelled or failed for good: nothing will resume from the
+            // partial files, so remove them now.
+            discard_run_staging(&staging_root, &request.work_items);
+        }
+        outcome
     }
 }
 
@@ -99,12 +149,49 @@ impl YoutubeDownloadExecutor {
     }
 
     /// Drive every work item through `executor`, publishing snapshots as it goes.
+    #[cfg(test)]
     fn run_items(
         &self,
         run_id: &str,
         request: &YoutubeDurableRequest,
         control: &TransientRunControl,
         executor: &dyn TransientExecutor,
+    ) -> ExecutorOutcome {
+        self.run_items_with(run_id, request, control, executor, false)
+    }
+
+    /// End a resumed attempt that failed: the live view becomes a paused
+    /// snapshot carrying the reason (no item is marked failed) and the run is
+    /// handed back to the user instead of failing.
+    fn pause_for_user(
+        &self,
+        run_id: &str,
+        snapshot: &mut TransientRunSnapshot,
+        error: &TransientError,
+    ) -> ExecutorOutcome {
+        let reason = pause_reason(&error.code, &error.message);
+        let shown = TransientError {
+            code: error.code.clone(),
+            message: reason.clone(),
+        };
+        if self.live.suspend_run(run_id, Some(shown.clone())).is_none() {
+            snapshot.state = crate::app::managed_process::TransientRunState::Paused;
+            snapshot.error = Some(shown);
+            snapshot.revision += 1;
+            self.live.publish_snapshot(snapshot.clone());
+        }
+        ExecutorOutcome::paused_for_user(reason, Some(error.code.clone()))
+    }
+
+    /// Drive every work item through `executor`. When `resumed`, a failure
+    /// pauses the run for the user instead of failing it.
+    fn run_items_with(
+        &self,
+        run_id: &str,
+        request: &YoutubeDurableRequest,
+        control: &TransientRunControl,
+        executor: &dyn TransientExecutor,
+        resumed: bool,
     ) -> ExecutorOutcome {
         let mut snapshot = match self.live.snapshot(Some(run_id)) {
             Ok(Some(snapshot)) => snapshot,
@@ -137,7 +224,14 @@ impl YoutubeDownloadExecutor {
             // Progress ticks, outcomes and failures all change the live
             // snapshot in place, so a pause or cancel requested meanwhile is
             // never overwritten by a copy this loop read earlier.
+            let mut last_total = 0u64;
             let outcome = TransientExecutor::execute(executor, item, control, &mut |update| {
+                if let (Some(ledger), Some(total)) = (&self.resume, update.bytes_total) {
+                    if total > 0 && total != last_total {
+                        last_total = total;
+                        ledger.record_expected_bytes(run_id, &item.occurrence_id, total);
+                    }
+                }
                 self.live.publish_item_progress(run_id, item, update);
             });
 
@@ -157,6 +251,11 @@ impl YoutubeDownloadExecutor {
                             .map(|error| error.message.clone())
                             .unwrap_or_else(|| "YouTube item failed".to_string());
                         let cancelled = matches!(outcome.state, TransientItemState::Cancelled);
+                        if resumed && !cancelled && !control.is_cancelled() {
+                            if let Some(error) = outcome.error.as_ref() {
+                                return self.pause_for_user(run_id, &mut snapshot, error);
+                            }
+                        }
                         self.commit(run_id, &mut snapshot, |live| {
                             finish_snapshot(live, cancelled, outcome.error.clone())
                         });
@@ -174,6 +273,9 @@ impl YoutubeDownloadExecutor {
                     // A cancelled run marks in-flight items Cancelled in
                     // `finish_snapshot`; only a real failure fails the item.
                     let cancelled = control.is_cancelled();
+                    if resumed && !cancelled {
+                        return self.pause_for_user(run_id, &mut snapshot, &error);
+                    }
                     self.commit(run_id, &mut snapshot, |live| {
                         if !cancelled {
                             apply_item_failure(live, item, &error);
@@ -335,6 +437,7 @@ mod tests {
             .expect("attach run");
         let kernel = YoutubeDownloadExecutor {
             live: Arc::clone(&live),
+            resume: None,
         };
 
         let outcome = kernel.run_items(
@@ -382,6 +485,7 @@ mod tests {
         .expect("attach run");
         let kernel = YoutubeDownloadExecutor {
             live: Arc::clone(&live),
+            resume: None,
         };
         let run = run_record("yt-preloop-run", "{not valid json".to_string());
 
@@ -422,6 +526,7 @@ mod tests {
         .expect("attach run");
         let kernel = YoutubeDownloadExecutor {
             live: Arc::clone(&live),
+            resume: None,
         };
 
         let outcome =
@@ -444,6 +549,7 @@ mod tests {
         }));
         let executor = YoutubeDownloadExecutor {
             live: Arc::clone(&live),
+            resume: None,
         };
         let run = RunRecord {
             id: "yt-orphan-run".to_string(),
@@ -544,6 +650,7 @@ mod tests {
             .expect("attach run");
         let kernel = YoutubeDownloadExecutor {
             live: Arc::clone(&live),
+            resume: None,
         };
         let executor = PausedMidItemExecutor {
             live: Arc::clone(&live),
@@ -624,6 +731,7 @@ mod tests {
         }));
         let kernel = YoutubeDownloadExecutor {
             live: Arc::clone(&live),
+            resume: None,
         };
 
         let outcome = kernel.run_items(
@@ -656,5 +764,169 @@ mod tests {
             "the item outcome reverted the pause"
         );
         assert!(control.pause_requested());
+    }
+
+    struct NetworkDrops;
+
+    impl TransientExecutor for NetworkDrops {
+        fn execute(
+            &self,
+            item: &TransientWorkItem,
+            _control: &TransientRunControl,
+            progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            progress(TransientProgressUpdate {
+                occurrence_id: item.occurrence_id.clone(),
+                phase: TransientItemPhase::Media,
+                bytes_completed: Some(400),
+                bytes_total: Some(1000),
+                fraction: Some(0.4),
+            });
+            Err(TransientError {
+                code: "HELPER_FAILED".to_string(),
+                message: "connection reset".to_string(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingLedger {
+        expected: Mutex<Vec<(String, u64)>>,
+    }
+
+    impl ResumeLedger for RecordingLedger {
+        fn is_resumed_attempt(&self, _run_id: &str) -> bool {
+            true
+        }
+
+        fn record_expected_bytes(&self, _run_id: &str, item_key: &str, bytes: u64) {
+            self.expected
+                .lock()
+                .unwrap()
+                .push((item_key.to_string(), bytes));
+        }
+    }
+
+    #[test]
+    fn a_failed_resumed_attempt_pauses_for_the_user_and_frees_the_slot() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1), work_item(2)];
+        let control = live
+            .attach_run(
+                "yt-paused".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: None,
+        };
+
+        let outcome = kernel.run_items_with(
+            "yt-paused",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            true,
+        );
+
+        assert!(!outcome.succeeded);
+        assert!(!outcome.cancelled);
+        assert!(outcome.pause_for_user, "a resumed attempt pauses, never fails");
+        assert_eq!(outcome.pause_code.as_deref(), Some("HELPER_FAILED"));
+        assert!(!live.has_active_run("yt-paused"), "the slot must be released");
+        let last = published.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.state, TransientRunState::Paused);
+        assert!(last.error.is_some());
+        assert_eq!(last.items[0].state, TransientItemState::Pending);
+        assert_eq!(last.counts.failed, 0);
+    }
+
+    #[test]
+    fn a_cancelled_resumed_attempt_is_cancelled_not_paused() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-cancel-resumed".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        control.request_cancel();
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: None,
+        };
+        let outcome = kernel.run_items_with(
+            "yt-cancel-resumed",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            true,
+        );
+        assert!(outcome.cancelled);
+        assert!(!outcome.pause_for_user);
+    }
+
+    #[test]
+    fn a_failed_first_attempt_still_fails_the_run() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-first".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: None,
+        };
+        let outcome = kernel.run_items_with(
+            "yt-first",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            false,
+        );
+        assert!(!outcome.succeeded);
+        assert!(!outcome.pause_for_user);
+    }
+
+    #[test]
+    fn the_item_size_is_recorded_once_for_the_next_resumes_disk_check() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-size".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        let ledger = Arc::new(RecordingLedger::default());
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+            resume: Some(ledger.clone()),
+        };
+        kernel.run_items_with(
+            "yt-size",
+            &durable_request(items),
+            &control,
+            &NetworkDrops,
+            true,
+        );
+        assert_eq!(
+            ledger.expected.lock().unwrap().clone(),
+            vec![("occ-1".to_string(), 1000u64)]
+        );
     }
 }

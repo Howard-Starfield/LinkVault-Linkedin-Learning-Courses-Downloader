@@ -8,8 +8,12 @@ use crate::app::safe_output_filesystem::{
     ValidatedOutputRoot,
 };
 use crate::providers::youtube::download_progress::{
-    DownloadProgress, ProgressReading, FORMATS_PRINT, PROGRESS_TEMPLATE,
+    parse_formats_line, DownloadProgress, ProgressReading, FORMATS_PRINT, PROGRESS_TEMPLATE,
 };
+use crate::providers::youtube::resume::{
+    classify_helper_failure, keep_staging_after, pause_reason, stale_part_leaves, FailureKind,
+};
+use crate::app::safe_output_filesystem::resume::StagingDisposition;
 use crate::providers::youtube::error::YouTubeError;
 use crate::providers::youtube::helper::{
     download_invocation, invocation, media_probe_invocation, output_error, MAX_RECORD_STDOUT_BYTES,
@@ -169,6 +173,8 @@ pub struct YouTubeExecutorItemContext {
 struct AttemptCleanup {
     root: ValidatedOutputRoot,
     lease: Option<OutputAttemptLease>,
+    /// Leave the directory in place on drop so a later attempt can resume.
+    keep: bool,
 }
 
 impl AttemptCleanup {
@@ -176,6 +182,7 @@ impl AttemptCleanup {
         Self {
             root: root.clone(),
             lease: Some(lease),
+            keep: false,
         }
     }
 
@@ -194,12 +201,19 @@ impl AttemptCleanup {
     fn disarm(&mut self) {
         self.lease = None;
     }
+
+    /// Release the lease without deleting its partial files.
+    fn keep_for_resume(&mut self) {
+        self.keep = true;
+    }
 }
 
 impl Drop for AttemptCleanup {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            let _ = self.root.discard_attempt_lease(lease);
+            if !self.keep {
+                let _ = self.root.discard_attempt_lease(lease);
+            }
         }
     }
 }
@@ -590,57 +604,23 @@ impl YouTubeExecutor {
     }
 }
 
-impl TransientExecutor for YouTubeExecutor {
-    fn execute(
+impl YouTubeExecutor {
+    /// Download into the leased staging directory, verify, and publish.
+    ///
+    /// `preserved_bytes` are partial bytes an earlier attempt left in the
+    /// reused staging directory; yt-dlp `--continue` picks them up. Every
+    /// attempt launches yt-dlp afresh, so expired media URLs are re-extracted
+    /// each time.
+    fn download_and_publish(
         &self,
         item: &TransientWorkItem,
         control: &TransientRunControl,
         progress: &mut dyn FnMut(TransientProgressUpdate),
+        stem: &str,
+        cleanup: &mut AttemptCleanup,
+        preserved_bytes: u64,
     ) -> Result<TransientExecutionOutcome, TransientError> {
-        if control.is_cancelled() {
-            return Err(TransientError {
-                code: "CANCELLED".to_string(),
-                message: "download was cancelled".to_string(),
-            });
-        }
-        // Mark the item running right away so a queued row never looks idle
-        // while the reuse check and staging setup run.
-        report_stage(progress, item, TransientItemPhase::Waiting, STAGE_START);
-        let stem = safe_stem_for_root(&self.output_root, item.ordinal, &item.title, &item.video_id)
-            .map_err(safe_output_error)?;
-        if let Some(artifact_kinds) = self.try_reuse_existing(item, &stem, control)? {
-            report_stage(progress, item, TransientItemPhase::Completed, STAGE_DONE);
-            // A prior run may have kept the video without its transcript (it
-            // was missing or could not be processed). A published folder is
-            // read-only to the executor, so the transcript cannot be added in
-            // place and the video must not be downloaded again. Report the
-            // gap as a warning, not as "Already saved", and say how to retry.
-            let transcript_expected = matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
-                && self
-                    .item_selected_transcript(item)
-                    .is_ok_and(|selected| selected.is_some());
-            if transcript_expected && !artifact_kinds.iter().any(|kind| kind == "transcript_json") {
-                return Ok(TransientExecutionOutcome::warning(
-                    TRANSCRIPT_MISSING_WARNING,
-                    artifact_kinds,
-                )
-                .with_warning_message(
-                    TRANSCRIPT_MISSING_WARNING,
-                    format!(
-                        "This video was saved earlier without its transcript. To try the \
-                         transcript again, delete or move the folder \"{}\" and download it again.",
-                        self.output_root.path().join(&stem).display()
-                    ),
-                ));
-            }
-            return Ok(TransientExecutionOutcome::skipped_existing(artifact_kinds));
-        }
-        let lease = self
-            .output_root
-            .staging_attempt_lease(&item.occurrence_id, &item.artifact_fingerprint)
-            .map_err(|error| safe_output_error(error))?;
-        let staging = lease.path().to_path_buf();
-        let mut cleanup = AttemptCleanup::new(&self.output_root, lease);
+        let staging = cleanup.lease().path().to_path_buf();
         if control.is_cancelled() {
             return Err(transient_error("CANCELLED", "download was cancelled"));
         }
@@ -654,6 +634,17 @@ impl TransientExecutor for YouTubeExecutor {
             _ => TransientItemPhase::Media,
         };
         report_stage(progress, item, download_phase.clone(), STAGE_START);
+        if preserved_bytes > 0 {
+            // Show the resumed download starting from the bytes already on
+            // disk instead of from zero; yt-dlp's own readings take over.
+            progress(TransientProgressUpdate {
+                occurrence_id: item.occurrence_id.clone(),
+                phase: download_phase.clone(),
+                bytes_completed: Some(preserved_bytes),
+                bytes_total: None,
+                fraction: None,
+            });
+        }
         cleanup
             .lease()
             .revalidate()
@@ -682,9 +673,18 @@ impl TransientExecutor for YouTubeExecutor {
         };
         let mut download_progress = DownloadProgress::new();
         let clock = self.clock;
+        // Format ids yt-dlp chose for this attempt. A resumed attempt may pick
+        // different formats than the interrupted one (expired or changed
+        // streams); partial files of any other format must not be mixed in.
+        let mut chosen_formats: Vec<String> = Vec::new();
+        let lease_for_purge = cleanup.lease();
         let output = self
             .runner
             .run_streaming(helper_spec, control, &mut |line| {
+                if let Some(ids) = parse_formats_line(line) {
+                    let _ = purge_stale_parts(lease_for_purge, &ids);
+                    chosen_formats = ids;
+                }
                 if let Some(reading) = download_progress.observe_line(line, clock()) {
                     report_download_progress(progress, item, download_phase.clone(), &reading);
                 }
@@ -709,11 +709,13 @@ impl TransientExecutor for YouTubeExecutor {
             return Err(transient_error("HELPER_TIMEOUT", "yt-dlp helper timed out"));
         }
         if !output.status.success() {
-            return Err(transient_error("HELPER_FAILED", output_error(&output)));
+            return Err(helper_failure(&output.stderr, &output_error(&output)));
         }
         if control.is_cancelled() {
             return Err(transient_error("CANCELLED", "download was cancelled"));
         }
+        purge_stale_parts(cleanup.lease(), &chosen_formats)
+            .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
         // Publish the last bytes if the throttle was still holding them back.
         if let Some(reading) = download_progress.flush(clock()) {
             report_download_progress(progress, item, download_phase, &reading);
@@ -895,7 +897,7 @@ impl TransientExecutor for YouTubeExecutor {
         drop(held_leaf_handles);
         let destination = self
             .output_root
-            .publish_attempt_lease(cleanup.take_lease(), &stem)
+            .publish_attempt_lease(cleanup.take_lease(), stem)
             .map_err(safe_output_error)?;
         verify_published_artifacts(&destination, &published_expectations)
             .map_err(|message| transient_error("OUTPUT_VERIFY_FAILED", message))?;
@@ -928,6 +930,81 @@ impl TransientExecutor for YouTubeExecutor {
         outcome.warning_messages = warning_messages;
         report_stage(progress, item, TransientItemPhase::Completed, STAGE_DONE);
         Ok(outcome)
+    }
+}
+
+impl TransientExecutor for YouTubeExecutor {
+    fn execute(
+        &self,
+        item: &TransientWorkItem,
+        control: &TransientRunControl,
+        progress: &mut dyn FnMut(TransientProgressUpdate),
+    ) -> Result<TransientExecutionOutcome, TransientError> {
+        if control.is_cancelled() {
+            return Err(TransientError {
+                code: "CANCELLED".to_string(),
+                message: "download was cancelled".to_string(),
+            });
+        }
+        // Mark the item running right away so a queued row never looks idle
+        // while the reuse check and staging setup run.
+        report_stage(progress, item, TransientItemPhase::Waiting, STAGE_START);
+        let stem = safe_stem_for_root(&self.output_root, item.ordinal, &item.title, &item.video_id)
+            .map_err(safe_output_error)?;
+        if let Some(artifact_kinds) = self.try_reuse_existing(item, &stem, control)? {
+            report_stage(progress, item, TransientItemPhase::Completed, STAGE_DONE);
+            // A prior run may have kept the video without its transcript (it
+            // was missing or could not be processed). A published folder is
+            // read-only to the executor, so the transcript cannot be added in
+            // place and the video must not be downloaded again. Report the
+            // gap as a warning, not as "Already saved", and say how to retry.
+            let transcript_expected = matches!(&self.mode, YouTubeDownloadMode::VideoAndTranscript)
+                && self
+                    .item_selected_transcript(item)
+                    .is_ok_and(|selected| selected.is_some());
+            if transcript_expected && !artifact_kinds.iter().any(|kind| kind == "transcript_json") {
+                return Ok(TransientExecutionOutcome::warning(
+                    TRANSCRIPT_MISSING_WARNING,
+                    artifact_kinds,
+                )
+                .with_warning_message(
+                    TRANSCRIPT_MISSING_WARNING,
+                    format!(
+                        "This video was saved earlier without its transcript. To try the \
+                         transcript again, delete or move the folder \"{}\" and download it again.",
+                        self.output_root.path().join(&stem).display()
+                    ),
+                ));
+            }
+            return Ok(TransientExecutionOutcome::skipped_existing(artifact_kinds));
+        }
+        let staging = self
+            .output_root
+            .resumable_staging_lease(&item.occurrence_id, &item.artifact_fingerprint)
+            .map_err(staging_error)?;
+        let resumable = !matches!(staging.disposition, StagingDisposition::Unresumable);
+        let preserved_bytes = match staging.disposition {
+            StagingDisposition::Reused { preserved_bytes } => preserved_bytes,
+            _ => 0,
+        };
+        let mut cleanup = AttemptCleanup::new(&self.output_root, staging.lease);
+        let result = self.download_and_publish(
+            item,
+            control,
+            progress,
+            &stem,
+            &mut cleanup,
+            preserved_bytes,
+        );
+        if let Err(error) = &result {
+            // A cancelled or non-transport failure removes its partial files
+            // (the cleanup guard discards on drop). A transport failure keeps
+            // them so the next attempt resumes from the same bytes.
+            if resumable && error.code != "CANCELLED" && keep_staging_after(&error.code) {
+                cleanup.keep_for_resume();
+            }
+        }
+        result
     }
 }
 
@@ -2293,6 +2370,44 @@ fn existing_output_collision_error(message: impl Into<String>) -> TransientError
     )
 }
 
+/// Map a staging-lease failure; a directory another attempt holds is its
+/// own code so nothing mistakes it for a bad output folder.
+fn staging_error(error: SafeOutputError) -> TransientError {
+    match error {
+        SafeOutputError::StagingBusy { .. } => transient_error(
+            "STAGING_BUSY",
+            "Another download is already using this video's temporary folder.",
+        ),
+        other => safe_output_error(other),
+    }
+}
+
+/// A failed helper run, classified so a full disk or a removed video gets its
+/// own code and wording instead of a generic helper failure.
+fn helper_failure(stderr: &str, summary: &str) -> TransientError {
+    // Classified from yt-dlp's own diagnostics; only the fixed summary is
+    // shown, because the raw text can carry signed media URLs.
+    match classify_helper_failure(stderr) {
+        FailureKind::DiskFull => transient_error("DISK_FULL", pause_reason("DISK_FULL", summary)),
+        FailureKind::VideoUnavailable => {
+            transient_error("VIDEO_UNAVAILABLE", pause_reason("VIDEO_UNAVAILABLE", summary))
+        }
+        FailureKind::Other => transient_error("HELPER_FAILED", summary),
+    }
+}
+
+/// Delete staging files that belong to formats other than `chosen`.
+fn purge_stale_parts(lease: &OutputAttemptLease, chosen: &[String]) -> Result<(), String> {
+    if chosen.is_empty() {
+        return Ok(());
+    }
+    let names = lease.leaf_names().map_err(|error| error.to_string())?;
+    for stale in stale_part_leaves(&names, chosen) {
+        lease.remove_leaf(&stale).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn safe_output_error(error: SafeOutputError) -> TransientError {
     let code = match &error {
         SafeOutputError::OutputCollision { .. } => "OUTPUT_COLLISION",
@@ -2920,6 +3035,11 @@ mod tests {
         script: Vec<ScriptStep>,
         /// Also write a second language track, as a misbehaving helper might.
         second_vtt: bool,
+        /// The next download leaves this partial file and fails with this
+        /// stderr, like a connection that dropped mid-download.
+        fail_next: std::sync::Mutex<Option<(String, usize, String)>>,
+        /// Files already in staging when a download starts: `(name, bytes)`.
+        seen_at_start: std::sync::Mutex<Vec<(String, u64)>>,
     }
 
     impl FakeRunner {
@@ -2933,6 +3053,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 script,
                 second_vtt: false,
+                fail_next: std::sync::Mutex::new(None),
+                seen_at_start: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -2942,6 +3064,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 script: Vec::new(),
                 second_vtt: true,
+                fail_next: std::sync::Mutex::new(None),
+                seen_at_start: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -2959,7 +3083,33 @@ mod tests {
                 self.downloads.fetch_add(1, Ordering::SeqCst);
                 let template = arg_after(&args, "--output").expect("download has --output");
                 let staging = Path::new(&template).parent().expect("template parent");
+                {
+                    let mut seen = self.seen_at_start.lock().unwrap();
+                    seen.clear();
+                    for entry in fs::read_dir(staging).unwrap() {
+                        let entry = entry.unwrap();
+                        seen.push((
+                            entry.file_name().to_string_lossy().into_owned(),
+                            entry.metadata().unwrap().len(),
+                        ));
+                    }
+                }
+                let planned_failure = self.fail_next.lock().unwrap().take();
+                if let Some((part_name, part_bytes, stderr)) = planned_failure {
+                    fs::write(staging.join(part_name), vec![9u8; part_bytes]).unwrap();
+                    return Ok(ManagedProcessOutput {
+                        status: std::process::ExitStatus::from_raw(1),
+                        stdout: String::new(),
+                        stderr,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        timed_out: false,
+                        cancelled: false,
+                    });
+                }
                 if !args.iter().any(|argument| argument == "--skip-download") {
+                    // A completed download consumes the stream it was resuming.
+                    let _ = fs::remove_file(staging.join("media.f137.mp4.part"));
                     fs::write(staging.join("media.mp4"), b"media bytes").unwrap();
                 }
                 if args.iter().any(|argument| argument == "--write-subs") {
@@ -3086,6 +3236,176 @@ mod tests {
         }
         names.sort();
         names
+    }
+
+    fn staging_dirs(temp: &Path) -> Vec<String> {
+        let lv = temp.join(".lv");
+        if !lv.exists() {
+            return Vec::new();
+        }
+        let mut names = fs::read_dir(lv)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("y-") && !name.ends_with(".lock"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_interrupted_attempt_keeps_its_part_file_and_the_next_attempt_resumes_from_it() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f137.mp4.part".to_string(),
+            5000,
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+
+        let (first, _) = run_collecting(&executor, &item);
+        assert_eq!(first.unwrap_err().code, "HELPER_FAILED");
+        let kept = staging_dirs(temp.path());
+        assert_eq!(kept.len(), 1, "the partial download must be kept: {kept:?}");
+        let part = temp.path().join(".lv").join(&kept[0]).join("media.f137.mp4.part");
+        assert_eq!(fs::metadata(&part).unwrap().len(), 5000);
+
+        let (second, stages) = run_collecting(&executor, &item);
+        second.expect("the resumed attempt completes");
+        assert_eq!(
+            runner.seen_at_start.lock().unwrap().clone(),
+            vec![("media.f137.mp4.part".to_string(), 5000u64)],
+            "the resumed attempt must start with the earlier bytes in place"
+        );
+        assert!(
+            staging_dirs(temp.path()).is_empty(),
+            "a published item leaves no staging behind"
+        );
+        assert!(stages.iter().any(|(phase, _)| *phase == TransientItemPhase::Media));
+    }
+
+    #[test]
+    fn a_resumed_attempt_reports_the_preserved_bytes_before_yt_dlp_speaks() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f137.mp4.part".to_string(),
+            7000,
+            "ERROR: network is unreachable".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+
+        let control = TransientRunControl::default();
+        let mut bytes = Vec::new();
+        TransientExecutor::execute(&*executor, &item, &control, &mut |update| {
+            bytes.push(update.bytes_completed);
+        })
+        .unwrap();
+        assert!(bytes.contains(&Some(7000)), "{bytes:?}");
+    }
+
+    #[test]
+    fn a_full_disk_is_classified_and_keeps_the_partial_download() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f137.mp4.part".to_string(),
+            100,
+            "OSError: [Errno 28] No space left on device".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            runner,
+        );
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(error.code, "DISK_FULL");
+        assert_eq!(staging_dirs(temp.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_removed_video_is_classified_as_unavailable() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(VALID_VTT);
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f137.mp4.part".to_string(),
+            1,
+            "ERROR: [youtube] abc: Video unavailable. This video has been removed".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            runner,
+        );
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(error.code, "VIDEO_UNAVAILABLE");
+    }
+
+    #[test]
+    fn a_failure_after_the_download_finished_discards_the_staging() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::new(MALFORMED_VTT);
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            false,
+            runner,
+        );
+        let error = run_collecting(&executor, &item).0.unwrap_err();
+        assert_eq!(error.code, "TRANSCRIPT_INVALID");
+        assert!(
+            staging_dirs(temp.path()).is_empty(),
+            "resuming would only repeat this failure"
+        );
+    }
+
+    #[test]
+    fn a_changed_format_removes_the_old_formats_partial_files() {
+        let temp = tempdir().unwrap();
+        let root = validate_output_root(temp.path()).unwrap();
+        let runner = FakeRunner::with_script(
+            VALID_VTT,
+            vec![ScriptStep::Line("LVFORMATS 137, 140".to_string())],
+        );
+        *runner.fail_next.lock().unwrap() = Some((
+            "media.f299.mp4.part".to_string(),
+            4096,
+            "ERROR: connection reset".to_string(),
+        ));
+        let (executor, item) = executor_with_fake(
+            &root,
+            YouTubeDownloadMode::VideoAndTranscript,
+            true,
+            Arc::clone(&runner),
+        );
+        run_collecting(&executor, &item).0.unwrap_err();
+
+        run_collecting(&executor, &item)
+            .0
+            .expect("stale parts of format 299 must not block the new format");
+        let files = published_files(temp.path());
+        assert!(
+            !files.iter().any(|name| name.contains("f299")),
+            "stale part published: {files:?}"
+        );
     }
 
     #[test]

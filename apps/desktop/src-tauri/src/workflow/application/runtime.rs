@@ -2317,4 +2317,106 @@ mod tests {
         let linkedin_outcome = slow_handle.join().expect("linkedin drain thread");
         assert!(linkedin_outcome.processed);
     }
+
+    struct PausesForUser;
+
+    impl StepExecutor for PausesForUser {
+        fn workflow_type(&self) -> &'static str {
+            "youtube_download"
+        }
+
+        fn execute(&self, _run: &RunRecord, _step: &StepRecord) -> ExecutorOutcome {
+            ExecutorOutcome::paused_for_user(
+                "connection reset".to_string(),
+                Some("HELPER_FAILED".to_string()),
+            )
+        }
+    }
+
+    #[test]
+    fn a_paused_for_user_outcome_pauses_the_run_instead_of_failing_it() {
+        use crate::workflow::domain::resume::{ResumeState, ResumeTrigger};
+        let (_dir, runtime) = runtime();
+        runtime.register_executor(Arc::new(PausesForUser));
+        runtime
+            .submit_youtube_download(
+                "yt-pause-outcome".to_string(),
+                "vid-1".to_string(),
+                "{}".to_string(),
+                ".".to_string(),
+                100,
+            )
+            .unwrap();
+        runtime.reconcile_youtube_after_restart(110).unwrap();
+        assert!(runtime
+            .begin_resume("yt-pause-outcome".to_string(), ResumeTrigger::Auto, 111)
+            .unwrap());
+
+        runtime.drain_type("youtube_download").unwrap();
+
+        let run = runtime.get_run("yt-pause-outcome".to_string()).unwrap().unwrap();
+        assert_eq!(run.state, RunState::Paused);
+        assert_eq!(run.error_message.as_deref(), Some("connection reset"));
+        let resume = runtime
+            .get_resume("yt-pause-outcome".to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.state, ResumeState::NeedsUser);
+        assert_eq!(resume.reason_code.as_deref(), Some("HELPER_FAILED"));
+        // No automatic retry: draining again finds nothing to run.
+        assert!(!runtime.drain_type("youtube_download").unwrap().processed);
+        // Continue admits exactly one more attempt.
+        assert!(runtime
+            .begin_resume("yt-pause-outcome".to_string(), ResumeTrigger::Manual, 120)
+            .unwrap());
+        assert!(runtime.drain_type("youtube_download").unwrap().processed);
+        assert_eq!(
+            runtime
+                .get_run("yt-pause-outcome".to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Paused,
+            "a failed manual attempt pauses again"
+        );
+    }
+
+    #[test]
+    fn youtube_restart_reconcile_pauses_queued_runs_and_leaves_other_providers() {
+        let (_dir, runtime) = runtime();
+        runtime
+            .submit_youtube_download(
+                "yt-queued-1".to_string(),
+                "vid-1".to_string(),
+                "{}".to_string(),
+                ".".to_string(),
+                100,
+            )
+            .unwrap();
+        runtime
+            .submit_coursera_download(
+                "coursera-queued-1".to_string(),
+                "ml-005".to_string(),
+                "{}".to_string(),
+                ".".to_string(),
+                101,
+            )
+            .unwrap();
+        let summary = runtime.reconcile_youtube_after_restart(102).unwrap();
+        assert_eq!(summary.resumable, 1);
+        let youtube = runtime.get_run("yt-queued-1".to_string()).unwrap().unwrap();
+        assert_eq!(youtube.state, RunState::Paused, "interrupted, not failed");
+        assert!(youtube
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("restart")));
+        assert!(runtime
+            .inner
+            .service
+            .claim_next_ready_step("youtube_download".to_string(), 103)
+            .unwrap()
+            .is_none());
+        let coursera = runtime.get_run("coursera-queued-1".to_string()).unwrap().unwrap();
+        assert_eq!(coursera.state, RunState::Queued);
+    }
 }

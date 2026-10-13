@@ -9,6 +9,7 @@ pub mod database;
 pub mod database_diagnostics;
 pub mod database_migrations;
 pub mod database_writer;
+pub mod disk_space;
 pub mod dpapi;
 pub mod managed_process;
 pub mod media_range;
