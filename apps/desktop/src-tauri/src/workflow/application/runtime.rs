@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::app::database_writer::DatabaseWriter;
 use crate::workflow::application::repository_service::WorkflowRepositoryService;
 use crate::workflow::domain::errors::WorkflowError;
+use crate::workflow::domain::resume::{ReconcileSummary, ResumeTrigger, RunResumeRecord};
 use crate::workflow::domain::state::{RunState, StepState};
 use crate::workflow::domain::types::{
     NewWorkflowRun, NewWorkflowStep, RunRecord, StepRecord, StepType, WorkflowType,
@@ -730,16 +731,76 @@ impl WorkflowRuntime {
         )
     }
 
-    pub fn reconcile_youtube_after_restart(&self, updated_at: i64) -> Result<usize, WorkflowError> {
+    /// Restart reconcile for YouTube: interrupted runs become resumable
+    /// (durably paused with a resume record) instead of failed. See
+    /// `ResumeState` for who moves them next.
+    pub fn reconcile_youtube_after_restart(
+        &self,
+        updated_at: i64,
+    ) -> Result<ReconcileSummary, WorkflowError> {
+        self.after_mutation(self.inner.service.reconcile_for_resume(
+            WorkflowType::youtube_download().as_str().to_string(),
+            "Interrupted by an application restart".to_string(),
+            updated_at,
+        ))
+    }
+
+    /// YouTube runs waiting for a resume decision or in a resumed attempt.
+    pub fn list_youtube_resumable(
+        &self,
+    ) -> Result<Vec<(RunRecord, RunResumeRecord)>, WorkflowError> {
+        self.inner
+            .service
+            .list_resumable(WorkflowType::youtube_download().as_str().to_string())
+    }
+
+    pub fn get_resume(&self, run_id: String) -> Result<Option<RunResumeRecord>, WorkflowError> {
+        self.inner.service.get_resume(run_id)
+    }
+
+    /// Durably admit one resumed attempt (spends the automatic budget) and
+    /// requeue the run. Returns `false` when another caller already did, or
+    /// the run is not resumable by `trigger`.
+    ///
+    /// Does not take the drain lock: callers hold [`Self::with_drain_lock`]
+    /// around "attach live control + begin_resume" exactly like a fresh
+    /// submit, so the supervisor cannot claim the run before its live control
+    /// exists.
+    pub fn begin_resume(
+        &self,
+        run_id: String,
+        trigger: ResumeTrigger,
+        now: i64,
+    ) -> Result<bool, WorkflowError> {
+        self.after_mutation(self.inner.service.begin_resume(run_id, trigger, now))
+    }
+
+    /// Keep a paused run waiting for the user, with `reason`, without
+    /// starting an attempt or spending the budget.
+    pub fn park_for_user(
+        &self,
+        run_id: String,
+        reason: String,
+        reason_code: Option<String>,
+        now: i64,
+    ) -> Result<bool, WorkflowError> {
         self.after_mutation(
-            // YouTube-only: fail queued/running/cancelling/(paused|retry_wait). Do not
-            // widen shared fail_running_runs used by other providers.
-            self.inner.service.fail_nonterminal_runs(
-                WorkflowType::youtube_download().as_str().to_string(),
-                "Interrupted by an application restart".to_string(),
-                updated_at,
-            ),
+            self.inner
+                .service
+                .park_for_user(run_id, reason, reason_code, now),
         )
+    }
+
+    pub fn record_expected_bytes(
+        &self,
+        run_id: String,
+        item_key: String,
+        bytes: u64,
+        now: i64,
+    ) -> Result<(), WorkflowError> {
+        self.inner
+            .service
+            .set_expected_bytes(run_id, item_key, bytes, now)
     }
 
     pub fn list_coursera_runs(
@@ -1253,6 +1314,21 @@ fn apply_executor_outcome(
                 .map(|run| run.state)
                 .unwrap_or(RunState::Cancelling),
         );
+    }
+    if outcome.pause_for_user && !outcome.succeeded {
+        let reason = outcome
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Paused after a failed attempt".to_string());
+        if service.pause_after_failed_attempt(
+            run_id.to_string(),
+            step_id.to_string(),
+            reason,
+            outcome.pause_code.clone(),
+            now,
+        )? {
+            return Ok(false);
+        }
     }
     if outcome.succeeded {
         let run_state = if outcome.warning {
@@ -2045,47 +2121,6 @@ mod tests {
             .error_message
             .unwrap_or_default()
             .contains("lease expired"));
-    }
-
-    #[test]
-    fn youtube_restart_reconcile_fails_queued_and_leaves_other_providers() {
-        let (_dir, runtime) = runtime();
-        let youtube_id = runtime
-            .submit_youtube_download(
-                "yt-queued-1".to_string(),
-                "vid-1".to_string(),
-                "{}".to_string(),
-                ".".to_string(),
-                100,
-            )
-            .unwrap();
-        let coursera_id = runtime
-            .submit_coursera_download(
-                "coursera-queued-1".to_string(),
-                "ml-005".to_string(),
-                "{}".to_string(),
-                ".".to_string(),
-                101,
-            )
-            .unwrap();
-        assert_eq!(runtime.reconcile_youtube_after_restart(102).unwrap(), 1);
-        let youtube = runtime.get_run(youtube_id.clone()).unwrap().unwrap();
-        assert_eq!(youtube.state, RunState::Failed);
-        assert!(youtube
-            .error_message
-            .as_deref()
-            .is_some_and(|message| message.contains("restart")));
-        let claimed = runtime
-            .inner
-            .service
-            .claim_next_ready_step("youtube_download".to_string(), 103)
-            .unwrap();
-        assert!(
-            claimed.is_none(),
-            "failed youtube queued run must not be claimable"
-        );
-        let coursera = runtime.get_run(coursera_id).unwrap().unwrap();
-        assert_eq!(coursera.state, RunState::Queued);
     }
 
     #[test]

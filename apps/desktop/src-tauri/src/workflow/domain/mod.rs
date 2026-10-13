@@ -2,6 +2,7 @@
 //! owns lifecycle vocabulary only.
 
 pub mod errors;
+pub mod resume;
 pub mod state;
 pub mod transitions;
 pub mod types;
