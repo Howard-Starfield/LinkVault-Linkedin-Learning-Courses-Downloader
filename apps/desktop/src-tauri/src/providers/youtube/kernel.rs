@@ -2,6 +2,7 @@
 
 use crate::app::managed_process::{
     TransientError, TransientExecutor, TransientItemState, TransientRunControl,
+    TransientRunSnapshot,
 };
 use crate::app::safe_output_filesystem::validate_output_root;
 use crate::providers::youtube::live::{
@@ -72,9 +73,29 @@ impl YoutubeDownloadExecutor {
                 &[],
             ),
         };
-        finish_snapshot(&mut snapshot, false, Some(error));
-        self.live.publish_snapshot(snapshot);
+        self.commit(run_id, &mut snapshot, |live| {
+            finish_snapshot(live, false, Some(error.clone()))
+        });
         ExecutorOutcome::failed(failure)
+    }
+
+    /// Apply `change` to the live snapshot in place, so a pause or cancel that
+    /// lands meanwhile is kept. If the run no longer owns the live slot the
+    /// change is applied to `fallback` and published instead. Returns the
+    /// resulting snapshot.
+    fn commit(
+        &self,
+        run_id: &str,
+        fallback: &mut TransientRunSnapshot,
+        mut change: impl FnMut(&mut TransientRunSnapshot),
+    ) -> TransientRunSnapshot {
+        if let Some(committed) = self.live.update_snapshot(run_id, &mut change) {
+            *fallback = committed.clone();
+            return committed;
+        }
+        change(fallback);
+        self.live.publish_snapshot(fallback.clone());
+        fallback.clone()
     }
 
     /// Drive every work item through `executor`, publishing snapshots as it goes.
@@ -97,8 +118,9 @@ impl YoutubeDownloadExecutor {
 
         for item in &request.work_items {
             if control.is_cancelled() {
-                finish_snapshot(&mut snapshot, true, None);
-                self.live.publish_snapshot(snapshot);
+                self.commit(run_id, &mut snapshot, |live| {
+                    finish_snapshot(live, true, None)
+                });
                 return ExecutorOutcome::cancelled("YouTube download was cancelled".to_string());
             }
             if control.pause_requested() {
@@ -106,24 +128,24 @@ impl YoutubeDownloadExecutor {
                 control.wait_for_resume();
             }
             if control.is_cancelled() {
-                finish_snapshot(&mut snapshot, true, None);
-                self.live.publish_snapshot(snapshot);
+                self.commit(run_id, &mut snapshot, |live| {
+                    finish_snapshot(live, true, None)
+                });
                 return ExecutorOutcome::cancelled("YouTube download was cancelled".to_string());
             }
 
-            // Progress ticks mutate the live snapshot in place so a pause or
-            // cancel requested meanwhile is not overwritten; re-read it after.
+            // Progress ticks, outcomes and failures all change the live
+            // snapshot in place, so a pause or cancel requested meanwhile is
+            // never overwritten by a copy this loop read earlier.
             let outcome = TransientExecutor::execute(executor, item, control, &mut |update| {
                 self.live.publish_item_progress(run_id, item, update);
             });
-            if let Ok(Some(current)) = self.live.snapshot(Some(run_id)) {
-                snapshot = current;
-            }
 
             match outcome {
                 Ok(outcome) => {
-                    apply_item_outcome(&mut snapshot, item, &outcome);
-                    self.live.publish_snapshot(snapshot.clone());
+                    self.commit(run_id, &mut snapshot, |live| {
+                        apply_item_outcome(live, item, &outcome)
+                    });
                     if matches!(
                         outcome.state,
                         TransientItemState::Failed | TransientItemState::Cancelled
@@ -134,12 +156,10 @@ impl YoutubeDownloadExecutor {
                             .as_ref()
                             .map(|error| error.message.clone())
                             .unwrap_or_else(|| "YouTube item failed".to_string());
-                        finish_snapshot(
-                            &mut snapshot,
-                            matches!(outcome.state, TransientItemState::Cancelled),
-                            outcome.error,
-                        );
-                        self.live.publish_snapshot(snapshot);
+                        let cancelled = matches!(outcome.state, TransientItemState::Cancelled);
+                        self.commit(run_id, &mut snapshot, |live| {
+                            finish_snapshot(live, cancelled, outcome.error.clone())
+                        });
                         if control.is_cancelled() {
                             return ExecutorOutcome::cancelled(message);
                         }
@@ -153,11 +173,13 @@ impl YoutubeDownloadExecutor {
                     };
                     // A cancelled run marks in-flight items Cancelled in
                     // `finish_snapshot`; only a real failure fails the item.
-                    if !control.is_cancelled() {
-                        apply_item_failure(&mut snapshot, item, &error);
-                    }
-                    finish_snapshot(&mut snapshot, control.is_cancelled(), Some(error));
-                    self.live.publish_snapshot(snapshot);
+                    let cancelled = control.is_cancelled();
+                    self.commit(run_id, &mut snapshot, |live| {
+                        if !cancelled {
+                            apply_item_failure(live, item, &error);
+                        }
+                        finish_snapshot(live, cancelled, Some(error.clone()));
+                    });
                     if control.is_cancelled() {
                         return ExecutorOutcome::cancelled(message);
                     }
@@ -166,10 +188,11 @@ impl YoutubeDownloadExecutor {
             }
         }
 
-        finish_snapshot(&mut snapshot, false, None);
-        let warning = snapshot.counts.completed_with_warnings > 0;
-        let payload = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
-        self.live.publish_snapshot(snapshot);
+        let finished = self.commit(run_id, &mut snapshot, |live| {
+            finish_snapshot(live, false, None)
+        });
+        let warning = finished.counts.completed_with_warnings > 0;
+        let payload = serde_json::to_string(&finished).unwrap_or_else(|_| "{}".to_string());
         if warning {
             let mut outcome = ExecutorOutcome::succeeded(payload);
             outcome.warning = true;
@@ -558,5 +581,80 @@ mod tests {
         let last = snapshots.last().expect("terminal snapshot");
         assert_eq!(last.state, TransientRunState::Completed);
         assert_eq!(last.items[0].state, TransientItemState::Completed);
+    }
+    struct CompletesImmediately;
+
+    impl TransientExecutor for CompletesImmediately {
+        fn execute(
+            &self,
+            _item: &TransientWorkItem,
+            _control: &TransientRunControl,
+            _progress: &mut dyn FnMut(TransientProgressUpdate),
+        ) -> Result<TransientExecutionOutcome, TransientError> {
+            Ok(TransientExecutionOutcome::completed(vec![
+                "video".to_string()
+            ]))
+        }
+    }
+
+    #[test]
+    fn a_pause_landing_just_before_the_item_outcome_is_applied_survives() {
+        let live = Arc::new(YouTubeLiveHandle::default());
+        let published = capture_sink(&live);
+        let items = vec![work_item(1)];
+        let control = live
+            .attach_run(
+                "yt-race-run".to_string(),
+                "sub-kernel".to_string(),
+                "plan-fp".to_string(),
+                &items,
+            )
+            .expect("attach run");
+        // The pause arrives in the window where the kernel used to hold a
+        // copy it had read earlier and was about to publish over the top.
+        let racing = Arc::clone(&live);
+        live.set_before_update(Box::new(move || {
+            let seen = racing
+                .snapshot(Some("yt-race-run"))
+                .expect("live snapshot")
+                .expect("active run");
+            racing
+                .pause("yt-race-run", seen.revision)
+                .expect("pause on the revision the UI last saw");
+        }));
+        let kernel = YoutubeDownloadExecutor {
+            live: Arc::clone(&live),
+        };
+
+        let outcome = kernel.run_items(
+            "yt-race-run",
+            &durable_request(items),
+            &control,
+            &CompletesImmediately,
+        );
+
+        assert!(outcome.succeeded);
+        let snapshots = published.lock().expect("published lock").clone();
+        let revisions = snapshots
+            .iter()
+            .map(|snapshot| snapshot.revision)
+            .collect::<Vec<_>>();
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] < pair[1]),
+            "every published revision must be strictly greater: {revisions:?}"
+        );
+        let after_outcome = snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.items[0].state == TransientItemState::Completed
+                    && !snapshot.state.is_terminal()
+            })
+            .expect("the item outcome is published before the run ends");
+        assert_eq!(
+            after_outcome.state,
+            TransientRunState::PauseRequested,
+            "the item outcome reverted the pause"
+        );
+        assert!(control.pause_requested());
     }
 }

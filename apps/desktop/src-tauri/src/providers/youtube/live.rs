@@ -72,6 +72,10 @@ pub struct YouTubeLiveHandle {
     shutting_down: AtomicBool,
     submissions: Mutex<HashMap<String, SubmissionLedgerEntry>>,
     submission_order: Mutex<VecDeque<String>>,
+    /// Runs once, just before the next `update_snapshot` takes the active
+    /// lock, so a test can land a pause in what used to be the race window.
+    #[cfg(test)]
+    before_update: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Default for YouTubeLiveHandle {
@@ -85,6 +89,8 @@ impl Default for YouTubeLiveHandle {
             shutting_down: AtomicBool::new(false),
             submissions: Mutex::new(HashMap::new()),
             submission_order: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            before_update: Mutex::new(None),
         }
     }
 }
@@ -98,6 +104,15 @@ impl YouTubeLiveHandle {
             .sink
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    /// Run `hook` once, right before the next `update_snapshot` locks the run.
+    #[cfg(test)]
+    pub(crate) fn set_before_update(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     #[cfg(test)]
@@ -441,6 +456,65 @@ impl YouTubeLiveHandle {
             current.snapshot.clone()
         };
         self.emit(&snapshot);
+    }
+
+    /// Change the live snapshot in place under the active lock and emit it.
+    ///
+    /// Item outcomes, failures and the terminal transition go through here, so
+    /// a pause, resume or cancel that lands meanwhile is part of the snapshot
+    /// being changed and cannot be overwritten by a stale copy. Returns `None`
+    /// without calling `apply` when `run_id` does not own the active slot.
+    /// The revision is guaranteed to move forward; `control_revision` is left
+    /// alone because an item change is not a control change. A terminal result
+    /// releases the slot, exactly like [`Self::publish_snapshot`].
+    pub fn update_snapshot(
+        &self,
+        run_id: &str,
+        mut apply: impl FnMut(&mut TransientRunSnapshot),
+    ) -> Option<TransientRunSnapshot> {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_update
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let (snapshot, control_to_retry) = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = active.as_mut()?;
+            if current.run_id != run_id {
+                return None;
+            }
+            let before = current.snapshot.revision;
+            apply(&mut current.snapshot);
+            if current.snapshot.revision <= before {
+                current.snapshot.revision = before + 1;
+            }
+            let snapshot = current.snapshot.clone();
+            let control = Arc::clone(&current.control);
+            if snapshot.state.is_terminal() {
+                *active = None;
+                (snapshot, Some(control))
+            } else {
+                (snapshot, None)
+            }
+        };
+        if let Some(control) = control_to_retry {
+            let _ = control.retry_cleanup_verifiers();
+        }
+        *self
+            .most_recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
+        self.emit(&snapshot);
+        Some(snapshot)
     }
 
     pub fn publish_snapshot(&self, snapshot: TransientRunSnapshot) {
