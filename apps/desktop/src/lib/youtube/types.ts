@@ -370,10 +370,14 @@ export interface YouTubeResumableRun {
   /** Bytes of partial download a resume keeps. */
   preservedBytes: number;
   updatedAt: number;
+  /** Identifies this pause; Continue sends it back so a stale click starts nothing. */
+  generation: number;
 }
 
 export interface ContinueYouTubeRunRequest {
   runId: string;
+  /** `YouTubeResumableRun.generation` of the pause the user is answering. */
+  generation: number;
 }
 
 export interface ContinueYouTubeRunResponse {

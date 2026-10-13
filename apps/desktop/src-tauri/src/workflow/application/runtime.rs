@@ -798,6 +798,30 @@ impl WorkflowRuntime {
         )
     }
 
+    /// Durably pause a running YouTube run for the user (a resumed attempt
+    /// failed), finding its running step. Returns `false` when the run is not
+    /// running (for example it is being cancelled).
+    pub fn pause_running_for_user(
+        &self,
+        run_id: String,
+        reason: String,
+        reason_code: String,
+    ) -> Result<bool, WorkflowError> {
+        let steps = self.inner.service.list_steps_for_run(run_id.clone())?;
+        let step_id = steps
+            .into_iter()
+            .find(|step| step.state == StepState::Running)
+            .map(|step| step.id)
+            .unwrap_or_default();
+        self.after_mutation(self.inner.service.pause_after_failed_attempt(
+            run_id,
+            step_id,
+            reason,
+            Some(reason_code),
+            chrono::Utc::now().timestamp(),
+        ))
+    }
+
     pub fn record_expected_bytes(
         &self,
         run_id: String,
@@ -1323,6 +1347,14 @@ fn apply_executor_outcome(
         );
     }
     if outcome.pause_for_user && !outcome.succeeded {
+        // The provider may already have committed the pause before it
+        // published its own view of it.
+        if service
+            .get_run(run_id.to_string())?
+            .is_some_and(|run| run.state == RunState::Paused)
+        {
+            return Ok(false);
+        }
         let reason = outcome
             .error_message
             .clone()

@@ -44,13 +44,16 @@ pub enum ResumeTrigger {
     Auto,
     /// The user pressed Continue.
     Manual,
+    /// Continue, valid only for the pause the user was shown (`generation`).
+    /// A delayed duplicate click carries a stale generation and is refused.
+    ManualAt(i64),
 }
 
 impl ResumeTrigger {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Manual => "manual",
+            Self::Manual | Self::ManualAt(_) => "manual",
         }
     }
 }
@@ -65,6 +68,9 @@ pub struct RunResumeRecord {
     pub expected_bytes: Option<u64>,
     pub expected_item_key: Option<String>,
     pub updated_at: i64,
+    /// Bumped every time the run enters a pause, so Continue can name the
+    /// pause it answers.
+    pub generation: i64,
 }
 
 /// What a restart reconcile did.

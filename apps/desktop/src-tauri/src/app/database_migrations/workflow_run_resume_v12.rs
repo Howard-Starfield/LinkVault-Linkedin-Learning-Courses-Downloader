@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS workflow_run_resume (
     reason_code TEXT,
     expected_bytes INTEGER CHECK(expected_bytes IS NULL OR expected_bytes >= 0),
     expected_item_key TEXT,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0
 );
 "#;
 
@@ -73,6 +74,7 @@ fn verify(connection: &Connection) -> Result<()> {
         ("expected_bytes", "INTEGER", 0, 0),
         ("expected_item_key", "TEXT", 0, 0),
         ("updated_at", "INTEGER", 1, 0),
+        ("generation", "INTEGER", 1, 0),
     ];
     if columns
         != expected

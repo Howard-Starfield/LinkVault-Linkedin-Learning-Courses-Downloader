@@ -189,6 +189,12 @@ export function sameResumableRuns(
       && run.state === other.state
       && run.reason === other.reason
       && run.preservedBytes === other.preservedBytes
-      && run.updatedAt === other.updatedAt;
+      && run.updatedAt === other.updatedAt
+      && run.generation === other.generation;
   });
+}
+
+/** Seconds between safety refetches while a resumed attempt is running; 0 when none is. */
+export function resumeRefetchIntervalMs(runs: readonly YouTubeResumableRun[]): number {
+  return runs.some((run) => run.state === "resuming") ? 10_000 : 0;
 }

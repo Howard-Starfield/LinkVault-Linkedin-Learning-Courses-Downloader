@@ -42,6 +42,7 @@ fn live_resume_phase() {
     runtime.register_executor(Arc::new(YoutubeDownloadExecutor {
         live: Arc::clone(&live),
         resume: Some(Arc::new(runtime.clone())),
+        notify_resume_changed: None,
     }));
     runtime.reconcile_youtube_after_restart(chrono::Utc::now().timestamp()).expect("reconcile");
     runtime.register_supervisor_hook(Arc::new(YoutubeResumeSupervisor::new(
@@ -153,7 +154,12 @@ fn live_resume_phase() {
             .is_some_and(|r| r.state == ResumeState::NeedsUser)
             && run.state == RunState::Paused;
         if needs_user && phase == "continue" && !continued {
-            let response = continue_run(&runtime, &live, RUN_ID).expect("continue");
+            let response = continue_run(
+                &runtime,
+                &live,
+                RUN_ID,
+                resume.as_ref().map_or(0, |r| r.generation),
+            ).expect("continue");
             println!("CONTINUE started={}", response.started);
             continued = true;
         } else if needs_user && phase != "continue" {

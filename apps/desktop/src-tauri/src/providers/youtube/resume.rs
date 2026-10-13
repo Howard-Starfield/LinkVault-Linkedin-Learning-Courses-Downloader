@@ -416,6 +416,9 @@ pub fn attach_and_begin(
 #[serde(rename_all = "camelCase")]
 pub struct ContinueYouTubeRunRequest {
     pub run_id: String,
+    /// The pause the user was shown (`YouTubeResumableRun::generation`). A
+    /// delayed duplicate click names an older pause and starts nothing.
+    pub generation: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -432,8 +435,9 @@ pub fn continue_run(
     runtime: &WorkflowRuntime,
     live: &YouTubeLiveHandle,
     run_id: &str,
+    generation: i64,
 ) -> Result<ContinueYouTubeRunResponse, YouTubeError> {
-    continue_run_with(runtime, live, run_id, &|run, resume| {
+    continue_run_with(runtime, live, run_id, generation, &|run, resume| {
         real_preflight(run, resume, false)
     })
 }
@@ -443,6 +447,7 @@ pub fn continue_run_with(
     runtime: &WorkflowRuntime,
     live: &YouTubeLiveHandle,
     run_id: &str,
+    generation: i64,
     preflight: &dyn Fn(&RunRecord, &RunResumeRecord) -> Preflight,
 ) -> Result<ContinueYouTubeRunResponse, YouTubeError> {
     let not_started = Ok(ContinueYouTubeRunResponse { started: false });
@@ -456,7 +461,7 @@ pub fn continue_run_with(
     let Some(resume) = runtime.get_resume(run_id.to_string()).map_err(lookup)? else {
         return not_started;
     };
-    if resume.state == ResumeState::Resuming {
+    if resume.state == ResumeState::Resuming || resume.generation != generation {
         return not_started;
     }
     let now = chrono::Utc::now().timestamp();
@@ -464,7 +469,7 @@ pub fn continue_run_with(
         let _ = runtime.park_for_user(run_id.to_string(), reason.clone(), Some(code.clone()), now);
         return Err(YouTubeError::new(code, reason));
     }
-    match attach_and_begin(runtime, live, &run, ResumeTrigger::Manual) {
+    match attach_and_begin(runtime, live, &run, ResumeTrigger::ManualAt(generation)) {
         Ok(Admission::Started) => Ok(ContinueYouTubeRunResponse { started: true }),
         Ok(Admission::NotResumable) => not_started,
         Err(error) => {
@@ -609,6 +614,8 @@ pub struct YouTubeResumableRun {
     /// Bytes of partial download a resume keeps.
     pub preserved_bytes: u64,
     pub updated_at: i64,
+    /// Identifies this pause; Continue must send it back.
+    pub generation: i64,
 }
 
 pub fn project_resumable(run: &RunRecord, resume: &RunResumeRecord) -> YouTubeResumableRun {
@@ -650,6 +657,7 @@ pub fn project_resumable(run: &RunRecord, resume: &RunResumeRecord) -> YouTubeRe
         auto_resume_used: resume.auto_resume_used,
         preserved_bytes,
         updated_at: resume.updated_at,
+        generation: resume.generation,
     }
 }
 

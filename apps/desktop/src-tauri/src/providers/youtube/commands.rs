@@ -744,7 +744,9 @@ pub async fn cancel_youtube_download(
         ) else {
             return Err(runtime_state_unavailable());
         };
-        cancel_youtube_download_blocking(&live, &runtime, &request.run_id)
+        let outcome = cancel_youtube_download_blocking(&live, &runtime, &request.run_id);
+        let _ = tauri::Emitter::emit(&app, resume::RESUME_EVENT_NAME, ());
+        outcome
     })
     .await
 }
@@ -836,7 +838,8 @@ pub async fn continue_youtube_run(
         ) else {
             return Err(runtime_state_unavailable());
         };
-        let outcome = resume::continue_run(&runtime, &live, &request.run_id);
+        let outcome =
+            resume::continue_run(&runtime, &live, &request.run_id, request.generation);
         let _ = tauri::Emitter::emit(&app, resume::RESUME_EVENT_NAME, ());
         outcome
     })

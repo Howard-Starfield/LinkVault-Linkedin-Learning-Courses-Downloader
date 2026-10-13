@@ -72,6 +72,9 @@ pub struct YouTubeLiveHandle {
     shutting_down: AtomicBool,
     submissions: Mutex<HashMap<String, SubmissionLedgerEntry>>,
     submission_order: Mutex<VecDeque<String>>,
+    /// Highest revision published per run, so a re-attached run (Continue)
+    /// keeps counting up and the UI never discards its events as stale.
+    last_revisions: Mutex<HashMap<String, u64>>,
     /// Runs once, just before the next `update_snapshot` takes the active
     /// lock, so a test can land a pause in what used to be the race window.
     #[cfg(test)]
@@ -89,6 +92,7 @@ impl Default for YouTubeLiveHandle {
             shutting_down: AtomicBool::new(false),
             submissions: Mutex::new(HashMap::new()),
             submission_order: Mutex::new(VecDeque::new()),
+            last_revisions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             before_update: Mutex::new(None),
         }
@@ -276,15 +280,23 @@ impl YouTubeLiveHandle {
             return Err(TransientRuntimeError::RunAlreadyActive);
         }
         let control = Arc::new(TransientRunControl::default());
-        let snapshot = initial_snapshot(
+        let mut snapshot = initial_snapshot(
             run_id.clone(),
             client_submission_id,
             plan_fingerprint,
             work_items,
         );
+        if let Some(last) = self
+            .last_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&run_id)
+        {
+            snapshot.revision = snapshot.revision.max(last + 1);
+        }
         *active = Some(ActiveDownload {
             run_id,
-            control_revision: 1,
+            control_revision: snapshot.revision,
             control: Arc::clone(&control),
             snapshot,
         });
@@ -635,6 +647,17 @@ impl YouTubeLiveHandle {
     }
 
     fn emit(&self, snapshot: &TransientRunSnapshot) {
+        {
+            let mut revisions = self
+                .last_revisions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if revisions.len() >= 256 && !revisions.contains_key(&snapshot.run_id) {
+                revisions.clear();
+            }
+            let entry = revisions.entry(snapshot.run_id.clone()).or_insert(0);
+            *entry = (*entry).max(snapshot.revision);
+        }
         if let Some(sink) = self
             .sink
             .lock()
@@ -813,6 +836,31 @@ mod tests {
         )
         .unwrap();
         (live, items[0].clone())
+    }
+
+    #[test]
+    fn a_reattached_run_keeps_counting_revisions_up() {
+        let (live, item) = live_with_run("run-continue");
+        tick(&live, "run-continue", &item, 0.5);
+        tick(&live, "run-continue", &item, 0.6);
+        let before = live.snapshot(Some("run-continue")).unwrap().unwrap().revision;
+        live.suspend_run("run-continue", None).unwrap();
+        let after_suspend = live.snapshot(Some("run-continue")).unwrap().unwrap().revision;
+        assert!(after_suspend > before);
+
+        live.attach_run(
+            "run-continue".to_string(),
+            "sub".to_string(),
+            "fp".to_string(),
+            std::slice::from_ref(&item),
+        )
+        .unwrap();
+
+        let reattached = live.snapshot(Some("run-continue")).unwrap().unwrap().revision;
+        assert!(
+            reattached > after_suspend,
+            "the UI discards events whose revision does not exceed the last one it saw"
+        );
     }
 
     #[test]

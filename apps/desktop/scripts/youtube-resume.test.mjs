@@ -6,6 +6,7 @@ import {
   resumableStatusText,
   resumeAnnouncement,
   resumeFraction,
+  resumeRefetchIntervalMs,
   sameResumableRuns
 } from "../src/lib/youtube/itemStatus.ts";
 import { isYouTubeRunSuspended } from "../src/lib/youtube/types.ts";
@@ -22,6 +23,7 @@ function run(overrides = {}) {
     autoResumeUsed: true,
     preservedBytes: 0,
     updatedAt: 10,
+    generation: 1,
     ...overrides
   };
 }
@@ -93,4 +95,14 @@ test("a paused snapshot with an error is suspended, a cooperative pause is not",
   assert.equal(isYouTubeRunSuspended({ state: "paused", error: null }), false);
   assert.equal(isYouTubeRunSuspended({ state: "running", error: null }), false);
   assert.equal(isYouTubeRunSuspended(null), false);
+});
+
+test("a new pause is a different list even when nothing else changed", () => {
+  assert.equal(sameResumableRuns([run({ generation: 1 })], [run({ generation: 2 })]), false);
+});
+
+test("a safety refetch runs only while a resumed attempt is running", () => {
+  assert.equal(resumeRefetchIntervalMs([run({ state: "resuming" })]), 10_000);
+  assert.equal(resumeRefetchIntervalMs([run({ state: "needs_user" }), run({ state: "auto_pending" })]), 0);
+  assert.equal(resumeRefetchIntervalMs([]), 0);
 });

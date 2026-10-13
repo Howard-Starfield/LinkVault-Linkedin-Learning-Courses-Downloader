@@ -166,6 +166,10 @@ fn interrupted_run(runtime: &WorkflowRuntime, id: &str, root: &str) -> RunRecord
     runtime.get_run(id.to_string()).unwrap().unwrap()
 }
 
+fn generation_of(runtime: &WorkflowRuntime, id: &str) -> i64 {
+    runtime.get_resume(id.to_string()).unwrap().unwrap().generation
+}
+
 fn go(_: &RunRecord, _: &RunResumeRecord) -> Preflight {
     Preflight::Go
 }
@@ -297,8 +301,8 @@ fn continue_starts_a_single_attempt_even_when_clicked_twice() {
         .park_for_user("yt-continue".to_string(), "network".to_string(), None, 120)
         .unwrap();
 
-    let first = continue_run_with(&runtime, &live, "yt-continue", &go).unwrap();
-    let second = continue_run_with(&runtime, &live, "yt-continue", &go).unwrap();
+    let first = continue_run_with(&runtime, &live, "yt-continue", generation_of(&runtime, "yt-continue"), &go).unwrap();
+    let second = continue_run_with(&runtime, &live, "yt-continue", generation_of(&runtime, "yt-continue"), &go).unwrap();
     assert!(first.started);
     assert!(!second.started, "a second click must do nothing");
     assert!(live.has_active_run("yt-continue"));
@@ -313,7 +317,7 @@ fn continue_while_the_attempt_is_running_does_nothing() {
         auto_resume_next(&runtime, &live, &go).unwrap(),
         AutoResumeStep::Started
     );
-    let response = continue_run_with(&runtime, &live, "yt-busy", &go).unwrap();
+    let response = continue_run_with(&runtime, &live, "yt-busy", generation_of(&runtime, "yt-busy"), &go).unwrap();
     assert!(!response.started);
 }
 
@@ -322,7 +326,7 @@ fn continue_reports_why_it_cannot_start_and_keeps_the_run_paused() {
     let (_dir, runtime) = runtime();
     let live = YouTubeLiveHandle::default();
     interrupted_run(&runtime, "yt-blocked", ".");
-    let error = continue_run_with(&runtime, &live, "yt-blocked", &|_, _| Preflight::Park {
+    let error = continue_run_with(&runtime, &live, "yt-blocked", generation_of(&runtime, "yt-blocked"), &|_, _| Preflight::Park {
         code: "DISK_FULL".to_string(),
         reason: "Not enough free disk space".to_string(),
     })
@@ -369,6 +373,7 @@ fn resume_record(expected: Option<u64>, key: Option<&str>) -> RunResumeRecord {
         expected_bytes: expected,
         expected_item_key: key.map(str::to_string),
         updated_at: 1,
+        generation: 0,
     }
 }
 
@@ -735,4 +740,60 @@ fn the_sweep_removes_a_cancelled_runs_staging_whatever_its_age() {
     sweep_orphans(&runtime, &[]);
 
     assert!(!path.exists());
+}
+
+struct FailsAgain;
+
+impl crate::workflow::ports::executor::StepExecutor for FailsAgain {
+    fn workflow_type(&self) -> &'static str {
+        "youtube_download"
+    }
+
+    fn execute(
+        &self,
+        _run: &RunRecord,
+        _step: &crate::workflow::domain::types::StepRecord,
+    ) -> crate::workflow::ports::executor::ExecutorOutcome {
+        crate::workflow::ports::executor::ExecutorOutcome::paused_for_user(
+            "dropped again".to_string(),
+            None,
+        )
+    }
+}
+
+// ---- Continue names the pause it answers -------------------------------------
+
+#[test]
+fn a_delayed_duplicate_continue_cannot_start_another_attempt_after_a_failure() {
+    let (_dir, runtime) = runtime();
+    let live = YouTubeLiveHandle::default();
+    interrupted_run(&runtime, "yt-dup", ".");
+    runtime
+        .park_for_user("yt-dup".to_string(), "network".to_string(), None, 120)
+        .unwrap();
+    let shown = generation_of(&runtime, "yt-dup");
+
+    // First click: admitted, the attempt runs and fails, the run pauses again.
+    assert!(
+        continue_run_with(&runtime, &live, "yt-dup", shown, &go)
+            .unwrap()
+            .started
+    );
+    runtime.register_executor(Arc::new(FailsAgain));
+    runtime.drain_type("youtube_download").unwrap();
+    live.clear_run("yt-dup");
+    assert_eq!(
+        runtime.get_run("yt-dup".to_string()).unwrap().unwrap().state,
+        RunState::Paused
+    );
+    assert!(generation_of(&runtime, "yt-dup") > shown);
+
+    // The duplicate of the first click arrives late, carrying the old pause.
+    let late = continue_run_with(&runtime, &live, "yt-dup", shown, &go).unwrap();
+    assert!(!late.started, "a stale generation must not start an attempt");
+    assert!(!live.has_active_run("yt-dup"));
+    assert_eq!(
+        runtime.get_run("yt-dup".to_string()).unwrap().unwrap().state,
+        RunState::Paused
+    );
 }

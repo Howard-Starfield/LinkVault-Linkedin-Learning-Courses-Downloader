@@ -17,6 +17,7 @@ import {
   resumableStatusText,
   resumeAnnouncement,
   resumeFraction,
+  resumeRefetchIntervalMs,
   sameResumableRuns,
   type ResumeProgress
 } from "../../lib/youtube/itemStatus";
@@ -82,6 +83,21 @@ export function YouTubeResumePanel() {
 
   const announcement = useMemo(() => resumeAnnouncement(runs), [runs]);
 
+  // Safety net for a missed event: refetch when the window regains focus, and
+  // every 10 s while a resumed attempt is running (so a pause that ended it
+  // always shows its Continue button).
+  const refetchMs = resumeRefetchIntervalMs(runs);
+  useEffect(() => {
+    if (!isTauriRuntime()) return undefined;
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
+    const timer = refetchMs > 0 ? window.setInterval(() => void refresh(), refetchMs) : null;
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [refetchMs, refresh]);
+
   const markBusy = (runId: string, busy: boolean) => {
     if (busy) busyRef.current.add(runId);
     else busyRef.current.delete(runId);
@@ -93,7 +109,7 @@ export function YouTubeResumePanel() {
     if (busyRef.current.has(run.runId)) return;
     markBusy(run.runId, true);
     try {
-      await continueYouTubeRun({ runId: run.runId });
+      await continueYouTubeRun({ runId: run.runId, generation: run.generation });
     } catch (error) {
       toast.error("Could not continue the download", { description: formatYouTubeInvokeError(error) });
     } finally {

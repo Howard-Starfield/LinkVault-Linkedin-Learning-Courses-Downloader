@@ -349,6 +349,16 @@ pub fn run() {
                 youtube::kernel::YoutubeDownloadExecutor {
                     live: Arc::clone(&youtube_live),
                     resume: Some(Arc::new(workflow_runtime.clone())),
+                    notify_resume_changed: {
+                        let handle = app.handle().clone();
+                        Some(Arc::new(move || {
+                            let _ = tauri::Emitter::emit(
+                                &handle,
+                                youtube::resume::RESUME_EVENT_NAME,
+                                (),
+                            );
+                        }))
+                    },
                 },
             ));
             let linkedin_cancellation = Arc::new(AtomicBool::new(false));

@@ -21,7 +21,7 @@ use crate::workflow::domain::types::RunRecord;
 use crate::workflow::ports::repository::WorkflowRepository;
 
 const RESUME_COLUMNS: &str = "run_id, state, auto_resume_used, last_interruption_reason,
-     reason_code, expected_bytes, expected_item_key, updated_at";
+     reason_code, expected_bytes, expected_item_key, updated_at, generation";
 
 fn map_resume(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunResumeRecord> {
     let state_text: String = row.get(1)?;
@@ -45,6 +45,7 @@ fn map_resume(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunResumeRecord> {
         expected_bytes: expected.and_then(|value| u64::try_from(value).ok()),
         expected_item_key: row.get(6)?,
         updated_at: row.get(7)?,
+        generation: row.get(8)?,
     })
 }
 
@@ -247,13 +248,14 @@ impl SqliteWorkflowRepository {
             }
             tx.execute(
                 "INSERT INTO workflow_run_resume
-                    (run_id, state, auto_resume_used, last_interruption_reason, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    (run_id, state, auto_resume_used, last_interruption_reason, updated_at, generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)
                  ON CONFLICT(run_id) DO UPDATE SET
                     state = excluded.state,
                     auto_resume_used = excluded.auto_resume_used,
                     last_interruption_reason = excluded.last_interruption_reason,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at,
+                    generation = workflow_run_resume.generation + 1",
                 params![run_id, next.as_str(), i64::from(used), next_reason, now],
             )?;
             append_event(
@@ -299,6 +301,10 @@ impl SqliteWorkflowRepository {
             ResumeTrigger::Auto => row.state == ResumeState::AutoPending && !row.auto_resume_used,
             ResumeTrigger::Manual => {
                 matches!(row.state, ResumeState::NeedsUser | ResumeState::AutoPending)
+            }
+            ResumeTrigger::ManualAt(generation) => {
+                row.generation == generation
+                    && matches!(row.state, ResumeState::NeedsUser | ResumeState::AutoPending)
             }
         };
         if !allowed {
@@ -380,13 +386,14 @@ impl SqliteWorkflowRepository {
         )?;
         tx.execute(
             "INSERT INTO workflow_run_resume
-                (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at)
-             VALUES (?1, 'needs_user', 1, ?2, ?3, ?4)
+                (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at, generation)
+             VALUES (?1, 'needs_user', 1, ?2, ?3, ?4, 1)
              ON CONFLICT(run_id) DO UPDATE SET
                 state = 'needs_user',
                 last_interruption_reason = excluded.last_interruption_reason,
                 reason_code = excluded.reason_code,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                generation = workflow_run_resume.generation + 1",
             params![run_id, reason, reason_code, now],
         )?;
         append_event(&tx, run_id, Some(step_id), "run_paused_for_user", "{}", now)?;
@@ -415,13 +422,14 @@ impl SqliteWorkflowRepository {
         }
         tx.execute(
             "INSERT INTO workflow_run_resume
-                (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at)
-             VALUES (?1, 'needs_user', 0, ?2, ?3, ?4)
+                (run_id, state, auto_resume_used, last_interruption_reason, reason_code, updated_at, generation)
+             VALUES (?1, 'needs_user', 0, ?2, ?3, ?4, 1)
              ON CONFLICT(run_id) DO UPDATE SET
                 state = 'needs_user',
                 last_interruption_reason = excluded.last_interruption_reason,
                 reason_code = excluded.reason_code,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                generation = workflow_run_resume.generation + 1",
             params![run_id, reason, reason_code, now],
         )?;
         tx.execute(
