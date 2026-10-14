@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.30 - 2026-10-13
+
+- **Videos with huge caption lists download again.** Caption info up to 64 MiB is accepted (one video printed 11 MB across 182 auto-caption languages), so starts no longer fail with `transcript inspection output exceeded the safety limit`. Oversized lists are trimmed while always keeping uploader captions, English and the original language.
+- **Better English caption default.** The picker prefers uploader English, then YouTube's untranslated "English (Original)" track, which is far less likely to be rate-limited.
+- **Watch YouTube downloads in the app.** Download history gets Play: playlists expand per video, captions are on by default with a CC toggle, playback resumes where you left off, and next/previous and cinema mode work like the LinkedIn player. Files are served by id with containment, link and size checks on the opened file.
+- **Interrupted downloads resume.** After an app restart, interrupted YouTube downloads continue automatically once from the bytes already downloaded. If that attempt fails or is interrupted again, the download pauses with a reason and a Continue button; it never retries in a loop. Missing helpers, a missing output drive, low disk space, a full disk or an unavailable video pause with a clear reason, and a finished download that fails its final check is kept so Continue only re-checks it. Unused partial downloads are cleaned up after 7 days.
+
 ## 0.2.29 - 2026-10-13
 
 - **YouTube downloads work after installing the helpers (#45).** Installed helpers now get a valid lock digest, so starts no longer fail with `MANIFEST_CONTRACT_INVALID: helperLockDigest must be a lowercase SHA-256 digest`. The post-download media check runs with FFmpeg alone and accepts valid MP4/MKV output.
