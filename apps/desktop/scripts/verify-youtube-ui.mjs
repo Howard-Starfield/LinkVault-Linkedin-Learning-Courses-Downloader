@@ -209,6 +209,7 @@ matches(view, /onPointerDown=\{handleSourcePointerDown\}/, "URL field does not i
 matches(view, /ensureDestinationFolder/, "URL interactions do not check for a destination folder");
 assert.doesNotMatch(view, /aria-label="Public YouTube URL"[\s\S]{0,200}disabled=\{activeRun\}/, "URL field is disabled during a download, so a new link cannot be pasted");
 matches(view, /downloadBusyRef\.current \|\| batches\.pendingVideos\(\) > 0\) \{\s*deferredLinksRef\.current = complete/, "Links pasted during a download are not deferred until it finishes");
+matches(view, /batches\.clear\(\);\s*\/\/[^\n]*\n\s*deferredLinksRef\.current = null;[\s\S]*?setIsCancelling\(true\)/, "Cancel does not drop links waiting behind the run");
 matches(view, /scanCompleteLinks\(waiting, undefined, true\)[\s\S]*?startDownloads\(targets\)/, "Deferred links are not downloaded after their scan");
 matches(view, /if \(downloadBusyRef\.current\) return;\s*transcriptInspectionGenerationRef/, "Clearing the URL field mid-download can wipe the running rows");
 matches(styles, /\.youtube-folder-gate-actions/, "Destination-folder gate dialog styles are missing");

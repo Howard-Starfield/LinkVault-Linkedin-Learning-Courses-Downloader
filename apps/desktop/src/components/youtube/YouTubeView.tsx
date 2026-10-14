@@ -1312,6 +1312,10 @@ export function YouTubeView({
     // Cancel also drops every batch not yet started.  (A start in flight cannot be cancelled: the
     // Cancel control exists only once a run does, and a start has no run until it succeeds.)
     batches.clear();
+    // Cancelling also drops links waiting behind this run, or they would start the moment it ends.
+    deferredLinksRef.current = null;
+    setDeferredLinkCount(0);
+    setAutoStartPending(false);
     setIsCancelling(true);
     try {
       const snapshot = await cancelYouTubeDownload({ runId: runSnapshot.runId });
