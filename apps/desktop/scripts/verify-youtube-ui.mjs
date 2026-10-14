@@ -178,6 +178,7 @@ matches(view, /playlistMode[\s\S]*scanYouTubeSource\([\s\S]*?playlistMode/, "Amb
 matches(view, /aria-label="When URL includes a video and playlist"/, "Ambiguous video+playlist URLs do not expose a choice");
 matches(view, /preferredLanguage[\s\S]*startYouTubeDownload\([\s\S]*?preferredLanguage/, "Preferred transcript language is not sent from typed state");
 matches(view, /fallbackLanguages[\s\S]*startYouTubeDownload\([\s\S]*?fallbackLanguages/, "Fallback transcript languages are not sent from typed state");
+matches(view, /\.filter\(\(tag\) => tag !== "" && tag !== preferredLanguage\)/, "Fallback languages can include the empty No-caption placeholder, which the backend rejects as an invalid transcript language");
 matches(view, /aria-label="Preferred transcript language"/, "Preferred transcript language control is missing");
 matches(view, /refreshDetectedLanguages|inspectYouTubeTranscripts/, "Preferred language is not detected from inspected transcript tracks");
 matches(view, /collectLanguageOptions/, "Detected caption languages are not collected into dropdown options");
@@ -206,7 +207,10 @@ matches(view, /folderGateOpen/, "Destination-folder gate dialog state is missing
 matches(view, /Choose destination folder/, "Destination-folder gate does not expose a folder picker action");
 matches(view, /onPointerDown=\{handleSourcePointerDown\}/, "URL field does not intercept clicks when no destination folder is set");
 matches(view, /ensureDestinationFolder/, "URL interactions do not check for a destination folder");
-matches(view, /disabled=\{activeRun\}/, "URL field remains helper-blocked instead of clickable until a run is active");
+assert.doesNotMatch(view, /aria-label="Public YouTube URL"[\s\S]{0,200}disabled=\{activeRun\}/, "URL field is disabled during a download, so a new link cannot be pasted");
+matches(view, /downloadBusyRef\.current \|\| batches\.pendingVideos\(\) > 0\) \{\s*deferredLinksRef\.current = complete/, "Links pasted during a download are not deferred until it finishes");
+matches(view, /scanCompleteLinks\(waiting, undefined, true\)[\s\S]*?startDownloads\(targets\)/, "Deferred links are not downloaded after their scan");
+matches(view, /if \(downloadBusyRef\.current\) return;\s*transcriptInspectionGenerationRef/, "Clearing the URL field mid-download can wipe the running rows");
 matches(styles, /\.youtube-folder-gate-actions/, "Destination-folder gate dialog styles are missing");
 
 // Search-first paste surface: detect complete YouTube URLs and scan without a required extra click.
