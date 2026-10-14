@@ -9,8 +9,10 @@ pub mod database;
 pub mod database_diagnostics;
 pub mod database_migrations;
 pub mod database_writer;
+pub mod disk_space;
 pub mod dpapi;
 pub mod managed_process;
+pub mod media_range;
 pub mod media_toolchain;
 #[cfg(feature = "crop-baseline")]
 pub mod newspaper_clipping_crop_baseline;
@@ -20,5 +22,7 @@ pub mod safe_output_filesystem;
 pub mod security;
 pub mod shell;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod updates;
 pub(crate) mod window_activation;

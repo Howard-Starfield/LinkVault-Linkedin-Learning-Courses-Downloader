@@ -1,21 +1,24 @@
 //! LinkedIn video bytes for `linkedin-media://v/{artifact_id}`.
 //!
-//! Registered beside newspaper-media. Does not import newspaper code.
+//! Registered beside newspaper-media. Does not import newspaper code. Range
+//! and MIME handling is the provider-neutral `app::media_range` module.
 
-use std::{
-    fs,
-    io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 
 use rusqlite::{params, OptionalExtension};
-use tauri::http::{
-    header::{
-        ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
-    },
-    HeaderValue, Request, Response, StatusCode,
+use tauri::http::{Request, Response, StatusCode};
+
+use crate::app::safe_output_filesystem::open_verified_file;
+use crate::app::media_range::{
+    is_symlink_or_reparse, mime_for_path, serve_file, text_response, ResolvedFile, ServeOptions,
 };
+
+const SERVE_OPTIONS: ServeOptions = ServeOptions {
+    internal_error_body: b"LinkedIn media could not be loaded.",
+    cache_control: "private, max-age=31536000, immutable",
+};
+
+type ResolvedMedia = ResolvedFile;
 
 pub fn handle_request(db_path: &Path, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     match resolve_media(db_path, request) {
@@ -33,18 +36,6 @@ pub fn handle_request(db_path: &Path, request: &Request<Vec<u8>>) -> Response<Ve
             b"LinkedIn media could not be loaded.".to_vec(),
         ),
     }
-}
-
-struct ResolvedMedia {
-    path: PathBuf,
-    len: u64,
-    mime_type: &'static str,
-}
-
-enum ByteRange {
-    Full,
-    Partial { start: u64, end: u64 },
-    Unsatisfiable,
 }
 
 enum MediaError {
@@ -83,8 +74,12 @@ fn resolve_media(db_path: &Path, request: &Request<Vec<u8>>) -> Result<ResolvedM
     if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_file() || metadata.len() == 0 {
         return Err(MediaError::NotFound);
     }
+    // Open once without following links and serve from that handle, so a
+    // swap after the checks above cannot redirect the read.
+    let file = open_verified_file(&canonical_path, metadata.len(), &canonical_root)
+        .map_err(|_| MediaError::NotFound)?;
     Ok(ResolvedMedia {
-        path: canonical_path,
+        file,
         len: metadata.len(),
         mime_type: mime_for_path(&artifact_path),
     })
@@ -124,212 +119,22 @@ fn parse_artifact_id(request: &Request<Vec<u8>>) -> Result<String, MediaError> {
     Ok(artifact_id.to_string())
 }
 
-const MAX_MEDIA_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
-
 fn serve_media(request: &Request<Vec<u8>>, media: ResolvedMedia) -> Response<Vec<u8>> {
-    serve_media_chunked(request, media, MAX_MEDIA_CHUNK_BYTES)
+    serve_file(request, media, SERVE_OPTIONS)
 }
 
-fn clamp_media_range_end(start: u64, end: u64, max_chunk: u64) -> u64 {
-    start.saturating_add(max_chunk.saturating_sub(1)).min(end)
-}
-
+#[cfg(test)]
 fn serve_media_chunked(
     request: &Request<Vec<u8>>,
     media: ResolvedMedia,
     max_chunk: u64,
 ) -> Response<Vec<u8>> {
-    match parse_byte_range(request.headers().get(RANGE), media.len) {
-        ByteRange::Full => {
-            if media.len == 0 {
-                return text_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    b"LinkedIn media could not be loaded.".to_vec(),
-                );
-            }
-            let end = clamp_media_range_end(0, media.len.saturating_sub(1), max_chunk);
-            serve_file_span(
-                &media,
-                0,
-                end,
-                media.len,
-                end >= media.len.saturating_sub(1),
-            )
-        }
-        ByteRange::Partial { start, end } => {
-            let end = clamp_media_range_end(start, end, max_chunk);
-            serve_file_span(&media, start, end, media.len, false)
-        }
-        ByteRange::Unsatisfiable => {
-            let builder = Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(CONTENT_LENGTH, "0")
-                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_RANGE, format!("bytes */{}", media.len))
-                .header(CACHE_CONTROL, "no-store");
-            builder
-                .body(Vec::new())
-                .unwrap_or_else(|_| fallback_internal())
-        }
-    }
+    crate::app::media_range::serve_file_chunked(request, media, max_chunk, SERVE_OPTIONS)
 }
 
-fn serve_file_span(
-    media: &ResolvedMedia,
-    start: u64,
-    end: u64,
-    total: u64,
-    whole_file: bool,
-) -> Response<Vec<u8>> {
-    match read_file_range(&media.path, start, end) {
-        Ok(bytes) if whole_file => {
-            media_response(StatusCode::OK, bytes, media.mime_type, None, total)
-        }
-        Ok(bytes) => media_response(
-            StatusCode::PARTIAL_CONTENT,
-            bytes,
-            media.mime_type,
-            Some((start, end)),
-            total,
-        ),
-        Err(_) => text_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            b"LinkedIn media could not be loaded.".to_vec(),
-        ),
-    }
-}
-
-fn parse_byte_range(header: Option<&HeaderValue>, total: u64) -> ByteRange {
-    let Some(value) = header.and_then(|value| value.to_str().ok()) else {
-        return ByteRange::Full;
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return ByteRange::Full;
-    }
-    let Some(spec) = value.strip_prefix("bytes=") else {
-        return ByteRange::Full;
-    };
-    if spec.contains(',') {
-        return ByteRange::Full;
-    }
-    let Some((start_raw, end_raw)) = spec.split_once('-') else {
-        return ByteRange::Full;
-    };
-    if total == 0 {
-        return ByteRange::Unsatisfiable;
-    }
-    if start_raw.is_empty() {
-        let Ok(suffix) = end_raw.parse::<u64>() else {
-            return ByteRange::Full;
-        };
-        if suffix == 0 {
-            return ByteRange::Unsatisfiable;
-        }
-        return ByteRange::Partial {
-            start: total.saturating_sub(suffix),
-            end: total - 1,
-        };
-    }
-    let Ok(start) = start_raw.parse::<u64>() else {
-        return ByteRange::Full;
-    };
-    if start >= total {
-        return ByteRange::Unsatisfiable;
-    }
-    let end = if end_raw.is_empty() {
-        total - 1
-    } else {
-        let Ok(end) = end_raw.parse::<u64>() else {
-            return ByteRange::Full;
-        };
-        end.min(total - 1)
-    };
-    if start > end {
-        return ByteRange::Unsatisfiable;
-    }
-    ByteRange::Partial { start, end }
-}
-
-fn read_file_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>, MediaError> {
-    let len = end.saturating_sub(start).saturating_add(1);
-    let len_usize = usize::try_from(len).map_err(|_| MediaError::Internal)?;
-    let mut file = fs::File::open(path).map_err(|_| MediaError::Internal)?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|_| MediaError::Internal)?;
-    let mut buf = vec![0_u8; len_usize];
-    file.read_exact(&mut buf)
-        .map_err(|_| MediaError::Internal)?;
-    Ok(buf)
-}
-
-fn mime_for_path(path: &str) -> &'static str {
-    match Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mkv") => "video/x-matroska",
-        _ => "application/octet-stream",
-    }
-}
-
-fn media_response(
-    status: StatusCode,
-    body: Vec<u8>,
-    mime_type: &str,
-    range: Option<(u64, u64)>,
-    total: u64,
-) -> Response<Vec<u8>> {
-    let mut builder = Response::builder()
-        .status(status)
-        .header(CONTENT_LENGTH, body.len().to_string())
-        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(CONTENT_TYPE, mime_type)
-        .header(ACCEPT_RANGES, "bytes")
-        .header(CACHE_CONTROL, "private, max-age=31536000, immutable");
-    if let Some((start, end)) = range {
-        builder = builder.header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
-    }
-    builder.body(body).unwrap_or_else(|_| fallback_internal())
-}
-
-fn text_response(status: StatusCode, body: Vec<u8>) -> Response<Vec<u8>> {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_LENGTH, body.len().to_string())
-        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(CACHE_CONTROL, "no-store")
-        .body(body)
-        .unwrap_or_else(|_| fallback_internal())
-}
-
-fn fallback_internal() -> Response<Vec<u8>> {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Vec::new())
-        .unwrap_or_else(|_| Response::new(Vec::new()))
-}
-
-fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+#[cfg(test)]
+fn clamp_media_range_end(start: u64, end: u64, max_chunk: u64) -> u64 {
+    crate::app::media_range::clamp_range_end(start, end, max_chunk)
 }
 
 #[cfg(test)]
@@ -337,6 +142,7 @@ mod tests {
     use super::*;
     use crate::cache::initialize_database;
     use rusqlite::params;
+    use std::path::PathBuf;
     use tauri::http::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE};
 
     fn request_for_url(url: &str) -> Request<Vec<u8>> {
@@ -458,7 +264,7 @@ mod tests {
         let (_directory, _db_path, video_path) = harness();
         fs::write(&video_path, vec![7_u8; 32]).unwrap();
         let media = ResolvedMedia {
-            path: video_path,
+            file: fs::File::open(&video_path).unwrap(),
             len: 32,
             mime_type: "video/mp4",
         };

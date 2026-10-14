@@ -7,6 +7,7 @@ use crate::cache::{get_setting, open_runtime, upsert_setting_json};
 use crate::providers::youtube::error::{YouTubeError, YouTubeInternalError};
 use crate::providers::youtube::executor::{YouTubeExecutorContext, YouTubeExecutorItemContext};
 use crate::providers::youtube::helper::helper_kind;
+use crate::providers::youtube::resume;
 use crate::providers::youtube::live::{DiscoveryGuard, YouTubeLiveHandle, YoutubeDurableRequest};
 use crate::providers::youtube::manifest_contract::{
     artifact_fingerprint, select_transcript, validate_helper_lock_digest, ArtifactFingerprintInput,
@@ -49,6 +50,10 @@ pub struct YouTubeState {
 impl YouTubeState {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
+    }
+
+    pub(super) fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     fn connection(&self) -> Result<Connection, YouTubeError> {
@@ -183,7 +188,7 @@ const HELPER_INTEGRITY_MESSAGE: &str =
 /// Internal embedded-lock builds with a corrupted sidecar report HELPER_MISSING
 /// (no managed install); Download YouTube helpers still repairs it because a
 /// managed install is resolved first.
-fn helper_status_response(
+pub(super) fn helper_status_response(
     identity: Result<HelperIdentity, ManagedProcessError>,
     install_present: impl FnOnce() -> bool,
 ) -> GetYouTubeHelperStatusResponse {
@@ -726,18 +731,131 @@ pub fn resume_youtube_download(
 }
 
 #[tauri::command]
-pub fn cancel_youtube_download(
-    live: State<'_, Arc<YouTubeLiveHandle>>,
-    state: State<'_, YouTubePlanStore>,
-    runtime: State<'_, WorkflowRuntime>,
+pub async fn cancel_youtube_download(
+    app: tauri::AppHandle,
     request: CancelYouTubeRunRequest,
 ) -> Result<TransientRunSnapshot, YouTubeError> {
-    let _ = state;
-    let snapshot = live.cancel(&request.run_id).map_err(YouTubeError::from)?;
-    runtime
-        .cancel_run(request.run_id, chrono::Utc::now().timestamp())
-        .map_err(|error| YouTubeError::new("CANCEL_FAILED", error.to_string()))?;
+    // Cancelling a paused run deletes its partial files, which must not run
+    // on the Tauri main thread.
+    run_youtube_blocking(move || {
+        let (Some(live), Some(runtime)) = (
+            app.try_state::<Arc<YouTubeLiveHandle>>(),
+            app.try_state::<WorkflowRuntime>(),
+        ) else {
+            return Err(runtime_state_unavailable());
+        };
+        let outcome = cancel_youtube_download_blocking(&live, &runtime, &request.run_id);
+        let _ = tauri::Emitter::emit(&app, resume::RESUME_EVENT_NAME, ());
+        outcome
+    })
+    .await
+}
+
+pub(super) fn cancel_youtube_download_blocking(
+    live: &YouTubeLiveHandle,
+    runtime: &WorkflowRuntime,
+    run_id: &str,
+) -> Result<TransientRunSnapshot, YouTubeError> {
+    // Cancel, attach and begin_resume all run under the drain lock. A cancel
+    // therefore either lands on a live control that is attached (and signals
+    // it), or makes the durable run non-paused first so a later admission
+    // refuses it; the executor can never start behind a cancel.
+    // The reference check and the deletion of any staging nothing else needs
+    // also happen under this lock, so an admission of a run using the same
+    // directory waits for the cleanup instead of racing it.
+    let snapshot = runtime.with_drain_lock(|| {
+        let durable = runtime
+            .get_run(run_id.to_string())
+            .map_err(|error| YouTubeError::new("CANCEL_FAILED", error.to_string()))?;
+        let paused = durable
+            .as_ref()
+            .filter(|run| run.state == crate::workflow::domain::state::RunState::Paused)
+            .cloned();
+        let snapshot = match live.cancel(run_id) {
+            Ok(snapshot) => snapshot,
+            // A paused run waiting to be resumed has no live control. Its
+            // snapshot continues the revisions the UI has already seen.
+            Err(crate::app::managed_process::TransientRuntimeError::RunNotFound)
+                if paused.is_some() =>
+            {
+                let mut snapshot = cancelled_snapshot_for(paused.as_ref());
+                let stored = runtime
+                    .get_resume(run_id.to_string())
+                    .ok()
+                    .flatten()
+                    .map_or(0, |record| record.last_revision);
+                snapshot.revision = live.revision_of(run_id).max(stored) + 1;
+                snapshot
+            }
+            Err(error) => return Err(YouTubeError::from(error)),
+        };
+        runtime
+            .cancel_run(run_id.to_string(), chrono::Utc::now().timestamp())
+            .map_err(|error| YouTubeError::new("CANCEL_FAILED", error.to_string()))?;
+        // Only a run with no attached control has no executor to clean up.
+        if let Some(run) = paused.filter(|_| !live.has_active_run(run_id)) {
+            let shared =
+                resume::staging_shared_with_others(runtime, run_id, &run.output_root);
+            resume::discard_paused_run_staging(&run, &shared);
+            live.publish_snapshot(snapshot.clone());
+        }
+        Ok::<_, YouTubeError>(snapshot)
+    })?;
     Ok(snapshot)
+}
+
+/// Terminal snapshot for a cancelled run that was never attached this session.
+fn cancelled_snapshot_for(run: Option<&crate::workflow::domain::types::RunRecord>) -> TransientRunSnapshot {
+    let request = run.and_then(|run| serde_json::from_str::<YoutubeDurableRequest>(&run.request_json).ok());
+    let mut snapshot = crate::providers::youtube::live::initial_snapshot(
+        run.map(|run| run.id.clone()).unwrap_or_default(),
+        request.as_ref().map(|r| r.client_submission_id.clone()).unwrap_or_default(),
+        request.as_ref().map(|r| r.plan_fingerprint.clone()).unwrap_or_default(),
+        request.as_ref().map(|r| r.work_items.as_slice()).unwrap_or(&[]),
+    );
+    crate::providers::youtube::live::finish_snapshot(&mut snapshot, true, None);
+    snapshot
+}
+
+/// Runs paused for a resume decision, or in a resumed attempt.
+#[tauri::command]
+pub async fn list_youtube_resumable_runs(
+    app: tauri::AppHandle,
+) -> Result<Vec<resume::YouTubeResumableRun>, YouTubeError> {
+    run_youtube_blocking(move || {
+        let Some(runtime) = app.try_state::<WorkflowRuntime>() else {
+            return Err(runtime_state_unavailable());
+        };
+        let runs = runtime
+            .list_youtube_resumable()
+            .map_err(|error| YouTubeError::new("RESUME_LIST_FAILED", error.to_string()))?;
+        Ok(runs
+            .iter()
+            .map(|(run, state)| resume::project_resumable(run, state))
+            .collect())
+    })
+    .await
+}
+
+/// The Continue button: starts exactly one resumed attempt.
+#[tauri::command]
+pub async fn continue_youtube_run(
+    app: tauri::AppHandle,
+    request: resume::ContinueYouTubeRunRequest,
+) -> Result<resume::ContinueYouTubeRunResponse, YouTubeError> {
+    run_youtube_blocking(move || {
+        let (Some(live), Some(runtime)) = (
+            app.try_state::<Arc<YouTubeLiveHandle>>(),
+            app.try_state::<WorkflowRuntime>(),
+        ) else {
+            return Err(runtime_state_unavailable());
+        };
+        let outcome =
+            resume::continue_run(&runtime, &live, &request.run_id, request.generation);
+        let _ = tauri::Emitter::emit(&app, resume::RESUME_EVENT_NAME, ());
+        outcome
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1027,7 +1145,7 @@ fn digest_bytes(input: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn opaque_id(prefix: &str) -> String {
+pub(super) fn opaque_id(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);

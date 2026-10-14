@@ -45,6 +45,7 @@ import {
   type DetectedYouTubeLink
 } from "../../lib/youtube/detect";
 import {
+  isYouTubeRunSuspended,
   isYouTubeRunTerminal,
   type InspectYouTubeTranscriptsResponse,
   type ScanYouTubeSourceResponse,
@@ -53,11 +54,15 @@ import {
   type YouTubeError,
   type YouTubeHistoryEntry,
   type YouTubeItemState,
+  type YouTubePlayerSession,
   type YouTubePlaylistMode,
   type YouTubeRunSnapshot,
   type YouTubeScanItem,
   type YouTubeTranscriptTrack
 } from "../../lib/youtube/types";
+import { YouTubeHistoryRow } from "./YouTubeHistoryRow";
+import { YouTubeResumePanel } from "./YouTubeResumePanel";
+import { YouTubePlayerPane } from "./YouTubePlayerPane";
 import { helperRecoveryKind, YOUTUBE_HELPER_STATUS_EVENT } from "../../lib/youtube/helperRecovery";
 import { youtubeItemStatusText, youtubeProgressDetail, type YouTubeRowRunContext } from "../../lib/youtube/itemStatus";
 import { loadYouTubeOutputDir, persistYouTubeOutputDir, readPreviewYouTubeOutputDir } from "../../lib/youtube/preferences";
@@ -231,11 +236,17 @@ function pickPreferredLanguage(
 ): string | null {
   if (options.length === 0 || (options.length === 1 && options[0]?.tag === "")) return null;
   if (current && options.some((option) => option.tag === current)) return current;
-  const english = options.find((option) => {
+  const english = options.filter((option) => {
     const tag = option.tag.toLowerCase();
     return tag === "en" || tag.startsWith("en-") || tag.startsWith("en_");
   });
-  return english?.tag ?? options[0]?.tag ?? null;
+  // Prefer uploader English, then YouTube's untranslated "-orig" track:
+  // automatic "en" on an English video is a machine translation that YouTube
+  // rate-limits (HTTP 429) far more often than the original track.
+  const preferred = english.find((option) => !option.label.toLowerCase().includes("automatic") && !option.tag.toLowerCase().endsWith("-orig"))
+    ?? english.find((option) => option.tag.toLowerCase().endsWith("-orig"))
+    ?? english[0];
+  return preferred?.tag ?? options[0]?.tag ?? null;
 }
 
 function helperStatusFailure(error: unknown): YouTubeError {
@@ -321,7 +332,14 @@ function formatYouTubeWarning(value: unknown): string {
   }
 }
 
-export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "history" }) {
+export function YouTubeView({
+  mode = "downloads",
+  onPlayerOpenChange
+}: {
+  mode?: "downloads" | "history";
+  /** Reports whether the in-app player is open so the shell can enter cinema mode. */
+  onPlayerOpenChange?: (open: boolean) => void;
+}) {
   const nativeRuntime = isTauriRuntime();
   const [helperStatus, setHelperStatus] = useState<HelperStatus>(nativeRuntime ? "pending" : "ready");
   const [helperError, setHelperError] = useState<YouTubeError | null>(null);
@@ -443,6 +461,8 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
   const [historyEntries, setHistoryEntries] = useState<YouTubeHistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(mode === "history");
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [player, setPlayer] = useState<YouTubePlayerSession | null>(null);
+  const [playerClosedCount, setPlayerClosedCount] = useState(0);
   const sourceInputRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptInspectionGenerationRef = useRef(0);
   const latestRunIdRef = useRef<string | null>(null);
@@ -529,6 +549,16 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
       disposed = true;
     };
   }, [nativeRuntime]);
+
+  useEffect(() => {
+    onPlayerOpenChange?.(player !== null);
+  }, [onPlayerOpenChange, player]);
+
+  useEffect(() => {
+    return () => {
+      onPlayerOpenChange?.(false);
+    };
+  }, [onPlayerOpenChange]);
 
   useEffect(() => {
     if (mode !== "history") return;
@@ -684,7 +714,11 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
     () => videosWithSection.filter((entry) => entry.section === queueSection),
     [videosWithSection, queueSection]
   );
-  const activeRun = runSnapshot !== null && !isYouTubeRunTerminal(runSnapshot.state);
+  // A run suspended after a failed resumed attempt is waiting for Continue in
+  // the interrupted-downloads panel; it is neither running nor finished.
+  const activeRun = runSnapshot !== null
+    && !isYouTubeRunTerminal(runSnapshot.state)
+    && !isYouTubeRunSuspended(runSnapshot);
   // A run that failed before any item could report an error (for example a bad
   // request) still has to say why; otherwise the rows just look stalled.
   const runFailureNotice = runSnapshot !== null
@@ -1327,7 +1361,25 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
 
   if (mode === "history") {
     return (
+      <>
+      {player ? (
+        <div
+          className="lv-workspace youtube-history-workspace youtube-player-workspace"
+          data-player-open="true"
+        >
+          <YouTubePlayerPane
+            session={player}
+            onClose={() => {
+              setPlayer(null);
+              setPlayerClosedCount((count) => count + 1);
+            }}
+          />
+        </div>
+      ) : null}
       <YouTubeHistoryPage
+        hidden={player !== null}
+        playerClosedCount={playerClosedCount}
+        onPlay={setPlayer}
         entries={historyEntries}
         loading={historyLoading}
         error={historyError}
@@ -1343,12 +1395,14 @@ export function YouTubeView({ mode = "downloads" }: { mode?: "downloads" | "hist
           }
         }}
       />
+      </>
     );
   }
 
   return (
     <div className="youtube-view" data-has-results={videos.length > 0 || isScanning || undefined}>
       <div className="youtube-live-announcer" role="status" aria-live="polite">{liveAnnouncement}</div>
+      <YouTubeResumePanel />
       {helperStatus !== "ready" && nativeRuntime ? (
         <div className="youtube-helper-error" role="alert">
           {helperStatus === "pending" ? (
@@ -1687,15 +1741,24 @@ function YouTubeHistoryPage({
   entries,
   loading,
   error,
-  onOpenFolder
+  hidden,
+  playerClosedCount,
+  onOpenFolder,
+  onPlay
 }: {
+  hidden: boolean;
   entries: YouTubeHistoryEntry[];
   loading: boolean;
   error: string | null;
+  playerClosedCount: number;
   onOpenFolder: (entry: YouTubeHistoryEntry) => void | Promise<void>;
+  onPlay: (session: YouTubePlayerSession) => void;
 }) {
   return (
-    <div className="lv-workspace download-history-workspace youtube-history-workspace">
+    <div
+      className="lv-workspace download-history-workspace youtube-history-workspace"
+      style={hidden ? { display: "none" } : undefined}
+    >
       <div className="download-history-header youtube-history-header">
         <p className="download-history-count">
           {loading
@@ -1721,28 +1784,14 @@ function YouTubeHistoryPage({
               `${entry.videoCount} video${entry.videoCount === 1 ? "" : "s"}`
             ].join(" · ");
             return (
-              <li key={entry.runId} className="download-history-row youtube-history-row">
-                <div className="download-history-copy">
-                  <strong>{entry.title}</strong>
-                  <span>{meta}</span>
-                  {entry.errorMessage ? (
-                    <span className="youtube-result-warning">{entry.errorMessage}</span>
-                  ) : null}
-                </div>
-                <div className="download-history-overlay">
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="ghost"
-                    className="download-history-file-action youtube-file-action"
-                    onClick={() => void onOpenFolder(entry)}
-                    aria-label={`Open folder for ${entry.title}`}
-                  >
-                    <FolderOpen aria-hidden="true" />
-                    Open Folder
-                  </Button>
-                </div>
-              </li>
+              <YouTubeHistoryRow
+                key={entry.runId}
+                entry={entry}
+                meta={meta}
+                refreshKey={playerClosedCount}
+                onOpenFolder={onOpenFolder}
+                onPlay={onPlay}
+              />
             );
           })}
         </ol>

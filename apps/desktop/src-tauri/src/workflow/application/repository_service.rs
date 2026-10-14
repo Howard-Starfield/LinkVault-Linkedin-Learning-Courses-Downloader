@@ -3,10 +3,12 @@
 use crate::app::database_diagnostics::DatabaseProvider;
 use crate::app::database_writer::{DatabaseWriteContext, DatabaseWriteError, DatabaseWriter};
 use crate::workflow::domain::errors::WorkflowError;
+use crate::workflow::domain::resume::{ReconcileSummary, ResumeTrigger, RunResumeRecord};
 use crate::workflow::domain::state::{RunState, StepState};
 use crate::workflow::domain::types::{
     NewWorkflowRun, NewWorkflowStep, RunRecord, StepRecord, WorkflowEventRecord,
 };
+use crate::workflow::infrastructure::resume_repository::PauseNote;
 use crate::workflow::infrastructure::sqlite_repository::SqliteWorkflowRepository;
 use crate::workflow::ports::repository::WorkflowRepository;
 
@@ -431,6 +433,136 @@ impl WorkflowRepositoryService {
                 },
             )
             .map_err(map_writer)
+    }
+}
+
+impl WorkflowRepositoryService {
+    fn with_connection<T: Send + 'static>(
+        &self,
+        operation: &'static str,
+        workflow_id: Option<String>,
+        task: impl FnOnce(&SqliteWorkflowRepository, &rusqlite::Connection) -> Result<T, WorkflowError>
+            + Send
+            + 'static,
+    ) -> Result<T, WorkflowError> {
+        let repository = self.repository;
+        self.writer
+            .execute(
+                DatabaseWriteContext {
+                    operation,
+                    provider: DatabaseProvider::Workflow,
+                    workflow_id,
+                },
+                move |connection| task(&repository, connection).map_err(map_domain),
+            )
+            .map_err(map_writer)
+    }
+
+    pub fn reconcile_for_resume(
+        &self,
+        workflow_type: String,
+        reason: String,
+        now: i64,
+    ) -> Result<ReconcileSummary, WorkflowError> {
+        self.with_connection("workflow_reconcile_for_resume", None, move |repo, conn| {
+            repo.reconcile_for_resume(conn, &workflow_type, &reason, now)
+        })
+    }
+
+    pub fn begin_resume(
+        &self,
+        run_id: String,
+        trigger: ResumeTrigger,
+        now: i64,
+    ) -> Result<bool, WorkflowError> {
+        let id = run_id.clone();
+        self.with_connection("workflow_begin_resume", Some(id), move |repo, conn| {
+            repo.begin_resume(conn, &run_id, trigger, now)
+        })
+    }
+
+    pub fn pause_after_failed_attempt(
+        &self,
+        run_id: String,
+        step_id: String,
+        reason: String,
+        reason_code: Option<String>,
+        last_revision: u64,
+        now: i64,
+    ) -> Result<bool, WorkflowError> {
+        let id = run_id.clone();
+        self.with_connection("workflow_pause_after_failed_attempt", Some(id), move |repo, conn| {
+            repo.pause_after_failed_attempt(
+                conn,
+                &run_id,
+                &step_id,
+                PauseNote {
+                    reason: &reason,
+                    reason_code: reason_code.as_deref(),
+                    last_revision,
+                },
+                now,
+            )
+        })
+    }
+
+    pub fn park_for_user(
+        &self,
+        run_id: String,
+        reason: String,
+        reason_code: Option<String>,
+        now: i64,
+        expected_generation: Option<i64>,
+    ) -> Result<bool, WorkflowError> {
+        let id = run_id.clone();
+        self.with_connection("workflow_park_for_user", Some(id), move |repo, conn| {
+            repo.park_for_user(
+                conn,
+                &run_id,
+                &reason,
+                reason_code.as_deref(),
+                now,
+                expected_generation,
+            )
+        })
+    }
+
+    pub fn set_expected_bytes(
+        &self,
+        run_id: String,
+        item_key: String,
+        bytes: u64,
+        now: i64,
+    ) -> Result<(), WorkflowError> {
+        let id = run_id.clone();
+        self.with_connection("workflow_set_expected_bytes", Some(id), move |repo, conn| {
+            repo.set_expected_bytes(conn, &run_id, &item_key, bytes, now)
+        })
+    }
+
+    pub fn get_resume(&self, run_id: String) -> Result<Option<RunResumeRecord>, WorkflowError> {
+        let id = run_id.clone();
+        self.with_connection("workflow_get_resume", Some(id), move |repo, conn| {
+            repo.get_resume(conn, &run_id)
+        })
+    }
+
+    pub fn list_nonterminal_runs(
+        &self,
+        workflow_type: String,
+    ) -> Result<Vec<RunRecord>, WorkflowError> {
+        self.with_connection("workflow_list_nonterminal", None, move |repo, conn| {
+            repo.list_nonterminal_runs(conn, &workflow_type)
+        })
+    }
+
+    pub fn list_resumable(
+        &self,
+        workflow_type: String,
+    ) -> Result<Vec<(RunRecord, RunResumeRecord)>, WorkflowError> {
+        self.with_connection("workflow_list_resumable", None, move |repo, conn| {
+            repo.list_resumable(conn, &workflow_type)
+        })
     }
 }
 

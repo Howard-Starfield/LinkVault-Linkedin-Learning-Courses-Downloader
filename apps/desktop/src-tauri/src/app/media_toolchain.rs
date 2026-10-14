@@ -1416,6 +1416,35 @@ pub fn active_component_paths() -> ToolchainResult<Option<ActiveToolchainPaths>>
 /// Download, verify, extract, health-check, and atomically activate the latest
 /// signed toolchain release. Blocking; uses sync reqwest.
 pub fn install_latest() -> ToolchainResult<MediaToolchainStatus> {
+    let _installing = InstallInProgress::begin();
+    install_latest_inner()
+}
+
+static INSTALLS_IN_PROGRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True while a toolchain install or repair is running in this process, so
+/// callers that need the helpers (automatic resume) can wait instead of
+/// reporting them missing.
+pub fn install_in_progress() -> bool {
+    INSTALLS_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+struct InstallInProgress;
+
+impl InstallInProgress {
+    fn begin() -> Self {
+        INSTALLS_IN_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for InstallInProgress {
+    fn drop(&mut self) {
+        INSTALLS_IN_PROGRESS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn install_latest_inner() -> ToolchainResult<MediaToolchainStatus> {
     let layout = MediaToolchainLayout::resolve()?;
     let operation_id = format!("install-{}", unique_temp_token());
     let stage = layout.staging_dir(&operation_id);

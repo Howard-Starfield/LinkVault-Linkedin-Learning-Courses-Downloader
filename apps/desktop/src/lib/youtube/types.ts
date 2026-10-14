@@ -293,3 +293,94 @@ export function isYouTubeRunTerminal(state: YouTubeRunState | null | undefined):
     || state === "failed"
     || state === "cancelled";
 }
+
+export interface ListYouTubeRunVideosRequest {
+  runId: string;
+}
+
+/**
+ * One video of a finished run, as the in-app player needs it.
+ * `mediaUrl` / `subtitlesUrl` are opaque `youtube-media` URLs (ids only).
+ * An unavailable video has no URLs and says why in `unavailableReason`.
+ */
+export interface YouTubeRunVideo {
+  occurrenceId: string;
+  ordinal: number;
+  title: string;
+  videoId: string;
+  mediaUrl: string | null;
+  subtitlesUrl: string | null;
+  available: boolean;
+  unavailableReason: string | null;
+  positionSeconds: number | null;
+  durationSeconds: number | null;
+  completed: boolean;
+}
+
+export interface GetYouTubePlaybackProgressRequest {
+  runId: string;
+  occurrenceId: string;
+}
+
+export interface SaveYouTubePlaybackProgressRequest {
+  runId: string;
+  occurrenceId: string;
+  positionSeconds: number;
+  durationSeconds: number;
+}
+
+export interface YouTubePlaybackProgress {
+  positionSeconds: number;
+  durationSeconds: number;
+  completed: boolean;
+}
+
+/** What the history page hands the player: one run and the video to start on. */
+export interface YouTubePlayerSession {
+  runId: string;
+  title: string;
+  videos: YouTubeRunVideo[];
+  startOccurrenceId: string;
+}
+
+/**
+ * A live snapshot that ended because a resumed attempt failed: the run is
+ * paused for the user (see `YouTubeResumableRun`), not running and not
+ * finished. It carries the reason in `error`.
+ */
+export function isYouTubeRunSuspended(
+  snapshot: { state: YouTubeRunState; error: YouTubeError | null } | null | undefined
+): boolean {
+  return snapshot?.state === "paused" && snapshot.error !== null;
+}
+
+/** Who moves an interrupted run next. */
+export type YouTubeResumeState = "auto_pending" | "needs_user" | "resuming";
+
+/** A run that was interrupted, or is in a resumed attempt (Rust `YouTubeResumableRun`). */
+export interface YouTubeResumableRun {
+  runId: string;
+  state: YouTubeResumeState;
+  reason: string | null;
+  reasonCode: string | null;
+  title: string;
+  videoCount: number;
+  outputDir: string;
+  autoResumeUsed: boolean;
+  /** Bytes of partial download a resume keeps. */
+  preservedBytes: number;
+  updatedAt: number;
+  /** Identifies this pause; Continue sends it back so a stale click starts nothing. */
+  generation: number;
+}
+
+export interface ContinueYouTubeRunRequest {
+  runId: string;
+  /** `YouTubeResumableRun.generation` of the pause the user is answering. */
+  generation: number;
+}
+
+export interface ContinueYouTubeRunResponse {
+  /** False when nothing was started because the run was already resuming or finished. */
+  started: boolean;
+}

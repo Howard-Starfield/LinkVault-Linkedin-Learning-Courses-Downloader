@@ -58,6 +58,9 @@ impl StepExecutor for NewspaperDownloadExecutor {
                     cancelled: false,
                     warning: true,
                     retryable: false,
+                    pause_for_user: false,
+                    pause_code: None,
+                    pause_revision: 0,
                     error_message: Some(format!(
                         "Newspaper download returned to the queue ({status})"
                     )),

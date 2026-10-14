@@ -28,6 +28,7 @@ pub enum DatabaseProvider {
     Linkedin,
     Coursera,
     Newspaper,
+    Youtube,
     Workflow,
 }
 

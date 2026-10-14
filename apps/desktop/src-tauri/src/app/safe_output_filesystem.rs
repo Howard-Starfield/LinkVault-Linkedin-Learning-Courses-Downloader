@@ -19,6 +19,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub mod resume;
+
 const MAX_SUPPORTED_PATH_UTF16: usize = 240;
 const MAX_HELPER_STAGING_DIR_UTF16: usize = 192;
 const MAX_HELPER_TEMP_ROOT_UTF16: usize = MAX_SUPPORTED_PATH_UTF16 - 1 - "roaming-app-data".len();
@@ -67,6 +69,8 @@ pub enum SafeOutputError {
     OutputCollision { path: PathBuf },
     #[error("output path exceeds the supported length")]
     PathTooLong,
+    #[error("staging directory is already in use by another download: {path}")]
+    StagingBusy { path: PathBuf },
     #[error("helper temporary workspace validation failed: {reason}")]
     HelperTemp { reason: String },
     #[cfg(windows)]
@@ -230,6 +234,8 @@ pub struct OutputAttemptLease {
     ancestor_leases: Vec<DirectoryLease>,
     identity: StableIdentity,
     handle: File,
+    /// Exclusive use of a resumable staging directory; released on drop.
+    claim: Option<resume::StagingClaim>,
 }
 
 /// Identity-held cleanup state for a staging attempt that is being discarded.
@@ -241,6 +247,8 @@ pub struct OutputAttemptLease {
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct OutputAttemptCleanupRecovery {
+    /// Keeps a resumable staging directory claimed until cleanup finishes.
+    _claim: Option<resume::StagingClaim>,
     root: ValidatedOutputRoot,
     ancestor_leases: Vec<DirectoryLease>,
     attempt: CleanupTarget,
@@ -304,10 +312,15 @@ impl ValidatedOutputRoot {
         &self.path
     }
 
+    /// The canonical form of the admitted root, for containment checks.
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
     /// Maximum UTF-16 units available to one direct child while retaining the
     /// conservative cross-helper path ceiling used by publication.
     pub fn direct_child_name_budget(&self) -> usize {
-        MAX_SUPPORTED_PATH_UTF16.saturating_sub(path_utf16_len(&self.path).saturating_add(1))
+        direct_child_name_budget_for(&self.path)
     }
 
     fn root_lease(&self) -> Result<&DirectoryLease, SafeOutputError> {
@@ -439,8 +452,20 @@ impl ValidatedOutputRoot {
             now_nanos(),
             NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
         );
-        validate_component(&attempt_name)?;
-        let names = [".lv", attempt_name.as_str()];
+        self.lease_staging_dir(&attempt_name, resume::LeaseMode::CreateNew)?
+            .ok_or(SafeOutputError::EscapedRoot)
+    }
+
+    /// Lease one directory under `<root>/.lv`, creating it or opening an
+    /// existing one. `OpenExisting` returns `None` when it does not exist.
+    /// Every step uses no-follow guards and records stable identities.
+    fn lease_staging_dir(
+        &self,
+        attempt_name: &str,
+        mode: resume::LeaseMode,
+    ) -> Result<Option<OutputAttemptLease>, SafeOutputError> {
+        validate_component(attempt_name)?;
+        let names = [".lv", attempt_name];
         self.revalidate()?;
         let mut current = self.path.clone();
         let mut ancestor_leases = Vec::with_capacity(names.len() - 1);
@@ -456,10 +481,26 @@ impl ValidatedOutputRoot {
                 return Err(SafeOutputError::PathTooLong);
             }
             let is_final = index + 1 == names.len();
-            match fs::create_dir(&current) {
-                Ok(()) => {}
-                Err(error) if !is_final && error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+            if is_final && mode == resume::LeaseMode::OpenExisting {
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if is_untrusted_directory(&metadata) {
+                            return Err(SafeOutputError::UnsafeDescendant { path: current });
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.revalidate()?;
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error)
+                        if !is_final && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             let handle = open_directory_guard(&current, is_final, false)?;
             let metadata = handle.metadata()?;
@@ -481,13 +522,14 @@ impl ValidatedOutputRoot {
         }
         let (handle, identity) = final_handle.ok_or(SafeOutputError::EscapedRoot)?;
         self.revalidate()?;
-        Ok(OutputAttemptLease {
+        Ok(Some(OutputAttemptLease {
             root: self.clone(),
             path: current,
             ancestor_leases,
             identity,
             handle,
-        })
+            claim: None,
+        }))
     }
 
     /// Verify and publish a leased attempt. Windows renames the held source
@@ -1283,8 +1325,10 @@ impl OutputAttemptCleanupRecovery {
             ancestor_leases,
             identity,
             handle,
+            claim,
         } = attempt;
         Self {
+            _claim: claim,
             root,
             ancestor_leases,
             attempt: CleanupTarget {
@@ -2274,7 +2318,27 @@ impl ExistingOutputDirectoryLease {
     }
 }
 
+/// [`ValidatedOutputRoot::direct_child_name_budget`] for a root that is only
+/// being read (no admission, no write probe). Uses the path as stored.
+pub fn direct_child_name_budget_for(root: &Path) -> usize {
+    MAX_SUPPORTED_PATH_UTF16.saturating_sub(path_utf16_len(root).saturating_add(1))
+}
+
 pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutputError> {
+    validate_output_root_inner(path, true)
+}
+
+/// Same admission checks as [`validate_output_root`] (absolute path, no
+/// reparse point on any ancestor, directory identity leases) without the
+/// write probe, for read-only consumers such as in-app playback.
+pub fn validate_output_root_for_read(path: &Path) -> Result<ValidatedOutputRoot, SafeOutputError> {
+    validate_output_root_inner(path, false)
+}
+
+fn validate_output_root_inner(
+    path: &Path,
+    probe_writable: bool,
+) -> Result<ValidatedOutputRoot, SafeOutputError> {
     if !path.is_absolute() {
         return Err(SafeOutputError::NotAbsolute);
     }
@@ -2294,16 +2358,101 @@ pub fn validate_output_root(path: &Path) -> Result<ValidatedOutputRoot, SafeOutp
         });
     }
     reject_reparse_components(path)?;
-    let leases = guard_root_chain(path)?;
+    let leases = guard_root_chain(path, probe_writable)?;
     let canonical_path = path.canonicalize()?;
     let root = ValidatedOutputRoot {
         path: path.to_path_buf(),
         canonical_path,
         leases: Arc::new(leases),
     };
-    probe_writable_dir(root.path())?;
+    if probe_writable {
+        probe_writable_dir(root.path())?;
+    }
     root.revalidate()?;
     Ok(root)
+}
+
+/// Open `path` once without following a link and prove the handle is the
+/// file that was validated: a regular, non-reparse file of exactly
+/// `expected_len` bytes, whose identity matches a second no-follow open of
+/// the path and whose real location is inside `canonical_root`. Callers read
+/// from the returned handle only, never from the path again.
+pub fn open_verified_file(
+    path: &Path,
+    expected_len: u64,
+    canonical_root: &Path,
+) -> Result<File, SafeOutputError> {
+    let (Some(parent), Some(name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Err(SafeOutputError::InvalidChildName);
+    };
+    let file = open_regular_leaf(parent, name, false)?;
+    verify_open_file(&file, expected_len, canonical_root)?;
+    let observer = open_regular_leaf(parent, name, false)?;
+    if stable_identity(&file)? != stable_identity(&observer)? {
+        return Err(SafeOutputError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(file)
+}
+
+/// Checks an already-open handle: regular file, not a reparse point, exact
+/// size, non-empty, and located inside `canonical_root` (where the platform
+/// can report the handle's real path).
+pub fn verify_open_file(
+    file: &File,
+    expected_len: u64,
+    canonical_root: &Path,
+) -> Result<(), SafeOutputError> {
+    let metadata = file.metadata()?;
+    if is_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(SafeOutputError::UnsafeDescendant {
+            path: canonical_root.to_path_buf(),
+        });
+    }
+    if metadata.len() == 0 || metadata.len() != expected_len {
+        return Err(SafeOutputError::IdentityChanged {
+            path: canonical_root.to_path_buf(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let real = handle_final_path(file)?;
+        if !real.starts_with(canonical_root) {
+            return Err(SafeOutputError::EscapedRoot);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn handle_final_path(file: &File) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buffer = vec![0_u16; 1024];
+    loop {
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle().cast(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                0,
+            )
+        } as usize;
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written < buffer.len() {
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer[..written],
+            )));
+        }
+        buffer.resize(written + 1, 0);
+    }
 }
 
 pub fn validate_output_component(name: &str) -> Result<(), SafeOutputError> {
@@ -2328,7 +2477,10 @@ fn validate_component(name: &str) -> Result<(), SafeOutputError> {
     validate_output_component(name)
 }
 
-fn guard_root_chain(path: &Path) -> Result<Vec<DirectoryLease>, SafeOutputError> {
+/// `writable` is false for read-only consumers (playback): every guard, the
+/// selected root included, is then opened without write-class access, so a
+/// root whose ACL grants only read still validates.
+fn guard_root_chain(path: &Path, writable: bool) -> Result<Vec<DirectoryLease>, SafeOutputError> {
     let mut paths = path
         .ancestors()
         .filter(|ancestor| ancestor.is_absolute())
@@ -2339,12 +2491,12 @@ fn guard_root_chain(path: &Path) -> Result<Vec<DirectoryLease>, SafeOutputError>
     let mut leases = Vec::with_capacity(path_count);
     for (index, current) in paths.into_iter().enumerate() {
         let is_selected_root = index + 1 == path_count;
-        let handle = open_directory_guard(&current, false, is_selected_root).map_err(|error| {
-            SafeOutputError::NotWritable {
+        let handle = open_directory_guard(&current, false, is_selected_root && writable).map_err(
+            |error| SafeOutputError::NotWritable {
                 path: current.clone(),
                 message: error.to_string(),
-            }
-        })?;
+            },
+        )?;
         let metadata = handle.metadata()?;
         if is_untrusted_directory(&metadata) {
             return Err(SafeOutputError::UntrustedDirectory { path: current });
@@ -2385,6 +2537,28 @@ fn revalidate_directory_lease(lease: &DirectoryLease) -> Result<(), SafeOutputEr
     Ok(())
 }
 
+#[cfg(windows)]
+const FILE_ADD_SUBDIRECTORY_ACCESS: u32 = 0x0004;
+#[cfg(windows)]
+const FILE_DELETE_CHILD_ACCESS: u32 = 0x0040;
+
+/// Access mask requested for a directory guard. Read-only guards (no delete,
+/// no add-child) request only list/read-attributes access.
+#[cfg(windows)]
+fn directory_guard_access(delete_access: bool, add_child_access: bool) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    };
+    FILE_LIST_DIRECTORY
+        | FILE_READ_ATTRIBUTES
+        | if delete_access { DELETE } else { 0 }
+        | if add_child_access {
+            FILE_ADD_SUBDIRECTORY_ACCESS | FILE_DELETE_CHILD_ACCESS
+        } else {
+            0
+        }
+}
+
 fn open_directory_guard(
     path: &Path,
     delete_access: bool,
@@ -2396,22 +2570,11 @@ fn open_directory_guard(
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
         };
-        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
-        const FILE_DELETE_CHILD: u32 = 0x0040;
         options
-            .access_mode(
-                FILE_LIST_DIRECTORY
-                    | FILE_READ_ATTRIBUTES
-                    | if delete_access { DELETE } else { 0 }
-                    | if add_child_access {
-                        FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
-                    } else {
-                        0
-                    },
-            )
+            .access_mode(directory_guard_access(delete_access, add_child_access))
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -2881,6 +3044,35 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn read_only_directory_guards_request_no_write_access() {
+        let write_bits = FILE_ADD_SUBDIRECTORY_ACCESS | FILE_DELETE_CHILD_ACCESS;
+        assert_eq!(directory_guard_access(false, false) & write_bits, 0);
+        assert_eq!(
+            directory_guard_access(false, false) & 0x0001_0000,
+            0,
+            "no DELETE"
+        );
+        assert_eq!(
+            directory_guard_access(false, true) & write_bits,
+            write_bits,
+            "the writable root guard still requests add-child access"
+        );
+    }
+
+    #[test]
+    fn read_validation_admits_a_root_without_probing_or_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = validate_output_root_for_read(temp.path()).unwrap();
+        assert!(root.canonical_path().is_dir());
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            0,
+            "read validation must leave no probe file behind"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 

@@ -7556,3 +7556,248 @@ textarea {
     transition: none;
   }
 }
+
+/* YouTube in-app playback: history Play actions, per-video rows, and the
+   player (which reuses the linkedin-player-* chrome). */
+.youtube-play-action {
+ flex: 0 0 auto;
+}
+
+.youtube-history-row[data-expanded="true"] {
+ border-color: var(--border-soft);
+}
+
+.youtube-history-videos {
+ grid-column: 1 / -1;
+ display: grid;
+ min-width: 0;
+ gap: 6px;
+ border-top: 1px solid var(--border-soft);
+ padding-top: 8px;
+}
+
+.youtube-history-videos-note {
+ margin: 0;
+ color: var(--text-soft);
+ font-size: 12px;
+ line-height: 16px;
+}
+
+.youtube-history-video-list {
+ display: grid;
+ min-width: 0;
+ gap: 2px;
+ list-style: none;
+ margin: 0;
+ padding: 0;
+}
+
+.youtube-history-video {
+ display: grid;
+ min-width: 0;
+ grid-template-columns: 28px minmax(0, 1fr) auto;
+ align-items: center;
+ gap: 8px;
+ border-radius: 8px;
+ padding: 6px 4px;
+}
+
+.youtube-history-video:hover,
+.youtube-history-video:focus-within {
+ background: var(--section-bg-hover, rgb(127 127 127 / 0.08));
+}
+
+.youtube-history-video[data-available="false"] .youtube-history-video-copy > strong {
+ color: var(--text-soft);
+}
+
+.youtube-history-video-ordinal {
+ color: var(--text-muted);
+ font-size: 12px;
+ font-variant-numeric: tabular-nums;
+ text-align: right;
+}
+
+.youtube-history-video-copy {
+ display: grid;
+ min-width: 0;
+ gap: 1px;
+}
+
+.youtube-history-video-copy > strong {
+ overflow: hidden;
+ color: var(--text-main);
+ font-size: 13px;
+ font-weight: 600;
+ line-height: 18px;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+
+.youtube-history-video-copy > span {
+ color: var(--text-soft);
+ font-size: 11px;
+ line-height: 15px;
+ overflow-wrap: anywhere;
+}
+
+.youtube-history-video-copy > .youtube-result-warning {
+ color: var(--warning);
+}
+
+.youtube-player-workspace {
+ width: 100%;
+ max-width: none;
+ min-height: 0;
+ height: 100%;
+ padding: 0;
+ gap: 0;
+ background: #000;
+ overflow: hidden;
+}
+
+.lv-shell[data-cinema="true"] .lv-content[data-active-view="youtube-history"] .lv-workspace {
+ overflow: hidden;
+}
+
+.youtube-player-position {
+ color: rgb(255 255 255 / 0.72);
+ font-size: 12px;
+ font-variant-numeric: tabular-nums;
+}
+
+.youtube-player-spacer {
+ flex: 1 1 auto;
+}
+
+.linkedin-player-control:disabled {
+ cursor: default;
+ opacity: 0.35;
+}
+
+.youtube-player-cc[aria-pressed="false"] {
+ opacity: 0.6;
+}
+
+.youtube-player-pane video::cue {
+ background: rgb(0 0 0 / 0.72);
+ color: #fff;
+}
+
+@container lv-main (max-width: 520px) {
+ .youtube-history-row {
+ grid-template-columns: minmax(0, 1fr);
+ }
+
+ .youtube-history-row .download-history-overlay {
+ flex-wrap: wrap;
+ justify-content: flex-start;
+ }
+
+ .youtube-player-position {
+ display: none;
+ }
+}
+
+@container lv-main (max-width: 520px) {
+ .youtube-history-video {
+ grid-template-columns: minmax(0, 1fr);
+ gap: 4px;
+ }
+
+ .youtube-history-video-ordinal {
+ display: none;
+ }
+
+ .youtube-history-video > .youtube-play-action {
+ justify-self: start;
+ }
+
+ .youtube-history-video-copy > span {
+ overflow-wrap: break-word;
+ }
+}
+
+/* Interrupted downloads: the single automatic resume, and runs paused for Continue. */
+.youtube-resume-panel {
+ min-width: 0;
+ margin: 0 0 12px;
+ border: 1px solid var(--border-soft);
+ border-radius: 10px;
+ background: var(--surface-faint);
+ padding: 4px;
+}
+
+.youtube-resume-list {
+ display: grid;
+ gap: 2px;
+ margin: 0;
+ padding: 0;
+ list-style: none;
+}
+
+.youtube-resume-row {
+ display: grid;
+ grid-template-columns: minmax(0, 1fr) auto;
+ align-items: center;
+ gap: 10px;
+ border-radius: 8px;
+ padding: 8px 10px;
+}
+
+.youtube-resume-row[data-state="needs_user"] {
+ background: color-mix(in srgb, var(--warning) 8%, transparent);
+}
+
+.youtube-resume-copy {
+ display: grid;
+ min-width: 0;
+ gap: 3px;
+}
+
+.youtube-resume-title {
+ overflow: hidden;
+ color: var(--foreground);
+ font-size: 13px;
+ font-weight: 600;
+ line-height: 18px;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+
+.youtube-resume-status {
+ color: var(--muted);
+ font-size: 12px;
+ line-height: 16px;
+ overflow-wrap: anywhere;
+}
+
+.youtube-resume-row[data-state="needs_user"] .youtube-resume-status {
+ color: var(--warning);
+}
+
+.youtube-resume-progress {
+ margin-top: 2px;
+}
+
+.youtube-resume-actions {
+ display: flex;
+ align-items: center;
+ gap: 2px;
+}
+
+@container lv-main (max-width: 520px) {
+ .youtube-resume-row {
+ grid-template-columns: minmax(0, 1fr);
+ gap: 6px;
+ }
+
+ .youtube-resume-actions {
+ justify-self: start;
+ }
+
+ .youtube-resume-title {
+ white-space: normal;
+ overflow-wrap: anywhere;
+ }
+}
