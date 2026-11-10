@@ -487,6 +487,13 @@ export function YouTubeView({
   const batches = batchesRef.current;
   const warnedRunIdRef = useRef<string | null>(null);
   const autoScanTimerRef = useRef<number | null>(null);
+  /** The backend runs one download at a time and refuses discovery meanwhile, so links pasted
+   *  during a download wait here and are scanned once it finishes. */
+  const downloadBusyRef = useRef(false);
+  const deferredLinksRef = useRef<DetectedYouTubeLink[] | null>(null);
+  const [deferredLinkCount, setDeferredLinkCount] = useState(0);
+  /** Set once a scan of deferred links finishes; the effect below then starts the download. */
+  const [autoStartPending, setAutoStartPending] = useState(false);
   const lastHeightSyncKeyRef = useRef<string | null>(null);
   /** Output dir used for the accepted run; File action falls back to this when paths are absent. */
   const runOutputDirRef = useRef("");
@@ -727,6 +734,7 @@ export function YouTubeView({
     && runSnapshot.items.every((item) => item.error === null)
     ? formatYouTubeFailure(runSnapshot.error)
     : null;
+  downloadBusyRef.current = activeRun || isStarting;
   const canPauseRun = activeRun && runSnapshot?.state === "running";
   const canResumeRun = activeRun && (runSnapshot?.state === "paused" || runSnapshot?.state === "pause_requested");
   const currentProgress = runSnapshot?.progress.fraction === null || runSnapshot?.progress.fraction === undefined
@@ -737,7 +745,8 @@ export function YouTubeView({
   const fallbackLanguages = useMemo(
     () => languageOptions
       .map((option) => option.tag)
-      .filter((tag) => tag !== preferredLanguage)
+      // The "No caption" placeholder has an empty tag; the backend rejects empty languages.
+      .filter((tag) => tag !== "" && tag !== preferredLanguage)
       .slice(0, 8),
     [languageOptions, preferredLanguage]
   );
@@ -779,6 +788,10 @@ export function YouTubeView({
   }, [runSnapshot]);
 
   function resetDetectedResults(): void {
+    deferredLinksRef.current = null;
+    setDeferredLinkCount(0);
+    // Clearing the field mid-download must not wipe the running rows or the batch queue.
+    if (downloadBusyRef.current) return;
     transcriptInspectionGenerationRef.current += 1;
     scanGenerationRef.current += 1;
     languageProbeTokenRef.current += 1;
@@ -883,7 +896,8 @@ export function YouTubeView({
 
   async function scanCompleteLinks(
     links: DetectedYouTubeLink[],
-    nextPlaylistMode?: YouTubePlaylistMode
+    nextPlaylistMode?: YouTubePlaylistMode,
+    autoStart = false
   ): Promise<void> {
     if (!ensureDestinationFolder()) return;
     const unique = links.filter((link, index) => links.findIndex((candidate) => candidate.canonicalUrl === link.canonicalUrl) === index);
@@ -896,6 +910,13 @@ export function YouTubeView({
       toast.error("YouTube helper is not ready", { description: helperError?.message ?? "Native discovery is blocked until helper integrity passes." });
       return;
     }
+    if (downloadBusyRef.current || batches.pendingVideos() > 0) {
+      deferredLinksRef.current = complete;
+      setDeferredLinkCount(complete.length);
+      return;
+    }
+    deferredLinksRef.current = null;
+    setDeferredLinkCount(0);
     const fingerprint = completeLinkFingerprint(complete);
     lastFingerprintRef.current = fingerprint;
     transcriptInspectionGenerationRef.current += 1;
@@ -947,6 +968,7 @@ export function YouTubeView({
           await refreshDetectedLanguages(captionedVideos, generation, YOUTUBE_LANGUAGE_PROBE_LIMIT);
         }
       }
+      if (autoStart && generation === scanGenerationRef.current) setAutoStartPending(true);
     } catch (error) {
       if (generation !== scanGenerationRef.current) return;
       toast.error("YouTube scan failed", { description: formatYouTubeInvokeError(error) });
@@ -955,6 +977,28 @@ export function YouTubeView({
       if (generation === scanGenerationRef.current) setIsScanning(false);
     }
   }
+
+  const downloadBusy = activeRun || isStarting;
+  useEffect(() => {
+    const waiting = deferredLinksRef.current;
+    if (downloadBusy || !waiting || batches.pendingVideos() > 0) return;
+    void scanCompleteLinks(waiting, undefined, true);
+    // scanCompleteLinks reads current state through refs; only the busy edge matters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [downloadBusy, deferredLinkCount]);
+
+  // Runs in a later render than the scan, so startGroup sees the freshly scanned plans.
+  useEffect(() => {
+    if (!autoStartPending || isScanning || downloadBusy) return;
+    setAutoStartPending(false);
+    const targets = videos.filter((video) => video.item.availability === "available");
+    if (targets.length === 0) {
+      toast.message("Nothing to download", { description: "The waiting link has no downloadable videos." });
+      return;
+    }
+    void startDownloads(targets);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStartPending, isScanning, downloadBusy]);
 
   function requestAutoScan(links: DetectedYouTubeLink[]): void {
     const fingerprint = completeLinkFingerprint(links);
@@ -1268,6 +1312,10 @@ export function YouTubeView({
     // Cancel also drops every batch not yet started.  (A start in flight cannot be cancelled: the
     // Cancel control exists only once a run does, and a start has no run until it succeeds.)
     batches.clear();
+    // Cancelling also drops links waiting behind this run, or they would start the moment it ends.
+    deferredLinksRef.current = null;
+    setDeferredLinkCount(0);
+    setAutoStartPending(false);
     setIsCancelling(true);
     try {
       const snapshot = await cancelYouTubeDownload({ runId: runSnapshot.runId });
@@ -1440,7 +1488,6 @@ export function YouTubeView({
             aria-label="Public YouTube URL"
             spellCheck={false}
             rows={1}
-            disabled={activeRun}
             className="youtube-search-input min-h-0"
           />
         </div>
@@ -1538,6 +1585,11 @@ export function YouTubeView({
             {scanNotes.map((note) => (
               <p key={note.key} className="youtube-scan-note">{note.text}</p>
             ))}
+            {deferredLinkCount > 0 ? (
+              <p className="youtube-scan-note">
+                {deferredLinkCount === 1 ? "1 new link is" : `${deferredLinkCount} new links are`} waiting. It will download when the current download finishes (not saved if you close the app).
+              </p>
+            ) : null}
           </div>
           <div className="queue-section-tabs youtube-queue-section-tabs" role="group" aria-label="YouTube download queue sections">
             <YouTubeQueueSectionTab
